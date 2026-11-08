@@ -47,12 +47,16 @@ pub const UNKNOWN_HOLDER: &str = "an unknown holder";
 const MAX_RECORD_CHARS: usize = 200;
 
 /// How to free the lock when a job cannot wait for a scrub —
-/// `.claude/rules/backup.md` §Supervisor Interaction: `cachyos-sentinel`
-/// restarts a stopped unit, so it is masked too, and unmasked once done.
-const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: systemctl stop \
-     das-scrub.service && systemctl mask das-scrub.service (stop alone is undone within \
-     seconds), then systemctl unmask das-scrub.service once done — the next scrub run \
-     resumes where this one stopped";
+/// `.claude/rules/backup.md` §Supervisor Interaction: a supervisor restarts
+/// a unit a stop left `failed`, so a runtime drop-in refuses manual starts
+/// first. `systemctl mask` cannot: the unit is installed in
+/// `/etc/systemd/system` (bd DAS-Backup-Manager-8f8j, tested 2026-11-08).
+const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: write \
+     /run/systemd/system/das-scrub.service.d/brake.conf with [Unit] \
+     RefuseManualStart=yes, systemctl daemon-reload, then systemctl stop das-scrub.timer \
+     das-scrub.service (a supervisor cannot restart it while the drop-in is there); once \
+     done, remove that drop-in, systemctl daemon-reload and systemctl start das-scrub.timer \
+     (a reboot removes it too) — the next scrub run resumes where this one stopped";
 
 /// Where the lock is and how often a waiting job looks at it again: the
 /// production lock in production, a scratch file in tests.
@@ -1052,9 +1056,10 @@ mod tests {
         for part in [
             "Waiting for the DAS maintenance lock /run/das-maintenance.lock",
             "held by btrdasd scrub run pid 9",
-            "systemctl stop das-scrub.service && systemctl mask das-scrub.service",
-            "stop alone is undone within seconds",
-            "systemctl unmask das-scrub.service",
+            "/run/systemd/system/das-scrub.service.d/brake.conf",
+            "RefuseManualStart=yes",
+            "systemctl stop das-scrub.timer das-scrub.service",
+            "remove that drop-in",
         ] {
             assert!(line.contains(part), "{part:?} missing from: {line}");
         }

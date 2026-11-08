@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The unread `UNAVAILABLE_TARGETS` array is removed; `tests/test_target_presence.sh` (CTest `shell-target-presence`) covers all four cases
 - **The Rust report send is bounded** (bd `DAS-Backup-Manager-sp78.2`): `report::Mailx` runs `mailx` under `timeout -k 10 60`, as `backup-run.sh` does — a relay that keeps trickling bytes used to hold `btrdasd backup run`, a GUI backup, the scrub pass or `doctor --email` at its report step for as long as it trickled
   - A timed-out send fails with `mailx timed out after 60 s`: measured against a trickling relay, a built `btrdasd doctor --email` gave up at 60 s, where 0.7.23.3 was still waiting at 150 s
+- **The documented way to stop a das unit deliberately works** (bd `DAS-Backup-Manager-8f8j`): the rules, `docs/DAS-BAY-MAPPING.md` and the scrub lock-wait message said `systemctl stop` AND `systemctl mask`, and `mask` is refused for every das unit (they are installed in `/etc/systemd/system`; `mask --runtime` is outranked by it, so a masked unit still starts — both tested 2026-11-08)
+  - The brake is now a runtime drop-in, `/run/systemd/system/<unit>.d/brake.conf` with `RefuseManualStart=yes`, then `systemctl stop` of the unit and its timers: a supervisor's restart of the `failed` unit a signalled run leaves is refused (exit 4); removing the drop-in, or a reboot, releases it
 
 ## [0.7.23.3] - 2026-11-08
 

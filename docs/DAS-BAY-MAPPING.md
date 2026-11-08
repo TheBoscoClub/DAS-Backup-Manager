@@ -134,12 +134,19 @@ cable.** Pulling the cable on a live enclosure is not a hot-unplug the filesyste
 can absorb.
 
 ```bash
-# 1. Stop and mask the units that mount the enclosure so nothing (and no watchdog)
-#    starts them mid-move.
-sudo systemctl stop das-backup.service das-backup-full.service das-scrub.service
-sudo systemctl mask das-backup.service das-backup-full.service das-scrub.service  # a service watchdog may restart them otherwise
-#    A job started from the GUI runs in btrdasd-helper, not in these units, and masking
-#    does not stop it. Both checks must print nothing; WAIT means a job still holds the DAS:
+# 1. Brake, then stop, the units that mount the enclosure so nothing (and no watchdog
+#    restarting a failed unit) starts them mid-move. `systemctl mask` cannot do this:
+#    the units are installed in /etc/systemd/system. The drop-ins live in /run, so a
+#    reboot removes them; to release earlier, delete them and daemon-reload.
+for u in das-backup.service das-backup-full.service das-scrub.service; do
+    sudo mkdir -p "/run/systemd/system/$u.d"
+    printf '[Unit]\nRefuseManualStart=yes\n' | sudo tee "/run/systemd/system/$u.d/brake.conf" >/dev/null
+done
+sudo systemctl daemon-reload
+sudo systemctl stop das-backup.timer das-backup-full.timer das-scrub.timer \
+    das-backup.service das-backup-full.service das-scrub.service
+#    A job started from the GUI runs in btrdasd-helper, not in these units, and the
+#    brake does not stop it. Both checks must print nothing; WAIT means a job still holds the DAS:
 sudo flock -n /run/das-backup.lock true || echo "WAIT: a backup is running"
 sudo flock -n /run/das-maintenance.lock true || echo "WAIT: a job holds the DAS; cat /run/das-maintenance.lock shows what it recorded"
 
@@ -160,8 +167,12 @@ for d in /sys/bus/usb/devices/*/; do
   printf '%-28s %s Mbit/s\n' "$(cat "$d/product")" "$(cat "$d/speed")"
 done | sort -u        # enclosure should read 10000
 
-# 6. Unmask and resume.
-sudo systemctl unmask das-backup.service das-backup-full.service das-scrub.service
+# 6. Release the brake and resume the schedule.
+for u in das-backup.service das-backup-full.service das-scrub.service; do
+    sudo rm -f "/run/systemd/system/$u.d/brake.conf"
+done
+sudo systemctl daemon-reload
+sudo systemctl start das-backup.timer das-backup-full.timer das-scrub.timer
 ```
 
 **What happens if you skip this.** If the cable is pulled while

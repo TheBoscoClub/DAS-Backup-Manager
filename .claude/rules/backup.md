@@ -166,8 +166,11 @@ Checked before any directory is created, both roots compared **after resolution*
 ## Supervisor Interaction — A Service Supervisor May Restart Failed Units
 
 - A supervisor (systemd `Restart=`, a monitor that restarts any unit it sees `failed`) must never meet a
-  failure the next start would meet again (it would loop). **To stop a unit deliberately: `systemctl stop`
-  AND `systemctl mask`.**
+  failure the next start would meet again (it would loop). **To stop a unit deliberately: brake it, then stop
+  it** — `/run/systemd/system/<unit>.d/brake.conf` with `[Unit]` `RefuseManualStart=yes`, `daemon-reload`, then
+  `systemctl stop` the unit and its timers; release: remove the drop-in, `daemon-reload`, start the timers (a
+  reboot clears both). Never `systemctl mask`: the units live in `/etc/systemd/system`, so it is refused, and
+  `--runtime` is outranked (bd `8f8j`).
 - The unit files carry no `Restart=`, `OnFailure=` or `OnUnitInactiveSec=`. Keep it that way: a failure the
   next start would meet again must never leave a unit `failed`. Prefer single non-template units.
   - `btrdasd scrub run`: **0** = the pass executed, whatever it found (findings travel by email); **nonzero** = could not start.
