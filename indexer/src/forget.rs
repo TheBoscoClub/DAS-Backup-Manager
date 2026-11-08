@@ -3,10 +3,13 @@
 //! Backs two commands that differ only in how they SELECT snapshots:
 //!
 //! * `btrdasd forget <glob>` (`bd DAS-Backup-Manager-u8n`) — selects by series
-//!   name. For snapshots stranded when a subvolume is renamed: the old
+//!   name. For snapshots stranded under a name no config entry holds: the old
 //!   `snapshot_name` matches no retention rule, so btrbk never prunes them
 //!   (`btrbk clean` handles incomplete/garbled only, `btrbk prune` matches
-//!   configured names) and they accumulate forever.
+//!   configured names) and they accumulate forever. A series whose entry sync
+//!   retired is not one of them: its backups are `btrdasd subvol expire`'s to
+//!   remove once past their window, and `forget` refuses it
+//!   ([`protected_series`], bd DAS-Backup-Manager-ow2a).
 //! * `btrdasd purge <glob>` (`bd DAS-Backup-Manager-rt6`) — selects by file
 //!   path, via the index, then deletes every snapshot containing it.
 //!

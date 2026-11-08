@@ -285,7 +285,16 @@ fn a_subvolume_created_after_setup_is_backed_up_by_the_next_run() {
 
     let outcome = rig.sync("2026-10-02");
     assert!(outcome.written && !outcome.failed(), "{outcome:?}");
-    assert_eq!(outcome.plan.adopt.len(), 2, "{:?}", outcome.plan);
+    // The two new subvolumes, and the volume's top level `.`, which every
+    // first sync of a primary-only volume adopts (bd xtnq).
+    let mut adopted_names: Vec<&str> = outcome.plan.adopt.iter().map(|a| a.name.as_str()).collect();
+    adopted_names.sort_unstable();
+    assert_eq!(
+        adopted_names,
+        [".", "@data/nested", "brand-new"],
+        "{:?}",
+        outcome.plan
+    );
     assert!(
         outcome.plan.retire.is_empty(),
         "nothing existing may be retired: {:?}",
@@ -337,7 +346,7 @@ fn a_subvolume_created_after_setup_is_backed_up_by_the_next_run() {
         .flat_map(|s| &s.subvolumes)
         .filter(|e| e.adopted.is_some())
         .collect();
-    assert_eq!(adopted_entries.len(), 2, "{adopted_entries:?}");
+    assert_eq!(adopted_entries.len(), 3, "{adopted_entries:?}");
 }
 
 #[test]
@@ -354,6 +363,21 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
     let snaps = rig.target_snapshots("src-adopted");
     assert!(snaps.iter().any(|n| n.starts_with("doomed.")), "{snaps:?}");
     assert!(snaps.iter().any(|n| n.starts_with("keeper.")), "{snaps:?}");
+    // The dates below are counted from btrbk's own stamp on the snapshot, not
+    // written in: btrbk stamps the real local date, and expiry keeps a
+    // snapshot newer than its retirement, so fixed dates passed only while
+    // the calendar was before them (bd DAS-Backup-Manager-pman).
+    let stamped = snaps
+        .iter()
+        .find_map(|n| n.strip_prefix("doomed."))
+        .and_then(|ts| (ts.len() >= 8).then(|| format!("{}-{}-{}", &ts[..4], &ts[4..6], &ts[6..8])))
+        .expect("doomed's snapshot carries a YYYYMMDD stamp");
+    let day = buttered_dasd::caldate::day_number(&stamped).expect("a real date");
+    let (retired_on, last_kept, first_gone) = (
+        stamped.clone(),
+        buttered_dasd::caldate::date_of(day + 7),
+        buttered_dasd::caldate::date_of(day + 8),
+    );
 
     rig.btrfs(&["subvolume", "delete", &rig.src_path("doomed")]);
     // Counter-direction: with the dead entry still in btrbk.conf, btrbk
@@ -369,7 +393,7 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
             .unwrap()
             .contains("doomed")
     );
-    let outcome = rig.sync("2026-10-03");
+    let outcome = rig.sync(&retired_on);
     assert!(outcome.written && !outcome.failed(), "{outcome:?}");
     assert_eq!(outcome.plan.retire.len(), 1, "{:?}", outcome.plan);
     assert_eq!(outcome.plan.retire[0].name, "doomed");
@@ -382,8 +406,8 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
     // Now btrbk must not fail on it (`must` asserts exit 0).
     rig.btrbk_run();
 
-    // Inside the 7-day window (retired 2026-10-03, kept through 2026-10-10).
-    let early = rig.expire("2026-10-10");
+    // Inside the 7-day window (kept through retirement + 7 days).
+    let early = rig.expire(&last_kept);
     assert!(!early.failed());
     assert!(
         early.deleted_paths().is_empty(),
@@ -414,9 +438,9 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
 
     // Past it: gone from the target and from the source side, and the entry
     // with them. The live neighbour is untouched.
-    let late = rig.expire("2026-10-11");
+    let late = rig.expire(&first_gone);
     assert!(!late.failed(), "{:?}", late.entries);
-    assert!(!late.deleted_paths().is_empty());
+    assert!(!late.deleted_paths().is_empty(), "{:#?}", late.entries);
     let left = rig.target_snapshots("src-adopted");
     assert!(
         !left.iter().any(|n| n.starts_with("doomed.")),
@@ -466,6 +490,10 @@ fn sync_refuses_an_unmounted_source_volume_and_changes_nothing() {
         "this test needs {base:?} on BTRFS to show the bare-mountpoint trap"
     );
     let rig = Rig::with_source_mount_in(Some(base));
+    // The first sync adopts the volume's top level (bd xtnq); after it, the
+    // config is what this volume settles to and a sync changes nothing.
+    let first = rig.sync("2026-10-02");
+    assert!(first.written && !first.failed(), "{first:?}");
 
     // Counter-direction: while mounted, the same call is healthy.
     let healthy = rig.sync("2026-10-02");

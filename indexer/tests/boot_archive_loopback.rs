@@ -70,6 +70,10 @@ struct Loopback {
     dir: tempfile::TempDir,
     mount: PathBuf,
     dev: String,
+    /// The filesystem's UUID: what a real target is identified by
+    /// (`mount_uuid`). A loop device has no drive serial, so a fixture named
+    /// by serial is refused by the write-target check (bd pman).
+    uuid: String,
 }
 
 impl Loopback {
@@ -84,7 +88,16 @@ impl Loopback {
         let mount = dir.path().join("mnt");
         std::fs::create_dir(&mount).unwrap();
         must("mount", &[&dev, mount.to_str().unwrap()]);
-        Self { dir, mount, dev }
+        let uuid = must("blkid", &["-s", "UUID", "-o", "value", &dev])
+            .trim()
+            .to_string();
+        assert!(!uuid.is_empty(), "blkid gave {dev} no UUID");
+        Self {
+            dir,
+            mount,
+            dev,
+            uuid,
+        }
     }
 
     fn subvol(&self, rel: &str) -> PathBuf {
@@ -137,7 +150,7 @@ fn config_for(fs: &Loopback, snapshot_name: &str) -> (Config, tempfile::NamedTem
         label: "primary".into(),
         serial: "LOOPTEST".into(),
         serials: vec!["LOOPTEST".into()],
-        mount_uuid: None,
+        mount_uuid: Some(fs.uuid.clone()),
         mount: fs.mount.to_string_lossy().into_owned(),
         role: buttered_dasd::config::TargetRole::Primary,
         retention: Default::default(),
