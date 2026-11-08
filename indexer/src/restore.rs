@@ -263,23 +263,178 @@ fn safe_member(file_path: &str) -> Result<&Path, String> {
     Ok(p)
 }
 
-/// Refuse a write whose directory `dir` does not resolve inside `dest` (the
-/// already-resolved destination root).
+/// A directory held open, reached one name at a time without following a
+/// link: every write of a restore goes through one (bd
+/// DAS-Backup-Manager-fcmk).
 ///
-/// `O_NOFOLLOW` guards only the final component. A link to a DIRECTORY
-/// already under the destination — planted, or restored earlier as a link —
-/// would otherwise carry `create_dir_all` and every write beneath it out of
-/// the destination, past the policy that judged only `dest` itself.
-fn dest_dir_within(dir: &Path, dest: &Path, what: &str) -> Result<(), String> {
-    match resolve_for_policy(dir) {
-        Ok(p) if p.starts_with(dest) => Ok(()),
-        Ok(p) => Err(format!(
-            "Refusing '{what}': its directory resolves to '{}', outside the destination",
-            p.display()
-        )),
-        Err(e) => Err(format!(
-            "Cannot resolve the destination directory of '{what}': {e}"
-        )),
+/// The policy judges the destination's RESOLVED path, and a write by path
+/// resolves it again: a directory on the way that another local user owns
+/// can be swapped for a link between the two, and root followed it.
+/// `O_NOFOLLOW` on a path guards only its last name. Here each name is
+/// opened `O_NOFOLLOW | O_DIRECTORY` relative to the one before, so a link
+/// anywhere on the way — there from the start, or swapped in at any moment —
+/// is refused (`ELOOP`/`ENOTDIR`), never followed. That also refuses a link
+/// under the destination that points back inside it: no write goes through
+/// a link at all.
+struct DirFd(std::os::fd::OwnedFd);
+
+/// `name` as a C string: one path component, never empty, `.` or `..`.
+fn c_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "'{}' is not a single path component",
+                name.to_string_lossy()
+            ),
+        ));
+    }
+    std::ffi::CString::new(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+/// A link met where a directory was expected, said so.
+fn refuse_link(e: std::io::Error, at: &Path) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => std::io::Error::new(
+            e.kind(),
+            format!(
+                "'{}' is a link or not a directory: a restore writes through no link",
+                at.display()
+            ),
+        ),
+        _ => e,
+    }
+}
+
+impl DirFd {
+    fn openat(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a valid directory fd (or AT_FDCWD) and a NUL-terminated name;
+        // the fd returned is owned here and closed on drop.
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by openat and is owned by nobody else.
+        Ok(Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn raw(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+
+    /// The directory `name` under this one, made (mode 0777 less the umask,
+    /// as `create_dir_all`) when it is missing and `create` is set.
+    fn child(&self, name: &std::ffi::OsStr, create: bool, at: &Path) -> std::io::Result<Self> {
+        let c = c_name(name)?;
+        match Self::openat(self.raw(), &c) {
+            Err(e) if create && e.raw_os_error() == Some(libc::ENOENT) => {
+                // SAFETY: valid dir fd and NUL-terminated name.
+                if unsafe { libc::mkdirat(self.raw(), c.as_ptr(), 0o777) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(e);
+                    }
+                }
+                Self::openat(self.raw(), &c).map_err(|e| refuse_link(e, at))
+            }
+            r => r.map_err(|e| refuse_link(e, at)),
+        }
+    }
+
+    /// The absolute directory `path`, opened from `/` one name at a time;
+    /// with `create`, missing directories are made.
+    fn open_abs(path: &Path, create: bool) -> std::io::Result<Self> {
+        use std::path::Component;
+        let mut dir = Self::openat(libc::AT_FDCWD, c"/")?;
+        let mut at = std::path::PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    at.push(name);
+                    dir = dir.child(name, create, &at)?;
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("'{}' is not an absolute, literal path", path.display()),
+                    ));
+                }
+            }
+        }
+        Ok(dir)
+    }
+
+    /// The directory `rel` (literal names only) under this one, made when
+    /// missing. `at` names this directory, for the error.
+    fn descend(&self, rel: &Path, at: &Path) -> std::io::Result<Self> {
+        use std::path::Component;
+        let mut at = at.to_path_buf();
+        let mut dir: Option<Self> = None;
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("'{}' contains a non-literal path component", rel.display()),
+                ));
+            };
+            at.push(name);
+            let next = dir.as_ref().unwrap_or(self).child(name, true, &at)?;
+            dir = Some(next);
+        }
+        match dir {
+            Some(d) => Ok(d),
+            // `rel` empty: this directory itself.
+            None => Ok(Self(self.0.try_clone()?)),
+        }
+    }
+
+    /// `name` in this directory opened for writing, created or truncated —
+    /// never through a link sitting at `name` (`O_NOFOLLOW`: `ELOOP`).
+    fn create_file(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::fd::FromRawFd;
+        let c = c_name(name)?;
+        // SAFETY: valid dir fd and NUL-terminated name; mode as std's create.
+        let fd = unsafe {
+            libc::openat(
+                self.raw(),
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o666 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by openat and is owned by nobody else.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// A link `name` -> `target` in this directory, replacing whatever
+    /// non-directory was there (as the path-based code removed it first).
+    fn replace_symlink(&self, target: &Path, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = c_name(name)?;
+        let t = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: valid dir fd and NUL-terminated names. A missing name is
+        // fine; any other unlink failure surfaces as symlinkat's EEXIST.
+        unsafe { libc::unlinkat(self.raw(), c.as_ptr(), 0) };
+        if unsafe { libc::symlinkat(t.as_ptr(), self.raw(), c.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -289,7 +444,7 @@ fn dest_dir_within(dir: &Path, dest: &Path, what: &str) -> Result<(), String> {
 /// symlink sitting at that path — so a pre-planted link at the destination
 /// turned a restore into an overwrite of whatever it pointed at. `O_NOFOLLOW`
 /// applies to the final component, which is precisely that case.
-fn copy_no_follow(src: &Path, dest: &Path) -> std::io::Result<u64> {
+fn copy_no_follow(src: &Path, dir: &DirFd, name: &std::ffi::OsStr) -> std::io::Result<u64> {
     use std::os::unix::fs::OpenOptionsExt;
     // O_NOFOLLOW on the source too: the caller judged it by symlink_metadata,
     // and a link swapped in since must not be read through. O_NONBLOCK so a
@@ -306,12 +461,7 @@ fn copy_no_follow(src: &Path, dest: &Path) -> std::io::Result<u64> {
             format!("'{}' is not a regular file", src.display()),
         ));
     }
-    let mut writer = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dest)?;
+    let mut writer = dir.create_file(name)?;
     std::io::copy(&mut reader, &mut writer)
 }
 
@@ -343,7 +493,10 @@ pub fn restore_files(
         &format!("Restoring {} files to {}", total, dest.display()),
     );
 
-    std::fs::create_dir_all(dest)?;
+    // Every write below goes through this fd: no link on the way is followed,
+    // whenever it appears (DirFd).
+    let dest_fd = DirFd::open_abs(dest, true)
+        .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
 
     let mut files_restored: usize = 0;
     let mut bytes_restored: u64 = 0;
@@ -361,7 +514,6 @@ pub fn restore_files(
             }
         };
         let src = snapshot_path.join(member);
-        let dest_file = dest.join(member);
 
         // Belt and braces: the member's PARENT must resolve inside the
         // snapshot, so no linked ancestor leads the read out of it. The member
@@ -389,25 +541,20 @@ pub fn restore_files(
             continue;
         }
 
-        // The same on the write side, before anything is created: a link
-        // already under the destination (planted, or restored earlier as a
-        // link) must not carry this member's write out of it.
-        let Some(dest_dir) = dest_file.parent() else {
+        // The write side: the member's directory, reached and made under
+        // the destination's fd with no link followed — planted, restored
+        // earlier as a link, or swapped in now (DirFd).
+        let (Some(name), Some(rel_dir)) = (member.file_name(), member.parent()) else {
             errors.push(format!("Path traversal blocked: '{file_path}'"));
             continue;
         };
-        if let Err(e) = dest_dir_within(dest_dir, dest, file_path) {
-            errors.push(e);
-            continue;
-        }
-
-        // Create parent directories for this file
-        if let Some(parent) = dest_file.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            errors.push(format!("Failed to create dirs for '{}': {}", file_path, e));
-            continue;
-        }
+        let dir = match dest_fd.descend(rel_dir, dest) {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(format!("Refusing '{file_path}': {e}"));
+                continue;
+            }
+        };
 
         // Check if source is a symlink — preserve it as a symlink
         match std::fs::symlink_metadata(&src) {
@@ -418,9 +565,7 @@ pub fn restore_files(
             Ok(meta) if meta.file_type().is_symlink() => {
                 match std::fs::read_link(&src) {
                     Ok(target) => {
-                        // Remove existing dest if present
-                        let _ = std::fs::remove_file(&dest_file);
-                        if let Err(e) = std::os::unix::fs::symlink(&target, &dest_file) {
+                        if let Err(e) = dir.replace_symlink(&target, name) {
                             errors.push(format!("Failed to create symlink '{}': {}", file_path, e));
                             continue;
                         }
@@ -434,7 +579,7 @@ pub fn restore_files(
                     }
                 }
             }
-            Ok(_) => match copy_no_follow(&src, &dest_file) {
+            Ok(_) => match copy_no_follow(&src, &dir, name) {
                 Ok(bytes) => {
                     bytes_restored += bytes;
                     files_restored += 1;
@@ -523,7 +668,10 @@ where
         ),
     );
 
-    std::fs::create_dir_all(dest)?;
+    // Made (and checked) the way every write after it is: no link on the way
+    // is followed (DirFd). `btrfs receive` then gets the path.
+    DirFd::open_abs(dest, true)
+        .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
 
     // Attempt btrfs send | btrfs receive first (fast path for btrfs subvolumes)
     let btrfs_result = fast_path(snapshot_path, dest, progress);
@@ -625,6 +773,9 @@ fn restore_snapshot_recursive(
     let mut bytes_restored: u64 = 0;
     let mut errors: Vec<String> = Vec::new();
     let mut file_index: u64 = 0;
+    // Every write below goes through this fd (DirFd).
+    let dest_fd = DirFd::open_abs(dest, false)
+        .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
 
     // Count total entries first for progress reporting (best-effort)
     let total_estimate: u64 = WalkDir::new(snapshot_path)
@@ -662,48 +813,30 @@ fn restore_snapshot_recursive(
         let dest_path = dest.join(rel_path);
         let file_type = entry.file_type();
 
-        // The directory this entry creates or lands in must resolve inside
-        // the destination before anything is created there.
-        let landing = if file_type.is_dir() {
-            Some(dest_path.as_path())
-        } else {
-            dest_path.parent()
-        };
-        if let Some(dir) = landing
-            && let Err(e) = dest_dir_within(dir, dest, &rel_path.to_string_lossy())
-        {
-            errors.push(e);
-            continue;
-        }
-
+        // The directory this entry is, or lands in, reached and made under
+        // the destination's fd with no link followed (DirFd).
         if file_type.is_dir() {
-            if let Err(e) = std::fs::create_dir_all(&dest_path) {
-                errors.push(format!(
-                    "Failed to create dir '{}': {}",
-                    dest_path.display(),
-                    e
-                ));
+            if let Err(e) = dest_fd.descend(rel_path, dest) {
+                errors.push(format!("Refusing '{}': {e}", rel_path.display()));
             }
             continue;
         }
-
-        // Ensure parent dir exists
-        if let Some(parent) = dest_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            errors.push(format!(
-                "Failed to create parent dir '{}': {}",
-                parent.display(),
-                e
-            ));
+        let (Some(name), Some(rel_dir)) = (rel_path.file_name(), rel_path.parent()) else {
+            errors.push(format!("Refusing '{}': no file name", rel_path.display()));
             continue;
-        }
+        };
+        let dir = match dest_fd.descend(rel_dir, dest) {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(format!("Refusing '{}': {e}", rel_path.display()));
+                continue;
+            }
+        };
 
         if file_type.is_symlink() {
             match std::fs::read_link(entry.path()) {
                 Ok(target) => {
-                    let _ = std::fs::remove_file(&dest_path);
-                    if let Err(e) = std::os::unix::fs::symlink(&target, &dest_path) {
+                    if let Err(e) = dir.replace_symlink(&target, name) {
                         errors.push(format!(
                             "Failed to create symlink '{}': {}",
                             dest_path.display(),
@@ -738,7 +871,7 @@ fn restore_snapshot_recursive(
         // default, so a pre-planted link was enough to write snapshot content
         // through it and defeat RESTORE_DENIED_ROOTS entirely.
         // bd DAS-Backup-Manager-nsp (finding #3).
-        match copy_no_follow(entry.path(), &dest_path) {
+        match copy_no_follow(entry.path(), &dir, name) {
             Ok(bytes) => {
                 bytes_restored += bytes;
                 files_restored += 1;
@@ -895,7 +1028,7 @@ mod tests {
         std::fs::write(&victim, "original").unwrap();
         std::os::unix::fs::symlink(&victim, dest.path().join("payload.txt")).unwrap();
 
-        let err = copy_no_follow(
+        let err = copy_to(
             &snap.path().join("payload.txt"),
             &dest.path().join("payload.txt"),
         )
@@ -937,7 +1070,7 @@ mod tests {
             result
                 .errors
                 .iter()
-                .any(|e| e.contains("outside the destination")),
+                .any(|e| e.contains("is a link or not a directory")),
             "the refusal must be REPORTED: {:?}",
             result.errors
         );
@@ -1053,6 +1186,13 @@ mod tests {
     }
 
     /// Permit a specific snapshot directory as a restore SOURCE.
+    /// [`copy_no_follow`] onto the path `dest`, its directory opened as a
+    /// restore opens it.
+    fn copy_to(src: &Path, dest: &Path) -> std::io::Result<u64> {
+        let dir = DirFd::open_abs(&dest.parent().unwrap().canonicalize()?, false)?;
+        copy_no_follow(src, &dir, dest.file_name().unwrap())
+    }
+
     fn test_sources(snap: &Path) -> Vec<String> {
         vec![snap.to_string_lossy().into_owned()]
     }
@@ -1642,7 +1782,7 @@ mod tests {
         assert_eq!(result.files_restored, 0);
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
-            result.errors[0].contains("outside the destination"),
+            result.errors[0].contains("is a link or not a directory"),
             "{:?}",
             result.errors
         );
@@ -1650,6 +1790,91 @@ mod tests {
             !outside.path().join("x.txt").exists(),
             "the write must not land outside the destination"
         );
+    }
+
+    /// A callback that, at the first "on_stage", replaces `swap` (a
+    /// directory) with a link to `to`: the swap a local user owning a
+    /// directory under the destination can make between the policy check and
+    /// the writes (bd DAS-Backup-Manager-fcmk).
+    struct SwapAtStage {
+        swap: std::path::PathBuf,
+        to: std::path::PathBuf,
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProgressCallback for SwapAtStage {
+        fn on_stage(&self, _: &str, _: u64) {
+            if !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::remove_dir_all(&self.swap).unwrap();
+                std::os::unix::fs::symlink(&self.to, &self.swap).unwrap();
+            }
+        }
+        fn on_progress(&self, _: u64, _: u64, _: &str) {}
+        fn on_throughput(&self, _: u64) {}
+        fn on_log(&self, _: LogLevel, _: &str) {}
+        fn on_complete(&self, _: bool, _: &str) {}
+    }
+
+    fn swap_at_stage(swap: &Path, to: &Path) -> SwapAtStage {
+        SwapAtStage {
+            swap: swap.to_path_buf(),
+            to: to.to_path_buf(),
+            done: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_check_carries_no_write_out_of_the_destination() {
+        // dest = <tmp>/owned/out, `owned` a directory another local user owns
+        // and swaps for a link to `outside` once the check has passed.
+        for whole_snapshot in [false, true] {
+            let snap = TempDir::new().unwrap();
+            write_file(&snap.path().join("d"), "x.txt", "payload");
+            let base = TempDir::new().unwrap();
+            let owned = base.path().join("owned");
+            std::fs::create_dir(&owned).unwrap();
+            let outside = TempDir::new().unwrap();
+            let progress = swap_at_stage(&owned, outside.path());
+            let dest = owned.join("out");
+            let outcome = if whole_snapshot {
+                restore_snapshot_with(
+                    snap.path(),
+                    &dest,
+                    &test_roots(),
+                    &test_sources(snap.path()),
+                    &progress,
+                    Instant::now(),
+                    |_, _, _| Err("no btrfs here".into()),
+                )
+            } else {
+                restore_files(
+                    snap.path(),
+                    &["d/x.txt"],
+                    &dest,
+                    &test_roots(),
+                    &test_sources(snap.path()),
+                    &progress,
+                )
+            };
+            let leaked: Vec<_> = WalkDir::new(outside.path())
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_path_buf())
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "whole snapshot {whole_snapshot}: written outside the destination: {leaked:?}"
+            );
+            let refused = match &outcome {
+                Err(e) => e.to_string(),
+                Ok(r) => r.errors.join("; "),
+            };
+            assert!(
+                refused.contains("link"),
+                "whole snapshot {whole_snapshot}: the refusal is reported: {refused:?}"
+            );
+        }
     }
 
     #[test]
@@ -1666,7 +1891,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (f, o) = (fifo.clone(), out.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(copy_no_follow(&f, &o).map_err(|e| e.to_string()));
+            let _ = tx.send(copy_to(&f, &o).map_err(|e| e.to_string()));
         });
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1685,7 +1910,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link")).unwrap();
         let out = dir.path().join("out.txt");
 
-        assert!(copy_no_follow(&dir.path().join("link"), &out).is_err());
+        assert!(copy_to(&dir.path().join("link"), &out).is_err());
         assert!(
             !out.exists(),
             "nothing is written when the source is a link"

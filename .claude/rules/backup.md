@@ -124,7 +124,9 @@ Checked before any directory is created, both roots compared **after resolution*
   grant a subdirectory, never `/srv` itself.
 - **`RESTORE_DENIED_ROOTS`** (`indexer/src/config.rs`) is checked first and **no configuration can
   override it** — system paths plus served roots `/srv/http` and `/srv/ftp`.
-- **`O_NOFOLLOW` on every write.** Absolute or non-literal member paths are rejected.
+- **No write goes through a link.** Every write is made under a directory fd reached one name at a time,
+  each opened `O_NOFOLLOW` (bd `fcmk`): a link on the way, planted or swapped in after the check, is
+  refused. Absolute or non-literal member paths are rejected.
 
 ## Email Reports
 
