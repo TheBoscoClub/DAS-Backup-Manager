@@ -1,9 +1,15 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.15.0
-# Date: 2026-11-01
+# Version: 4.16.0
+# Date: 2026-11-08
 #
 # Features:
+#   - A drive that is gone is a row (v4.16.0, bd DAS-Backup-Manager-uhi):
+#     check_das_connected records a "Target <label>" row for every target --
+#     OK naming its drives, WARN for a RAID-1 running on one leg (the run still
+#     exits 0), FAIL for a target with no drive and no mountable UUID -- and
+#     SMART STATUS has a row per configured serial, ABSENT for a missing one.
+#     UNAVAILABLE_TARGETS, collected and never read, is gone.
 #   - Subvolume coverage (v4.15.0, bd DAS-Backup-Manager-sp78.1): the sync runs
 #     with --db and, on a real run, --record-coverage; record_subvol_coverage
 #     records its "SUBVOLUME COVERAGE: " row as subvol_coverage (OK or WARN as
@@ -759,10 +765,6 @@ BACKUP_FORCE_FULL="false"
 # cleanup() no-ops immediately (unmount_all/record_backup_run_in_db already
 # ran in main()'s own body for a clean run). bd DAS-Backup-Manager-oeo.
 SCRIPT_COMPLETED="false"
-# Targets configured but not present this run. Recorded so an absent
-# target produces a row in the report instead of merely being missing
-# from every section — an absent row is what nobody notices. bd nsp (c6).
-UNAVAILABLE_TARGETS=()
 # "true" once capture_report_data() has read the snapshot counters, "false"
 # when that read failed, so an empty RAW is not read as "nothing was sent"
 # (bd nsp c4). Empty until then: a run that ends before the read records its
@@ -1022,6 +1024,10 @@ check_das_connected() {
     # outage — we proceed with a warning.
     declare -gA DISCOVERED_DEVICES=()
     declare -gA TARGET_AVAILABLE=()
+    # Every configured serial's device, "" when absent, per target: the
+    # report's SMART STATUS shows a row for each, so a missing leg of a RAID-1
+    # pair is a row saying ABSENT, not a row nobody notices is gone (bd uhi).
+    declare -gA TARGET_SERIAL_DEVS=()
     local any_primary_available="false"
     local any_primary_configured="false"
 
@@ -1037,13 +1043,14 @@ check_das_connected() {
         local -a found_devs=()
         local -a missing_serials=()
         local -a found_serials=()
-        local serial
+        local serial serial_devs=""
         for serial in $serials_list; do
             local dev
             dev=$(find_device_by_serial "$serial") || dev=""
+            serial_devs+="${serial_devs:+ }$serial=$dev"
             if [[ -n "$dev" ]]; then
                 found_devs+=("$dev")
-                found_serials+=("$serial")
+                found_serials+=("$serial=$dev")
                 if [[ -z "$first_dev" ]]; then
                     first_dev="$dev"
                 fi
@@ -1080,12 +1087,31 @@ check_das_connected() {
         fi
 
         TARGET_AVAILABLE[$label]="$available"
+        TARGET_SERIAL_DEVS[$label]="$serial_devs"
+        # "SERIAL11 /dev/sdb, SERIAL12 /dev/sdc", for the report row.
+        local present_text="" pair
+        for pair in "${found_serials[@]}"; do
+            present_text+="${present_text:+, }${pair%%=*} ${pair#*=}"
+        done
         if [[ "$available" == "true" ]]; then
             DISCOVERED_DEVICES[$label]="$first_dev"
-            if (( ${#missing_serials[@]} > 0 )); then
-                log_warn "  $label: present=[${found_serials[*]}] missing=[${missing_serials[*]}] — RAID-1 degraded, proceeding"
+            # A missing leg is a WARN, not a FAIL: the backup still runs from
+            # the surviving leg (a degraded mount), so the run did its work and
+            # exits 0 -- but the report says so in a row of its own, where it
+            # used to be one line in the journal (bd DAS-Backup-Manager-uhi).
+            if (( ${#missing_serials[@]} > 0 )) && (( ${#found_serials[@]} > 0 )); then
+                log_warn "  $label: present=[$present_text] missing=[${missing_serials[*]}] — RAID-1 degraded, proceeding"
+                record_op "target_${label}" "WARN" "RAID-1 degraded: ${missing_serials[*]} absent; running on $present_text"
+            elif (( ${#missing_serials[@]} > 0 )); then
+                # Found by its filesystem UUID with no configured serial seen:
+                # a replaced drive, or a bridge that hides the serial. The
+                # filesystem is whole, so not a WARN; the row and SMART STATUS
+                # say which serials were not seen.
+                log_info "  $label: found by UUID on ${first_dev:-an unknown disk}; serial(s) not seen: ${missing_serials[*]} — $role"
+                record_op "target_${label}" "OK" "found by UUID on ${first_dev:-an unknown disk}; serial(s) not seen: ${missing_serials[*]}"
             else
-                log_info "  $label: $first_dev (${found_serials[*]:-<uuid-only>}) — $role"
+                log_info "  $label: $present_text — $role"
+                record_op "target_${label}" "OK" "$present_text"
             fi
             if [[ "$role" == "primary" ]]; then
                 any_primary_available="true"
@@ -1095,6 +1121,7 @@ check_das_connected() {
                 log_error "  $label ($role): no expected drives present and no mountable UUID"
                 log_error "    expected serials: ${serials_list:-<none>}"
                 log_error "    mount UUID:       ${uuid:-<unset>}"
+                record_op "target_${label}" "FAIL" "unavailable: ${serials_list:-no serial configured} absent and no mountable UUID"
             else
                 # An unavailable non-primary used to be logged once here and
                 # then be absent from EVERY report section -- throughput,
@@ -1104,8 +1131,7 @@ check_das_connected() {
                 # fall off the bus and every nightly email would still read
                 # ALL OPERATIONS SUCCESSFUL. bd nsp (c6).
                 log_warn "  $label ($role): no expected drives present — will skip"
-                record_op "target_${label}" "FAIL" "unavailable: no expected drive present and no mountable UUID"
-                UNAVAILABLE_TARGETS+=("$label")
+                record_op "target_${label}" "FAIL" "unavailable: ${serials_list:-no serial configured} absent and no mountable UUID"
             fi
         fi
     done
@@ -3371,6 +3397,16 @@ generate_report() {
         subvol_sections+=$'\n'"$RECOVERY_OS_REPORT"$'\n'
     fi
 
+    # One row per target detection looked at (record_op "target_<label>"),
+    # after the fixed rows: a drive that is gone is a row naming it, never
+    # just a row that is not there (bd DAS-Backup-Manager-uhi). None before
+    # detection has run.
+    local target_rows="" key
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        target_rows+=$'\n'"$(printf '  %-21s %s  (%s)' "Target ${key#target_}" "${OP_STATUS[$key]}" "${OP_STATUS[${key}_detail]:-n/a}")"
+    done < <(printf '%s\n' "${!OP_STATUS[@]}" | grep '^target_' | grep -v '_detail$' | sort)
+
     # Build the report
     cat <<-REPORT
 ===============================================================
@@ -3392,7 +3428,7 @@ BACKUP OPERATIONS
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
   Subvolume coverage    ${OP_STATUS[subvol_coverage]:-N/A}  (${OP_STATUS[subvol_coverage_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
-  Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})
+  Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})${target_rows}
 ${subvol_sections}
 THROUGHPUT
 ───────────────────────────────────────────────────────────────
@@ -3415,7 +3451,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.15.0
+  backup-run.sh v4.16.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -3518,19 +3554,42 @@ generate_growth_section() {
     done
 }
 
+# One row per configured serial of every target, in label order: a drive
+# that is absent is a row saying ABSENT, never left out -- a RAID-1 target
+# used to show only its first drive, so a missing leg had no row to miss
+# (bd DAS-Backup-Manager-uhi). A target found only by its filesystem UUID (no
+# configured serial present) also gets a row for the disk under it.
 generate_smart_section() {
-    for label in "${!DISCOVERED_DEVICES[@]}"; do
-        local drive="${DISCOVERED_DEVICES[$label]}"
-        if [[ -z "$drive" || ! -b "$drive" ]]; then continue; fi
-        local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]}]:-$label}"
-        local smart_data
-        smart_data=$(get_smart_summary "$drive")
-        local health=${smart_data%%|*}; smart_data=${smart_data#*|}
-        local temp=${smart_data%%|*}; smart_data=${smart_data#*|}
-        local hours=${smart_data%%|*}; smart_data=${smart_data#*|}
-        local serial=$smart_data
-        printf "  %-24s %-10s %-8s %s°C  %s hours\n" "$name" "$serial" "$health" "$temp" "$hours"
-    done
+    local label
+    while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]:-}]:-$label}"
+        local pair any_present="false"
+        for pair in ${TARGET_SERIAL_DEVS[$label]}; do
+            local serial="${pair%%=*}" drive="${pair#*=}"
+            if [[ -z "$drive" ]]; then
+                printf "  %-24s %-10s %s\n" "$name" "$serial" "ABSENT"
+                continue
+            fi
+            any_present="true"
+            smart_row "$name" "$drive" "$serial"
+        done
+        local uuid_dev="${DISCOVERED_DEVICES[$label]:-}"
+        if [[ "$any_present" == "false" && -n "$uuid_dev" ]]; then
+            smart_row "$name" "$uuid_dev" ""
+        fi
+    done < <(printf '%s\n' "${!TARGET_SERIAL_DEVS[@]}" | sort)
+}
+
+# smart_row <name> <device> <configured serial, or "" to show the drive's own>
+smart_row() {
+    local smart_data
+    smart_data=$(get_smart_summary "$2")
+    local health=${smart_data%%|*}; smart_data=${smart_data#*|}
+    local temp=${smart_data%%|*}; smart_data=${smart_data#*|}
+    local hours=${smart_data%%|*}; smart_data=${smart_data#*|}
+    local serial="${3:-$smart_data}"
+    printf "  %-24s %-10s %-8s %s°C  %s hours\n" "$1" "$serial" "$health" "$temp" "$hours"
 }
 
 # Upper bound on one report's delivery. mailx talks SMTP to the local relay,

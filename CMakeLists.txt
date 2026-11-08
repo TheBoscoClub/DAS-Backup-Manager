@@ -329,6 +329,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os.sh
     )
     add_test(
+        NAME shell-target-presence
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_presence.sh
+    )
+    add_test(
         NAME shell-recovery-os-vm
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os_vm.sh
     )

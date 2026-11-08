@@ -238,7 +238,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 
 **Symptoms**:
 
-- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. As of `backup-run.sh` v4.12.0 the emailed report has no line of its own for this and its SMART section shows one serial per target, so a clean-looking email does not prove both legs are present
+- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.16.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target <primary-label>  WARN  (RAID-1 degraded: … absent; …)` row under BACKUP OPERATIONS, and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
 - `sudo btrfs filesystem show <primary-label>` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show /mnt/backup-<primary-label>` then answers only `not a valid btrfs filesystem`
 - Once it is mounted (Step 2), `sudo btrfs device stats /mnt/backup-<primary-label>` shows non-zero error counters on one leg
 

@@ -124,7 +124,7 @@ sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=
 sudo btrfs device stats /mnt/backup-<primary-label>   # a device with non-zero error counters is the failing one
 ```
 
-The system's automatic backups already mount by UUID with `degraded` in their mount options, so the next nightly backup runs even with one drive missing. The backup log says so (`journalctl -u das-backup -u das-backup-full | grep 'RAID-1 degraded'` — Sunday's full run logs under the second); the emailed report has no line of its own for it, so do not wait for the email to tell you.
+The system's automatic backups already mount by UUID with `degraded` in their mount options, so the next nightly backup runs even with one drive missing. The emailed report says so: its status line reads `COMPLETED WITH WARNINGS`, the target's row under BACKUP OPERATIONS reads `WARN  (RAID-1 degraded: <serial> absent; running on …)`, and SMART STATUS shows the missing drive's serial as `ABSENT` (`backup-run.sh` v4.16.0 and later). The backup log says it too (`journalctl -u das-backup -u das-backup-full | grep 'RAID-1 degraded'` — Sunday's full run logs under the second).
 
 #### 3. Replace the failed drive
 

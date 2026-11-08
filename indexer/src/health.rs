@@ -36,6 +36,79 @@ pub struct TargetHealth {
     pub power_on_hours: Option<u64>,
     pub errors: Option<u64>,
     pub scrub: ScrubHealth,
+    /// Every configured drive of the target, in `serials` order: a RAID-1
+    /// pair has two, so a missing leg is a member with `present: false`, not
+    /// a drive nobody lists (bd DAS-Backup-Manager-uhi). The fields above
+    /// carry the first present drive's SMART reading, for the JSON consumers.
+    pub members: Vec<MemberHealth>,
+}
+
+/// One configured drive of a target and its SMART reading.
+#[derive(Debug, Clone, Default)]
+pub struct MemberHealth {
+    pub serial: String,
+    /// A block device with this serial was found.
+    pub present: bool,
+    pub smart_status: Option<String>,
+    pub temperature_c: Option<i32>,
+    pub power_on_hours: Option<u64>,
+}
+
+/// The members of a target with `serials`, each looked up by `device_of`
+/// (`(device, is_usb)`) and read by `smart_of`, beside the SMART details of
+/// the first present one (for [`TargetHealth`]'s single-drive fields).
+pub fn members_with(
+    serials: &[String],
+    device_of: &dyn Fn(&str) -> Option<(String, bool)>,
+    smart_of: &dyn Fn(&str, bool) -> Option<SmartDetails>,
+) -> (Vec<MemberHealth>, Option<SmartDetails>) {
+    let mut members = Vec::new();
+    let mut first = None;
+    for serial in serials.iter().filter(|s| !s.is_empty()) {
+        let Some((dev, is_usb)) = device_of(serial) else {
+            members.push(MemberHealth {
+                serial: serial.clone(),
+                ..MemberHealth::default()
+            });
+            continue;
+        };
+        let details = smart_of(&dev, is_usb);
+        members.push(MemberHealth {
+            serial: serial.clone(),
+            present: true,
+            smart_status: details.as_ref().map(|d| d.status.clone()),
+            temperature_c: details.as_ref().and_then(|d| d.temperature_c),
+            power_on_hours: details.as_ref().and_then(|d| d.power_on_hours),
+        });
+        if first.is_none() {
+            first = details;
+        }
+    }
+    (members, first)
+}
+
+/// The warning for a target some of whose drives are absent while another is
+/// present: a RAID-1 running degraded on its surviving leg. `None` when every
+/// drive is present, or none is (the not-mounted warning covers that).
+pub fn degraded_warning(label: &str, members: &[MemberHealth]) -> Option<String> {
+    let absent: Vec<&str> = members
+        .iter()
+        .filter(|m| !m.present)
+        .map(|m| m.serial.as_str())
+        .collect();
+    let present: Vec<&str> = members
+        .iter()
+        .filter(|m| m.present)
+        .map(|m| m.serial.as_str())
+        .collect();
+    if absent.is_empty() || present.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Target '{label}': RAID-1 degraded — {} absent, running on {}",
+        absent.join(", "),
+        present.join(", ")
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,25 +1006,33 @@ pub fn get_health_timed(
             0
         };
 
-        // 4. Get SMART details (use -d sat for USB-attached SATA drives)
-        let smart_details = if !target.serial.is_empty() {
-            let smart_start = Instant::now();
-            let details = device_info_from_serial(&target.serial)
-                .and_then(|(dev, is_usb)| {
-                    let mut cmd = std::process::Command::new("smartctl");
-                    cmd.args(["--json", "--all"]);
-                    if is_usb {
-                        cmd.arg("-d").arg("sat");
-                    }
-                    cmd.arg(&dev).output().ok()
-                })
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|json| parse_smartctl_details(&json));
-            times.record(format!("{label} smart"), smart_start.elapsed());
-            details
+        // 4. Get SMART details of every configured drive (use -d sat for
+        // USB-attached SATA drives); a RAID-1 pair is two (bd uhi).
+        let serials: Vec<String> = if target.serials.is_empty() {
+            vec![target.serial.clone()]
         } else {
-            None
+            target.serials.clone()
         };
+        let smart_start = Instant::now();
+        let (members, smart_details) =
+            members_with(&serials, &device_info_from_serial, &|dev, is_usb| {
+                let mut cmd = std::process::Command::new("smartctl");
+                cmd.args(["--json", "--all"]);
+                if is_usb {
+                    cmd.arg("-d").arg("sat");
+                }
+                cmd.arg(dev)
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .and_then(|json| parse_smartctl_details(&json))
+            });
+        if !members.is_empty() {
+            times.record(format!("{label} smart"), smart_start.elapsed());
+        }
+        if let Some(w) = degraded_warning(label, &members) {
+            warnings.push(w);
+        }
 
         let smart_status = smart_details.as_ref().map(|d| d.status.clone());
         let temperature_c = smart_details.as_ref().and_then(|d| d.temperature_c);
@@ -1042,6 +1123,7 @@ pub fn get_health_timed(
             power_on_hours,
             errors,
             scrub: scrub_health,
+            members,
         });
     }
 
@@ -1290,6 +1372,7 @@ daily = 7
             power_on_hours: Some(12345),
             errors: None,
             scrub: ScrubHealth::not_applicable(),
+            members: Vec::new(),
         };
         let pct = th.usage_percent();
         assert!((pct - 25.0).abs() < 0.01);
@@ -1310,6 +1393,7 @@ daily = 7
             power_on_hours: None,
             errors: None,
             scrub: ScrubHealth::not_applicable(),
+            members: Vec::new(),
         };
         assert_eq!(th.usage_percent(), 0.0);
     }
@@ -1539,6 +1623,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 power_on_hours: None,
                 errors: None,
                 scrub: ScrubHealth::not_applicable(),
+                members: Vec::new(),
             },
             TargetHealth {
                 label: "t2".into(),
@@ -1553,6 +1638,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 power_on_hours: None,
                 errors: None,
                 scrub: ScrubHealth::not_applicable(),
+                members: Vec::new(),
             },
         ];
         let warnings: Vec<String> = vec![];
@@ -1574,6 +1660,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             power_on_hours: None,
             errors: None,
             scrub: ScrubHealth::not_applicable(),
+            members: Vec::new(),
         }];
         let warnings = vec!["Target 't1' is nearly full: 90.0% used".to_string()];
         assert_eq!(determine_status(&targets, &warnings), HealthStatus::Warning);
@@ -1594,6 +1681,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             power_on_hours: None,
             errors: None,
             scrub: ScrubHealth::not_applicable(),
+            members: Vec::new(),
         }];
         let warnings = vec!["Target 't1': SMART status FAILED".to_string()];
         assert_eq!(
@@ -1617,6 +1705,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             power_on_hours: None,
             errors: None,
             scrub: ScrubHealth::not_applicable(),
+            members: Vec::new(),
         }];
         let warnings = vec!["Target 't1' is critically full: 97.0% used".to_string()];
         assert_eq!(
@@ -1857,6 +1946,56 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         assert_eq!(h.resolve_error.as_deref(), Some("no serial"));
     }
 
+    #[test]
+    fn members_lists_every_serial_and_marks_the_absent_one() {
+        let serials = vec!["SERIAL11".to_string(), "SERIAL12".to_string()];
+        let device_of = |s: &str| (s == "SERIAL12").then(|| ("/dev/sdc".to_string(), true));
+        let smart_of = |dev: &str, is_usb: bool| {
+            assert_eq!((dev, is_usb), ("/dev/sdc", true));
+            Some(SmartDetails {
+                status: "PASSED".into(),
+                temperature_c: Some(30),
+                power_on_hours: Some(7),
+                errors: Some(0),
+            })
+        };
+        let (members, first) = members_with(&serials, &device_of, &smart_of);
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            (members[0].serial.as_str(), members[0].present),
+            ("SERIAL11", false)
+        );
+        assert_eq!(members[0].smart_status, None);
+        assert_eq!(
+            (members[1].serial.as_str(), members[1].present),
+            ("SERIAL12", true)
+        );
+        assert_eq!(members[1].smart_status.as_deref(), Some("PASSED"));
+        assert_eq!(members[1].power_on_hours, Some(7));
+        // The single-drive fields read the first PRESENT drive, not serials[0].
+        assert_eq!(first.map(|d| d.temperature_c), Some(Some(30)));
+        assert_eq!(
+            degraded_warning("p", &members).as_deref(),
+            Some("Target 'p': RAID-1 degraded — SERIAL11 absent, running on SERIAL12")
+        );
+        // Empty serials are skipped, not listed as absent drives.
+        let (none, _) = members_with(&[String::new()], &device_of, &smart_of);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn degraded_warning_needs_one_drive_absent_and_one_present() {
+        let m = |serial: &str, present| MemberHealth {
+            serial: serial.into(),
+            present,
+            ..MemberHealth::default()
+        };
+        assert_eq!(degraded_warning("t", &[m("A", true), m("B", true)]), None);
+        assert_eq!(degraded_warning("t", &[m("A", false), m("B", false)]), None);
+        assert_eq!(degraded_warning("t", &[m("A", true)]), None);
+        assert!(degraded_warning("t", &[m("A", true), m("B", false)]).is_some());
+    }
+
     fn base_target_health(scrub: ScrubHealth) -> TargetHealth {
         TargetHealth {
             label: "t1".into(),
@@ -1871,6 +2010,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             power_on_hours: None,
             errors: None,
             scrub,
+            members: Vec::new(),
         }
     }
 

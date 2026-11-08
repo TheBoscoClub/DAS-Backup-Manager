@@ -172,21 +172,60 @@ pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -
     }
     r.push_str(&format!("\nSMART STATUS\n{thin}\n"));
     for th in &health.targets {
-        let smart = th.smart_status.as_deref().unwrap_or("N/A");
-        let temp = th
-            .temperature_c
-            .map(|t| format!("{t}°C"))
-            .unwrap_or_else(|| "N/A".to_string());
-        let hours = th
-            .power_on_hours
-            .map(|h| format!("{h}h"))
-            .unwrap_or_else(|| "N/A".to_string());
-        r.push_str(&format!(
-            "  {:<25}{:<11}{:<8}{:<8}{}\n",
-            th.label, th.serial, smart, temp, hours
-        ));
+        // One row per configured drive, an absent one saying ABSENT: a RAID-1
+        // target used to show only its first drive (bd DAS-Backup-Manager-uhi).
+        // A health report built without members keeps the one-row form.
+        if th.members.is_empty() {
+            smart_row(
+                &mut r,
+                &th.label,
+                &th.serial,
+                th.smart_status.as_deref(),
+                th.temperature_c,
+                th.power_on_hours,
+            );
+            continue;
+        }
+        for m in &th.members {
+            if m.present {
+                smart_row(
+                    &mut r,
+                    &th.label,
+                    &m.serial,
+                    m.smart_status.as_deref(),
+                    m.temperature_c,
+                    m.power_on_hours,
+                );
+            } else {
+                r.push_str(&format!("  {:<25}{:<11}ABSENT\n", th.label, m.serial));
+            }
+        }
     }
     r
+}
+
+fn smart_row(
+    r: &mut String,
+    label: &str,
+    serial: &str,
+    smart: Option<&str>,
+    temperature_c: Option<i32>,
+    power_on_hours: Option<u64>,
+) {
+    let temp = temperature_c
+        .map(|t| format!("{t}°C"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let hours = power_on_hours
+        .map(|h| format!("{h}h"))
+        .unwrap_or_else(|| "N/A".to_string());
+    r.push_str(&format!(
+        "  {:<25}{:<11}{:<8}{:<8}{}\n",
+        label,
+        serial,
+        smart.unwrap_or("N/A"),
+        temp,
+        hours
+    ));
 }
 
 /// `LATEST SNAPSHOTS` from `btrbk list latest` output, its header line
@@ -1200,7 +1239,47 @@ mod tests {
             power_on_hours: None,
             errors: None,
             scrub: crate::health::ScrubHealth::not_applicable(),
+            members: Vec::new(),
         }
+    }
+
+    #[test]
+    fn smart_has_a_row_per_drive_and_an_absent_leg_says_absent() {
+        // bd DAS-Backup-Manager-uhi: a RAID-1 target listed only its first
+        // drive, so a missing leg had no row to miss.
+        let mut pair = target_health("pair", true);
+        pair.members = vec![
+            crate::health::MemberHealth {
+                serial: "SERIAL11".into(),
+                present: true,
+                smart_status: Some("PASSED".into()),
+                temperature_c: Some(30),
+                power_on_hours: Some(1200),
+            },
+            crate::health::MemberHealth {
+                serial: "SERIAL12".into(),
+                ..Default::default()
+            },
+        ];
+        let health = crate::health::HealthReport {
+            status: crate::health::HealthStatus::Healthy,
+            targets: vec![pair],
+            last_backup: None,
+            growth_points: Vec::new(),
+            warnings: Vec::new(),
+            recovery_os: Vec::new(),
+        };
+        let text = render_capacity_and_smart(Some(&health));
+        let smart = text.split_once("SMART STATUS").unwrap().1;
+        assert!(
+            smart.contains("  pair                     SERIAL11   PASSED  30°C    1200h\n"),
+            "{text}"
+        );
+        assert!(
+            smart.contains("  pair                     SERIAL12   ABSENT\n"),
+            "{text}"
+        );
+        assert!(!smart.contains("SER-pair"), "{text}");
     }
 
     #[test]
