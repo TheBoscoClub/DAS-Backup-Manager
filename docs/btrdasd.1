@@ -687,7 +687,9 @@ section follow the script's rule: a stale drive or a
 .B WARNING
 row is WARN (the run still exits 0), a root that cannot be read, a record that
 cannot be written, or a reading that passes the same 900 s bound is FAIL and
-fails the run. The summary the CLI prints and the GUI shows ends with a
+fails the run. A reading past the bound is told to stop, and stops before its
+next drive; the drives are unmounted, and the locks given back, only once it
+has, so a drive it was reading is read to its end first. The summary the CLI prints and the GUI shows ends with a
 .B "recovery OS"
 line saying which.
 .PP

@@ -1240,10 +1240,26 @@ pub fn status_noting(
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
     note: &mut dyn FnMut(String),
 ) -> Vec<DriveEntry> {
+    status_noting_until(cfg, host, today, is_mounted, fs_uuid, note, &|| false)
+}
+
+/// [`status_noting`], asking `stop` before each drive: once it answers true
+/// no further drive is read, and the drives read so far are returned
+/// ([`record_within`] discards them; bd DAS-Backup-Manager-ay0n).
+pub fn status_noting_until(
+    cfg: &Config,
+    host: &HostVersions,
+    today: &str,
+    is_mounted: &dyn Fn(&Path) -> bool,
+    fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    note: &mut dyn FnMut(String),
+    stop: &dyn Fn() -> bool,
+) -> Vec<DriveEntry> {
     let max = cfg.recovery_os.max_age_days;
     cfg.targets
         .iter()
         .filter(|t| t.role == TargetRole::Mirror)
+        .take_while(|_| !stop())
         .map(|t| {
             let root = os_root(&t.mount);
             let mount = Path::new(&t.mount);
@@ -1907,7 +1923,10 @@ pub fn classify(entries: &[DriveEntry], state_error: Option<&str>) -> (RecordSta
 
 /// Reads the mirror targets of a config, handing each per-drive note
 /// ([`status_noting`]) to its second argument: [`record_within`]'s reader.
-pub type ReadDrives = dyn Fn(&Config, &mut dyn FnMut(String)) -> Vec<DriveEntry> + Send + Sync;
+/// The third answers true once the reading is to stop; it is asked before
+/// each drive ([`status_noting_until`]).
+pub type ReadDrives =
+    dyn Fn(&Config, &mut dyn FnMut(String), &dyn Fn() -> bool) -> Vec<DriveEntry> + Send + Sync;
 
 /// What the reading thread sends back.
 enum Heard {
@@ -1924,8 +1943,13 @@ enum Heard {
 /// A reading that does not finish in time is a `FAIL` that says where it
 /// was — `while reading <drive> at <root>`, `after reading every mounted
 /// drive` or `before reading any drive` — as `backup-run.sh`'s bound says,
-/// and nothing is written: a reading still running is left to finish and is
-/// discarded, so it can never write a record once the targets are gone.
+/// and nothing is written. The reading is told to stop and this returns only
+/// once it has: it stops before its next drive, so a drive it is reading is
+/// read to its end, and the step can take `timeout` plus that drive's
+/// reading. Its files are then closed when the caller unmounts the drive
+/// and gives back the locks; a reading left running kept the drive busy, and
+/// the helper released its locks with the drive still mounted (bd
+/// DAS-Backup-Manager-ay0n). What it answers is discarded.
 pub fn record_within(
     cfg: &Config,
     state_file: Option<&Path>,
@@ -1937,13 +1961,19 @@ pub fn record_within(
 ) -> Recording {
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = cfg.clone();
-    std::thread::spawn(move || {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = stop.clone();
+    let reading_thread = std::thread::spawn(move || {
         let notes = tx.clone();
         // A send fails only once the step has stopped listening (it timed
         // out): the reading is then discarded, which is the point.
-        let entries = read(&owned, &mut |n| {
-            let _ = notes.send(Heard::Note(n));
-        });
+        let entries = read(
+            &owned,
+            &mut |n| {
+                let _ = notes.send(Heard::Note(n));
+            },
+            &|| stopping.load(std::sync::atomic::Ordering::SeqCst),
+        );
         let _ = tx.send(Heard::Done(entries));
     });
     let deadline = std::time::Instant::now() + timeout;
@@ -1970,6 +2000,18 @@ pub fn record_within(
                     (None, true) => "after reading every mounted drive".to_string(),
                     (None, false) => "before reading any drive".to_string(),
                 };
+                // The reading holds files open under the drive: the caller
+                // unmounts it and gives back the locks next, so the reading
+                // stops first (bd DAS-Backup-Manager-ay0n). It is told to stop
+                // and stops before its next drive; a drive it is in the
+                // middle of is read to its end. What it answers is never
+                // received, so nothing is written.
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                note(
+                    "timed out: waiting for the reading to stop before the drive is unmounted"
+                        .into(),
+                );
+                let _ = reading_thread.join();
                 return failed(format!(
                     "reading the recovery OSes timed out after {} s {place}",
                     timeout.as_secs()
@@ -1999,14 +2041,15 @@ pub fn record(cfg: &Config, state_file: &Path, note: &mut dyn FnMut(String)) -> 
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let reader_host = host.clone();
-    let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |cfg, note| {
-        status_noting(
+    let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |cfg, note, stop| {
+        status_noting_until(
             cfg,
             &reader_host,
             &today,
             &crate::health::is_mountpoint,
             &mounted_uuid,
             note,
+            stop,
         )
     });
     record_within(
@@ -5540,7 +5583,7 @@ mod tests {
     /// A reader that answers `entries` after sending `notes`.
     fn reader(notes: &[&str], entries: Vec<DriveEntry>) -> std::sync::Arc<ReadDrives> {
         let notes: Vec<String> = notes.iter().map(|n| n.to_string()).collect();
-        std::sync::Arc::new(move |_, note| {
+        std::sync::Arc::new(move |_, note, _| {
             for n in &notes {
                 note(n.clone());
             }
@@ -5615,18 +5658,23 @@ mod tests {
         );
     }
 
-    /// A reader that sends `notes`, then waits for `release` before answering.
+    /// A reader that sends `notes`, then reads on until it is told to stop,
+    /// sets `finished` as its last act and answers a reading — one that, if
+    /// it were written, the test would see.
     fn stalled_reader(
         notes: &[&str],
-        release: std::sync::mpsc::Receiver<()>,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::sync::Arc<ReadDrives> {
         let notes: Vec<String> = notes.iter().map(|n| n.to_string()).collect();
-        let release = std::sync::Mutex::new(release);
-        std::sync::Arc::new(move |_, note| {
+        std::sync::Arc::new(move |_, note, stop| {
             for n in &notes {
                 note(n.clone());
             }
-            let _ = release.lock().unwrap().recv();
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop() && std::time::Instant::now() < give_up {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
             vec![drive("A", read_as(false, false))]
         })
     }
@@ -5651,8 +5699,8 @@ mod tests {
                 "after reading every mounted drive",
             ),
         ] {
-            let (go, release) = std::sync::mpsc::channel();
-            let mut heard = 0;
+            let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut heard = Vec::new();
             let started = std::time::Instant::now();
             let rec = record_within(
                 &cfg,
@@ -5660,11 +5708,26 @@ mod tests {
                 1,
                 &host("7.2"),
                 std::time::Duration::from_millis(300),
-                stalled_reader(notes, release),
-                &mut |_| heard += 1,
+                stalled_reader(notes, finished.clone()),
+                &mut |n| heard.push(n),
             );
             assert!(started.elapsed() >= std::time::Duration::from_millis(300));
-            assert_eq!(heard, notes.len());
+            // bd DAS-Backup-Manager-ay0n: the reading has stopped before the
+            // step returns, so nothing holds a file open under the drive
+            // when its caller unmounts it and gives back the locks.
+            assert!(
+                finished.load(std::sync::atomic::Ordering::SeqCst),
+                "the step returned while the reading still ran"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(4),
+                "the reading was told to stop, not waited out"
+            );
+            assert_eq!(heard.len(), notes.len() + 1, "{heard:?}");
+            assert_eq!(
+                heard.last().map(String::as_str),
+                Some("timed out: waiting for the reading to stop before the drive is unmounted")
+            );
             let want = format!("reading the recovery OSes timed out after 0 s {place}");
             assert_eq!(rec.status, RecordStatus::Fail);
             assert_eq!(rec.detail, want);
@@ -5673,17 +5736,48 @@ mod tests {
                 format!("RECOVERY OS\n  CHECK FAILED: {want}\n")
             );
             assert!(rec.entries.is_empty());
-            // The reading finishes after all: it is discarded, never written.
-            go.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // The reading finished after all: it is discarded, never written.
             assert!(!state.exists(), "a late reading wrote the record");
         }
     }
 
     #[test]
+    fn a_reading_told_to_stop_reads_no_further_drive() {
+        let cfg = mirror_config(&[("A", "/nonexistent/r/A"), ("B", "/nonexistent/r/B")]);
+        let stopped = std::cell::Cell::new(false);
+        let mut heard = Vec::new();
+        let entries = status_noting_until(
+            &cfg,
+            &host("7.2"),
+            "2026-11-08",
+            &|_| true,
+            &|_| None,
+            &mut |n| {
+                // Told to stop while A is read.
+                stopped.set(true);
+                heard.push(n);
+            },
+            &|| stopped.get(),
+        );
+        assert_eq!(entries.len(), 1, "only A was read");
+        assert_eq!(entries[0].label, "A");
+        assert!(heard.iter().all(|n| !n.contains(" B ")), "{heard:?}");
+        // Never told to stop: both.
+        let both = status_noting(
+            &cfg,
+            &host("7.2"),
+            "2026-11-08",
+            &|_| true,
+            &|_| None,
+            &mut |_| {},
+        );
+        assert_eq!(both.len(), 2);
+    }
+
+    #[test]
     fn a_reading_that_dies_fails_the_recording() {
         let cfg = mirror_config(&[("A", "/r/A")]);
-        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(|_, _| panic!("reader died"));
+        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(|_, _, _| panic!("reader died"));
         let rec = record_within(
             &cfg,
             None,
@@ -5705,7 +5799,7 @@ mod tests {
         let cfg = mirror_config(&[("A", "/r/A")]);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let saw = seen.clone();
-        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |c, _| {
+        let read: std::sync::Arc<ReadDrives> = std::sync::Arc::new(move |c, _, _| {
             saw.lock()
                 .unwrap()
                 .extend(c.targets.iter().map(|t| t.label.clone()));
