@@ -298,10 +298,15 @@ private Q_SLOTS:
     {
         DBusClient client;
         BackupHistoryView view(&client);
-        // Newest first: a failed run that could not count (NULL), a failed run
-        // that counted nothing sent (a measured 0), a clean run that sent
-        // bytes, and a clean run with nothing to send.
+        // Newest first: a run stopped during btrbk that sent snapshots and
+        // could not measure their size (bytes NULL, bd DAS-Backup-Manager-3lpr),
+        // a failed run that could not count (NULL), a failed run that counted
+        // nothing sent (a measured 0), a clean run that sent bytes, and a clean
+        // run with nothing to send.
         view.showHistory(QStringLiteral(R"([
+            {"id": 5, "timestamp": 1791100000, "mode": "incremental", "success": false,
+             "duration_secs": 60, "snaps_created": 3, "snaps_sent": 3,
+             "bytes_sent": null, "errors": ["stopped"]},
             {"id": 4, "timestamp": 1791000000, "mode": "full", "success": false,
              "duration_secs": 5, "snaps_created": null, "snaps_sent": null,
              "bytes_sent": 0, "errors": ["btrbk: exit code 10"]},
@@ -318,7 +323,7 @@ private Q_SLOTS:
         const auto *table = view.findChild<QTableView *>();
         QVERIFY(table != nullptr);
         QAbstractItemModel *model = table->model();
-        QCOMPARE(model->rowCount(), 4);
+        QCOMPARE(model->rowCount(), 5);
         int column = -1;
         for (int c = 0; c < model->columnCount(); ++c) {
             if (model->headerData(c, Qt::Horizontal).toString() == QStringLiteral("Sent"))
@@ -328,8 +333,9 @@ private Q_SLOTS:
         QStringList cells;
         for (int r = 0; r < model->rowCount(); ++r)
             cells << model->index(r, column).data().toString();
-        QCOMPARE(cells, (QStringList{QStringLiteral("unknown"), QStringLiteral("No"),
-                                     QStringLiteral("Yes"), QStringLiteral("\u2014")}));
+        QCOMPARE(cells, (QStringList{QStringLiteral("Yes"), QStringLiteral("unknown"),
+                                     QStringLiteral("No"), QStringLiteral("Yes"),
+                                     QStringLiteral("\u2014")}));
     }
 
     void backupStepsMapToTheHelpersKeys()

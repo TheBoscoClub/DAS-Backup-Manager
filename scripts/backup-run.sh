@@ -2831,6 +2831,25 @@ capture_usage() {
     fi
 }
 
+# What target $1 grew by across btrbk, into USAGE_DELTA: its used bytes after
+# less before; "unknown" when it was read once and not twice, or a reading was
+# not a number (a run stopped while btrbk ran, a df that printed nothing) —
+# never 0, which reads as a measured nothing (bd DAS-Backup-Manager-3lpr); ""
+# when neither reading found it mounted, so it was not written to.
+usage_delta() {
+    local mnt="$1"
+    USAGE_DELTA=""
+    if [[ -z "${USAGE_BEFORE[$mnt]+x}${USAGE_AFTER[$mnt]+x}" ]]; then
+        return 0
+    fi
+    local before="${USAGE_BEFORE[$mnt]:-}" after="${USAGE_AFTER[$mnt]:-}"
+    if [[ "$before" =~ ^[[:digit:]]+$ && "$after" =~ ^[[:digit:]]+$ ]]; then
+        USAGE_DELTA=$((after - before))
+    else
+        USAGE_DELTA="unknown"
+    fi
+}
+
 # Cache all report data that requires a live mount or a live btrbk call,
 # while targets are still mounted. MUST run before unmount_all() in main()'s
 # real-backup path. generate_capacity_section(), generate_growth_section(),
@@ -3452,15 +3471,27 @@ generate_growth_section() {
     # generate_capacity_section() above. Tracks bd DAS-Backup-Manager-ecg.
     for mnt in "${REPORT_TARGETS[@]}"; do
         local name="${TARGET_NAMES[$mnt]:-$mnt}"
-        local current="${USAGE_AFTER[$mnt]:-0}"
-        local today_delta=$(( ${USAGE_AFTER[$mnt]:-0} - ${USAGE_BEFORE[$mnt]:-0} ))
+        # A missing reading is unknown, never 0: 0 made a target's whole used
+        # space read as today's growth (bd DAS-Backup-Manager-3lpr).
+        usage_delta "$mnt"
+        local today_delta=0
 
         printf "  %s:\n" "$name"
-        printf "    Today:              +%s\n" "$(format_bytes $today_delta)"
+        if [[ "$USAGE_DELTA" =~ ^-?[[:digit:]]+$ ]]; then
+            today_delta=$USAGE_DELTA
+            printf "    Today:              +%s\n" "$(format_bytes "$today_delta")"
+        else
+            printf "    Today:              unknown (not measured before and after btrbk)\n"
+        fi
 
-        local avg_7d avg_30d
-        avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
-        avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
+        # The averages compare against the current reading; with none, they
+        # are not computed rather than computed against 0.
+        local current="${USAGE_AFTER[$mnt]:-}"
+        local avg_7d=0 avg_30d=0
+        if [[ "$current" =~ ^[[:digit:]]+$ ]]; then
+            avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
+            avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
+        fi
 
         if (( avg_7d > 0 )); then
             printf "    7-day avg:          %s/day\n" "$(format_bytes "$avg_7d")"
@@ -3710,16 +3741,24 @@ record_run_args() {
 
     local elapsed=$(( BTRBK_END_TIME - BTRBK_START_TIME ))
 
-    # Compute total bytes sent across all targets
+    # Total bytes sent across all targets: each target's growth (a target
+    # that shrank grew by 0). One target not measured makes the total unknown
+    # (bd DAS-Backup-Manager-3lpr) — it travels as --bytes-unknown, never 0.
     local total_bytes=0
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
-        local before="${USAGE_BEFORE[$mnt]:-0}"
-        local after="${USAGE_AFTER[$mnt]:-0}"
-        local delta=$(( after - before ))
-        if (( delta > 0 )); then
-            total_bytes=$(( total_bytes + delta ))
+        usage_delta "$mnt"
+        if [[ "$USAGE_DELTA" == "unknown" ]]; then
+            total_bytes="unknown"
+            break
+        fi
+        if [[ -n "$USAGE_DELTA" ]] && ((USAGE_DELTA > 0)); then
+            total_bytes=$((total_bytes + USAGE_DELTA))
         fi
     done
+    local bytes_args=(--bytes-sent "$total_bytes")
+    if [[ "$total_bytes" == "unknown" ]]; then
+        bytes_args=(--bytes-unknown)
+    fi
 
     # Snapshot counters: decided by decide_run_counts — already in main(),
     # before the run status and the report (bd DAS-Backup-Manager-bzw); again
@@ -3744,7 +3783,7 @@ record_run_args() {
         --db "$DAS_DB_PATH"
         --mode "$mode"
         "${RUN_COUNTS[@]}"
-        --bytes-sent "$total_bytes"
+        "${bytes_args[@]}"
         --duration-secs "$elapsed"
     )
     if [[ "$overall_status" == "SUCCESS" ]]; then

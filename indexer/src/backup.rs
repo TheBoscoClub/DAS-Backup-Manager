@@ -483,7 +483,10 @@ pub struct BackupResult {
     /// Snapshots sent to a target. `None` = unknown, as `snapshots_created`.
     pub snapshots_sent: Option<usize>,
     pub snapshots_cleaned: usize,
-    pub bytes_sent: u64,
+    /// Bytes the targets grew by across the btrbk steps. `None` = unknown: a
+    /// target read before them and not after, or unreadable — recorded as
+    /// NULL (schema 6), shown as "unknown", never 0 (bd DAS-Backup-Manager-3lpr).
+    pub bytes_sent: Option<u64>,
     pub boot: BootStep,
     pub recovery_os: RecoveryOsStep,
     pub indexed: bool,
@@ -694,7 +697,7 @@ struct StepEnv<'a> {
     verify: &'a VerifyTargets<'a>,
     /// Whether a path is a mount point now (`health::is_mountpoint`).
     is_mountpoint: &'a dyn Fn(&Path) -> bool,
-    /// Bytes in use across the mounted targets, read after a sync
+    /// Bytes in use on each mounted target, read after a sync
     /// ([`synced_target_usage`]): what `bytes_sent` is the difference of.
     usage: &'a UsageOf<'a>,
     /// Index the snapshots now on the mounted targets; whether any target was
@@ -721,7 +724,41 @@ fn record_recovery_os(config: &Config, progress: &dyn ProgressCallback) -> recov
 type IndexTargets<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> bool + 'a;
 
 /// The reading behind [`StepEnv::usage`].
-type UsageOf<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> u64 + 'a;
+type UsageOf<'a> = dyn Fn(&Config, &dyn ProgressCallback) -> TargetUsage + 'a;
+
+/// One usage reading of the targets: each mounted target's label and the
+/// bytes in use on it, `None` when it is mounted and could not be read. A
+/// target that is not mounted is absent.
+pub(crate) type TargetUsage = std::collections::BTreeMap<String, Option<u64>>;
+
+/// What the targets grew by between two readings: the sum, per target, of
+/// what it grew by (a target that shrank grew by 0, never a wrapped number).
+/// `None` — unknown — when any target is unreadable in either reading or is in
+/// one and not the other: its growth was never measured, and a 0 or its whole
+/// used space would both be wrong (bd DAS-Backup-Manager-3lpr). A target in
+/// neither was not mounted and sent nothing.
+fn bytes_grown(before: &TargetUsage, after: &TargetUsage) -> Option<u64> {
+    let labels: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    labels.into_iter().try_fold(0u64, |sum, label| {
+        let (b, a) = (
+            before.get(label).copied().flatten()?,
+            after.get(label).copied().flatten()?,
+        );
+        Some(sum.saturating_add(a.saturating_sub(b)))
+    })
+}
+
+/// A usage reading as the log says it: the total of what was read, and how
+/// many targets could not be.
+fn usage_text(usage: &TargetUsage) -> String {
+    let read: u64 = usage.values().flatten().sum();
+    let unread = usage.values().filter(|v| v.is_none()).count();
+    if unread == 0 {
+        format!("{read} bytes")
+    } else {
+        format!("{read} bytes ({unread} target(s) unreadable)")
+    }
+}
 
 /// The check behind [`StepEnv::verify`]: the targets (all configured ones),
 /// the labels about to be written, and where to say what it found.
@@ -1370,9 +1407,9 @@ fn sync_targets(config: &Config) {
     }
 }
 
-/// Bytes in use across the mounted targets, after forcing their pending
+/// Bytes in use on each mounted target, after forcing their pending
 /// transactions out ([`sync_targets`]) so the reading is not stale.
-fn synced_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64 {
+fn synced_target_usage(config: &Config, progress: &dyn ProgressCallback) -> TargetUsage {
     sync_targets(config);
     measure_target_usage(config, progress)
 }
@@ -1383,13 +1420,13 @@ fn used_bytes(blocks: u64, available_blocks: u64, block_size: u64) -> u64 {
     (blocks * block_size).saturating_sub(available_blocks * block_size)
 }
 
-/// Measure total used bytes across all mounted backup targets.
+/// Measure the used bytes on each mounted backup target.
 ///
 /// Uses `statvfs(2)` to read filesystem usage directly (no child process).
-/// Returns the sum of used bytes across all target mount points. Used to
-/// calculate bytes_sent as the delta between before/after a backup, since
-/// btrbk doesn't report transfer sizes in its output.
-fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64 {
+/// Used to calculate bytes_sent as the growth between before/after a backup,
+/// since btrbk doesn't report transfer sizes in its output. A target that is
+/// not mounted is left out; one that is and cannot be read is `None`.
+fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> TargetUsage {
     config
         .targets
         .iter()
@@ -1408,7 +1445,10 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
                     return None;
                 }
             };
-            let c_path = std::ffi::CString::new(path.clone()).ok()?;
+            let label = tgt.label.clone();
+            let Ok(c_path) = std::ffi::CString::new(path.clone()) else {
+                return Some((label, None));
+            };
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
             if rc != 0 {
@@ -1419,7 +1459,7 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
                         tgt.label
                     ),
                 );
-                return None;
+                return Some((label, None));
             }
             let used = used_bytes(stat.f_blocks, stat.f_bavail, stat.f_frsize);
             progress.on_log(
@@ -1429,9 +1469,9 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> u64
                     tgt.label
                 ),
             );
-            Some(used)
+            Some((label, Some(used)))
         })
-        .sum()
+        .collect()
 }
 
 /// One boot subvolume of the boot step: what `[boot].subvolumes` names, the
@@ -2754,7 +2794,7 @@ fn run_backup_with(
             snapshots_created: Some(0),
             snapshots_sent: Some(0),
             snapshots_cleaned: 0,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             boot: BootStep::NotSelected,
             recovery_os: RecoveryOsStep::NotSelected,
             indexed: false,
@@ -2796,7 +2836,7 @@ fn run_backup_with(
     let usage_before = (env.usage)(config, progress);
     progress.on_log(
         LogLevel::Info,
-        &format!("Target usage before: {} bytes", usage_before),
+        &format!("Target usage before: {}", usage_text(&usage_before)),
     );
 
     let done = run_pipeline(
@@ -2813,28 +2853,36 @@ fn run_backup_with(
     errors.extend(done.errors);
     let (snapshots_created, snapshots_sent, snapshots_cleaned) =
         (done.created, done.sent, done.cleaned);
-    let mut bytes_sent = done.bytes;
+    let mut bytes_sent = Some(done.bytes);
 
-    // Calculate bytes_sent from target disk usage delta. btrbk doesn't report
+    // Calculate bytes_sent from target disk usage growth. btrbk doesn't report
     // transfer sizes in its output, so we measure before/after. For incremental
     // mode (no cleanup) this is the actual bytes sent. For full mode (with
-    // cleanup) it's the net change, which may underestimate if old data was
-    // purged. Still better than reporting 0.
-    if bytes_sent == 0 && (snapshots_sent.unwrap_or(0) > 0 || snapshots_created.unwrap_or(0) > 0) {
+    // cleanup) it's the growth less what was purged, which may underestimate.
+    // Only a run that counted nothing created and nothing sent is known to
+    // have sent 0 without a second reading; a run whose counts are unknown (a
+    // step failed or was stopped) is read again, never assumed to have sent
+    // nothing (bd DAS-Backup-Manager-3lpr).
+    let nothing_done = snapshots_created == Some(0) && snapshots_sent == Some(0);
+    if done.bytes == 0 && !nothing_done {
         // `usage` forces BTRFS to commit pending transactions first, so statvfs
         // reflects the data that was just received. Without that, BTRFS defers
         // metadata updates and statvfs returns stale values, making the delta
         // zero.
         let usage_after = (env.usage)(config, progress);
+        bytes_sent = bytes_grown(&usage_before, &usage_after);
         progress.on_log(
-            LogLevel::Info,
+            if bytes_sent.is_some() {
+                LogLevel::Info
+            } else {
+                LogLevel::Warning
+            },
             &format!(
-                "Target usage after: {} bytes (delta: {})",
-                usage_after,
-                usage_after.saturating_sub(usage_before)
+                "Target usage after: {} (grown by: {})",
+                usage_text(&usage_after),
+                crate::report::format_size(bytes_sent)
             ),
         );
-        bytes_sent = usage_after.saturating_sub(usage_before);
     }
 
     // Recovery OSes — after btrbk, while the targets are mounted, as
@@ -3310,7 +3358,8 @@ fn abort_job(
         snapshots_created: None,
         snapshots_sent: None,
         snapshots_cleaned: 0,
-        bytes_sent: 0,
+        // Stopped before btrbk ran: nothing was sent, which is known.
+        bytes_sent: Some(0),
         boot: BootStep::NotSelected,
         recovery_os: RecoveryOsStep::NotSelected,
         indexed: false,
@@ -4132,7 +4181,7 @@ mod tests {
             Some(0),
             "dry_run must send 0 snapshots"
         );
-        assert_eq!(result.bytes_sent, 0);
+        assert_eq!(result.bytes_sent, Some(0));
         assert_eq!(result.boot, BootStep::NotSelected);
 
         // Verify at least one DRY RUN log message was emitted.
@@ -6285,9 +6334,14 @@ mod tests {
         // host has bytes in use, no targets have none.
         let mut config = make_test_config();
         config.targets[0].mount = "/".into();
-        assert!((StepEnv::HOST.usage)(&config, &TestProgress::new()) > 0);
+        let usage = (StepEnv::HOST.usage)(&config, &TestProgress::new());
+        let label = config.targets[0].label.clone();
+        assert!(
+            matches!(usage.get(&label), Some(Some(n)) if *n > 0),
+            "{usage:?}"
+        );
         config.targets.clear();
-        assert_eq!((StepEnv::HOST.usage)(&config, &TestProgress::new()), 0);
+        assert!((StepEnv::HOST.usage)(&config, &TestProgress::new()).is_empty());
     }
 
     #[test]
@@ -6531,7 +6585,7 @@ mod tests {
             runner,
             verify,
             is_mountpoint: &|_| true,
-            usage: &|_, _| 0,
+            usage: &|_, _| TargetUsage::new(),
             index: &|_, _| false,
             recovery_os: &|_, _| quiet_recording(),
         }
@@ -7551,20 +7605,34 @@ mod tests {
     // themselves reported no size, again after: the difference is what was
     // sent. `readings` are what the usage reads in turn.
 
-    /// A live run of `options` with btrbk answering `script`, the usage
-    /// reading `readings` in turn (the last one repeats). Returns the result
-    /// and how many readings were taken.
+    /// A live run of `options` with btrbk answering `script`, the usage of
+    /// its one target reading `readings` in turn (the last one repeats).
+    /// Returns the result and how many readings were taken.
     fn live_run_measuring(
         options: BackupOptions,
         script: Vec<(String, i32, String)>,
         readings: &[u64],
+    ) -> (BackupResult, usize) {
+        let readings: Vec<TargetUsage> = readings
+            .iter()
+            .map(|&n| TargetUsage::from([("primary-22tb".to_string(), Some(n))]))
+            .collect();
+        live_run_reading(options, script, &readings)
+    }
+
+    /// [`live_run_measuring`] with whole readings: which targets were
+    /// mounted, and which could be read.
+    fn live_run_reading(
+        options: BackupOptions,
+        script: Vec<(String, i32, String)>,
+        readings: &[TargetUsage],
     ) -> (BackupResult, usize) {
         let runner = Scripted::from_owned(script);
         let taken = std::cell::Cell::new(0usize);
         let usage = |_: &Config, _: &dyn ProgressCallback| {
             let n = taken.get();
             taken.set(n + 1);
-            readings[n.min(readings.len() - 1)]
+            readings[n.min(readings.len() - 1)].clone()
         };
         let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
         let host = StepEnv {
@@ -7614,7 +7682,7 @@ mod tests {
             (result.snapshots_created, result.snapshots_sent),
             (Some(1), Some(1))
         );
-        assert_eq!(result.bytes_sent, 4000);
+        assert_eq!(result.bytes_sent, Some(4000));
         assert_eq!(taken, 2, "before the steps and after them");
     }
 
@@ -7634,7 +7702,7 @@ mod tests {
             (result.snapshots_created, result.snapshots_sent),
             (Some(0), Some(1))
         );
-        assert_eq!((result.bytes_sent, taken), (4000, 2));
+        assert_eq!((result.bytes_sent, taken), (Some(4000), 2));
 
         let snapshot_only = BackupOptions {
             steps: BtrbkSteps::SnapshotOnly,
@@ -7646,7 +7714,7 @@ mod tests {
             (result.snapshots_created, result.snapshots_sent),
             (Some(1), Some(0))
         );
-        assert_eq!((result.bytes_sent, taken), (4000, 2));
+        assert_eq!((result.bytes_sent, taken), (Some(4000), 2));
     }
 
     #[test]
@@ -7664,7 +7732,7 @@ mod tests {
             (result.snapshots_created, result.snapshots_sent),
             (Some(1), None)
         );
-        assert_eq!((result.bytes_sent, taken), (4000, 2));
+        assert_eq!((result.bytes_sent, taken), (Some(4000), 2));
     }
 
     #[test]
@@ -7682,7 +7750,11 @@ mod tests {
             (result.snapshots_created, result.snapshots_sent),
             (Some(0), Some(0))
         );
-        assert_eq!((result.bytes_sent, taken), (0, 1), "no second reading");
+        assert_eq!(
+            (result.bytes_sent, taken),
+            (Some(0), 1),
+            "no second reading"
+        );
     }
 
     #[test]
@@ -7696,8 +7768,70 @@ mod tests {
             btrbk_script(0, ">>> /t/a.1 (incremental, 2.0 MiB)\n", &row),
             &[1000, 5000],
         );
-        assert_eq!(result.bytes_sent, 2 * 1_048_576);
+        assert_eq!(result.bytes_sent, Some(2 * 1_048_576));
         assert_eq!(taken, 1, "the step's own figure is the answer");
+    }
+
+    #[test]
+    fn a_run_whose_counts_are_unknown_reads_the_targets_again_and_never_assumes_zero() {
+        // Both steps fail (btrbk exit 10): nothing is known about what was
+        // created or sent, so it is measured, not read as "nothing was done"
+        // (bd DAS-Backup-Manager-3lpr).
+        let f = "/proc/self/root /proc/self/home";
+        let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let script = vec![
+            (at(&format!("snapshot {f}")), 10, String::new()),
+            (at(&format!("resume {f}")), 10, String::new()),
+            (at(&format!("--format=raw list latest {f}")), 0, row),
+        ];
+        let (result, taken) = live_run_measuring(BackupOptions::default(), script, &[1000, 5000]);
+        assert_eq!(
+            (result.snapshots_created, result.snapshots_sent),
+            (None, None)
+        );
+        assert_eq!((result.bytes_sent, taken), (Some(4000), 2));
+    }
+
+    #[test]
+    fn a_target_read_before_the_steps_and_not_after_leaves_bytes_unknown() {
+        let row = raw_row("/s/a.1", "/t/a.1");
+        let read = |pairs: &[(&str, Option<u64>)]| -> TargetUsage {
+            pairs.iter().map(|(l, n)| (l.to_string(), *n)).collect()
+        };
+        let both = read(&[("primary-22tb", Some(1000)), ("recovery-b", Some(500))]);
+        for after in [
+            read(&[("primary-22tb", Some(5000))]),
+            read(&[("primary-22tb", Some(5000)), ("recovery-b", None)]),
+        ] {
+            let (result, taken) = live_run_reading(
+                BackupOptions::default(),
+                btrbk_script(0, ">>> /t/a.1\n", &row),
+                &[both.clone(), after.clone()],
+            );
+            assert_eq!((result.bytes_sent, taken), (None, 2), "{after:?}");
+            let history = recorded(&result);
+            assert_eq!(history.bytes_sent, None, "stored as NULL, not 0");
+        }
+    }
+
+    #[test]
+    fn bytes_grown_sums_each_targets_own_growth() {
+        let read = |pairs: &[(&str, Option<u64>)]| -> TargetUsage {
+            pairs.iter().map(|(l, n)| (l.to_string(), *n)).collect()
+        };
+        let before = read(&[("a", Some(1000)), ("b", Some(500))]);
+        // b shrank (retention cleanup): it grew by 0, and a's growth is not
+        // eaten by b's shrinking.
+        let after = read(&[("a", Some(5000)), ("b", Some(200))]);
+        assert_eq!(bytes_grown(&before, &after), Some(4000));
+        // A target mounted for neither reading sent nothing.
+        assert_eq!(
+            bytes_grown(&TargetUsage::new(), &TargetUsage::new()),
+            Some(0)
+        );
+        // Read after and not before: unknown, never its whole used space.
+        assert_eq!(bytes_grown(&read(&[("a", Some(1000))]), &after), None);
     }
 
     #[test]
@@ -7708,7 +7842,7 @@ mod tests {
             btrbk_script(0, ">>> /t/a.1\n", &row),
             &[5000, 1000],
         );
-        assert_eq!((result.bytes_sent, taken), (0, 2));
+        assert_eq!((result.bytes_sent, taken), (Some(0), 2));
     }
 
     #[test]
@@ -9242,7 +9376,7 @@ mod tests {
                 snapshots_created: Some(2),
                 snapshots_sent: Some(2),
                 snapshots_cleaned: 0,
-                bytes_sent: 10,
+                bytes_sent: Some(10),
                 boot: BootStep::NotSelected,
                 recovery_os: RecoveryOsStep::NotSelected,
                 indexed: true,
@@ -10209,7 +10343,7 @@ mod tests {
             snapshots_created: Some(created),
             snapshots_sent: Some(sent),
             snapshots_cleaned: cleaned,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             boot: BootStep::Ran(BootOutcome {
                 updated: 1,
                 ..Default::default()

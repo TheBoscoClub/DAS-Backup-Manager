@@ -25,7 +25,7 @@ const HARNESS: &str = r#"
 set -euo pipefail
 script="$1" setup="$2" status="$3" full="$4"
 extract() { sed -n "/^$1() {/,/^}/p" "$script"; }
-for fn in decide_run_counts record_run_args record_op note_abort; do
+for fn in decide_run_counts record_run_args record_op note_abort usage_delta; do
     body="$(extract "$fn")"
     if [[ -z "$body" ]]; then
         echo "HARNESS BROKEN: $fn() not found in $script" >&2
@@ -93,7 +93,7 @@ struct Row {
     mode: String,
     snaps_created: Option<i64>,
     snaps_sent: Option<i64>,
-    bytes_sent: i64,
+    bytes_sent: Option<i64>,
     duration_secs: i64,
     errors: String,
 }
@@ -194,7 +194,7 @@ fn a_normal_run_is_recorded_with_its_counts() {
             mode: "incremental".into(),
             snaps_created: Some(2),
             snaps_sent: Some(4),
-            bytes_sent: 3096,
+            bytes_sent: Some(3096),
             duration_secs: 516,
             errors: String::new(),
         }]
@@ -222,7 +222,7 @@ fn a_run_whose_counts_are_unknown_is_recorded_with_null_counts() {
     assert_eq!(row.success, 0);
     assert_eq!(row.mode, "full");
     assert_eq!((row.snaps_created, row.snaps_sent), (None, None), "{row:?}");
-    assert_eq!((row.bytes_sent, row.duration_secs), (0, 516));
+    assert_eq!((row.bytes_sent, row.duration_secs), (Some(0), 516));
     let mut errors: Vec<&str> = row.errors.lines().collect();
     errors.sort_unstable();
     assert_eq!(
@@ -232,6 +232,64 @@ fn a_run_whose_counts_are_unknown_is_recorded_with_null_counts() {
             "btrbk_counters: btrbk list latest failed; counts unknown"
         ]
     );
+}
+
+/// A run stopped while btrbk ran (bd DAS-Backup-Manager-3lpr): the targets
+/// were read before btrbk, and cleanup() stamped its end, but no second
+/// reading was ever taken.
+const STOPPED_DURING_BTRBK_STATE: &str =
+    "ALL_TARGET_MOUNTS=(/mnt/backup-22tb /mnt/backup-system-recovery-B)
+USAGE_BEFORE=([/mnt/backup-22tb]=1000 [/mnt/backup-system-recovery-B]=500)
+BTRBK_START_TIME=1000
+BTRBK_END_TIME=1060";
+
+#[test]
+fn a_run_stopped_while_btrbk_ran_is_recorded_with_unknown_bytes_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+
+    let vector = record_as_the_script_does(&db, STOPPED_DURING_BTRBK_STATE, "FAILURE", "false");
+
+    assert!(
+        vector.iter().any(|a| a == "--bytes-unknown")
+            && !vector.iter().any(|a| a == "--bytes-sent"),
+        "an unmeasured size must travel as unknown, never as a number: {vector:?}"
+    );
+    let got = rows(&db);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].bytes_sent, got[0].duration_secs), (None, 60));
+}
+
+#[test]
+fn one_target_read_twice_and_another_once_is_unknown_bytes() {
+    // The second shape: summing what was read would report the primary's
+    // growth as the whole, or a target's whole used space as sent.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let state = "ALL_TARGET_MOUNTS=(/mnt/backup-22tb /mnt/backup-system-recovery-B)
+USAGE_BEFORE=([/mnt/backup-22tb]=1000 [/mnt/backup-system-recovery-B]=500)
+USAGE_AFTER=([/mnt/backup-22tb]=4096 [/mnt/backup-system-recovery-B]='')
+BTRBK_START_TIME=1000
+BTRBK_END_TIME=1516";
+
+    record_as_the_script_does(&db, state, "SUCCESS", "false");
+
+    assert_eq!(rows(&db)[0].bytes_sent, None);
+}
+
+#[test]
+fn a_run_with_no_target_mounted_sent_zero_bytes_which_is_known() {
+    // Neither reading found a target: nothing could be sent, and 0 is true.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let state = "ALL_TARGET_MOUNTS=(/mnt/backup-22tb)
+BTRBK_START_TIME=1000
+BTRBK_END_TIME=1060";
+
+    let vector = record_as_the_script_does(&db, state, "FAILURE", "false");
+
+    assert!(!vector.iter().any(|a| a == "--bytes-unknown"), "{vector:?}");
+    assert_eq!(rows(&db)[0].bytes_sent, Some(0));
 }
 
 #[test]
@@ -296,7 +354,7 @@ note_abort 3 'exit 3'"#;
     assert_eq!((row.snaps_created, row.snaps_sent), (None, None), "{row:?}");
     assert_eq!(
         (row.bytes_sent, row.duration_secs),
-        (0, 0),
+        (Some(0), 0),
         "btrbk never ran"
     );
     assert_eq!(

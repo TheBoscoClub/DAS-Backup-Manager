@@ -551,9 +551,13 @@ enum BackupAction {
         /// unknown (NULL), never as a number
         #[arg(long, conflicts_with_all = ["snaps_created", "snaps_sent"])]
         counts_unknown: bool,
-        /// Bytes sent to targets
-        #[arg(long, default_value = "0")]
-        bytes_sent: u64,
+        /// Bytes sent to targets (required unless --bytes-unknown)
+        #[arg(long, required_unless_present = "bytes_unknown")]
+        bytes_sent: Option<u64>,
+        /// The run could not measure what it sent (a target read before btrbk
+        /// and not after): record it as unknown (NULL), never as 0
+        #[arg(long, conflicts_with = "bytes_sent")]
+        bytes_unknown: bool,
         /// Duration in seconds
         #[arg(long, default_value = "0")]
         duration_secs: u64,
@@ -1468,8 +1472,8 @@ fn flag_selection(list: Vec<String>) -> Option<Vec<String>> {
     (!list.is_empty()).then_some(list)
 }
 
-/// `backup run --json`: the counts are `null` when the run could not take
-/// them, never 0 (bd DAS-Backup-Manager-no4).
+/// `backup run --json`: the counts and size are `null` when the run could not
+/// take them, never 0 (bd DAS-Backup-Manager-no4, -3lpr).
 fn backup_run_json(result: &backup::BackupResult) -> String {
     let count = |n: Option<usize>| serde_json::Value::from(n).to_string();
     format!(
@@ -1477,7 +1481,7 @@ fn backup_run_json(result: &backup::BackupResult) -> String {
         result.success,
         count(result.snapshots_created),
         count(result.snapshots_sent),
-        result.bytes_sent,
+        serde_json::Value::from(result.bytes_sent),
         result.duration_secs
     )
 }
@@ -1508,7 +1512,7 @@ fn backup_run_line(result: &backup::BackupResult) -> String {
         },
         count(result.snapshots_created),
         count(result.snapshots_sent),
-        report::format_bytes(result.bytes_sent),
+        report::format_size(result.bytes_sent),
         result.duration_secs
     )
 }
@@ -2638,7 +2642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             run.duration_secs,
                             serde_json::Value::from(run.snaps_created),
                             serde_json::Value::from(run.snaps_sent),
-                            run.bytes_sent
+                            serde_json::Value::from(run.bytes_sent)
                         );
                     }
                     println!("]");
@@ -2673,6 +2677,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // flag and never both, so the counts are None exactly when it
                 // was given — the unknown the row then stores as NULL.
                 counts_unknown: _,
+                // The same for the size: None exactly when this flag was given.
+                bytes_unknown: _,
                 bytes_sent,
                 duration_secs,
                 errors,
@@ -3343,7 +3349,7 @@ mod tests {
             snapshots_created: created,
             snapshots_sent: sent,
             snapshots_cleaned: 0,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             boot: backup::BootStep::NotSelected,
             recovery_os: backup::RecoveryOsStep::NotSelected,
             indexed: false,
@@ -3359,6 +3365,20 @@ mod tests {
         assert_eq!(
             backup_run_line(&result(None, Some(0))),
             "Backup FAILED: snapshots created: unknown, sent: 0, 0 B in 7s"
+        );
+        // An unmeasured size is null and `unknown`, never 0 (bd DAS-Backup-Manager-3lpr).
+        let unmeasured = backup::BackupResult {
+            bytes_sent: None,
+            ..result(Some(1), Some(1))
+        };
+        assert!(
+            backup_run_json(&unmeasured).contains("\"bytes_sent\":null"),
+            "{}",
+            backup_run_json(&unmeasured)
+        );
+        assert_eq!(
+            backup_run_line(&unmeasured),
+            "Backup FAILED: snapshots created: 1, sent: 1, unknown in 7s"
         );
         // The counter-case: measured counts print as numbers.
         let ok = backup::BackupResult {
@@ -3433,10 +3453,44 @@ mod tests {
     /// refused as an unknown option, so a run whose counts were unknown was
     /// not recorded at all (bd DAS-Backup-Manager-6wt).
     #[test]
+    fn record_run_takes_bytes_sent_or_bytes_unknown() {
+        // An unmeasured size travels as --bytes-unknown and is None, never 0
+        // (bd DAS-Backup-Manager-3lpr); a size is required one way or the other.
+        use clap::error::ErrorKind;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["btrdasd", "backup", "record-run", "--counts-unknown"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let bytes = |cli: Cli| match cli.command {
+            Commands::Backup {
+                action:
+                    BackupAction::RecordRun {
+                        bytes_sent,
+                        bytes_unknown,
+                        ..
+                    },
+            } => (bytes_sent, bytes_unknown),
+            _ => panic!("not record-run"),
+        };
+        let kind = |extra: &[&str]| parse(extra).err().map(|e| e.kind());
+        assert_eq!(
+            bytes(parse(&["--bytes-sent", "0"]).unwrap()),
+            (Some(0), false)
+        );
+        assert_eq!(bytes(parse(&["--bytes-unknown"]).unwrap()), (None, true));
+        assert_eq!(
+            kind(&["--bytes-unknown", "--bytes-sent", "1"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(kind(&[]), Some(ErrorKind::MissingRequiredArgument));
+    }
+
+    #[test]
     fn record_run_takes_both_counts_or_counts_unknown() {
         use clap::error::ErrorKind;
         let parse = |extra: &[&str]| {
-            let mut argv = vec!["btrdasd", "backup", "record-run"];
+            let mut argv = vec!["btrdasd", "backup", "record-run", "--bytes-sent", "1"];
             argv.extend_from_slice(extra);
             Cli::try_parse_from(argv)
         };

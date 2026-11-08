@@ -32,7 +32,7 @@ struct BackupRunInfo {
     qint64 durationSecs = 0;
     std::optional<qint64> snapsCreated; // no value: the run could not count
     std::optional<qint64> snapsSent;    // no value: the run could not count
-    qint64 bytesSent = 0;
+    std::optional<qint64> bytesSent;    // no value: the run could not measure
     QStringList errors;
 };
 
@@ -43,6 +43,16 @@ struct BackupRunInfo {
 class BackupHistoryModel : public QAbstractTableModel
 {
     Q_OBJECT
+
+    // Bytes measured, or — when the size could not be measured (a run
+    // stopped while btrbk ran, bd DAS-Backup-Manager-3lpr) — snapshots
+    // counted as sent. An unmeasured size is never read as 0 bytes.
+    static bool sentSomething(const BackupRunInfo &run)
+    {
+        if (run.bytesSent)
+            return *run.bytesSent > 0;
+        return run.snapsSent.value_or(0) > 0;
+    }
 
 public:
     // What the view sorts by: the shown value, except that the snapshot
@@ -90,7 +100,8 @@ public:
                         obj.value(QLatin1String("snaps_created"))),
                     .snapsSent = BackupHistoryView::countFromJson(
                         obj.value(QLatin1String("snaps_sent"))),
-                    .bytesSent = obj.value(QLatin1String("bytes_sent")).toInteger(),
+                    .bytesSent = BackupHistoryView::countFromJson(
+                        obj.value(QLatin1String("bytes_sent"))),
                     .errors = errors,
                 });
             }
@@ -128,7 +139,7 @@ public:
                     : QIcon::fromTheme(QStringLiteral("dialog-error"));
             }
             if (index.column() == Sent) {
-                if (run.bytesSent > 0)
+                if (sentSomething(run))
                     return QIcon::fromTheme(QStringLiteral("dialog-ok-apply"));
                 if (!run.success)
                     return QIcon::fromTheme(QStringLiteral("dialog-error"));
@@ -169,7 +180,7 @@ public:
             return i18n("unknown");
 
         case Sent:
-            if (run.bytesSent > 0)
+            if (sentSomething(run))
                 return i18n("Yes");
             // A run that could not count what it sent did not send "no"
             // snapshots: it does not know.

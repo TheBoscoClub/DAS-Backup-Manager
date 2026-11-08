@@ -80,7 +80,7 @@ backup-run.sh                   btrdasd CLI
 
 ### Tables
 
-**snapshots** — One row per indexed BTRFS snapshot (schema version 5, stored in `PRAGMA user_version`; an older database is migrated on open).
+**snapshots** — One row per indexed BTRFS snapshot (schema version 6, stored in `PRAGMA user_version`; an older database is migrated on open).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -121,7 +121,7 @@ backup-run.sh                   btrdasd CLI
 
 Primary key is `(snapshot_id, target_root)`.
 
-**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. A snapshot count the run could not take is NULL — shown as `unknown`, never as 0 — since schema 4, whose migration rebuilds this table alone in one transaction, keeping every row, id and value; the one exception is a negative count, which is no measurement and becomes NULL (`record-run` never accepted one, so only a hand-written row could hold it). **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`. **coverage_state**, **coverage_baseline**, **coverage_accepted** (schema 5) — the subvolume coverage record: the one-row summary of recorded checks, every (volume, subvolume, target) pair scheduled at the last recorded backup run plus each dropped pair until restored, gone or accepted, and the accept log. Written only by a real backup run's sync (`subvol sync --record-coverage`, `backup run`), kept by `reindex --rebuild`, never read by a schema-4 binary.
+**backup_runs** — One row per recorded backup run (`timestamp`, `success`, `mode`, `snaps_created`, `snaps_sent`, `bytes_sent`, `duration_secs`, `errors`); written by `btrdasd backup record-run` and `btrdasd backup run`, read by the GUI history. A snapshot count the run could not take is NULL — shown as `unknown`, never as 0 — since schema 4, whose migration rebuilds this table alone in one transaction, keeping every row, id and value; the one exception is a negative count, which is no measurement and becomes NULL (`record-run` never accepted one, so only a hand-written row could hold it). A size the run could not measure — a target read before btrbk and not after, as when the run was stopped while btrbk ran — is NULL the same way since schema 6, whose migration is the same rebuild (`record-run --bytes-unknown`; a stored 0 stays 0). **target_usage** — capacity samples per target label (`total_bytes`, `used_bytes`, `snapshot_count`) feeding the growth trend. Neither is touched by `reindex --rebuild`. **coverage_state**, **coverage_baseline**, **coverage_accepted** (schema 5) — the subvolume coverage record: the one-row summary of recorded checks, every (volume, subvolume, target) pair scheduled at the last recorded backup run plus each dropped pair until restored, gone or accepted, and the accept log. Written only by a real backup run's sync (`subvol sync --record-coverage`, `backup run`), kept by `reindex --rebuild`, never read by a schema-4 binary.
 
 **files_fts** — FTS5 virtual table synced from `files` via triggers. Enables full-text search on file names and paths.
 

@@ -35,7 +35,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in decide_run_counts record_run_args record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
+for fn in decide_run_counts record_run_args usage_delta record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -287,6 +287,25 @@ record_backup_run_in_db FAILURE false
 check "no binary: FAIL" "${OP_STATUS[run_history]:-unset}" "FAIL"
 check "no binary: the reason" "$(x="${OP_STATUS[run_history_detail]:-unset}"; echo "${x%%:*}")" "recording it failed"
 BTRDASD_BIN="$WORK/btrdasd"
+
+# --- the growth section: a missing reading is unknown, never 0 (bd 3lpr) ----------------------
+# The real generate_growth_section (the stub above stands in for it elsewhere).
+for fn in generate_growth_section usage_delta format_bytes; do
+    body="$(extract "$fn")"
+    [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
+    eval "$body"
+done
+compute_growth_stats() { echo 0; }
+declare -A TARGET_NAMES=([/t1]=primary [/t2]=recovery) AVAIL_BYTES=()
+USAGE_BEFORE=([/t1]=1000 [/t2]=500)
+USAGE_AFTER=([/t1]=3048)
+REPORT_TARGETS=(/t1 /t2)
+growth="$(generate_growth_section)"
+check "growth: a target read twice shows its growth" \
+    "$(grep -A1 '^  primary:' <<<"$growth" | tail -1)" "    Today:              +2.00 KiB"
+check "growth: a target read once is unknown, not its whole used space" \
+    "$(grep -A1 '^  recovery:' <<<"$growth" | tail -1)" \
+    "    Today:              unknown (not measured before and after btrbk)"
 
 echo
 if (( fails > 0 )); then

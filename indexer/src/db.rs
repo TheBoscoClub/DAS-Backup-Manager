@@ -13,7 +13,10 @@ use std::time::Duration;
 ///     subvolume/target pairs the configuration scheduled at the last recorded
 ///     backup run, and dropped pairs until restored, gone or accepted
 ///     (bd DAS-Backup-Manager-sp78.1).
-pub const SCHEMA_VERSION: i64 = 5;
+/// 6 — `backup_runs.bytes_sent` is NULL when the run could not measure it: a
+///     run stopped while btrbk ran, a target read once and not twice
+///     (bd DAS-Backup-Manager-3lpr).
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -37,8 +40,7 @@ pub const SERIES_SEP: char = '\u{1f}';
 pub const DEFAULT_DB_PATH: &str = "/var/lib/das-backup/backup-index.db";
 
 /// The `backup_runs` columns. `SCHEMA_SQL` creates a new table from them and
-/// the schema-4 migration rebuilds an old one from them, so the two cannot
-/// drift apart.
+/// the migration rebuilds an old one from them, so the two cannot drift apart.
 macro_rules! backup_runs_columns {
     () => {
         "
@@ -51,14 +53,16 @@ macro_rules! backup_runs_columns {
     -- (bd DAS-Backup-Manager-6wt).
     snaps_created   INTEGER CHECK (snaps_created >= 0),
     snaps_sent      INTEGER CHECK (snaps_sent >= 0),
-    bytes_sent      INTEGER NOT NULL DEFAULT 0,
+    -- NULL when the run could not measure it, for the same reason
+    -- (bd DAS-Backup-Manager-3lpr).
+    bytes_sent      INTEGER CHECK (bytes_sent >= 0),
     duration_secs   INTEGER NOT NULL DEFAULT 0,
     errors          TEXT NOT NULL DEFAULT ''
 "
     };
 }
 
-/// Every `backup_runs` column, in order — the same in schema 3 and 4.
+/// Every `backup_runs` column, in order — the same in schemas 3 to 6.
 const BACKUP_RUNS_COLUMNS: [&str; 9] = [
     "id",
     "timestamp",
@@ -71,9 +75,9 @@ const BACKUP_RUNS_COLUMNS: [&str; 9] = [
     "errors",
 ];
 
-/// The schema-4 `backup_runs`, built beside the old one by the migration.
-const BACKUP_RUNS_V4_TABLE: &str = concat!(
-    "CREATE TABLE backup_runs_v4 (",
+/// The current `backup_runs`, built beside the old one by the migration.
+const BACKUP_RUNS_NEW_TABLE: &str = concat!(
+    "CREATE TABLE backup_runs_new (",
     backup_runs_columns!(),
     ");"
 );
@@ -323,18 +327,22 @@ impl Database {
         // already made it, so nothing to add here — but the stamp must advance,
         // and existing rows carry no presence until the next walk records it.
         // v3 -> v4: an unknown run count can be stored, as NULL.
-        Self::migrate_backup_runs_counts(conn)?;
+        // v5 -> v6: so can an unknown byte count — the same rebuild.
+        Self::migrate_backup_runs_nullable(conn)?;
         // v4 -> v5: coverage_* tables, made by COVERAGE_SQL's IF NOT EXISTS;
-        // the stamp advances below. A v4 database re-runs the steps above,
-        // each idempotent by the table's shape. A v4 binary on a v5 database
-        // returns at its own `version >= 4` and never touches these tables.
+        // the stamp advances below. An older database re-runs the steps above,
+        // each idempotent by the table's shape. An older binary on a newer
+        // database returns at its own `version >= N` and never touches what
+        // it does not know.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
-    /// Schema 3 → 4: make `backup_runs.snaps_created` / `snaps_sent` nullable,
-    /// so a count a run could not take is stored as NULL rather than refused
-    /// (bd DAS-Backup-Manager-6wt).
+    /// Schema 3 → 4 and 5 → 6: make `backup_runs.snaps_created` / `snaps_sent`
+    /// (bd DAS-Backup-Manager-6wt) and `bytes_sent` (bd DAS-Backup-Manager-3lpr)
+    /// nullable, so a count or size a run could not take is stored as NULL
+    /// rather than refused or recorded as 0. A v3 table takes both in one
+    /// rebuild; a v4/v5 one only the second.
     ///
     /// SQLite cannot drop NOT NULL from a column in place, so the table is
     /// rebuilt the way SQLite documents ("Making Other Kinds Of Table Schema
@@ -345,24 +353,26 @@ impl Database {
     /// opening the database at the same moment waits, then finds it done.
     ///
     /// Only `backup_runs` is touched, so the cost does not grow with the
-    /// content index. Every value is copied as it was except a negative count,
-    /// which is no measurement — only the "unknown" sentinel — and becomes
-    /// NULL. A real 0 stays 0.
+    /// content index. Every value is copied as it was except a negative count
+    /// or size, which is no measurement — only the "unknown" sentinel — and
+    /// becomes NULL. A stored 0 stays 0: the migration cannot tell a measured
+    /// nothing from an old unknown.
     ///
     /// Idempotent by the table's shape, not by the stamp: a table whose counts
-    /// are already nullable is left alone whatever the stamp says (a crash
+    /// and size are already nullable is left alone whatever the stamp says (a crash
     /// between this commit and the stamp, or `rebuild_content_tables` resetting
     /// it). Refuses, changing nothing, to rebuild a table another table
     /// references — the DROP would cascade into or break those rows; nothing
     /// in this schema references it — or one with a column schema 3 never
     /// had, whose data the copy would lose.
-    fn migrate_backup_runs_counts(conn: &Connection) -> Result<(), rusqlite::Error> {
+    fn migrate_backup_runs_nullable(conn: &Connection) -> Result<(), rusqlite::Error> {
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let not_null = tx
             .prepare(
                 "SELECT 1 FROM pragma_table_info('backup_runs')
-                 WHERE name IN ('snaps_created', 'snaps_sent') AND \"notnull\" = 1",
+                 WHERE name IN ('snaps_created', 'snaps_sent', 'bytes_sent')
+                   AND \"notnull\" = 1",
             )?
             .exists([])?;
         if !not_null {
@@ -375,7 +385,7 @@ impl Database {
         if columns != BACKUP_RUNS_COLUMNS {
             return Err(migration_refused(format!(
                 "it has the columns ({}), not schema 3's ({}); \
-                 rebuilding it would lose the ones schema 4 does not have",
+                 rebuilding it would lose the ones schema {SCHEMA_VERSION} does not have",
                 columns.join(", "),
                 BACKUP_RUNS_COLUMNS.join(", ")
             )));
@@ -405,14 +415,15 @@ impl Database {
             .query_map([], |r| r.get(0))?
             .collect::<SqlResult<_>>()?;
 
-        tx.execute_batch(BACKUP_RUNS_V4_TABLE)?;
+        tx.execute_batch(BACKUP_RUNS_NEW_TABLE)?;
         let copied = tx.execute(
-            "INSERT INTO backup_runs_v4 (id, timestamp, success, mode, snaps_created,
+            "INSERT INTO backup_runs_new (id, timestamp, success, mode, snaps_created,
                  snaps_sent, bytes_sent, duration_secs, errors)
              SELECT id, timestamp, success, mode,
                     CASE WHEN snaps_created >= 0 THEN snaps_created END,
                     CASE WHEN snaps_sent >= 0 THEN snaps_sent END,
-                    bytes_sent, duration_secs, errors
+                    CASE WHEN bytes_sent >= 0 THEN bytes_sent END,
+                    duration_secs, errors
              FROM backup_runs",
             [],
         )?;
@@ -429,7 +440,7 @@ impl Database {
         // view names the right table again once the rename is done.
         let legacy: bool = tx.pragma_query_value(None, "legacy_alter_table", |r| r.get(0))?;
         tx.pragma_update(None, "legacy_alter_table", true)?;
-        let renamed = tx.execute_batch("ALTER TABLE backup_runs_v4 RENAME TO backup_runs;");
+        let renamed = tx.execute_batch("ALTER TABLE backup_runs_new RENAME TO backup_runs;");
         tx.pragma_update(None, "legacy_alter_table", legacy)?;
         renamed?;
         for sql in &dependents {
@@ -1220,7 +1231,7 @@ impl Database {
                 run.mode,
                 count_to_sql(run.snaps_created)?,
                 count_to_sql(run.snaps_sent)?,
-                run.bytes_sent as i64,
+                count_to_sql(run.bytes_sent)?,
                 run.duration_secs as i64,
                 errors_str,
             ],
@@ -1251,7 +1262,7 @@ impl Database {
                 mode: row.get(3)?,
                 snaps_created: count_from_sql(row, 4)?,
                 snaps_sent: count_from_sql(row, 5)?,
-                bytes_sent: row.get::<_, i64>(6)? as u64,
+                bytes_sent: count_from_sql(row, 6)?,
                 duration_secs: row.get::<_, i64>(7)? as u64,
                 errors,
             })
@@ -1326,7 +1337,8 @@ pub struct NewBackupRun<'a> {
     pub snaps_created: Option<u64>,
     /// `None`: the run could not count them — stored as NULL, never as 0.
     pub snaps_sent: Option<u64>,
-    pub bytes_sent: u64,
+    /// `None`: the run could not measure it — stored as NULL, never as 0.
+    pub bytes_sent: Option<u64>,
     pub duration_secs: u64,
     pub errors: &'a [String],
 }
@@ -1342,7 +1354,8 @@ pub struct BackupRunRecord {
     pub snaps_created: Option<u64>,
     /// `None`: the run could not count them (NULL in the database).
     pub snaps_sent: Option<u64>,
-    pub bytes_sent: u64,
+    /// `None`: the run could not measure it (NULL in the database).
+    pub bytes_sent: Option<u64>,
     pub duration_secs: u64,
     pub errors: Vec<String>,
 }
@@ -1852,7 +1865,7 @@ mod tests {
             mode: "incremental",
             snaps_created: Some(1),
             snaps_sent: Some(1),
-            bytes_sent: 1,
+            bytes_sent: Some(1),
             duration_secs: 1,
             errors: &[],
         })
@@ -3017,7 +3030,7 @@ mod tests {
                 mode: "incremental",
                 snaps_created: Some(5),
                 snaps_sent: Some(5),
-                bytes_sent: 1_073_741_824,
+                bytes_sent: Some(1_073_741_824),
                 duration_secs: 3600,
                 errors: &[],
             })
@@ -3032,7 +3045,7 @@ mod tests {
         assert_eq!(history[0].mode, "incremental");
         assert_eq!(history[0].snaps_created, Some(5));
         assert_eq!(history[0].snaps_sent, Some(5));
-        assert_eq!(history[0].bytes_sent, 1_073_741_824);
+        assert_eq!(history[0].bytes_sent, Some(1_073_741_824));
         assert_eq!(history[0].duration_secs, 3600);
         assert!(history[0].errors.is_empty());
     }
@@ -3048,7 +3061,7 @@ mod tests {
                 mode: "full",
                 snaps_created: Some(2),
                 snaps_sent: Some(0),
-                bytes_sent: 0,
+                bytes_sent: Some(0),
                 duration_secs: 60,
                 errors: &errors,
             })
@@ -3072,7 +3085,7 @@ mod tests {
             mode: "incremental",
             snaps_created: Some(1),
             snaps_sent: Some(1),
-            bytes_sent: 100,
+            bytes_sent: Some(100),
             duration_secs: 10,
             errors: &[],
         })
@@ -3083,7 +3096,7 @@ mod tests {
             mode: "full",
             snaps_created: Some(5),
             snaps_sent: Some(5),
-            bytes_sent: 500,
+            bytes_sent: Some(500),
             duration_secs: 60,
             errors: &[],
         })
@@ -3095,7 +3108,7 @@ mod tests {
             mode: "incremental",
             snaps_created: Some(0),
             snaps_sent: Some(0),
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             duration_secs: 5,
             errors: &errs,
         })
@@ -3118,7 +3131,7 @@ mod tests {
                 mode: "incremental",
                 snaps_created: Some(1),
                 snaps_sent: Some(1),
-                bytes_sent: 100,
+                bytes_sent: Some(100),
                 duration_secs: 10,
                 errors: &[],
             })
@@ -3139,7 +3152,7 @@ mod tests {
             mode: "incremental",
             snaps_created: created,
             snaps_sent: sent,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             duration_secs: 516,
             errors: &[],
         }
@@ -3253,7 +3266,7 @@ mod tests {
         mode: String,
         snaps_created: Option<i64>,
         snaps_sent: Option<i64>,
-        bytes_sent: i64,
+        bytes_sent: Option<i64>,
         duration_secs: i64,
         errors: String,
     }
@@ -3277,7 +3290,7 @@ mod tests {
             mode: mode.into(),
             snaps_created,
             snaps_sent,
-            bytes_sent,
+            bytes_sent: Some(bytes_sent),
             duration_secs,
             errors: errors.into(),
         }
@@ -3337,9 +3350,31 @@ mod tests {
     /// integrity has something to check afterwards, a capacity sample, and the
     /// stamp at 3.
     fn v3_fixture(path: &Path, runs: &[RunRow], extra_sql: &str) {
+        old_fixture(path, V3_BACKUP_RUNS, 3, runs, extra_sql);
+    }
+
+    /// `backup_runs` exactly as schemas 4 and 5 created it: counts nullable,
+    /// `bytes_sent` still NOT NULL (`SCHEMA_SQL` at 9dbdf3db).
+    const V5_BACKUP_RUNS: &str = "
+        CREATE TABLE backup_runs (
+            id              INTEGER PRIMARY KEY,
+            timestamp       INTEGER NOT NULL,
+            success         INTEGER NOT NULL DEFAULT 0,
+            mode            TEXT NOT NULL DEFAULT 'incremental',
+            snaps_created   INTEGER CHECK (snaps_created >= 0),
+            snaps_sent      INTEGER CHECK (snaps_sent >= 0),
+            bytes_sent      INTEGER NOT NULL DEFAULT 0,
+            duration_secs   INTEGER NOT NULL DEFAULT 0,
+            errors          TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_backup_runs_ts ON backup_runs(timestamp);";
+
+    /// A database at `path` stamped `version`, whose `backup_runs` is
+    /// `table_sql` holding `runs`; every other table as `SCHEMA_SQL` makes it.
+    fn old_fixture(path: &Path, table_sql: &str, version: i64, runs: &[RunRow], extra_sql: &str) {
         drop(Database::open(path).unwrap());
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(&format!("DROP TABLE backup_runs; {V3_BACKUP_RUNS}"))
+        conn.execute_batch(&format!("DROP TABLE backup_runs; {table_sql}"))
             .unwrap();
         for r in runs {
             conn.execute(
@@ -3373,7 +3408,69 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(extra_sql).unwrap();
-        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
+    /// `notnull` of `bytes_sent`, as `PRAGMA table_info` reports it.
+    fn bytes_not_null(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('backup_runs') WHERE name = 'bytes_sent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrating_v5_makes_bytes_sent_nullable_and_keeps_every_run() {
+        // A run stopped while btrbk ran has no second usage reading: its bytes
+        // are unknown, which a NOT NULL column could only store as 0, a
+        // measured nothing (bd DAS-Backup-Manager-3lpr).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let mut runs = v3_runs();
+        runs[3].snaps_created = None;
+        runs[3].snaps_sent = None;
+        old_fixture(&path, V5_BACKUP_RUNS, 5, &runs, "");
+
+        let db = Database::open(&path).expect("a v5 database must open and migrate");
+
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
+        assert_eq!(bytes_not_null(&db.conn), 0, "bytes_sent must be nullable");
+        assert_eq!(counts_not_null(&db.conn), vec![0, 0]);
+        // Every row as it was: a stored 0 stays 0 — the migration cannot tell
+        // a measured nothing from an old unknown, so it changes neither.
+        assert_eq!(run_rows(&db.conn), runs);
+        assert!(
+            db.conn
+                .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_backup_runs_ts' AND tbl_name = 'backup_runs'")
+                .unwrap()
+                .exists([])
+                .unwrap(),
+            "the timestamp index must be back on the new table"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO backup_runs (timestamp, bytes_sent) VALUES (5000, NULL)",
+                [],
+            )
+            .expect("an unknown byte count must be storable");
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO backup_runs (timestamp, bytes_sent) VALUES (6000, -1)",
+                    []
+                )
+                .is_err(),
+            "a negative byte count must be refused"
+        );
+        drop(db);
+        let db = Database::open(&path).expect("second open");
+        assert_eq!(
+            db.conn.total_changes(),
+            0,
+            "a second open must write no row"
+        );
     }
 
     fn user_version(conn: &Connection) -> i64 {
@@ -3816,10 +3913,10 @@ mod tests {
     }
 
     #[test]
-    fn a_new_database_is_schema_5_with_the_coverage_tables() {
+    fn a_new_database_is_at_the_current_schema_with_the_coverage_tables() {
         let db = Database::open(":memory:").unwrap();
-        assert_eq!(SCHEMA_VERSION, 5);
-        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(tables(&db.conn), COVERAGE_TABLES);
         assert_eq!(
             db.coverage_baseline().unwrap(),
@@ -3832,7 +3929,7 @@ mod tests {
     /// A schema-4 database: what this binary's predecessor left. Every
     /// earlier step re-runs on it and changes nothing; the stamp moves.
     #[test]
-    fn a_v4_database_migrates_to_5_keeping_its_history_and_a_second_open_changes_nothing() {
+    fn a_v4_database_migrates_to_current_keeping_its_history_and_a_second_open_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v4.db");
         v3_fixture(&path, &v3_runs(), "");
@@ -3848,17 +3945,18 @@ mod tests {
             run_rows(&conn)
         };
         let db = Database::open(&path).expect("a v4 database opens");
-        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(tables(&db.conn), COVERAGE_TABLES);
         assert_eq!(run_rows(&db.conn), runs, "history survives the migration");
         drop(db);
         let db = Database::open(&path).unwrap();
         assert_eq!(db.conn.total_changes(), 0, "a second open writes nothing");
-        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
     }
 
     /// What a schema-4 binary does to a schema-5 database: it runs its own
-    /// schema (`SCHEMA_SQL`, unchanged since 4), returns at its `version >=
+    /// schema (`SCHEMA_SQL` stands in: its `IF NOT EXISTS` changes no
+    /// existing table), returns at its `version >=
     /// 4`, records runs; its `rebuild_content_tables` resets the stamp and
     /// stamps 4. None of it touches coverage, and this binary then finds
     /// the coverage rows where they were.
@@ -3898,7 +3996,7 @@ mod tests {
         }
         assert_eq!(read_coverage_read_only(&path).unwrap(), before);
         let db = Database::open(&path).unwrap();
-        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(db.coverage_baseline().unwrap(), before);
         assert_eq!(run_rows(&db.conn).len(), 1);
     }
@@ -3920,7 +4018,7 @@ mod tests {
         db.rebuild_content_tables().unwrap();
         assert_eq!(db.coverage_baseline().unwrap(), baseline);
         assert_eq!(db.coverage_accepted().unwrap(), accepted);
-        assert_eq!(user_version(&db.conn), 5);
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
     }
 
     #[test]

@@ -15,7 +15,8 @@ pub struct BackupRun {
     pub snapshots_created: Option<u64>,
     /// `None`: the run could not count them.
     pub snapshots_sent: Option<u64>,
-    pub bytes_sent: u64,
+    /// `None`: the run could not measure it.
+    pub bytes_sent: Option<u64>,
     pub duration_secs: u64,
     pub errors: Vec<String>,
 }
@@ -27,9 +28,16 @@ pub fn format_count(count: Option<u64>) -> String {
     count.map_or_else(|| "unknown".to_string(), |n| n.to_string())
 }
 
+/// A byte count as a report shows it: [`format_bytes`], or `unknown` when the
+/// run could not measure it — never 0 B (bd DAS-Backup-Manager-3lpr).
+pub fn format_size(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unknown".to_string(), format_bytes)
+}
+
 /// The run history as the GUI reads it from the D-Bus helper
-/// (`IndexBackupHistory`): one object per run, in the order given. A count the
-/// run could not take is `null`, never 0 or -1; the GUI shows it as "unknown".
+/// (`IndexBackupHistory`): one object per run, in the order given. A count or
+/// size the run could not take is `null`, never 0 or -1; the GUI shows it as
+/// "unknown".
 pub fn backup_history_json(runs: &[BackupRunRecord]) -> serde_json::Value {
     runs.iter()
         .map(|r| {
@@ -311,13 +319,18 @@ pub fn format_report_from(
 
     // Throughput — simple summary from result data.
     r.push_str(&format!("\nTHROUGHPUT\n{thin}\n"));
-    if result.bytes_sent > 0 && result.duration_secs > 0 {
-        let rate = result.bytes_sent as f64 / result.duration_secs as f64;
+    if let Some(bytes) = result.bytes_sent.filter(|&b| b > 0)
+        && result.duration_secs > 0
+    {
+        let rate = bytes as f64 / result.duration_secs as f64;
         r.push_str(&format!(
             "  Total                    {} @ {}/s\n",
-            format_bytes(result.bytes_sent),
+            format_bytes(bytes),
             format_bytes(rate as u64),
         ));
+    } else if result.bytes_sent.is_none() {
+        // A target read before the steps and not after (bd DAS-Backup-Manager-3lpr).
+        r.push_str("  (not measured — a target could not be read after the steps)\n");
     } else if result.snapshots_created.is_none() || result.snapshots_sent.is_none() {
         // A step failed before its counts were taken (bd DAS-Backup-Manager-no4):
         // nothing is known about what was sent, so none of it is said.
@@ -825,7 +838,7 @@ mod tests {
             snapshots_created: Some(5),
             snapshots_sent: Some(5),
             snapshots_cleaned: 2,
-            bytes_sent: 1_073_741_824,
+            bytes_sent: Some(1_073_741_824),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: true,
@@ -932,7 +945,7 @@ mod tests {
             snapshots_created: created,
             snapshots_sent: sent,
             snapshots_cleaned: 0,
-            bytes_sent: bytes,
+            bytes_sent: Some(bytes),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,
@@ -960,6 +973,16 @@ mod tests {
         }
         // The controls: counts that are real zeros do say it, and a real
         // measurement says neither.
+        // Counted, and a target not read after the steps: the size is unknown
+        // (bd DAS-Backup-Manager-3lpr), never "no data transferred".
+        let mut unmeasured = result_with(Some(1), Some(1), 0, &[]);
+        unmeasured.bytes_sent = None;
+        let report = format_report(&unmeasured, &cfg);
+        assert!(
+            report.contains("(not measured — a target could not be read"),
+            "{report}"
+        );
+        assert!(!report.contains("no data transferred"), "{report}");
         let report = format_report(&result_with(Some(0), Some(0), 0, &[]), &cfg);
         assert!(report.contains("(no data transferred)"), "{report}");
         assert!(!report.contains("not measured"), "{report}");
@@ -1001,7 +1024,7 @@ mod tests {
             snapshots_created: Some(1),
             snapshots_sent: Some(1),
             snapshots_cleaned: 0,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,
@@ -1056,7 +1079,7 @@ mod tests {
             snapshots_created: Some(3),
             snapshots_sent: Some(3),
             snapshots_cleaned: 0,
-            bytes_sent: 500_000,
+            bytes_sent: Some(500_000),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: true,
@@ -1075,7 +1098,7 @@ mod tests {
         assert_eq!(history[0].mode, "incremental");
         assert_eq!(history[0].snapshots_created, Some(3));
         assert_eq!(history[0].snapshots_sent, Some(3));
-        assert_eq!(history[0].bytes_sent, 500_000);
+        assert_eq!(history[0].bytes_sent, Some(500_000));
         assert_eq!(history[0].duration_secs, 120);
         assert!(history[0].errors.is_empty());
     }
@@ -1097,7 +1120,7 @@ mod tests {
                 mode: "full".into(),
                 snaps_created: None,
                 snaps_sent: None,
-                bytes_sent: 0,
+                bytes_sent: Some(0),
                 duration_secs: 516,
                 errors: vec![
                     "btrbk: exit code 10".into(),
@@ -1111,7 +1134,7 @@ mod tests {
                 mode: "incremental".into(),
                 snaps_created: Some(0),
                 snaps_sent: Some(41),
-                bytes_sent: 4096,
+                bytes_sent: Some(4096),
                 duration_secs: 300,
                 errors: vec![],
             },
@@ -1146,7 +1169,7 @@ mod tests {
             snapshots_created: Some(2),
             snapshots_sent: Some(0),
             snapshots_cleaned: 0,
-            bytes_sent: 0,
+            bytes_sent: Some(0),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             indexed: false,

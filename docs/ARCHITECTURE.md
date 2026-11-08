@@ -123,7 +123,9 @@ The system has six major components:
          │                                   (bd DAS-Backup-Manager-8cf)
          ├──▶ mailx                        → sends email report (local relay, 127.0.0.1:25), bounded: TERM after 60 s, KILL 10 s later;
          │                                   report written to last_report first (a write that fails is logged, and the journal has it)
-         └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown)
+         └──▶ btrdasd backup record-run    → adds the run to backup_runs, an uncountable snapshot count as NULL (--counts-unknown),
+                                             an unmeasured size as NULL (--bytes-unknown: a target read before btrbk and not
+                                             after, e.g. a run stopped while btrbk ran; bd DAS-Backup-Manager-3lpr)
 ```
 
 The report goes out before the run is recorded, because the record carries the report's own
@@ -338,7 +340,7 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 5, kept in
+The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 6, kept in
 `PRAGMA user_version`) uses four index tables, two history tables, three coverage tables and an FTS5
 virtual table:
 
@@ -351,7 +353,8 @@ snapshot_targets (snapshot_id FK ON DELETE CASCADE, target_root, path,
 files_fts (FTS5 virtual: name, path — synced via triggers)
 backup_runs  (id PK, timestamp, success, mode, snaps_created, snaps_sent, bytes_sent,
               duration_secs, errors)              -- run history, read by the GUI; schema v4: a
-                                                  -- count the run could not take is NULL
+                                                  -- count the run could not take is NULL; v6: so
+                                                  -- is a size it could not measure
 target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_count)
 coverage_state    (id PK = 1, first_recorded, last_recorded, checks)   -- schema v5: no row = no record yet
 coverage_baseline (volume, subvolume, target, target_identity, source_label, first_covered,
@@ -363,7 +366,12 @@ coverage_accepted (id PK, volume, subvolume, target, drop_rule, dropped_since, a
 
 The schema-5 tables are added by `CREATE TABLE IF NOT EXISTS` after schema 4's (nothing existing is
 rebuilt), a schema-4 binary opening a schema-5 database never reads them, and `reindex --rebuild` keeps
-them with the run history (bd `DAS-Backup-Manager-sp78.1`).
+them with the run history (bd `DAS-Backup-Manager-sp78.1`). Schema 6 makes `backup_runs.bytes_sent`
+nullable by the same one-transaction rebuild as schema 4 (every row, id and value kept; a stored 0 stays
+0, since nothing tells an old measured nothing from an old unknown). A run's size is each target's growth
+across btrbk, summed; a target read once and not twice, or unreadable, makes the whole size unknown — never
+0, and never that target's whole used space (bd `DAS-Backup-Manager-3lpr`). A schema-5 binary opens a
+schema-6 database without migrating it and fails to read a NULL size (see `INSTALL.md`).
 
 ### Span-Based Deduplication
 
@@ -734,10 +742,10 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1471 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
-| Rust CLI + setup tests | 292 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
+| Rust unit tests | 1475 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust CLI + setup tests | 293 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 39 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
-| Rust integration tests | 58 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (28), `recovery_os_cli.rs` (7), `record_run_contract.rs` (6), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
+| Rust integration tests | 61 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (28), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1860 Rust (1871 incl. manual) + 55 Qt** | |
+| **Total** | **1868 Rust (1879 incl. manual) + 55 Qt** | |
