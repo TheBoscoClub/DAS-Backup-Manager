@@ -397,7 +397,13 @@ Regenerate all managed files from the existing configuration
 .B btrdasd\-helper.service
 when it is running, so the GUI is served by the new binary. All of it is done
 holding setup's two locks (below); the restart may hold them for at most 300
-seconds, so no job can start mounting under it. A restart that fails or does
+seconds, so no job can start mounting under it. A unit that refuses a manual
+stop (RefuseManualStop=yes, from a host drop\-in) refuses the try\-restart; the
+upgrade then runs
+.B "systemctl kill \-\-wait"
+and
+.BR "systemctl start" ,
+under the same locks, and says so. A restart that fails or does
 not return in time, or a unit state that cannot be read, is an error (exit 1).
 Before regenerating, it removes the backup units an older version's
 .B "cmake \-\-install"

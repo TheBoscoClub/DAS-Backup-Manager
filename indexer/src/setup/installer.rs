@@ -929,6 +929,17 @@ pub fn upgrade(
             &["show", "--property=ActiveState", "--value", HELPER_UNIT],
         )
     };
+    let refuses_manual_stop = || {
+        command_stdout(
+            SYSTEMCTL,
+            &[
+                "show",
+                "--property=RefuseManualStop",
+                "--value",
+                HELPER_UNIT,
+            ],
+        )
+    };
     let systemctl = |args: &[&str]| command_status_within(SYSTEMCTL, args, HELPER_RESTART_LIMIT);
     let retire = |say: &mut dyn FnMut(String)| {
         super::retired_units::remove_retired_units(Path::new(RETIRE_ROOT), say)
@@ -942,6 +953,7 @@ pub fn upgrade(
             install: &install,
             helper: HelperHost {
                 active_state: &active_state,
+                refuses_manual_stop: &refuses_manual_stop,
                 systemctl: &systemctl,
             },
         },
@@ -1242,6 +1254,9 @@ const HELPER_RESTART_LATER: &str = "sudo systemctl try-restart btrdasd-helper.se
 struct HelperHost<'a> {
     /// The unit's `ActiveState`, as `systemctl show --value` prints it.
     active_state: &'a dyn Fn() -> Result<String, String>,
+    /// The unit's `RefuseManualStop`, as `systemctl show --value` prints it
+    /// (`yes` or `no`). Read only when a `try-restart` was refused.
+    refuses_manual_stop: &'a dyn Fn() -> Result<String, String>,
     /// `systemctl`, one invocation per call — bounded by
     /// [`HELPER_RESTART_LIMIT`] on the host.
     systemctl: UnitRunner<'a>,
@@ -1311,6 +1326,9 @@ fn restart_helper(
             ));
             Ok(HelperRestart::Done)
         }
+        Err(e) if (host.refuses_manual_stop)().is_ok_and(|v| v.trim() == "yes") => {
+            restart_helper_by_signal(host, &e, say).map_err(|()| not_restarted())
+        }
         Err(e) => {
             say(format!(
                 "ERROR: could not restart {HELPER_UNIT} ({e}). The running helper may be the \
@@ -1319,6 +1337,44 @@ fn restart_helper(
                  then run: sudo systemctl restart {HELPER_UNIT}"
             ));
             Err(not_restarted())
+        }
+    }
+}
+
+/// Restart a helper whose unit refuses a stop job (`RefuseManualStop=yes`,
+/// set by a drop-in this project does not ship), so `try-restart` was refused
+/// with `refused` (bd DAS-Backup-Manager-sp78.15). The caller holds setup's
+/// locks, so no job in the helper is mounting: `systemctl kill --wait` sends
+/// the unit's processes SIGTERM — what a stop job would send — without a stop
+/// job, and waits until they are gone; `start` then runs the binary just
+/// installed. A start without the wait could find the old helper still
+/// running and do nothing. Either call failing or not returning in time is an
+/// error: the helper may still be the old binary.
+fn restart_helper_by_signal(
+    host: &HelperHost,
+    refused: &str,
+    say: &mut dyn FnMut(String),
+) -> Result<HelperRestart, ()> {
+    match (host.systemctl)(&["kill", "--wait", HELPER_UNIT])
+        .and_then(|()| (host.systemctl)(&["start", HELPER_UNIT]))
+    {
+        Ok(()) => {
+            say(format!(
+                "Restarted {HELPER_UNIT} by signal: the unit refuses a manual stop \
+                 (RefuseManualStop=yes), so the old helper was sent SIGTERM and the unit started \
+                 again. The D-Bus helper now runs the binary just installed."
+            ));
+            Ok(HelperRestart::Done)
+        }
+        Err(e) => {
+            say(format!(
+                "ERROR: could not restart {HELPER_UNIT}: the unit refuses a manual stop \
+                 ({refused}), and restarting it by signal failed ({e}). The running helper may \
+                 be the old binary. See systemctl status {HELPER_UNIT}, then, when no backup or \
+                 restore job is running: sudo systemctl kill --wait {HELPER_UNIT} && sudo \
+                 systemctl start {HELPER_UNIT}"
+            ));
+            Err(())
         }
     }
 }
@@ -3244,6 +3300,19 @@ auth = "starttls""#,
         state: Result<&str, &str>,
         systemctl: Result<(), &str>,
     ) -> Restarted {
+        run_restart_helper_on(init, state, Ok("no"), &|_| {
+            systemctl.map_err(str::to_string)
+        })
+    }
+
+    /// [`run_restart_helper`], with the unit's `RefuseManualStop` reading
+    /// `refuses` and systemctl answering each call by its arguments.
+    fn run_restart_helper_on(
+        init: InitSystem,
+        state: Result<&str, &str>,
+        refuses: Result<&str, &str>,
+        answer: &dyn Fn(&str) -> Result<(), String>,
+    ) -> Restarted {
         let locks = ScratchLocks::new();
         let held = match take_setup_locks(&locks.site, UPGRADE_JOB).unwrap() {
             SetupLockAttempt::Taken(held) => held,
@@ -3253,15 +3322,19 @@ auth = "starttls""#,
         config.init.system = init;
         let calls = std::cell::RefCell::new(Vec::new());
         let active_state = || state.map(str::to_string).map_err(str::to_string);
+        let refuses_manual_stop = || refuses.map(str::to_string).map_err(str::to_string);
         let run = |args: &[&str]| {
-            calls.borrow_mut().push(args.join(" "));
-            systemctl.map_err(str::to_string)
+            let call = args.join(" ");
+            let answered = answer(&call);
+            calls.borrow_mut().push(call);
+            answered
         };
         let mut lines = Vec::new();
         let result = restart_helper(
             &config,
             &HelperHost {
                 active_state: &active_state,
+                refuses_manual_stop: &refuses_manual_stop,
                 systemctl: &run,
             },
             &held,
@@ -3310,6 +3383,106 @@ auth = "starttls""#,
                      journalctl -u btrdasd-helper.service, then run: sudo systemctl restart \
                      btrdasd-helper.service"
                 )]
+            );
+        }
+    }
+
+    // bd DAS-Backup-Manager-sp78.15 — a unit that refuses a manual stop
+
+    const REFUSED: &str = "systemctl try-restart btrdasd-helper.service exited with exit status: 4";
+
+    #[test]
+    fn a_helper_whose_unit_refuses_a_stop_is_restarted_by_signal() {
+        let r = run_restart_helper_on(InitSystem::Systemd, Ok("active"), Ok("yes\n"), &|call| {
+            if call.starts_with("try-restart") {
+                Err(REFUSED.to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(r.result, Ok(HelperRestart::Done));
+        assert_eq!(
+            r.calls,
+            vec![
+                "try-restart btrdasd-helper.service",
+                "kill --wait btrdasd-helper.service",
+                "start btrdasd-helper.service",
+            ]
+        );
+        assert_eq!(
+            r.lines,
+            vec![
+                "Restarted btrdasd-helper.service by signal: the unit refuses a manual stop \
+                 (RefuseManualStop=yes), so the old helper was sent SIGTERM and the unit started \
+                 again. The D-Bus helper now runs the binary just installed."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_restart_is_signalled_only_when_the_unit_says_it_refuses_stops() {
+        // A unit that does not refuse stops, or whose setting cannot be read,
+        // is never signalled: the refusal is some other failure.
+        for refuses in [Ok("no"), Err("systemctl could not be run")] {
+            let r = run_restart_helper_on(InitSystem::Systemd, Ok("active"), refuses, &|call| {
+                if call.starts_with("try-restart") {
+                    Err(REFUSED.to_string())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(r.result.is_err(), "{refuses:?}");
+            assert_eq!(
+                r.calls,
+                vec!["try-restart btrdasd-helper.service"],
+                "{refuses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signal_restart_that_fails_is_an_error_and_starts_nothing_after_a_failed_kill() {
+        for (failing, calls) in [
+            (
+                "kill --wait btrdasd-helper.service",
+                vec![
+                    "try-restart btrdasd-helper.service",
+                    "kill --wait btrdasd-helper.service",
+                ],
+            ),
+            (
+                "start btrdasd-helper.service",
+                vec![
+                    "try-restart btrdasd-helper.service",
+                    "kill --wait btrdasd-helper.service",
+                    "start btrdasd-helper.service",
+                ],
+            ),
+        ] {
+            let r = run_restart_helper_on(InitSystem::Systemd, Ok("active"), Ok("yes"), &|call| {
+                if call.starts_with("try-restart") {
+                    Err(REFUSED.to_string())
+                } else if call == failing {
+                    Err("did not return within 300 s".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(
+                r.result,
+                Err("btrdasd-helper.service was not restarted — see above".to_string()),
+                "{failing}"
+            );
+            assert_eq!(r.calls, calls, "{failing}");
+            assert_eq!(r.lines.len(), 1, "{failing}");
+            assert!(
+                r.lines[0].starts_with(
+                    "ERROR: could not restart btrdasd-helper.service: the unit refuses a manual \
+                     stop"
+                ) && r.lines[0].contains("(did not return within 300 s)"),
+                "{failing}: {}",
+                r.lines[0]
             );
         }
     }
@@ -3699,6 +3872,7 @@ auth = "starttls""#,
                 install: &install,
                 helper: HelperHost {
                     active_state: &active_state,
+                    refuses_manual_stop: &|| Ok("no".to_string()),
                     systemctl: &systemctl,
                 },
             },
@@ -4110,6 +4284,7 @@ auth = "starttls""#,
                 install: &install,
                 helper: HelperHost {
                     active_state: &active_state,
+                    refuses_manual_stop: &|| Ok("no".to_string()),
                     systemctl: &systemctl,
                 },
             },
@@ -5218,6 +5393,7 @@ auth = "starttls""#,
                     install: &install,
                     helper: HelperHost {
                         active_state: &active_state,
+                        refuses_manual_stop: &|| Ok("no".to_string()),
                         systemctl: &restart,
                     },
                 },
