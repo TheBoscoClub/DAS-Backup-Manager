@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - SMART STATUS has one row per configured serial on both paths (`backup-run.sh` and the Rust report's `render_capacity_and_smart`), a missing drive shown as `ABSENT`; it used to list only a target's first serial
   - `btrdasd health` (and the GUI) warn `RAID-1 degraded — <serial> absent, running on <serial>`; the single-drive SMART fields read the first present drive, not `serials[0]`
   - The unread `UNAVAILABLE_TARGETS` array is removed; `tests/test_target_presence.sh` (CTest `shell-target-presence`) covers all four cases
+- **The Rust report send is bounded** (bd `DAS-Backup-Manager-sp78.2`): `report::Mailx` runs `mailx` under `timeout -k 10 60`, as `backup-run.sh` does — a relay that keeps trickling bytes used to hold `btrdasd backup run`, a GUI backup, the scrub pass or `doctor --email` at its report step for as long as it trickled
+  - A timed-out send fails with `mailx timed out after 60 s`: measured against a trickling relay, a built `btrdasd doctor --email` gave up at 60 s, where 0.7.23.3 was still waiting at 150 s
 
 ## [0.7.23.3] - 2026-11-08
 

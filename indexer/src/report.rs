@@ -497,6 +497,11 @@ pub struct Mailx {
 /// The mailer every production entry point hands down: `mailx` from `PATH`.
 pub const MAILX: Mailx = Mailx { program: "mailx" };
 
+/// The bound on one send, `backup-run.sh`'s `MAIL_TIMEOUT_SECS` and
+/// `MAIL_KILL_AFTER_SECS`: TERM after 60 s, KILL 10 s later.
+const MAIL_TIMEOUT_SECS: u64 = 60;
+const MAIL_KILL_AFTER_SECS: u64 = 10;
+
 /// True in every test build: the `test-overrides` feature, which only this
 /// crate's dev-dependency on itself turns on, and which every target `cargo
 /// test` builds therefore has — this crate's unit tests (`cargo test --lib`
@@ -518,6 +523,22 @@ impl Mailx {
     /// The program this mailer runs.
     pub fn program(&self) -> &'static str {
         self.program
+    }
+
+    /// What [`Mailer::send`] runs: `mailx` under `timeout -k 10 60`, as
+    /// `backup-run.sh` bounds its send. s-nail gives up by itself after about
+    /// 45 s of silence, but not on a relay that keeps trickling bytes; that
+    /// one used to hold a backup, scrub or doctor run at its report step for
+    /// as long as it trickled (bd DAS-Backup-Manager-sp78.2).
+    pub fn command(&self, message: &MailMessage) -> (&'static str, Vec<String>) {
+        let mut args = vec![
+            "-k".to_string(),
+            MAIL_KILL_AFTER_SECS.to_string(),
+            MAIL_TIMEOUT_SECS.to_string(),
+            self.program.to_string(),
+        ];
+        args.extend(Self::args(message));
+        ("timeout", args)
     }
 
     /// `mailx`'s arguments for `message`, in order. No credential and no TLS
@@ -562,8 +583,8 @@ impl Mailer for Mailx {
                 self.program
             ));
         }
-        let output = spawn_with_stdin(self.program, &Self::args(message), &message.body)
-            .map_err(|e| e.to_string())?;
+        let (program, args) = self.command(message);
+        let output = spawn_with_stdin(program, &args, &message.body).map_err(|e| e.to_string())?;
         mailx_outcome(&output)
     }
 
@@ -598,6 +619,9 @@ fn spawn_with_stdin(
 fn mailx_outcome(output: &std::process::Output) -> Result<(), String> {
     if output.status.success() {
         Ok(())
+    } else if output.status.code() == Some(124) || output.status.code() == Some(137) {
+        // timeout(1): 124 when TERM ended it, 137 when KILL had to.
+        Err(mailx_timed_out(&output.status))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
@@ -606,6 +630,15 @@ fn mailx_outcome(output: &std::process::Output) -> Result<(), String> {
             stderr.trim()
         ))
     }
+}
+
+/// The error for a send `timeout(1)` ended. Its own function, so
+/// `mailx_outcome` keeps the one text `tests/test_report_mail.sh` looks for in
+/// the shipped binaries.
+fn mailx_timed_out(status: &std::process::ExitStatus) -> String {
+    format!(
+        "mailx timed out after {MAIL_TIMEOUT_SECS} s ({status}): the relay did not take the report in time"
+    )
 }
 
 /// What a report's message takes from the machine and the environment: the
@@ -1694,6 +1727,38 @@ mod tests {
         );
         let absent = dir.path().join("absent");
         assert!(spawn_with_stdin(absent.to_str().unwrap(), &[], "").is_err());
+    }
+
+    /// bd DAS-Backup-Manager-sp78.2: the send runs under `timeout -k 10 60`,
+    /// as `backup-run.sh`'s does, so a relay that keeps trickling bytes costs
+    /// the report, not the run.
+    #[test]
+    fn the_production_send_is_bounded_as_the_script_bounds_it() {
+        let msg = message(
+            "s",
+            "f@example.org",
+            "t@example.org",
+            "smtp://127.0.0.1:25",
+            "b",
+        );
+        let (program, args) = MAILX.command(&msg);
+        assert_eq!(program, "timeout");
+        assert_eq!(args[..4], ["-k", "10", "60", "mailx"]);
+        assert_eq!(args[4..], Mailx::args(&msg)[..]);
+    }
+
+    #[test]
+    fn a_send_that_never_finishes_is_ended_at_the_bound() {
+        let start = std::time::Instant::now();
+        let args: Vec<String> = ["-k", "1", "1", "sleep", "30"].map(String::from).to_vec();
+        let out = spawn_with_stdin("timeout", &args, "body").unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "ended at the bound, not when sleep finished: {:?}",
+            start.elapsed()
+        );
+        let err = mailx_outcome(&out).unwrap_err();
+        assert!(err.contains("timed out after 60 s"), "{err}");
     }
 
     #[test]

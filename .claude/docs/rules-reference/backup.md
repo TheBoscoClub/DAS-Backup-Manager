@@ -671,6 +671,9 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
   D-Bus helper included) carries the refusal (bd `1x76`, `test-safety.md`).
 - **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed: s-nail gives
   up after ~45 s of silence, but not on a relay that keeps trickling bytes; that must cost the report, not the run.
+  Both paths: `send_report()` in the script, and `report::Mailx::command` in Rust (bd `sp78.2`; until then
+  the Rust send waited as long as the relay trickled — a built `btrdasd doctor --email` against a trickling
+  relay now gives up at 60 s, measured 2026-11-08, where 0.7.23.3 was still waiting at 150 s).
 - The report is written to `$LAST_REPORT` before any send; a relay outage costs delivery only. A failed
   write is logged, and the not-emailed lines then name the journal. With email off, an unsavable report
   is a FAIL (exit 3, `report:` in the row): the journal has the only copy. **One rule on both paths**

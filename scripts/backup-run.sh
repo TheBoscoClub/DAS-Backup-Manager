@@ -1093,6 +1093,7 @@ check_das_connected() {
         for pair in "${found_serials[@]}"; do
             present_text+="${present_text:+, }${pair%%=*} ${pair#*=}"
         done
+        present_text="${present_text:-no serial configured}"
         if [[ "$available" == "true" ]]; then
             DISCOVERED_DEVICES[$label]="$first_dev"
             # A missing leg is a WARN, not a FAIL: the backup still runs from
@@ -3563,7 +3564,8 @@ generate_smart_section() {
     local label
     while IFS= read -r label; do
         [[ -n "$label" ]] || continue
-        local name="${TARGET_NAMES[${TARGET_MOUNTS[$label]:-}]:-$label}"
+        local mnt="${TARGET_MOUNTS[$label]:-}" name="$label"
+        [[ -z "$mnt" ]] || name="${TARGET_NAMES[$mnt]:-$label}"
         local pair any_present="false"
         for pair in ${TARGET_SERIAL_DEVS[$label]}; do
             local serial="${pair%%=*}" drive="${pair#*=}"
