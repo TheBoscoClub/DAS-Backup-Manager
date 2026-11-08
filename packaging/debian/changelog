@@ -1,3 +1,12 @@
+das-backup-manager (0.7.23.3-1) unstable; urgency=medium
+
+  * A run's bytes sent is unknown (NULL, schema 6) when it was not measured, never 0
+  * A subvolume no longer backed up while it still exists is a WARN every run until restored, gone or accepted (subvol coverage accept/list)
+  * Scrubs run at best-effort I/O level 0, nice -20 (btrfs scrub -c 2 -n 0)
+  * Every report send goes through one mailer; no test build can spawn mailx
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Sun, 08 Nov 2026 12:57:41 -0600
+
 das-backup-manager (0.7.23.2-1) unstable; urgency=medium
 
   * Recovery-drive update: a NIC with no carrier gets one host-side link toggle before egress

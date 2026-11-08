@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Dependencies
 
-**Version**: 0.7.23.2
+**Version**: 0.7.23.3
 
 ## 1. Rust Crate Dependencies
 
@@ -11,7 +11,7 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 
 | Crate | Version (locked) | Purpose | License |
 | --- | --- | --- | --- |
-| `rusqlite` | 0.40.2 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
+| `rusqlite` | 0.41.1 | SQLite bindings with FTS5 support; uses `bundled` feature to compile SQLite from source | MIT |
 | `clap` | 4.6.7 | Command-line argument parsing with derive macros (`derive` feature) | MIT / Apache-2.0 |
 | `walkdir` | 2.5.0 | Recursive directory traversal for snapshot indexing | Unlicense / MIT |
 | `regex` | 1.13.1 | Pattern matching for snapshot path filtering | MIT / Apache-2.0 |
@@ -37,7 +37,7 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 
 | Crate | Version | Role |
 | --- | --- | --- |
-| `libsqlite3-sys` | 0.38.2 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
+| `libsqlite3-sys` | 0.39.1 | Low-level SQLite FFI; compiles bundled SQLite via the `cc` crate |
 | `clap_derive` | 4.6.7 | Proc-macro backend for clap derive API |
 | `regex-automata` | 0.4.16 | DFA/NFA engine underlying the `regex` crate |
 | `aho-corasick` | 1.1.4 | Multi-pattern string search used by `regex` |

@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.23.2
+Version:        0.7.23.3
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -63,6 +63,12 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
+* Sun Nov 08 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.3-1
+- A run's bytes sent is unknown (NULL, schema 6) when it was not measured, never 0
+- A subvolume no longer backed up while it still exists is a WARN every run until restored, gone or accepted (subvol coverage accept/list)
+- Scrubs run at best-effort I/O level 0, nice -20 (btrfs scrub -c 2 -n 0)
+- Every report send goes through one mailer; no test build can spawn mailx
+
 * Sat Oct 31 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.2-1
 - Recovery-drive update: a NIC with no carrier gets one host-side link toggle before egress
 - config.toml is edited in place: unknown keys and comments survive every save; backup-scoping keys pinned

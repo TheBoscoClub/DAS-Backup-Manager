@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.23.3] - 2026-11-08
+
 ### Added
 
 - **`tests/test_builds_never_mail.rs`** — the library in an integration build, and the `btrdasd` the tests run (`doctor --email`), each refuse to spawn `mailx`, with a recording stub standing where it would be (bd `DAS-Backup-Manager-1x76`)
@@ -1493,7 +1495,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.2...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.3...HEAD
+[0.7.23.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.2...v0.7.23.3
 [0.7.23.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.1...v0.7.23.2
 [0.7.23.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.0...v0.7.23.1
 [0.7.23.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.22.3...v0.7.23.0

@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.23.2
+**Version**: 0.7.23.3
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -46,7 +46,7 @@ long as it exists. A read-only snapshot of the parent shows **0 bytes** at that
 path. See `.claude/rules/backup.md` for the reproduction and the
 per-filesystem command that finds coverage gaps.
 
-## Component Overview (v0.7.23.2)
+## Component Overview (v0.7.23.3)
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -737,8 +737,8 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 
 ### Tests
 
-Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case at 0.7.23.2
-(2026-11-01); re-run that command rather than trusting these numbers.
+Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case at 0.7.23.3
+(2026-11-08); re-run that command rather than trusting these numbers.
 
 | Suite | Count | Framework |
 | --- | --- | --- |

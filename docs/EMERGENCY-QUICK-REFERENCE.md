@@ -257,4 +257,4 @@ sudo btrfs filesystem show
 ---
 
 *Print on both sides. Laminate if possible. Store with the DAS enclosure.*
-*Backup system version: 0.7.23.2*
+*Backup system version: 0.7.23.3*
