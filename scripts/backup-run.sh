@@ -1865,7 +1865,7 @@ mount_targets() {
         if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
             log_info "  Mounted $label at $mnt ($part_dev)"
         else
-            log_warn "  Could not mount $label at $mnt — btrbk will skip it"
+            log_warn "  Could not mount $label at $mnt — the run will refuse to invoke btrbk (verify_targets_before_btrbk)"
         fi
     done
 }
