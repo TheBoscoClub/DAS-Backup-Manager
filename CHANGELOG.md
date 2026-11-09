@@ -8,14 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A backup whose subvolume sync failed no longer runs btrbk on a stale `btrbk.conf`** (bd `DAS-Backup-Manager-03j3`): `btrdasd backup run` and the GUI's backups go on after a failed sync so the configured subvolumes are still backed up, but btrbk reads the file, not `config.toml` — and with everything selected it got no filter, so it acted on whatever the file declared
-  - The run now compares `btrbk.conf` with what `config.toml` renders and refuses btrbk when they differ (or cannot be compared), saying so; while they agree it goes on as before
-- **`setup --upgrade` no longer prints systemd's refusal above a restart that worked** (bd `DAS-Backup-Manager-sp78.16`): a unit that refuses a manual stop printed `Failed to try-restart … Operation refused` and then `Restarted btrdasd-helper.service by signal`; setup's bounded `systemctl` calls now keep the command's stderr for their error message, which is printed only when the restart did fail
-- **A growth average with no history to average over says `unknown`** (bd `DAS-Backup-Manager-sp78.9`): `compute_growth_stats` in `backup-run.sh` answered `0` with no growth log, no entry for the mount in the window, or under a day of history — the `0` a measured flat target gives — and the report then left the line out; GROWTH ANALYSIS now prints `7-day avg: unknown (not enough growth history)`, and a measured `0 B/day` as such (`tests/test_growth_stats.sh`, CTest `shell-growth-stats`)
-- **`config validate` refuses a `target_labels` entry no `[[target]]` has** (bd `DAS-Backup-Manager-sp78.8`): a typo rendered the source with no target line, so nothing of it was backed up and validation passed; `setup`, the GUI's config edits and every run's sync now say which source and which label
-
 ## [0.7.23.3] - 2026-11-08
 
 ### Added
@@ -36,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backup whose subvolume sync failed no longer runs btrbk on a stale `btrbk.conf`** (bd `DAS-Backup-Manager-03j3`): `btrdasd backup run` and the GUI's backups go on after a failed sync so the configured subvolumes are still backed up, but btrbk reads the file, not `config.toml` — and with everything selected it got no filter, so it acted on whatever the file declared
+  - The run now compares `btrbk.conf` with what `config.toml` renders and refuses btrbk when they differ (or cannot be compared), saying so; while they agree it goes on as before
+- **`setup --upgrade` no longer prints systemd's refusal above a restart that worked** (bd `DAS-Backup-Manager-sp78.16`): a unit that refuses a manual stop printed `Failed to try-restart … Operation refused` and then `Restarted btrdasd-helper.service by signal`; setup's bounded `systemctl` calls now keep the command's stderr for their error message, which is printed only when the restart did fail
+- **A growth average with no history to average over says `unknown`** (bd `DAS-Backup-Manager-sp78.9`): `compute_growth_stats` in `backup-run.sh` answered `0` with no growth log, no entry for the mount in the window, or under a day of history — the `0` a measured flat target gives — and the report then left the line out; GROWTH ANALYSIS now prints `7-day avg: unknown (not enough growth history)`, and a measured `0 B/day` as such (`tests/test_growth_stats.sh`, CTest `shell-growth-stats`)
+- **`config validate` refuses a `target_labels` entry no `[[target]]` has** (bd `DAS-Backup-Manager-sp78.8`): a typo rendered the source with no target line, so nothing of it was backed up and validation passed; `setup`, the GUI's config edits and every run's sync now say which source and which label
 - **The index database is root's alone** (bd `DAS-Backup-Manager-pxl`): `/var/lib/das-backup/backup-index.db` was `0644`, so any local user could list the path of every file in every backup; `Database::open` now creates it `0600` and narrows an existing one, and its `-wal`/`-shm`, on the next open by root — every reader already runs as root (the backup, the D-Bus helper, the CLI)
 - **The DAS lock files are root's alone** (bd `DAS-Backup-Manager-qab`): `/run/das-*.lock` were `0644`, and `flock` works on a read-only descriptor, so any local user could hold the maintenance lock and keep the nightly backup and scrub waiting indefinitely
   - `scrub::FileLock` (every Rust job), `backup-run.sh`, `backup-verify.sh` and `recovery-os-vm.sh` create them `0600` and narrow one an older version left `0644` (a regular file only — never a device node a path names); a failure to narrow is a warning, the lock still works
