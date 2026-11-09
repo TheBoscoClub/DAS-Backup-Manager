@@ -3863,6 +3863,23 @@ pub fn record_recovery_os_job(
     }
 }
 
+/// `drives` with `ro` added to `[das].mount_opts`: the record step only
+/// reads the recovery OSes, and a read-only mount makes that the kernel's
+/// guarantee rather than the code's (bd DAS-Backup-Manager-sp78.17). A drive
+/// already mounted is used as it is.
+fn mounted_read_only(drives: &Config) -> Config {
+    let mut ro = drives.clone();
+    let opts = &mut ro.das.mount_opts;
+    if !opts.split(',').any(|o| o.trim() == "ro") {
+        if opts.trim().is_empty() {
+            *opts = "ro".into();
+        } else {
+            opts.push_str(",ro");
+        }
+    }
+    ro
+}
+
 /// [`RecordHost`] on this machine.
 pub struct SystemRecordHost {
     /// Recorded in the maintenance lock file as its holder.
@@ -3885,7 +3902,7 @@ impl RecordHost for SystemRecordHost {
         progress: &dyn ProgressCallback,
         held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String> {
-        mount::ensure_targets_mounted(drives, progress, held)
+        mount::ensure_targets_mounted(&mounted_read_only(drives), progress, held)
             .map(|guard| Box::new(guard) as Box<dyn Release>)
             .map_err(|e| e.to_string())
     }
@@ -3915,6 +3932,23 @@ impl RecordHost for SystemRecordHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_record_step_mounts_its_drives_read_only() {
+        let mut drives = make_test_config();
+        for (given, want) in [
+            ("degraded,noatime", "degraded,noatime,ro"),
+            ("", "ro"),
+            ("noatime,ro", "noatime,ro"),
+        ] {
+            drives.das.mount_opts = given.into();
+            assert_eq!(mounted_read_only(&drives).das.mount_opts, want, "{given:?}");
+        }
+        assert_eq!(
+            drives.das.mount_opts, "noatime,ro",
+            "the caller's config is not changed"
+        );
+    }
 
     // --- manual-backup interlock (bd DAS-Backup-Manager-pe6) ----------------
 
