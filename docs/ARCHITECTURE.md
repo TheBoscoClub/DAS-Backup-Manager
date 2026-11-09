@@ -737,15 +737,15 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 
 ### Tests
 
-Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case after bd sp78.3
+Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest case after bd ac82
 (2026-11-08); re-run that command rather than trusting these numbers.
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1491 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust unit tests | 1494 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
 | Rust CLI + setup tests | 296 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 42 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 62 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (29), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1891 Rust (1902 incl. manual) + 55 Qt** | |
+| **Total** | **1894 Rust (1905 incl. manual) + 55 Qt** | |

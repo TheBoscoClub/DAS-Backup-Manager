@@ -4,6 +4,8 @@
       "assessment": {
         "age_basis": "last_applied_upgrade",
         "age_days": 19,
+        "boot_problems": [],
+        "fstab_unchecked": null,
         "reasons": [],
         "stale": false,
         "warnings": [

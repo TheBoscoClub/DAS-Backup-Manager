@@ -1713,11 +1713,12 @@ check_recovery_os() {
     # Which drives were not looked at, whether any was, and what an exit 1
     # was for: read from the section the command printed (awk exits 0 on no
     # match).
-    local not_mounted inspected stale warned suffix="" why=""
+    local not_mounted inspected stale warned boot_problems suffix="" why=""
     not_mounted="$(awk '/^  .*  not mounted$/ { sub(/^  /, ""); sub(/  not mounted$/, ""); printf "%s%s", sep, $0; sep = ", " }' <<<"$RECOVERY_OS_REPORT")"
     inspected="$(awk '/^    Result  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
     stale="$(awk '/^    Result  +STALE/ { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
     warned="$(awk '/^    WARNING  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
+    boot_problems="$(awk '/^    BOOT PROBLEM  / { n++ } END { print n + 0 }' <<<"$RECOVERY_OS_REPORT")"
     if [[ -n "$not_mounted" ]]; then
         suffix="; not mounted: $not_mounted"
     fi
@@ -1741,6 +1742,12 @@ check_recovery_os() {
             if (( warned > 0 )); then
                 why="${why:+$why; }btrbk may run at boot"
                 log_warn "btrbk may run when a recovery OS boots — see RECOVERY OS in the report"
+            fi
+            # A BOOT PROBLEM row: its fstab names a partition the drive does
+            # not have, so that OS would not boot (bd DAS-Backup-Manager-ac82).
+            if (( boot_problems > 0 )); then
+                why="${why:+$why; }its boot may stop: fstab names a partition the drive lacks"
+                log_warn "A recovery OS may not boot: its fstab names a partition the drive lacks — see RECOVERY OS in the report"
             fi
             if [[ -z "$why" ]]; then
                 why="needs attention"

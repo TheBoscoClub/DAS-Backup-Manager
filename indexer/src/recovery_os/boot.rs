@@ -930,6 +930,18 @@ fn read_file(root: &Path, rel: &str, probe: MountFlags, mounts: Option<&Mounts>)
     }
 }
 
+/// That OS's `etc/fstab`, read as every other boot input is ([`read_file`]:
+/// through its links, never out of the root, `O_NOATIME`); `Ok(None)` when it
+/// has none (bd DAS-Backup-Manager-ac82).
+pub(super) fn read_fstab(root: &Path, probe: MountFlags) -> Result<Option<String>, String> {
+    match read_file(root, FSTAB, probe, None) {
+        FileRead::Text(text) => Ok(Some(text)),
+        FileRead::Nothing => Ok(None),
+        FileRead::NotFile => Err(format!("{FSTAB}: not a regular file")),
+        FileRead::Unread(why) | FileRead::Unknown(why) => Err(why),
+    }
+}
+
 /// Why `rel` is not what that OS sees at boot ([`Mounts::shadows`]), when
 /// what it mounts is known; else only the [`VOLATILE`] trees count.
 fn shadowed(mounts: Option<&Mounts>, rel: &str) -> Option<String> {

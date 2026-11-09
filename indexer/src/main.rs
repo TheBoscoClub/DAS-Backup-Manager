@@ -1595,6 +1595,7 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 now,
                 &health::is_mountpoint,
                 &ros::mounted_uuid,
+                &ros::drive_partition_ids,
                 &mut |n| eprintln!("recovery-os: {n}"),
             );
             if json {

@@ -26,7 +26,7 @@ pub mod lines;
 pub mod panel;
 pub mod session;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -988,13 +988,23 @@ pub struct Assessment {
     /// What to look at before booting it, whatever its age: [`boot_warning`].
     /// A warning does not make it stale.
     pub warnings: Vec<String>,
+    /// What would stop that OS's boot: an `etc/fstab` entry naming a
+    /// partition this drive does not have ([`fstab_problems`]; bd
+    /// DAS-Backup-Manager-ac82 — drive B's fstab named the ESP by its old
+    /// label after a relabel, and its boot stopped in emergency mode).
+    #[serde(default)]
+    pub boot_problems: Vec<String>,
+    /// Why its fstab could not be checked against the drive, when it could
+    /// not; shown, never a problem by itself.
+    #[serde(default)]
+    pub fstab_unchecked: Option<String>,
 }
 
 impl Assessment {
     /// Stale, or carrying a warning: what `recovery-os` exits 1 for, and
     /// what the backup run marks WARN.
     pub fn needs_attention(&self) -> bool {
-        self.stale || !self.warnings.is_empty()
+        self.stale || !self.warnings.is_empty() || !self.boot_problems.is_empty()
     }
 }
 
@@ -1127,6 +1137,9 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         stale: !reasons.is_empty(),
         reasons,
         warnings: boot_warning(os).into_iter().collect(),
+        // Filled in by the reading, which knows the drive ([`fstab_problems`]).
+        boot_problems: Vec::new(),
+        fstab_unchecked: None,
     }
 }
 
@@ -1203,6 +1216,119 @@ pub fn inspect_drive(
     }
 }
 
+/// The partitions of a recovery drive by every name an fstab can give them
+/// (`LABEL=`, `UUID=`, `PARTUUID=`, `PARTLABEL=`), or why they could not be
+/// listed; `None` when the caller has no way to look (a test's fixture).
+pub type DriveIds = dyn Fn(&Path) -> Option<Result<BTreeSet<String>, String>>;
+
+/// That OS's `etc/fstab`, read as the boot record reads its inputs.
+fn read_fstab(root: &Path) -> Result<Option<String>, String> {
+    boot::read_fstab(root, mount_flags)
+}
+
+/// The `etc/fstab` entries naming a partition by `LABEL=`, `UUID=`,
+/// `PARTUUID=` or `PARTLABEL=` that `ids` (this drive's partitions) does not
+/// have: such a boot stops in emergency mode, or with a dead loader, as
+/// drive B's did after its ESP was relabelled (bd DAS-Backup-Manager-ac82).
+/// A device path, a memory filesystem and a `nofail` entry (the boot goes on
+/// without it) are not judged. Values are compared as libmount reads them:
+/// quotes dropped, `\040` a space, UUIDs in any case.
+pub fn fstab_problems(fstab: &str, ids: &BTreeSet<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for line in fstab.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(spec) = fields.next() else { continue };
+        if spec.starts_with('#') {
+            continue;
+        }
+        let point = fields.next().unwrap_or("?");
+        let options = fields.nth(1).unwrap_or("");
+        let Some((key, value)) = spec.split_once('=') else {
+            continue;
+        };
+        if !["LABEL", "UUID", "PARTUUID", "PARTLABEL"].contains(&key)
+            || options.split(',').any(|o| o == "nofail")
+        {
+            continue;
+        }
+        let value = value.trim_matches('"').replace("\\040", " ");
+        let found = ids.iter().any(|id| {
+            id.split_once('=').is_some_and(|(k, v)| {
+                k == key
+                    && if key.ends_with("UUID") {
+                        v.eq_ignore_ascii_case(&value)
+                    } else {
+                        v == value
+                    }
+            })
+        });
+        if !found {
+            problems.push(format!(
+                "etc/fstab mounts {point} from {spec}, which no partition of this drive has: \
+                 its boot stops in emergency mode"
+            ));
+        }
+    }
+    problems
+}
+
+/// [`DriveIds`] on this machine: the disk under the filesystem mounted at
+/// `mount` (`findmnt`, then `lsblk`'s parent), and every name `lsblk` gives
+/// its partitions. Read only.
+pub fn drive_partition_ids(mount: &Path) -> Option<Result<BTreeSet<String>, String>> {
+    let run = |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .output()
+            .map_err(|e| format!("{}: {e}", args[0]))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!("{} exited with {}", args.join(" "), out.status))
+        }
+    };
+    Some((|| {
+        let mount = mount.to_str().ok_or("the mount path is not UTF-8")?;
+        let source = run(&["findmnt", "-n", "-o", "SOURCE", "--target", mount])?;
+        // A btrfs subvolume mount reads `/dev/sdX2[/@]`.
+        let dev = source.trim().split('[').next().unwrap_or("").to_string();
+        if dev.is_empty() {
+            return Err(format!("no device is mounted at {mount}"));
+        }
+        let disk = run(&["lsblk", "-n", "-d", "-o", "PKNAME", &dev])?;
+        let disk = disk.trim();
+        if disk.is_empty() {
+            return Err(format!("{dev} has no parent disk"));
+        }
+        let listed = run(&[
+            "lsblk",
+            "-n",
+            "-P",
+            "-o",
+            "LABEL,UUID,PARTUUID,PARTLABEL",
+            &format!("/dev/{disk}"),
+        ])?;
+        Ok(partition_ids(&listed))
+    })())
+}
+
+/// The names in `lsblk -P -o LABEL,UUID,PARTUUID,PARTLABEL` output, each as
+/// an fstab would write it (`LABEL=x`); an empty value is no name.
+fn partition_ids(listed: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for line in listed.lines() {
+        for pair in line.split("\" ") {
+            let pair = pair.trim().trim_end_matches('"');
+            if let Some((key, value)) = pair.split_once("=\"")
+                && !value.is_empty()
+            {
+                ids.insert(format!("{key}={value}"));
+            }
+        }
+    }
+    ids
+}
+
 /// The UUID of the filesystem mounted at `mount`, read as the write guard
 /// reads it ([`crate::mount::filesystem_uuid_at`]); `None` when it cannot be
 /// told.
@@ -1226,7 +1352,15 @@ pub fn status_with(
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<DriveEntry> {
-    status_noting(cfg, host, today, is_mounted, fs_uuid, &mut |_| {})
+    status_noting(
+        cfg,
+        host,
+        today,
+        is_mounted,
+        fs_uuid,
+        &|_| None,
+        &mut |_| {},
+    )
 }
 
 /// [`status_with`], handing `note` a line before each mounted drive is read
@@ -1238,20 +1372,32 @@ pub fn status_noting(
     today: &str,
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    drive_ids: &DriveIds,
     note: &mut dyn FnMut(String),
 ) -> Vec<DriveEntry> {
-    status_noting_until(cfg, host, today, is_mounted, fs_uuid, note, &|| false)
+    status_noting_until(
+        cfg,
+        host,
+        today,
+        is_mounted,
+        fs_uuid,
+        drive_ids,
+        note,
+        &|| false,
+    )
 }
 
 /// [`status_noting`], asking `stop` before each drive: once it answers true
 /// no further drive is read, and the drives read so far are returned
 /// ([`record_within`] discards them; bd DAS-Backup-Manager-ay0n).
+#[allow(clippy::too_many_arguments)]
 pub fn status_noting_until(
     cfg: &Config,
     host: &HostVersions,
     today: &str,
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    drive_ids: &DriveIds,
     note: &mut dyn FnMut(String),
     stop: &dyn Fn() -> bool,
 ) -> Vec<DriveEntry> {
@@ -1268,6 +1414,20 @@ pub fn status_noting_until(
                 let started = std::time::Instant::now();
                 let before = fs_uuid(mount);
                 let mut entry = inspect_drive(&t.label, &root, host, today, max);
+                if let DriveReport::Inspected { assessment, .. } = &mut entry.report
+                    && let Some(ids) = drive_ids(mount)
+                {
+                    match ids {
+                        Ok(ids) => match read_fstab(&root) {
+                            Ok(Some(text)) => {
+                                assessment.boot_problems = fstab_problems(&text, &ids)
+                            }
+                            Ok(None) => {}
+                            Err(why) => assessment.fstab_unchecked = Some(why),
+                        },
+                        Err(why) => assessment.fstab_unchecked = Some(why),
+                    }
+                }
                 let after = fs_uuid(mount);
                 note(format!(
                     "read {} in {:.1} s",
@@ -1502,6 +1662,12 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                 }
                 for w in &assessment.warnings {
                     out.push_str(&row("WARNING", w));
+                }
+                for b in &assessment.boot_problems {
+                    out.push_str(&row("BOOT PROBLEM", b));
+                }
+                if let Some(why) = &assessment.fstab_unchecked {
+                    out.push_str(&row("Fstab", &format!("not checked: {why}")));
                 }
                 out.push_str(&row("Result", &verdict(assessment)));
             }
@@ -1788,6 +1954,7 @@ pub fn status_run_with(
         now_epoch,
         is_mounted,
         fs_uuid,
+        &|_| None,
         &mut |_| {},
     )
 }
@@ -1802,9 +1969,10 @@ pub fn status_run_noting(
     now_epoch: i64,
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
+    drive_ids: &DriveIds,
     note: &mut dyn FnMut(String),
 ) -> StatusRun {
-    let entries = status_noting(cfg, host, today, is_mounted, fs_uuid, note);
+    let entries = status_noting(cfg, host, today, is_mounted, fs_uuid, drive_ids, note);
     let state_error = state_file.and_then(|p| write_state(p, &entries, now_epoch).err());
     let code = if state_error.is_some() {
         2
@@ -1907,6 +2075,9 @@ pub fn classify(entries: &[DriveEntry], state_error: Option<&str>) -> (RecordSta
         }
         if assessments().any(|a| !a.warnings.is_empty()) {
             why.push("btrbk may run at boot");
+        }
+        if assessments().any(|a| !a.boot_problems.is_empty()) {
+            why.push("its boot may stop: fstab names a partition the drive lacks");
         }
         return (
             RecordStatus::Warn,
@@ -2048,6 +2219,7 @@ pub fn record(cfg: &Config, state_file: &Path, note: &mut dyn FnMut(String)) -> 
             &today,
             &crate::health::is_mountpoint,
             &mounted_uuid,
+            &drive_partition_ids,
             note,
             stop,
         )
@@ -3816,6 +3988,117 @@ mod tests {
         Config::from_toml(&text).unwrap()
     }
 
+    fn ids(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn an_fstab_naming_a_partition_the_drive_lacks_is_a_boot_problem() {
+        // bd DAS-Backup-Manager-ac82: drive B's fstab still named its ESP by
+        // the label it had before the relabel.
+        let fstab = "# static file system information\n\
+                     UUID=fs-b / btrfs subvol=/@,noatime 0 0\n\
+                     LABEL=RECOV-ESP-3 /efi vfat defaults 0 2\n\
+                     PARTUUID=gone /data ext4 defaults,nofail 0 2\n\
+                     /dev/sdz1 /mnt/x ext4 defaults 0 0\n\
+                     tmpfs /tmp tmpfs defaults 0 0\n";
+        let have = ids(&["UUID=fs-b", "LABEL=RECOV-ESP-4"]);
+        assert_eq!(
+            fstab_problems(fstab, &have),
+            [
+                "etc/fstab mounts /efi from LABEL=RECOV-ESP-3, which no partition of this drive has: its boot stops in emergency mode"
+            ],
+            "the nofail entry, the device path and the tmpfs are not judged"
+        );
+        assert!(fstab_problems("LABEL=RECOV-ESP-4 /efi vfat defaults 0 2\n", &have).is_empty());
+        // As libmount reads them: quoted, an encoded space, a UUID's case.
+        let have = ids(&["UUID=ab12-cd", "LABEL=my disk"]);
+        assert!(
+            fstab_problems(
+                "UUID=\"AB12-CD\" / btrfs defaults 0 0\nLABEL=my\\040disk /d ext4 defaults 0 2\n",
+                &have
+            )
+            .is_empty(),
+            "{:?}",
+            fstab_problems(
+                "UUID=\"AB12-CD\" / btrfs defaults 0 0\nLABEL=my\\040disk /d ext4 defaults 0 2\n",
+                &have
+            )
+        );
+    }
+
+    #[test]
+    fn partition_ids_are_named_as_an_fstab_names_them() {
+        let listed = "LABEL=\"\" UUID=\"\" PARTUUID=\"\" PARTLABEL=\"\"\n\
+                      LABEL=\"RECOV-ESP-4\" UUID=\"ABCD-0002\" PARTUUID=\"p-1\" PARTLABEL=\"\"\n\
+                      LABEL=\"das-r\" UUID=\"fs-b\" PARTUUID=\"p-2\" PARTLABEL=\"root\"\n";
+        assert_eq!(
+            partition_ids(listed),
+            ids(&[
+                "LABEL=RECOV-ESP-4",
+                "UUID=ABCD-0002",
+                "PARTUUID=p-1",
+                "LABEL=das-r",
+                "UUID=fs-b",
+                "PARTUUID=p-2",
+                "PARTLABEL=root",
+            ])
+        );
+    }
+
+    #[test]
+    fn the_status_reading_checks_each_drive_s_fstab_against_its_partitions() {
+        let a = tempfile::tempdir().unwrap();
+        full_root(&a.path().join("@"));
+        write(
+            &a.path().join("@"),
+            "etc/fstab",
+            "UUID=fs-a / btrfs subvol=/@ 0 0\nLABEL=RECOV-ESP-3 /efi vfat defaults 0 2\n",
+        );
+        let cfg = mirror_config(&[("A", a.path().to_str().unwrap())]);
+        let read = |drive_ids: &DriveIds| {
+            status_noting(
+                &cfg,
+                &host("7.2"),
+                TODAY,
+                &|_| true,
+                &no_uuid,
+                drive_ids,
+                &mut |_| {},
+            )
+        };
+        let assessment = |e: &[DriveEntry]| match &e[0].report {
+            DriveReport::Inspected { assessment, .. } => assessment.clone(),
+            other => panic!("{other:?}"),
+        };
+        // The drive has the ESP under its new label: a boot problem.
+        let entries = read(&|_| Some(Ok(ids(&["UUID=fs-a", "LABEL=RECOV-ESP-4"]))));
+        let a1 = assessment(&entries);
+        assert_eq!(a1.boot_problems.len(), 1, "{a1:?}");
+        assert!(a1.needs_attention());
+        assert_eq!(exit_code(&entries), 1);
+        let section = format_section(&entries, &host("7.2"));
+        assert!(
+            section.contains("BOOT PROBLEM        etc/fstab mounts /efi from LABEL=RECOV-ESP-3"),
+            "{section}"
+        );
+        let (status, detail) = classify(&entries, None);
+        assert_eq!(status, RecordStatus::Warn);
+        assert!(detail.contains("its boot may stop"), "{detail}");
+        // Every name resolves: nothing.
+        let entries = read(&|_| Some(Ok(ids(&["UUID=fs-a", "LABEL=RECOV-ESP-3"]))));
+        assert!(assessment(&entries).boot_problems.is_empty());
+        // The partitions cannot be listed: said, not a problem.
+        let entries = read(&|_| Some(Err("lsblk exited with 1".into())));
+        let a3 = assessment(&entries);
+        assert!(a3.boot_problems.is_empty());
+        assert_eq!(a3.fstab_unchecked.as_deref(), Some("lsblk exited with 1"));
+        assert!(
+            format_section(&entries, &host("7.2"))
+                .contains("Fstab               not checked: lsblk exited with 1")
+        );
+    }
+
     #[test]
     fn os_root_is_the_at_subvolume_of_the_mount() {
         assert_eq!(os_root("/mnt/r"), PathBuf::from("/mnt/r/@"));
@@ -3904,6 +4187,7 @@ mod tests {
             1,
             &is_mounted,
             &no_uuid,
+            &|_| None,
             &mut |n| notes.push(n),
         );
         assert_eq!(run.entries.len(), 2);
@@ -5752,6 +6036,7 @@ mod tests {
             "2026-11-08",
             &|_| true,
             &|_| None,
+            &|_| None,
             &mut |n| {
                 // Told to stop while A is read.
                 stopped.set(true);
@@ -5768,6 +6053,7 @@ mod tests {
             &host("7.2"),
             "2026-11-08",
             &|_| true,
+            &|_| None,
             &|_| None,
             &mut |_| {},
         );

@@ -155,6 +155,16 @@ check "boot warning: the log line names btrbk" "$(grep -c '^WARN: btrbk may run 
 report="$(generate_report)"
 check "boot warning: status says warnings" "$(grep -c '^  Status: COMPLETED WITH WARNINGS$' <<<"$report")" "1"
 check "boot warning: row shows WARN" "$(grep -c '^  Recovery OS           WARN  (btrbk may run at boot' <<<"$report")" "1"
+
+# --- a boot problem: an fstab entry naming a partition the drive lacks ------
+# (bd DAS-Backup-Manager-ac82) — its own words, not "btrbk" and not "stale".
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    BOOT PROBLEM        etc/fstab mounts /efi from LABEL=RECOV-ESP-3, which no partition of this drive has: its boot stops in emergency mode\n    Result              current\n' >"$WORK/out"; echo 1 >"$WORK/rc"
+rc=0; check_recovery_os run || rc=$?
+check "boot problem: returns 0" "$rc" "0"
+check "boot problem: WARN" "${OP_STATUS[recovery_os]}" "WARN"
+check "boot problem: detail says the boot may stop" "${OP_STATUS[recovery_os_detail]}" "its boot may stop: fstab names a partition the drive lacks — see RECOVERY OS in the report"
+check "boot problem: the log line says so" "$(grep -c '^WARN: A recovery OS may not boot: its fstab names a partition the drive lacks' "$WORK/log")" "1"
 check "boot warning: the WARNING row reaches the report" "$(grep -c "^    WARNING             $boot_warning\$" <<<"$report")" "1"
 check "boot warning: the run is still recorded as SUCCESS" "$(run_status)" "SUCCESS"
 check "boot warning: the subject says so" "$(subject_status)" "SUCCESS WITH WARNINGS"
