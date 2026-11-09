@@ -755,12 +755,18 @@ where
     );
 
     // Made (and checked) the way every write after it is: no link on the way
-    // is followed (DirFd). `btrfs receive` then gets the path.
-    DirFd::open_abs(dest, true)
+    // is followed (DirFd). `btrfs receive` gets the directory held open, by
+    // its /proc/<pid>/fd/<n> name: the kernel resolves that to this very
+    // directory, so a link swapped in on the path since cannot redirect the
+    // receive (bd DAS-Backup-Manager-sp78.18). `held` lives until it returns.
+    let held = DirFd::open_abs(dest, true)
         .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
+    let held_path =
+        std::path::PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), held.raw()));
 
     // Attempt btrfs send | btrfs receive first (fast path for btrfs subvolumes)
-    let btrfs_result = fast_path(snapshot_path, dest, progress);
+    let btrfs_result = fast_path(snapshot_path, &held_path, progress);
+    drop(held);
 
     match btrfs_result {
         Ok(result) => {
@@ -2231,6 +2237,39 @@ mod tests {
             summary.contains("btrfs send/receive (4096 bytes)"),
             "{summary}"
         );
+    }
+
+    /// bd DAS-Backup-Manager-sp78.18 (1): `btrfs receive` was handed the
+    /// destination's path, which a link swapped in after the walk could
+    /// redirect. It gets the directory the walk holds open, by its
+    /// `/proc/<pid>/fd/<n>` name, which the kernel resolves to that directory
+    /// whatever the path now leads to.
+    #[test]
+    fn the_fast_path_is_given_the_held_directory_not_the_path() {
+        let snap = snapshot_tree();
+        let dest = TempDir::new().unwrap();
+        let seen = std::sync::Mutex::new(None);
+        restore_snapshot_with(
+            snap.path(),
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &crate::progress::NullProgress,
+            Instant::now(),
+            |_, given, _| {
+                *seen.lock().unwrap() = Some((given.to_path_buf(), given.canonicalize().ok()));
+                Ok(RestoreResult {
+                    files_restored: 0,
+                    bytes_restored: 0,
+                    errors: Vec::new(),
+                    duration_secs: 0,
+                })
+            },
+        )
+        .unwrap();
+        let (given, resolves_to) = seen.lock().unwrap().clone().expect("the fast path ran");
+        assert!(given.starts_with("/proc/"), "{given:?}");
+        assert_eq!(resolves_to, Some(dest.path().canonicalize().unwrap()));
     }
 
     #[test]

@@ -127,7 +127,7 @@ through links root owns, bd `sp78.18`):
   override it** — system paths plus served roots `/srv/http` and `/srv/ftp`.
 - **No copied file or link goes through a link.** Every write of the copy paths is made under a directory
   fd reached one name at a time, each opened `O_NOFOLLOW` (bd `fcmk`): a link on the way, planted or
-  swapped in after the check, is refused. The `btrfs receive` fast path still takes a path (bd `sp78.18`).
+  swapped in after the check, is refused; `btrfs receive` gets the held directory's `/proc/<pid>/fd/<n>` (bd `sp78.18`).
   Absolute or non-literal member paths are rejected.
 
 ## Email Reports
