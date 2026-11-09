@@ -415,7 +415,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 | `device` | string | — | Block device path (e.g., `"/dev/nvme0n1p2"`) |
 | `snapshot_dir` | string | `".btrbk-snapshots"` | Directory on the source volume that holds btrbk's local snapshots |
 | `target_subdirs` | string[] | `[]` | Subdirectory on each target this source sends into |
-| `target_labels` | string[] | `[]` (all targets) | `[[target]].label` values this source sends to; bulk data should name only the primary |
+| `target_labels` | string[] | `[]` (all targets) | `[[target]].label` values this source sends to; bulk data should name only the primary; a label no `[[target]]` has is refused |
 
 Subvolumes are an array of tables, `[[source.subvolumes]]`, one per subvolume (a bare string such as `"@"` is also accepted):
 

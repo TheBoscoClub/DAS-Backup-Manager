@@ -2080,6 +2080,22 @@ impl Config {
             ));
         }
 
+        // A label no [[target]] has renders the source with no target line:
+        // nothing of it is backed up, without a word (bd sp78.8). Unlike the
+        // scrub's labels, target_labels has no built-in default an older
+        // config could carry, so such a label is a typo.
+        for source in &self.sources {
+            for label in &source.target_labels {
+                if !self.targets.iter().any(|t| &t.label == label) {
+                    errors.push(format!(
+                        "source '{}': target_labels names '{label}', which no [[target]] has — \
+                         nothing of this source would be backed up there",
+                        source.label
+                    ));
+                }
+            }
+        }
+
         // A recovery drive's own OS backs nothing up: it has no sources by design.
         if self.sources.is_empty() && !self.general.recovery_drive {
             errors.push("No backup sources defined — add at least one [[source]]".into());
@@ -2434,6 +2450,32 @@ mod tests {
         // A retired entry is not rendered and sends nowhere.
         let mut cfg = top_level_config(&source_with("x", "/vol", &[(".", Some("vol-toplevel"))]));
         cfg.sources[1].subvolumes[0].retired = Some("2026-10-01".into());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_a_target_label_no_target_has() {
+        // bd DAS-Backup-Manager-sp78.8: a typo renders the source with no
+        // target line, so nothing of it is backed up, and validate passed.
+        let typo = source_with("x", "/vol", &[("@a", None)]).replacen(
+            "device = \"/dev/sda\"\n",
+            "device = \"/dev/sda\"\ntarget_labels = [\"t\", \"primray\"]\n",
+            1,
+        );
+        let cfg = Config::from_toml(&minimal_toml(&format!("{typo}{ONE_TARGET}"))).unwrap();
+        let errors = cfg.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'x'") && errors[0].contains("'primray'"),
+            "{errors:?}"
+        );
+        // Every label a target has: valid.
+        let named = source_with("x", "/vol", &[("@a", None)]).replacen(
+            "device = \"/dev/sda\"\n",
+            "device = \"/dev/sda\"\ntarget_labels = [\"t\"]\n",
+            1,
+        );
+        let cfg = Config::from_toml(&minimal_toml(&format!("{named}{ONE_TARGET}"))).unwrap();
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 

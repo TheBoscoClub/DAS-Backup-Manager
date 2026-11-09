@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A backup whose subvolume sync failed no longer runs btrbk on a stale `btrbk.conf`** (bd `DAS-Backup-Manager-03j3`): `btrdasd backup run` and the GUI's backups go on after a failed sync so the configured subvolumes are still backed up, but btrbk reads the file, not `config.toml` — and with everything selected it got no filter, so it acted on whatever the file declared
   - The run now compares `btrbk.conf` with what `config.toml` renders and refuses btrbk when they differ (or cannot be compared), saying so; while they agree it goes on as before
+- **`config validate` refuses a `target_labels` entry no `[[target]]` has** (bd `DAS-Backup-Manager-sp78.8`): a typo rendered the source with no target line, so nothing of it was backed up and validation passed; `setup`, the GUI's config edits and every run's sync now say which source and which label
 
 ## [0.7.23.3] - 2026-11-08
 
