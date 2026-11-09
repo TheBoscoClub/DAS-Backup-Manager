@@ -154,9 +154,23 @@ jobs:
           # absent file. The paths are proven above, so a zero here is a
           # measured fact; a list ERROR exits non-zero and stops the job.
           ALL=$(cargo mutants --list --in-diff mutants.diff | wc -l)
-          LISTED=$(cargo mutants --list --in-diff mutants.diff \
-            --shard "$SHARD/$SHARDS" --sharding round-robin | wc -l)
+          # A small push is not sharded: shard 0 runs every mutant and the rest
+          # skip. Round-robin spread a handful of mutants so thin that a shard
+          # could hold only unviable ones, and the gate then rightly failed it
+          # as "verified nothing" while the push as a whole was verified
+          # (3e9c62d2: 7 mutants, 3 caught, 4 unviable, two shards red). One
+          # run judges viability over the whole push. Above SMALL_PUSH the
+          # shards are large enough that an all-unviable shard is a finding.
+          SMALL_PUSH=40
+          if [ "$ALL" -lt "$SMALL_PUSH" ]; then
+            SHARD_ARGS=""
+            if [ "$SHARD" = 0 ]; then LISTED=$ALL; else LISTED=0; fi
+          else
+            SHARD_ARGS="--shard $SHARD/$SHARDS --sharding round-robin"
+            LISTED=$(cargo mutants --list --in-diff mutants.diff $SHARD_ARGS | wc -l)
+          fi
           echo "listed=$LISTED" >> "$GITHUB_OUTPUT"
+          echo "shard_args=$SHARD_ARGS" >> "$GITHUB_OUTPUT"
           echo "mutants intersecting this push: $ALL; in shard $SHARD/$SHARDS: $LISTED"
 
       - name: Mutants
@@ -165,8 +179,10 @@ jobs:
         continue-on-error: true # the gate below decides, not this exit code
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
+          # Word-split on purpose: empty for an unsharded small push.
+          # shellcheck disable=SC2086
           cargo mutants --in-place --no-shuffle -vV --in-diff mutants.diff \
-            --shard "$SHARD/$SHARDS" --sharding round-robin
+            ${{ steps.diff.outputs.shard_args }}
 
       - name: Gate — did this run verify anything?
         if: steps.diff.outputs.listed != '0'
