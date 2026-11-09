@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **An ABORTED report carries the SUBVOLUME SYNC section** (bd `DAS-Backup-Manager-sp78.12`): `backup-run.sh`'s `generate_abort_report` left out what the sync adopted or retired and its coverage row when a run aborted after its sync (a target that failed verification), so that night's report hid them
+- **A restore root reached through a link is compared resolved** (bd `DAS-Backup-Manager-sp78.18`): the destination was resolved and `[restore] allowed_roots` were compared as written, so on a host where `/home` is a link (`/home -> var/home`) every restore into it was refused; an allowed root is now also matched by its resolution — only through links root owns, judged one link at a time, so a root a local user can re-point never widens the policy — and the denied roots are matched resolved too
 - **`config validate` refuses one volume spelled two ways** (bd `DAS-Backup-Manager-sp78.13`): `/ssd` and `/ssd/` in two `[[source]]`s were two volumes to sync, which groups by the string, so every subvolume on that filesystem was adopted and sent twice; sources sharing one spelling (how sync splits a volume) stay valid. A symlinked spelling is not judged (it needs the filesystem)
 - **`btrdasd subvol sync --json` is refused** (bd `DAS-Backup-Manager-sp78.3`): the flag was accepted and the text report printed anyway; with no JSON form, it now exits 2 before anything runs
 

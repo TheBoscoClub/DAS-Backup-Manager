@@ -118,7 +118,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 ## Restore Destination Policy (since 0.7.20.0)
 
-Checked before any directory is created, both roots compared **after resolution**:
+Checked before any directory is created, both roots compared **after resolution** (an allowed root only
+through links root owns, bd `sp78.18`):
 
 - **`[restore] allowed_roots`** in `config.toml` — default `/home`, `/tmp`. Widen it there, not in code;
   grant a subdirectory, never `/srv` itself.

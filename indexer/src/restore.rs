@@ -128,7 +128,9 @@ fn resolve_for_policy(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// Two checks, denylist first: [`RESTORE_DENIED_ROOTS`] can never be written to
 /// even if someone lists one in `allowed_roots`, and the destination must then
 /// fall under one of the configured roots. Both are applied to the RESOLVED
-/// path, so a symlinked ancestor cannot smuggle a write past them.
+/// path, so a symlinked ancestor cannot smuggle a write past them; each root
+/// is matched as written and resolved — an allowed root only through links
+/// root owns ([`resolve_root`], bd DAS-Backup-Manager-sp78.18).
 ///
 /// Before 0.7.20.0 there was no check at all: `restore_files` runs as root under
 /// the D-Bus helper and would happily write into a systemd unit directory or a
@@ -140,8 +142,18 @@ pub fn check_dest_allowed(
     let resolved = resolve_for_policy(dest)
         .map_err(|e| format!("Cannot resolve destination '{}': {e}", dest.display()))?;
 
+    // Each root is compared as written and resolved: the destination is
+    // resolved, and a root reached through a link (`/home -> var/home`)
+    // otherwise never matched it (bd DAS-Backup-Manager-sp78.18). For the
+    // denylist that only refuses more.
+    let under = |root: &Path| resolved.starts_with(root);
+    let under_resolved = |root: &Path| {
+        under(root) || resolve_root(root, owner_of_link).is_some_and(|r| resolved.starts_with(r))
+    };
     for denied in crate::config::RESTORE_DENIED_ROOTS {
-        if resolved.starts_with(denied) {
+        if under(Path::new(denied))
+            || resolve_for_policy(Path::new(denied)).is_ok_and(|r| resolved.starts_with(r))
+        {
             return Err(format!(
                 "Refusing to restore into '{}': '{denied}' is never a permitted destination",
                 resolved.display()
@@ -151,7 +163,7 @@ pub fn check_dest_allowed(
 
     if allowed_roots
         .iter()
-        .any(|root| resolved.starts_with(Path::new(root)))
+        .any(|root| under_resolved(Path::new(root)))
     {
         Ok(resolved)
     } else {
@@ -161,6 +173,73 @@ pub fn check_dest_allowed(
             allowed_roots.join(", ")
         ))
     }
+}
+
+/// The owner of the link at `path`, `None` when it cannot be read.
+fn owner_of_link(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| m.uid())
+}
+
+/// An allowed root resolved, but only through links root owns: `/home ->
+/// var/home` is the host's layout, while a link a local user owns could be
+/// pointed anywhere and carry the policy with it — compared as written, such
+/// a root admits only what lies under the link's own path (bd sp78.18).
+/// `None` when the root cannot be resolved, or a link on its way is not
+/// root's.
+fn resolve_root(root: &Path, owner: impl Fn(&Path) -> Option<u32>) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    // realpath, one name at a time, so every link met — in the root as
+    // written AND inside any link's target — is judged by its owner.
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> =
+        std::collections::VecDeque::new();
+    if !root.is_absolute() {
+        return None;
+    }
+    for c in root.components() {
+        if let Component::Normal(n) = c {
+            pending.push_back(n.to_os_string());
+        } else if c == Component::ParentDir {
+            pending.push_back("..".into());
+        }
+    }
+    let mut out = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(m) if m.file_type().is_symlink() => {
+                hops += 1;
+                if hops > 40 || owner(&next) != Some(0) {
+                    return None;
+                }
+                let target = std::fs::read_link(&next).ok()?;
+                if target.is_absolute() {
+                    out = PathBuf::from("/");
+                }
+                let mut front: Vec<std::ffi::OsString> = Vec::new();
+                for c in target.components() {
+                    match c {
+                        Component::Normal(n) => front.push(n.to_os_string()),
+                        Component::ParentDir => front.push("..".into()),
+                        _ => {}
+                    }
+                }
+                for n in front.into_iter().rev() {
+                    pending.push_front(n);
+                }
+            }
+            Ok(_) => out = next,
+            // What does not exist yet holds no link: the rest is taken as written.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+            Err(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// The directory roots a restore is permitted to read a snapshot FROM.
@@ -985,6 +1064,53 @@ mod tests {
         // Positive control: without this, the two refusals above would pass
         // even if the function refused everything unconditionally.
         check_dest_allowed(dir.path(), &test_roots()).expect("temp dir must be allowed");
+    }
+
+    #[test]
+    fn an_allowed_root_reached_through_a_link_is_compared_resolved() {
+        // bd DAS-Backup-Manager-sp78.18: the destination is resolved, the root
+        // was not — on a host where /home is a link (/home -> var/home) every
+        // restore into /home was refused.
+        let real = TempDir::new().unwrap();
+        let links = TempDir::new().unwrap();
+        let root = links.path().join("home");
+        std::os::unix::fs::symlink(real.path(), &root).unwrap();
+        // Through a link root owns: resolved.
+        let root_owned = |_: &Path| Some(0);
+        assert_eq!(
+            resolve_root(&root, root_owned),
+            Some(real.path().canonicalize().unwrap())
+        );
+        // A root-owned link whose target runs through a user's link: the
+        // user's link is judged too (the test's links are the user's own
+        // when not root, so: owner 0 only for the first).
+        let inner = links.path().join("inner");
+        std::os::unix::fs::symlink(real.path(), &inner).unwrap();
+        let outer = links.path().join("outer");
+        std::os::unix::fs::symlink(&inner, &outer).unwrap();
+        let only_outer = |p: &Path| {
+            if p == outer.as_path() {
+                Some(0)
+            } else {
+                Some(1000)
+            }
+        };
+        assert_eq!(resolve_root(&outer, only_outer), None);
+        assert_eq!(
+            resolve_root(&outer, root_owned),
+            Some(real.path().canonicalize().unwrap())
+        );
+        // Through a link a local user owns (this test's own link, when not
+        // run as root): not resolved, so a user cannot point a root elsewhere.
+        // SAFETY: geteuid() is always safe.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(resolve_root(&root, owner_of_link), None);
+            let allowed = [root.to_string_lossy().into_owned()];
+            assert!(
+                check_dest_allowed(&root.join("restored"), &allowed).is_err(),
+                "a user's link does not widen the policy"
+            );
+        }
     }
 
     #[test]
