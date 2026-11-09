@@ -1940,8 +1940,11 @@ fn scrub_one_target(
 /// Ensure `mount_point` holds the filesystem with `fsuuid`.
 ///
 /// Returns whether this call performed the mount (and therefore owns the
-/// unmount). Any filesystem found at the mount point that is *not* the expected
-/// one is an error — never an invitation to unmount it. `_held` is the proof
+/// unmount). The expected filesystem already mounted is reused only under a
+/// handed-down hold; otherwise it was left by an earlier job and is taken
+/// down and mounted afresh (bd DAS-Backup-Manager-jgm).
+/// Any filesystem found at the mount point that is *not* the expected one is
+/// an error — never an invitation to unmount it. `held` is the proof
 /// that this process holds the maintenance lock, as for
 /// `mount::ensure_targets_mounted` (bd DAS-Backup-Manager-frb).
 fn ensure_mounted(
@@ -1949,27 +1952,53 @@ fn ensure_mounted(
     fsuuid: &str,
     mount_opts: &str,
     progress: &dyn ProgressCallback,
-    _held: &MaintenanceHeld,
+    held: &MaintenanceHeld,
 ) -> Result<bool, String> {
     let path = Path::new(mount_point);
 
     if path.exists() && crate::health::is_mountpoint(path) {
-        return match mounted_fs_uuid(mount_point) {
-            Some(found) if found.eq_ignore_ascii_case(fsuuid) => {
+        match mounted_fs_uuid(mount_point) {
+            // The target, left mounted by an earlier job: taken down and
+            // mounted afresh below, so this pass owns the unmount; one that
+            // will not come down, even with `umount -f`, is not scrubbed
+            // (bd DAS-Backup-Manager-jgm, operator 2026-11-09).
+            // Under a handed-down hold the parent mounted it for this pass
+            // and takes it down itself.
+            Some(found) if found.eq_ignore_ascii_case(fsuuid) && held.is_delegated() => {
                 progress.on_log(
                     LogLevel::Info,
                     &format!("{mount_point} already holds {fsuuid} — reusing existing mount"),
                 );
-                Ok(false)
+                return Ok(false);
             }
-            Some(found) => Err(format!(
-                "{mount_point} is mounted but holds filesystem '{found}', expected '{fsuuid}' — \
-                 refusing to scrub the wrong filesystem"
-            )),
-            None => Err(format!(
-                "{mount_point} is a mountpoint but findmnt could not report its filesystem UUID"
-            )),
-        };
+            Some(found) if found.eq_ignore_ascii_case(fsuuid) => {
+                crate::mount::take_down_leftover(mount_point, progress).map_err(|why| {
+                    format!(
+                        "{mount_point} holds {fsuuid}, left mounted by an earlier job, and \
+                         cannot be unmounted ({why}) — refusing to scrub until it is"
+                    )
+                })?;
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!(
+                        "{mount_point} holds {fsuuid}, left mounted by an earlier job — \
+                         unmounted, to be mounted afresh for this pass"
+                    ),
+                );
+            }
+            Some(found) => {
+                return Err(format!(
+                    "{mount_point} is mounted but holds filesystem '{found}', expected \
+                     '{fsuuid}' — refusing to scrub the wrong filesystem"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "{mount_point} is a mountpoint but findmnt could not report its filesystem \
+                     UUID"
+                ));
+            }
+        }
     }
 
     // Track whether the directory is ours, so a failed mount can take it back

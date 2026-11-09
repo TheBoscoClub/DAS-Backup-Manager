@@ -107,6 +107,8 @@ The system has six major components:
          │                                    WARN on every run until restored, gone or accepted (`btrdasd subvol coverage accept`); never a failure, never an
          │                                    exit code; the same check runs inside `backup run` (CLI, GUI), and a dry run compares without recording)
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
+         │                                   (a target an earlier job left mounted: identity checked, unmounted — 5 tries, then umount -f — and mounted
+         │                                    afresh; one that will not come down, or is not the target, aborts with 3 before btrbk, bd jgm)
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
          ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it), including what it starts at boot and whether that runs btrbk; STALE, or a WARNING that its boot will or may run btrbk, is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun); the Rust `backup run` (CLI, GUI) does the same in process for the mirror targets it selected (`backup::recovery_os_step`), and `btrdasd recovery-os record` does it without a backup
@@ -742,10 +744,10 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1494 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust unit tests | 1497 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
 | Rust CLI + setup tests | 296 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 42 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 62 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (29), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1894 Rust (1905 incl. manual) + 55 Qt** | |
+| **Total** | **1897 Rust (1908 incl. manual) + 55 Qt** | |

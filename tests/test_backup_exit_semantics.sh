@@ -364,6 +364,15 @@ if listed umount_fails_once "$dst" && ! listed umount_failed "$dst"; then
     echo "umount: $dst: target is busy (stub)." >&2
     exit 32
 fi
+# Busy to the plain unmount until one `umount -f` has been tried (bd jgm).
+if listed umount_busy_until_forced "$dst" && ! listed umount_forced "$dst"; then
+    if [[ "$1" == -f ]]; then
+        echo "$dst" >>"$S/knobs/umount_forced"
+    else
+        echo "umount: $dst: target is busy (stub)." >&2
+        exit 32
+    fi
+fi
 if listed umount_fails_always "$dst"; then
     echo "umount: $dst: target is busy (stub)." >&2
     exit 32
@@ -1762,6 +1771,69 @@ calls_for() {
         echo 0
     fi
 }
+
+# ---------------------------------------------------------------------------
+echo "== a target an earlier job left mounted (bd DAS-Backup-Manager-jgm)"
+# ---------------------------------------------------------------------------
+# Operator 2026-11-09: the next job unmounts it, retries with force if it
+# still will not unmount, and refuses to run only if force fails too.
+leftover_primary() {
+    mkdir -p "$PRIMARY_MNT"
+    printf '%s\t%s\t/\n' "$PRIMARY_MNT" "${1:-primary-uuid}" >>"$STATE/mounted"
+}
+
+fresh
+leftover_primary
+run_backup
+check "leftover, unmounts: exit status" "$RC" "0"
+show_tail 0
+check "leftover, unmounts: said so" \
+    "$(grep -c "primary-22tb: $PRIMARY_MNT was left mounted by an earlier job — unmounting it, to mount it afresh for this run" "$STATE/out")" "1"
+check "leftover, unmounts: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
+check "leftover, unmounts: unmounted twice (the leftover, then the run's own)" \
+    "$(calls_for umount "$PRIMARY_MNT")" "2"
+check "leftover, unmounts: no force needed" "$(grep -c -- "^-f " "$STATE/calls/umount")" "0"
+check "leftover, unmounts: nothing left mounted" "$(left_mounted)" "nothing"
+
+fresh
+leftover_primary
+knob umount_busy_until_forced "$PRIMARY_MNT"
+run_backup
+check "leftover, busy until forced: exit status" "$RC" "0"
+show_tail 0
+check "leftover, busy until forced: five plain tries, then -f once" \
+    "$(grep -c -- "^$PRIMARY_MNT\$" "$STATE/calls/umount") $(grep -c -- "^-f $PRIMARY_MNT\$" "$STATE/calls/umount")" "6 1"
+check "leftover, busy until forced: said so" \
+    "$(grep -c "primary-22tb: retrying with umount -f" "$STATE/out")" "1"
+check "leftover, busy until forced: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
+check "leftover, busy until forced: btrbk ran" "$(ran_btrbk)" "yes"
+
+fresh
+leftover_primary
+knob umount_fails_always "$PRIMARY_MNT"
+run_backup
+check "leftover, will not unmount even forced: exit status" "$RC" "3"
+show_tail 3
+check "leftover, will not unmount even forced: -f was tried" \
+    "$(grep -c -- "^-f $PRIMARY_MNT\$" "$STATE/calls/umount")" "1"
+check "leftover, will not unmount even forced: never mounted over it" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "leftover, will not unmount even forced: btrbk never ran" "$(ran_btrbk)" "no"
+check "leftover, will not unmount even forced: ABORTED" "$(mail_status 1)" "ABORTED"
+check "leftover, will not unmount even forced: what aborted" "$(body_field 1 'What aborted')" "a leftover mount"
+check "leftover, will not unmount even forced: recorded as failed" "$(recorded_as)" "failure"
+
+fresh
+leftover_primary a-different-filesystem
+run_backup
+check "a foreign filesystem at the target's path: exit status" "$RC" "3"
+show_tail 3
+check "a foreign filesystem at the target's path: not unmounted before the abort" \
+    "$(grep -c "was left mounted by an earlier job" "$STATE/out")" "0"
+check "a foreign filesystem at the target's path: never mounted over it" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "a foreign filesystem at the target's path: what aborted" \
+    "$(body_field 1 'What aborted')" "a mount at a target's path"
+check "a foreign filesystem at the target's path: why" \
+    "$(grep -cF -- "primary-22tb: $PRIMARY_MNT has fs UUID 'a-different-filesystem', expected 'primary-uuid'" "$STATE/mail.1.body")" "1"
 # second_source <label> <volume> <device>: a second source in the config.
 second_source() {
     sed -i 's/^DAS_SOURCE_COUNT=1$/DAS_SOURCE_COUNT=2/' "$STATE/env"

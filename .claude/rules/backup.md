@@ -252,6 +252,10 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
 - **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`);
   `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down
   (`DAS_MAINTENANCE_LOCK_FD`) or they fail.
+- **A target left mounted by an earlier job is taken down by the next** (bd `jgm`, operator 2026-11-09):
+  shown to be the target (UUID, else serial), it is unmounted — 5 tries, then one `umount -f` — and
+  mounted afresh; only if that fails too does the job refuse (`backup-run.sh`: exit 3, ABORTED). A
+  foreign filesystem at the path refuses, never unmounted. Never `umount -l`. A handed-down hold uses it as found.
 
 **Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
 deadlock-free; release order is irrelevant.

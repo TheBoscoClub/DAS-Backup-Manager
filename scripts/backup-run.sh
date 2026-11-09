@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.16.0
-# Date: 2026-11-08
+# Version: 4.17.0
+# Date: 2026-11-09
 #
 # Features:
+#   - A target an earlier job left mounted is taken down (v4.17.0, bd
+#     DAS-Backup-Manager-jgm): take_down_leftover checks it is the target
+#     (mounted_is_target, shared with verify_targets_before_btrbk), unmounts
+#     it -- 5 tries, then one umount -f -- and mount_targets mounts it afresh;
+#     one that will not come down, or is not the target, aborts with 3.
 #   - A drive that is gone is a row (v4.16.0, bd DAS-Backup-Manager-uhi):
 #     check_das_connected records a "Target <label>" row for every target --
 #     OK naming its drives, WARN for a RAID-1 running on one leg (the run still
@@ -1820,6 +1825,40 @@ subject_status() {
     fi
 }
 
+# A target already mounted when mount_targets looks: no job of this project
+# holds it (this run holds the maintenance lock), so an earlier job failed
+# to give it back (bd DAS-Backup-Manager-jgm, operator 2026-11-09). Shown to
+# be the target, it is unmounted — the plain unmount with its retries, then
+# one `umount -f` — and mount_targets mounts it afresh with this run's
+# options. What is not the target, or will not come down, aborts the run
+# (3: a target's state, met again by the next start) before btrbk.
+# Never `umount -l`: it takes the path out of the mount table while the
+# filesystem stays live, the state the "safe to disconnect" check exists to
+# catch. On a busy local btrfs `-f` is refused like the plain unmount
+# (measured on a loop device, 2026-11-09).
+take_down_leftover() {
+    local label="$1"
+    local mnt="${TARGET_MOUNTS[$label]}" err
+    if ! mounted_is_target "$label"; then
+        log_error "ABORTING: $mnt is mounted, but not by target $label — not this run's to unmount"
+        log_error "  - $IDENTITY_WHY"
+        record_op "mount_targets" "FAIL" "$IDENTITY_WHY"
+        abort_reason "a mount at a target's path" "$IDENTITY_WHY"
+        exit 3
+    fi
+    log_warn "  $label: $mnt was left mounted by an earlier job — unmounting it, to mount it afresh for this run"
+    umount_with_retry "$mnt" && return 0
+    log_warn "  $label: retrying with umount -f"
+    if err="$(umount -f "$mnt" 2>&1)"; then
+        return 0
+    fi
+    local why="$label: $mnt was left mounted by an earlier job and will not unmount, even with umount -f: ${err:-no message}"
+    log_error "ABORTING: $why"
+    record_op "mount_targets" "FAIL" "$why"
+    abort_reason "a leftover mount" "$why"
+    exit 3
+}
+
 mount_targets() {
     log_info "Mounting backup targets..."
 
@@ -1834,7 +1873,7 @@ mount_targets() {
         fi
 
         if mountpoint -q "$mnt"; then
-            continue
+            take_down_leftover "$label"
         fi
 
         # Prefer mount-by-UUID when configured. BTRFS auto-discovers all
@@ -1978,6 +2017,54 @@ create_target_dirs() {
 #
 # This is the last gate before btrbk gets to make irreversible decisions.
 # Tracks bd DAS-Backup-Manager-9on.
+# Whether what is mounted at target <label>'s mount point is that target:
+# its filesystem UUID when one is configured (it matches a BTRFS RAID-1 even
+# when mounted degraded), else its drive's serial. 0 with IDENTITY_OK set to
+# what matched; 1 with IDENTITY_WHY, one line naming the label, set to why it
+# is not, or why it cannot be told. Shared by verify_targets_before_btrbk and
+# mount_targets' leftover check (bd DAS-Backup-Manager-jgm).
+mounted_is_target() {
+    local label="$1"
+    local mnt="${TARGET_MOUNTS[$label]}"
+    local uuid="${TARGET_MOUNT_UUIDS[$label]}"
+    local serials_list="${DAS_SERIALS_LIST[$label]}"
+    IDENTITY_OK="" IDENTITY_WHY=""
+    if [[ -n "$uuid" ]]; then
+        local fs_uuid
+        fs_uuid=$(findmnt -n -o UUID --target "$mnt" 2>/dev/null || true)
+        if [[ "$fs_uuid" != "$uuid" ]]; then
+            IDENTITY_WHY="$label: $mnt has fs UUID '${fs_uuid:-<none>}', expected '$uuid' — different filesystem mounted here"
+            return 1
+        fi
+        IDENTITY_OK="$mnt → UUID=$fs_uuid"
+        return 0
+    fi
+
+    # Legacy device-by-serial verification (used when mount_uuid is unset)
+    local mount_src
+    mount_src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
+    if [[ -z "$mount_src" ]]; then
+        IDENTITY_WHY="$label: $mnt is a mountpoint but findmnt could not resolve its source device"
+        return 1
+    fi
+    local mount_dev
+    # findmnt prints a btrfs subvolume as /dev/sde1[/@sub]: keep the device.
+    if ! mount_dev="$(parent_disk "${mount_src%%\[*}")"; then
+        IDENTITY_WHY="$label: $mnt is mounted from $mount_src, whose disk lsblk could not resolve -- cannot check its serial"
+        return 1
+    fi
+    local got_serial expected
+    got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
+    for expected in $serials_list; do
+        if [[ "$got_serial" == "$expected" ]]; then
+            IDENTITY_OK="$mnt → $mount_src, serial=$got_serial"
+            return 0
+        fi
+    done
+    IDENTITY_WHY="$label: $mnt mounted from $mount_src (serial='${got_serial:-?}'), expected one of: $serials_list"
+    return 1
+}
+
 verify_targets_before_btrbk() {
     log_info "Verifying every backup target is backed by an expected DAS device..."
 
@@ -1986,8 +2073,6 @@ verify_targets_before_btrbk() {
     for label in "${!TARGET_MOUNTS[@]}"; do
         local mnt="${TARGET_MOUNTS[$label]}"
         local available="${TARGET_AVAILABLE[$label]:-false}"
-        local uuid="${TARGET_MOUNT_UUIDS[$label]}"
-        local serials_list="${DAS_SERIALS_LIST[$label]}"
         local role="${TARGET_ROLES[$label]}"
 
         # State A: target intentionally not active this run (no DAS drive
@@ -2008,47 +2093,12 @@ verify_targets_before_btrbk() {
 
         # State B verification: the mounted filesystem must be the one we
         # expected, not some other filesystem (or worse, the root FS shadowing
-        # an unmounted path). Prefer UUID match (works for BTRFS RAID-1 even
-        # under degraded mount), fall back to disk serial.
-        if [[ -n "$uuid" ]]; then
-            local fs_uuid
-            fs_uuid=$(findmnt -n -o UUID --target "$mnt" 2>/dev/null || true)
-            if [[ "$fs_uuid" != "$uuid" ]]; then
-                violations+=("$label: $mnt has fs UUID '${fs_uuid:-<none>}', expected '$uuid' — different filesystem mounted here")
-                continue
-            fi
-            log_info "  $label: OK ($mnt → UUID=$fs_uuid)"
+        # an unmounted path).
+        if ! mounted_is_target "$label"; then
+            violations+=("$IDENTITY_WHY")
             continue
         fi
-
-        # Legacy device-by-serial verification (used when mount_uuid is unset)
-        local mount_src
-        mount_src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
-        if [[ -z "$mount_src" ]]; then
-            violations+=("$label: $mnt is a mountpoint but findmnt could not resolve its source device")
-            continue
-        fi
-        local mount_dev
-        # findmnt prints a btrfs subvolume as /dev/sde1[/@sub]: keep the device.
-        if ! mount_dev="$(parent_disk "${mount_src%%\[*}")"; then
-            violations+=("$label: $mnt is mounted from $mount_src, whose disk lsblk could not resolve -- cannot check its serial")
-            continue
-        fi
-        local got_serial
-        got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
-        local serial_match="false"
-        local expected
-        for expected in $serials_list; do
-            if [[ "$got_serial" == "$expected" ]]; then
-                serial_match="true"
-                break
-            fi
-        done
-        if [[ "$serial_match" != "true" ]]; then
-            violations+=("$label: $mnt mounted from $mount_src (serial='${got_serial:-?}'), expected one of: $serials_list")
-            continue
-        fi
-        log_info "  $label: OK ($mnt → $mount_src, serial=$got_serial)"
+        log_info "  $label: OK ($IDENTITY_OK)"
     done
 
     if (( ${#violations[@]} > 0 )); then
@@ -3475,7 +3525,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.16.0
+  backup-run.sh v4.17.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

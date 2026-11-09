@@ -33,6 +33,20 @@ pub enum MountError {
     MountFailed { label: String, detail: String },
     /// `mkdir -p` failed for the mount point directory.
     MkdirFailed { label: String, path: String },
+    /// An earlier job left the target mounted, and neither the plain unmount
+    /// (retried) nor `umount -f` released it (bd DAS-Backup-Manager-jgm).
+    LeftoverMounted {
+        label: String,
+        mount: String,
+        detail: String,
+    },
+    /// Something is mounted at the target's path that cannot be shown to be
+    /// the target. Never unmounted: it is not this job's.
+    ForeignMount {
+        label: String,
+        mount: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for MountError {
@@ -57,6 +71,24 @@ impl fmt::Display for MountError {
             Self::MkdirFailed { label, path } => {
                 write!(f, "Target '{label}': mkdir -p '{path}' failed")
             }
+            Self::LeftoverMounted {
+                label,
+                mount,
+                detail,
+            } => write!(
+                f,
+                "Target '{label}': {mount} was left mounted by an earlier job and cannot be \
+                 unmounted ({detail}) — refusing to run until it is"
+            ),
+            Self::ForeignMount {
+                label,
+                mount,
+                detail,
+            } => write!(
+                f,
+                "Target '{label}': {mount} is mounted but is not this target ({detail}) — \
+                 refusing to run; it is not this job's to unmount"
+            ),
         }
     }
 }
@@ -183,6 +215,104 @@ pub fn fail_if_still_mounted<T>(
     }
 }
 
+/// `umount` one mount point, up to [`UMOUNT_ATTEMPTS`] times with
+/// [`UMOUNT_RETRY_PAUSE`] between attempts. `Err` carries why the last
+/// attempt failed; `retrying` is told about each earlier one.
+fn umount_retrying(
+    runner: &dyn CommandRunner,
+    mount_point: &str,
+    mut retrying: impl FnMut(&str),
+) -> Result<(), String> {
+    let mut why = String::new();
+    for attempt in 1..=UMOUNT_ATTEMPTS {
+        if attempt > 1 {
+            retrying(&format!(
+                "{mount_point}: {why} (attempt {} of {UMOUNT_ATTEMPTS}) — retrying",
+                attempt - 1
+            ));
+            runner.pause(UMOUNT_RETRY_PAUSE);
+        }
+        why = match runner.status(Command::new("umount").arg(mount_point)) {
+            Ok(s) if s.success() => return Ok(()),
+            Ok(s) => exit_why("umount", s),
+            Err(e) => format!("umount failed to run: {e}"),
+        };
+    }
+    Err(why)
+}
+
+fn exit_why(what: &str, status: ExitStatus) -> String {
+    format!("{what} exited with code {}", status.code().unwrap_or(-1))
+}
+
+/// Take down a mount an earlier job left behind (bd DAS-Backup-Manager-jgm,
+/// operator 2026-11-09): the plain unmount with its retries, then one
+/// `umount -f`. `Err` says why both failed; the caller then refuses to run.
+///
+/// Never `umount -l`: a lazy unmount takes the path out of the mount table
+/// while the filesystem stays live and its device held, which is the state
+/// the "safe to disconnect" check and a recovery-drive VM session exist to
+/// catch. On a busy local btrfs `-f` is refused like the plain unmount
+/// (measured on a loop device, 2026-11-09): the force step is what the
+/// operator asked for, not a stronger tool.
+fn take_down_leftover_with(
+    runner: &dyn CommandRunner,
+    mount_point: &str,
+    progress: &dyn ProgressCallback,
+) -> Result<(), String> {
+    let why = match umount_retrying(runner, mount_point, |msg| {
+        progress.on_log(crate::progress::LogLevel::Warning, msg);
+    }) {
+        Ok(()) => return Ok(()),
+        Err(why) => why,
+    };
+    progress.on_log(
+        crate::progress::LogLevel::Warning,
+        &format!("{mount_point}: {why} after {UMOUNT_ATTEMPTS} attempts — retrying with umount -f"),
+    );
+    let forced = match runner.status(Command::new("umount").arg("-f").arg(mount_point)) {
+        Ok(s) if s.success() => return Ok(()),
+        Ok(s) => exit_why("umount -f", s),
+        Err(e) => format!("umount -f failed to run: {e}"),
+    };
+    Err(format!("{why} after {UMOUNT_ATTEMPTS} attempts; {forced}"))
+}
+
+/// [`take_down_leftover_with`] on this host, for a job that mounts a target
+/// by its own code (the scrub engine). Its caller has already shown the
+/// mount is the target.
+pub fn take_down_leftover(
+    mount_point: &str,
+    progress: &dyn ProgressCallback,
+) -> Result<(), String> {
+    take_down_leftover_with(&SystemRunner, mount_point, progress)
+}
+
+/// Whether what is mounted at `target.mount` is the target: its filesystem
+/// UUID when one is configured, else its drive's serial, as
+/// [`verify_write_targets`] has it. `Err` says why it is not, or why it
+/// cannot be told.
+fn mounted_is_target(
+    runner: &dyn CommandRunner,
+    target: &crate::config::Target,
+) -> Result<(), String> {
+    match target.mount_uuid.as_deref().filter(|u| !u.is_empty()) {
+        Some(expected) => match filesystem_uuid_with(runner, &target.mount) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(format!(
+                "'{}' has filesystem UUID '{actual}', expected '{expected}'",
+                target.mount
+            )),
+            None => Err(format!(
+                "could not determine the filesystem UUID mounted at '{}' (expected \
+                 '{expected}')",
+                target.mount
+            )),
+        },
+        None => verify_legacy_serial(runner, target).map(|_| ()),
+    }
+}
+
 impl MountGuard {
     fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
@@ -202,23 +332,8 @@ impl MountGuard {
     /// `umount` one mount point, up to [`UMOUNT_ATTEMPTS`] times with
     /// [`UMOUNT_RETRY_PAUSE`] between attempts. `Err` carries why the last
     /// attempt failed; `retrying` is told about each earlier one.
-    fn release(&self, mount_point: &str, mut retrying: impl FnMut(&str)) -> Result<(), String> {
-        let mut why = String::new();
-        for attempt in 1..=UMOUNT_ATTEMPTS {
-            if attempt > 1 {
-                retrying(&format!(
-                    "{mount_point}: {why} (attempt {} of {UMOUNT_ATTEMPTS}) — retrying",
-                    attempt - 1
-                ));
-                self.runner.pause(UMOUNT_RETRY_PAUSE);
-            }
-            why = match self.runner.status(Command::new("umount").arg(mount_point)) {
-                Ok(s) if s.success() => return Ok(()),
-                Ok(s) => format!("umount exited with code {}", s.code().unwrap_or(-1)),
-                Err(e) => format!("umount failed to run: {e}"),
-            };
-        }
-        Err(why)
+    fn release(&self, mount_point: &str, retrying: impl FnMut(&str)) -> Result<(), String> {
+        umount_retrying(&*self.runner, mount_point, retrying)
     }
 
     /// Unmount everything this guard mounted, last-mounted first, retrying
@@ -373,20 +488,17 @@ fn ensure_targets_mounted_with(
     for (i, target) in config.targets.iter().enumerate() {
         let mount_path = Path::new(&target.mount);
 
-        // Already mounted at configured path — nothing to do
+        // Already mounted at the configured path.
         if mount_path.exists() && (probes.is_mountpoint)(mount_path) {
-            any_available = true;
-            progress.on_progress(
-                (i + 1) as u64,
-                total,
-                &format!("{} already mounted", target.label),
-            );
-            // Not this run's to unmount — say so, so a target an earlier run
-            // failed to unmount is visible rather than quietly reused.
-            // Under a handed-down lock the parent mounted it for this run (and
-            // its own pre-existing-mount check reports a leftover), so it is
-            // not a finding here; an owned hold keeps the warning.
+            // Under a handed-down lock the parent (`backup-run.sh`) mounted it
+            // for this run and takes it down itself: used as found.
             if held.is_delegated() {
+                any_available = true;
+                progress.on_progress(
+                    (i + 1) as u64,
+                    total,
+                    &format!("{} already mounted", target.label),
+                );
                 progress.on_log(
                     crate::progress::LogLevel::Info,
                     &format!(
@@ -395,17 +507,36 @@ fn ensure_targets_mounted_with(
                         target.label, target.mount
                     ),
                 );
-            } else {
-                progress.on_log(
-                    crate::progress::LogLevel::Warning,
-                    &format!(
-                        "Target '{}': {} was already mounted before this run and will be \
-                         left mounted",
-                        target.label, target.mount
-                    ),
-                );
+                continue;
             }
-            continue;
+            // An owned hold: no job of this project is using the target, so
+            // this is a mount an earlier job failed to give back
+            // (bd DAS-Backup-Manager-jgm). Shown to be the target, it is
+            // taken down and mounted afresh below, so this run owns — and
+            // gives back — the mount it uses, with its own options. What
+            // cannot be shown to be the target, or cannot be taken down,
+            // refuses the job before it mounts anything.
+            let foreign = |detail| MountError::ForeignMount {
+                label: target.label.clone(),
+                mount: target.mount.clone(),
+                detail,
+            };
+            mounted_is_target(&*guard.runner, target).map_err(foreign)?;
+            take_down_leftover_with(&*guard.runner, &target.mount, progress).map_err(|detail| {
+                MountError::LeftoverMounted {
+                    label: target.label.clone(),
+                    mount: target.mount.clone(),
+                    detail,
+                }
+            })?;
+            progress.on_log(
+                crate::progress::LogLevel::Warning,
+                &format!(
+                    "Target '{}': {} was left mounted by an earlier job — unmounted, to be \
+                     mounted afresh for this run",
+                    target.label, target.mount
+                ),
+            );
         }
 
         // Already mounted elsewhere (e.g. udisks2 at /run/media/) — bind-mount
@@ -1172,6 +1303,9 @@ mod tests {
         /// Mount points of every scripted `mount` that succeeded and has not
         /// been `umount`ed since, so the host's mount table can follow.
         mounted: Mutex<Vec<String>>,
+        /// Mount points a scripted `umount` released, so a mount the host
+        /// described as pre-existing stops being one (bd jgm).
+        unmounted: Mutex<Vec<String>>,
         /// How many times each `Seq` rule has answered.
         seq_pos: Mutex<std::collections::HashMap<String, usize>>,
         /// Every pause asked for, in order; none is really taken.
@@ -1191,6 +1325,7 @@ mod tests {
                     .map(|(key, reply)| (key.to_string(), reply.clone()))
                     .collect(),
                 mounted: Mutex::new(Vec::new()),
+                unmounted: Mutex::new(Vec::new()),
                 seq_pos: Mutex::new(std::collections::HashMap::new()),
                 pauses: Mutex::new(Vec::new()),
             })
@@ -1224,7 +1359,10 @@ mod tests {
                 let mut mounted = self.mounted.lock().unwrap();
                 match argv[0].as_str() {
                     "mount" => mounted.push(mount_point.clone()),
-                    "umount" => mounted.retain(|m| m != mount_point),
+                    "umount" => {
+                        mounted.retain(|m| m != mount_point);
+                        self.unmounted.lock().unwrap().push(mount_point.clone());
+                    }
                     _ => {}
                 }
             }
@@ -1293,7 +1431,13 @@ mod tests {
             f: impl FnOnce(&MountProbes<'_>) -> R,
         ) -> R {
             let is_mountpoint = |p: &Path| {
-                self.mountpoints.iter().any(|m| m == p)
+                (self.mountpoints.iter().any(|m| m == p)
+                    && !runner
+                        .unmounted
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|m| Path::new(m) == p))
                     || runner
                         .mounted
                         .lock()
@@ -1807,52 +1951,214 @@ mod tests {
     // ensure_targets_mounted
     // -----------------------------------------------------------------------
 
-    /// Targets already mounted where they belong are available, are reported,
-    /// and are NOT the guard's to unmount.
+    /// A target an earlier job left mounted (bd DAS-Backup-Manager-jgm,
+    /// operator 2026-11-09): once it is shown to be the target, it is
+    /// unmounted and mounted afresh, so this run owns — and gives back — the
+    /// mount it uses.
     #[test]
-    fn targets_already_mounted_are_reported_and_left_alone() {
+    fn a_leftover_target_is_unmounted_and_mounted_afresh_for_this_run() {
         let scratch = Scratch::new();
-        let a = scratch.mkdir("mnt/a");
-        let b = scratch.mkdir("mnt/b");
-        let config = config_with(
-            vec![
-                target("alpha", "SER-A", &a, TargetRole::Primary),
-                target("beta", "SER-B", &b, TargetRole::Mirror),
-            ],
-            Vec::new(),
-        );
-        let host = Host {
-            mountpoints: vec![PathBuf::from(&a), PathBuf::from(&b)],
-            ..Host::default()
-        };
-        let runner = ScriptedRunner::succeeding();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        let runner = ScriptedRunner::with_rules(&[(
+            "UUID",
+            Reply::Exit {
+                code: 0,
+                stdout: "u-p\n",
+                stderr: "",
+            },
+        )]);
         let progress = Recorder::default();
 
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
-        assert_eq!(guard.count(), 0);
-        drop(guard);
-        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
-        assert_eq!(progress.stages(), vec![("Mounting targets".into(), 2)]);
         assert_eq!(
-            progress.steps(),
+            runner.calls(),
             vec![
-                (1, 2, "alpha already mounted".to_string()),
-                (2, 2, "beta already mounted".to_string()),
+                output_call(&["findmnt", "-n", "-o", "UUID", "--target", &mnt]),
+                status_call(&["umount", &mnt]),
+                output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt]),
             ]
         );
-        let logs = progress.logs();
-        assert_eq!(logs.len(), 2, "{logs:?}");
-        for (log, (label, mnt)) in logs.iter().zip([("alpha", &a), ("beta", &b)]) {
-            assert_eq!(log.0, LogLevel::Warning);
-            assert_eq!(
-                log.1,
+        assert_eq!(guard.count(), 1, "the fresh mount is this run's");
+        assert_eq!(
+            progress.logs(),
+            vec![(
+                LogLevel::Warning,
                 format!(
-                    "Target '{label}': {mnt} was already mounted before this run and will be \
-                     left mounted"
+                    "Target 'primary': {mnt} was left mounted by an earlier job — unmounted, \
+                     to be mounted afresh for this run"
                 )
-            );
-        }
+            )]
+        );
+        drop(guard);
+        assert_eq!(runner.calls()[3..], [status_call(&["umount", &mnt])]);
+    }
+
+    /// The plain unmount is retried; when every try finds it busy, one
+    /// `umount -f` follows before anything is refused.
+    #[test]
+    fn a_leftover_the_plain_unmount_cannot_release_is_forced() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "UUID",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "u-p\n",
+                    stderr: "",
+                },
+            ),
+            ("umount", Reply::Seq(&[32, 32, 32, 32, 32, 0])),
+        ]);
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls[1..6], vec![status_call(&["umount", &mnt]); 5][..]);
+        assert_eq!(calls[6], status_call(&["umount", "-f", &mnt]));
+        assert_eq!(
+            calls[7],
+            output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt])
+        );
+        assert_eq!(guard.count(), 1);
+        assert!(
+            progress
+                .logs()
+                .iter()
+                .any(|(level, msg)| *level == LogLevel::Warning
+                    && msg
+                        == &format!(
+                            "{mnt}: umount exited with code 32 after {UMOUNT_ATTEMPTS} attempts — \
+                     retrying with umount -f"
+                        )),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
+    /// Only when the forced unmount fails too is the job refused — before it
+    /// mounts anything, and with the target still mounted as it was.
+    #[test]
+    fn a_leftover_that_survives_the_forced_unmount_refuses_the_job() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "UUID",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "u-p\n",
+                    stderr: "",
+                },
+            ),
+            ("umount", Reply::Seq(&[32])),
+        ]);
+
+        let err = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .err()
+            .expect("a leftover that cannot be unmounted refuses the job");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Target 'primary': {mnt} was left mounted by an earlier job and cannot be \
+                 unmounted (umount exited with code 32 after {UMOUNT_ATTEMPTS} attempts; \
+                 umount -f exited with code 32) — refusing to run until it is"
+            )
+        );
+        assert!(
+            !runner.calls().iter().any(|c| c.argv[0] == "mount"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// Something other than the target at the target's path is never
+    /// unmounted: it is not this project's to take down. Refused.
+    #[test]
+    fn a_foreign_filesystem_at_the_target_path_is_refused_never_unmounted() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        let runner = ScriptedRunner::with_rules(&[(
+            "UUID",
+            Reply::Exit {
+                code: 0,
+                stdout: "u-other\n",
+                stderr: "",
+            },
+        )]);
+
+        let err = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .err()
+            .expect("a foreign mount refuses the job");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Target 'primary': {mnt} is mounted but is not this target ('{mnt}' has \
+                 filesystem UUID 'u-other', expected 'u-p') — refusing to run; it is not \
+                 this job's to unmount"
+            )
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![output_call(&[
+                "findmnt", "-n", "-o", "UUID", "--target", &mnt
+            ])]
+        );
+    }
+
+    /// A target with no `mount_uuid` is identified by its drive's serial; one
+    /// that cannot be identified is refused, never unmounted.
+    #[test]
+    fn a_leftover_that_cannot_be_identified_is_refused_never_unmounted() {
+        let scratch = Scratch::new();
+        let a = scratch.mkdir("mnt/a");
+        let config = config_with(
+            vec![target("alpha", "SER-A", &a, TargetRole::Primary)],
+            Vec::new(),
+        );
+        let host = Host {
+            mountpoints: vec![PathBuf::from(&a)],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+
+        let err = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .err()
+            .expect("an unidentified mount refuses the job");
+
+        assert!(
+            err.to_string().starts_with(&format!(
+                "Target 'alpha': {a} is mounted but is not this target ("
+            )),
+            "{err}"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "umount" || c.argv[0] == "mount"),
+            "{:?}",
+            runner.calls()
+        );
     }
 
     /// Under a handed-down lock the parent (`backup-run.sh`) mounted the
