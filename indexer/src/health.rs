@@ -607,12 +607,12 @@ pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
 /// actual mount path (which may be `/run/media/…` from udisks2, or the
 /// configured `/mnt/backup-…`, or wherever the kernel says it is).
 pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> {
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let mounts = fs::read_to_string("/proc/self/mountinfo").ok()?;
     find_mount_for_device_with(&device_from_serial, &mounts, serial, role)
 }
 
-/// [`find_mount_for_device`] with the serial lookup and the `/proc/mounts`
-/// text supplied.
+/// [`find_mount_for_device`] with the serial lookup and the
+/// `/proc/self/mountinfo` text supplied.
 pub fn find_mount_for_device_with(
     dev_of_serial: &dyn Fn(&str) -> Option<String>,
     mounts_text: &str,
@@ -630,32 +630,26 @@ pub fn find_mount_for_device_with(
     top_level_mount_of(mounts_text, &canonical_part)
 }
 
-/// The first mount of `device` in `/proc/mounts` text that shows the
-/// filesystem's TOP LEVEL, never a subvolume of it. Binding a subvolume mount
-/// (a booted recovery drive's `/`, subvolume `@`) at a target path would put a
-/// different tree where the target's snapshots are expected. A BTRFS entry
-/// qualifies on `subvolid=5`; an entry with a `subvol=`/`subvolid=` option that
-/// says otherwise is skipped; a filesystem with neither option has no
-/// subvolumes and qualifies.
-fn top_level_mount_of(mounts: &str, device: &str) -> Option<String> {
-    for line in mounts.lines() {
-        let mut cols = line.split(' ');
-        let (Some(dev), Some(mountpoint)) = (cols.next(), cols.next()) else {
+/// The first mount of `device` in `/proc/self/mountinfo` text that shows the
+/// filesystem's TOP LEVEL, never a subvolume of it nor a directory within it.
+/// Binding a subvolume mount (a booted recovery drive's `/`, subvolume `@`) at a
+/// target path would put a different tree where the target's snapshots are
+/// expected. A mount qualifies only when its root (field 4) is `/`:
+/// `/proc/mounts` cannot tell a bind of a subdirectory of the top level from
+/// the top level itself — both read `subvolid=5` (bd DAS-Backup-Manager-71q1).
+fn top_level_mount_of(mountinfo: &str, device: &str) -> Option<String> {
+    for line in mountinfo.lines() {
+        // `<id> <parent> <maj:min> <root> <mount point> <options> [optional…]
+        // - <fstype> <source> <super options>`
+        let Some((mine, theirs)) = line.split_once(" - ") else {
             continue;
         };
-        if dev != device {
+        let mut left = mine.split(' ');
+        let (Some(root), Some(mount_point)) = (left.nth(3), left.next()) else {
             continue;
-        }
-        let opts: Vec<&str> = cols.nth(1).unwrap_or("").split(',').collect();
-        let top = if opts.contains(&"subvolid=5") {
-            true
-        } else {
-            !opts
-                .iter()
-                .any(|o| o.starts_with("subvolid=") || o.starts_with("subvol="))
         };
-        if top {
-            return Some(mountpoint.to_string());
+        if theirs.split(' ').nth(1) == Some(device) && root == "/" {
+            return Some(mount_point.to_string());
         }
     }
     None
@@ -2166,22 +2160,39 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
     fn a_bind_never_takes_a_subvolume_mount_of_the_device() {
         // The booted recovery drive: its `/` is subvolume @ (listed first),
         // and the same partition's top level is mounted elsewhere.
+        // /proc/self/mountinfo: field 4 is the part of the filesystem mounted.
         let mounts = "\
-/dev/sdk2 / btrfs rw,noatime,subvolid=256,subvol=/@ 0 0
-/dev/sdk2 /home btrfs rw,subvolid=257,subvol=/@home 0 0
-/dev/sdb1 /srv ext4 rw 0 0
-/dev/sdk2 /run/media/b/top btrfs rw,subvolid=5,subvol=/ 0 0
+26 1 0:24 /@ / rw,noatime shared:1 - btrfs /dev/sdk2 rw,subvolid=256,subvol=/@
+27 26 0:24 /@home /home rw shared:2 - btrfs /dev/sdk2 rw,subvolid=257,subvol=/@home
+28 26 8:17 / /srv rw shared:3 - ext4 /dev/sdb1 rw
+29 26 0:24 / /run/media/b/top rw shared:4 - btrfs /dev/sdk2 rw,subvolid=5,subvol=/
 ";
         assert_eq!(
             top_level_mount_of(mounts, "/dev/sdk2").as_deref(),
             Some("/run/media/b/top")
         );
         // Only subvolume mounts: nothing to bind.
-        let only_sub = "/dev/sdk2 / btrfs rw,subvolid=256,subvol=/@ 0 0\n";
+        let only_sub = "26 1 0:24 /@ / rw shared:1 - btrfs /dev/sdk2 rw,subvolid=256,subvol=/@\n";
         assert_eq!(top_level_mount_of(only_sub, "/dev/sdk2"), None);
-        // A subvol= with no id is still a subvolume.
-        let named = "/dev/sdk2 / btrfs rw,subvol=/@ 0 0\n";
-        assert_eq!(top_level_mount_of(named, "/dev/sdk2"), None);
+        // A bind of a subdirectory of the top level (bd 71q1, F3): /proc/mounts
+        // shows it subvolid=5, as if it were the top level; mountinfo does not.
+        let subdir = "\
+30 1 0:24 /.btrbk-snapshots /mnt/x rw - btrfs /dev/sdk2 rw,subvolid=5,subvol=/
+31 1 0:24 / /mnt/top rw - btrfs /dev/sdk2 rw,subvolid=5,subvol=/
+";
+        assert_eq!(
+            top_level_mount_of(subdir, "/dev/sdk2").as_deref(),
+            Some("/mnt/top")
+        );
+        // No optional fields before the separator, and a line without one.
+        assert_eq!(
+            top_level_mount_of(
+                "31 1 0:24 / /mnt/top rw - btrfs /dev/sdk2 rw\nbroken\n",
+                "/dev/sdk2"
+            )
+            .as_deref(),
+            Some("/mnt/top")
+        );
         // A filesystem without subvolumes qualifies; another device does not match.
         assert_eq!(
             top_level_mount_of(mounts, "/dev/sdb1").as_deref(),
@@ -2220,8 +2231,10 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
 
     #[test]
     fn find_mount_for_device_with_resolves_serial_partition_and_top_level_mount() {
-        let dir = std::env::temp_dir().join(format!("fmfd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh directory: a pid-named one collides across runs in a PID
+        // namespace, where the pid repeats.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         // `<dev>1` and `<dev>2` are symlinks to the real partition nodes.
         let (real1, real2) = (dir.join("real1"), dir.join("real2"));
         std::fs::write(&real1, "").unwrap();
@@ -2234,9 +2247,9 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             real2.canonicalize().unwrap().to_string_lossy().to_string(),
         );
         let mounts = format!(
-            "{c1} /mnt/one btrfs rw,subvolid=5,subvol=/ 0 0\n\
-             {c2} /sub btrfs rw,subvolid=256,subvol=/@ 0 0\n\
-             {c2} /mnt/two btrfs rw,subvolid=5,subvol=/ 0 0\n"
+            "40 1 0:41 / /mnt/one rw - btrfs {c1} rw,subvolid=5,subvol=/\n\
+             41 1 0:42 /@ /sub rw - btrfs {c2} rw,subvolid=256,subvol=/@\n\
+             42 1 0:42 / /mnt/two rw - btrfs {c2} rw,subvolid=5,subvol=/\n"
         );
         let resolver = |s: &str| (s == "SER").then(|| dev.clone());
         let find = |serial: &str, role: &TargetRole| {
@@ -2260,7 +2273,6 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             None,
             "not mounted"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

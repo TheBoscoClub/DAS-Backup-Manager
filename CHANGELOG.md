@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd walk` refuses a path under a refused target root, and finds a target's top level by what is mounted, not by its options** (bd `DAS-Backup-Manager-71q1`)
+  - `reconcile::VerifiedRoots::refusal_for` matched only the refused mount point itself, so `walk <refused root>/nvme` walked under a refused bind; anything under it is now refused, matched by component (`/mnt/ab` is not under `/mnt/a`)
+  - `health::find_mount_for_device` reads `/proc/self/mountinfo` and takes a mount only when its root (field 4) is `/`: `/proc/mounts` shows a bind of a subdirectory of the top level as `subvolid=5`, the same as the top level, so it could be picked and then refused by the FSROOT check
+  - A refused `walk` prints the refusal once; the error it returns says the target was not walked and points at it
+
 - **An ESP a killed recovery-OS reading left mounted no longer lets the DAS be called safe to disconnect** (bd `DAS-Backup-Manager-s5jv.1`): `backup-run.sh` 4.17.2's `unmount_all` releases anything mounted directly under `/run/das-backup/esp/` before the targets, and one that stays mounted fails the unmount step and gates the claim, as a target does
 - **A send that took under a second is reported, not called "no data transferred"** (bd `DAS-Backup-Manager-sp78.14`): the CLI/GUI report's `THROUGHPUT` line now reads `Total  <size> in under a second` when the run's whole-second duration is 0; before, the bytes sent were dropped and the line said nothing was sent
 - **A recovery drive whose partitions `lsblk` lists as none is "not checked", not a drive with no partitions** (bd `DAS-Backup-Manager-sp78.19`): `drive_partition_ids` returned an empty set, so every `etc/fstab` entry on that drive became a false `BOOT PROBLEM`; it now says why the fstab and ESP were not checked

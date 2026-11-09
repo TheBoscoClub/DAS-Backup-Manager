@@ -1799,8 +1799,7 @@ fn cmd_walk(
     // A mount point is not an identity: the root must be the configured
     // filesystem's top level before anything is read from or pruned under it.
     let verified = checked_roots(&cfg);
-    let refusal = verified.refusal_for(target).map(str::to_string);
-    let result = match &refusal {
+    let result = match verified.refusal_for(target) {
         Some(_) => None,
         None => Some(indexer::walk(target, &database)),
     };
@@ -1810,7 +1809,12 @@ fn cmd_walk(
     let still_mounted = guard.unmount(progress);
     let Some(result) = result else {
         mount::require_released(&still_mounted)?;
-        return Err(refusal.unwrap_or_default().into());
+        // checked_roots has printed why; say once what it meant (bd 71q1, F4).
+        return Err(format!(
+            "{} was not walked: refused, as said above",
+            target.display()
+        )
+        .into());
     };
     let result = result?;
     let (out, warning) = walk_report(json, &result, &reconciled);

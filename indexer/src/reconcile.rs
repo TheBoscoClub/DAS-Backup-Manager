@@ -207,13 +207,14 @@ pub struct VerifiedRoots {
 }
 
 impl VerifiedRoots {
-    /// The refusal message when `path` is a refused mount point.
+    /// The refusal message when `path` is a refused mount point or lies
+    /// under one (by component: `/mnt/ab` is not under `/mnt/a`).
     pub fn refusal_for(&self, path: &Path) -> Option<&str> {
         let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.refused.iter().find_map(|(mount, why)| {
             let m = Path::new(mount);
             let m = m.canonicalize().unwrap_or_else(|_| m.to_path_buf());
-            (m == want).then_some(why.as_str())
+            want.starts_with(&m).then_some(why.as_str())
         })
     }
 }
@@ -528,6 +529,13 @@ mod tests {
             Some(v.refused[0].1.as_str())
         );
         assert_eq!(v.refusal_for(Path::new("/mnt/other")), None);
+        // Anything under a refused root is refused too (bd 71q1, F2): walking
+        // /mnt/a/nvme walked under the refused bind. Matched by component.
+        assert_eq!(
+            v.refusal_for(Path::new("/mnt/a/nvme")),
+            Some(v.refused[0].1.as_str())
+        );
+        assert_eq!(v.refusal_for(Path::new("/mnt/ab")), None);
     }
 
     #[test]
