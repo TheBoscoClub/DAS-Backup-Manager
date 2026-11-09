@@ -126,9 +126,15 @@ through links root owns, bd `sp78.18`):
   grant a subdirectory, never `/srv` itself.
 - **`RESTORE_DENIED_ROOTS`** (`indexer/src/config.rs`) is checked first and **no configuration can
   override it** — system paths plus served roots `/srv/http` and `/srv/ftp`.
-- **No copied file or link goes through a link.** Every write of the copy paths is made under a directory
-  fd reached one name at a time, each opened `O_NOFOLLOW` (bd `fcmk`): a link on the way, planted or
-  swapped in after the check, is refused; `btrfs receive` gets the held directory's `/proc/<pid>/fd/<n>` (bd `sp78.18`).
+- **No copied file or link goes through a link, but one kind is followed.** Every write of the copy paths is
+  made under a directory fd reached one name at a time, each opened `O_NOFOLLOW` (bd `fcmk`): a link on the
+  way, planted or swapped in after the check, is refused; `btrfs receive` gets the held directory's
+  `/proc/<pid>/fd/<n>` (bd `sp78.18`). The destination itself is always reached strictly.
+- **The one link followed** (bd `mz3z`, operator 2026-11-09): **below** the destination, a link owned by root or
+  by the destination's owner (read through the held fd, `fstatat`) whose target — every link on its way passing
+  the same owner test — resolves under an `allowed_roots` entry and no denied root, to an existing directory.
+  That directory is re-opened from `/` by the strict walk; the link is never traversed. Any other link is
+  refused, naming the target and, when a grant would allow it, the `allowed_roots` entry to add; at most 8 per walk.
   Absolute or non-literal member paths are rejected.
 
 ## Email Reports

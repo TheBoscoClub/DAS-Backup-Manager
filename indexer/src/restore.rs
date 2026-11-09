@@ -141,7 +141,32 @@ pub fn check_dest_allowed(
 ) -> Result<std::path::PathBuf, String> {
     let resolved = resolve_for_policy(dest)
         .map_err(|e| format!("Cannot resolve destination '{}': {e}", dest.display()))?;
+    match judge_dest(resolved, allowed_roots) {
+        DestPolicy::Allowed(p) => Ok(p),
+        DestPolicy::Denied { resolved, root } => Err(format!(
+            "Refusing to restore into '{}': '{root}' is never a permitted destination",
+            resolved.display()
+        )),
+        DestPolicy::NotAllowed(resolved) => Err(format!(
+            "Refusing to restore into '{}': not under any [restore] allowed_roots ({})",
+            resolved.display(),
+            allowed_roots.join(", ")
+        )),
+    }
+}
 
+/// What the destination policy says of a resolved path.
+enum DestPolicy {
+    Allowed(std::path::PathBuf),
+    Denied {
+        resolved: std::path::PathBuf,
+        root: &'static str,
+    },
+    NotAllowed(std::path::PathBuf),
+}
+
+/// [`check_dest_allowed`]'s rule on a path already resolved.
+fn judge_dest(resolved: std::path::PathBuf, allowed_roots: &[String]) -> DestPolicy {
     // Each root is compared as written and resolved: the destination is
     // resolved, and a root reached through a link (`/home -> var/home`)
     // otherwise never matched it (bd DAS-Backup-Manager-sp78.18). For the
@@ -154,10 +179,10 @@ pub fn check_dest_allowed(
         if under(Path::new(denied))
             || resolve_for_policy(Path::new(denied)).is_ok_and(|r| resolved.starts_with(r))
         {
-            return Err(format!(
-                "Refusing to restore into '{}': '{denied}' is never a permitted destination",
-                resolved.display()
-            ));
+            return DestPolicy::Denied {
+                resolved,
+                root: denied,
+            };
         }
     }
 
@@ -165,13 +190,9 @@ pub fn check_dest_allowed(
         .iter()
         .any(|root| under_resolved(Path::new(root)))
     {
-        Ok(resolved)
+        DestPolicy::Allowed(resolved)
     } else {
-        Err(format!(
-            "Refusing to restore into '{}': not under any [restore] allowed_roots ({})",
-            resolved.display(),
-            allowed_roots.join(", ")
-        ))
+        DestPolicy::NotAllowed(resolved)
     }
 }
 
@@ -188,6 +209,13 @@ fn owner_of_link(path: &Path) -> Option<u32> {
 /// `None` when the root cannot be resolved, or a link on its way is not
 /// root's.
 fn resolve_root(root: &Path, owner: impl Fn(&Path) -> Option<u32>) -> Option<std::path::PathBuf> {
+    resolve_trusting(root, |link| owner(link) == Some(0))
+}
+
+/// `path` resolved one name at a time, every link met — in the path as
+/// written and inside any link's target — passing `trusted`; `None` when one
+/// does not, or the path cannot be resolved.
+fn resolve_trusting(root: &Path, trusted: impl Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
     // realpath, one name at a time, so every link met — in the root as
     // written AND inside any link's target — is judged by its owner.
@@ -214,7 +242,7 @@ fn resolve_root(root: &Path, owner: impl Fn(&Path) -> Option<u32>) -> Option<std
         match std::fs::symlink_metadata(&next) {
             Ok(m) if m.file_type().is_symlink() => {
                 hops += 1;
-                if hops > 40 || owner(&next) != Some(0) {
+                if hops > 40 || !trusted(&next) {
                     return None;
                 }
                 let target = std::fs::read_link(&next).ok()?;
@@ -352,10 +380,65 @@ fn safe_member(file_path: &str) -> Result<&Path, String> {
 /// `O_NOFOLLOW` on a path guards only its last name. Here each name is
 /// opened `O_NOFOLLOW | O_DIRECTORY` relative to the one before, so a link
 /// anywhere on the way — there from the start, or swapped in at any moment —
-/// is refused (`ELOOP`/`ENOTDIR`), never followed. That also refuses a link
-/// under the destination that points back inside it: no write goes through
-/// a link at all.
+/// is refused (`ELOOP`/`ENOTDIR`), never followed. No write goes through a
+/// link: below the destination, one link [`Follow`] admits is resolved and
+/// its directory re-opened by that real path the same way (bd mz3z).
 struct DirFd(std::os::fd::OwnedFd);
+
+/// When the walk below a destination may follow a link (bd
+/// DAS-Backup-Manager-mz3z): one owned by root or by the destination's owner
+/// whose target — every link on its way judged the same — resolves under an
+/// `allowed_roots` entry and no denied root, to an existing directory. That
+/// directory is then re-opened from `/` by the strict walk, so the link itself
+/// is never traversed. Any other link is refused, as before.
+struct Follow<'a> {
+    allowed_roots: &'a [String],
+    /// The owner of the destination's own root, held open by the restore.
+    dest_owner: u32,
+    /// The owner of the link `name` in the directory held: `fstatat` with
+    /// `AT_SYMLINK_NOFOLLOW`, never by path. A seam for tests.
+    link_owner: &'a dyn Fn(&DirFd, &std::ffi::CStr) -> std::io::Result<u32>,
+    /// The owner of a link met on the way to a target, by path. A seam.
+    path_owner: &'a dyn Fn(&Path) -> Option<u32>,
+}
+
+/// How many links one walk below a destination may follow.
+const MAX_FOLLOWS: u32 = 8;
+
+impl<'a> Follow<'a> {
+    /// The policy for a restore into `dest`, held open: the real owner
+    /// lookups.
+    fn on_this_host(allowed_roots: &'a [String], dest: &DirFd) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dest_owner = std::fs::File::from(dest.0.try_clone()?).metadata()?.uid();
+        Ok(Self {
+            allowed_roots,
+            dest_owner,
+            link_owner: &link_owner_at,
+            path_owner: &owner_of_link,
+        })
+    }
+}
+
+/// The owner of the link `name` in `dir`, read through the directory held
+/// (`fstatat`, `AT_SYMLINK_NOFOLLOW`): never by a path that could be swapped.
+fn link_owner_at(dir: &DirFd, name: &std::ffi::CStr) -> std::io::Result<u32> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: valid dir fd, NUL-terminated name, st large enough.
+    let r = unsafe {
+        libc::fstatat(
+            dir.raw(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstatat succeeded and filled st.
+    Ok(unsafe { st.assume_init() }.st_uid)
+}
 
 /// `name` as a C string: one path component, never empty, `.` or `..`.
 fn c_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
@@ -416,7 +499,13 @@ impl DirFd {
     /// as `create_dir_all`) when it is missing and `create` is set.
     fn child(&self, name: &std::ffi::OsStr, create: bool, at: &Path) -> std::io::Result<Self> {
         let c = c_name(name)?;
-        match Self::openat(self.raw(), &c) {
+        self.open_child(&c, create).map_err(|e| refuse_link(e, at))
+    }
+
+    /// `name` under this one, made when missing and `create` is set; the raw
+    /// error, a link met there being `ELOOP`.
+    fn open_child(&self, c: &std::ffi::CStr, create: bool) -> std::io::Result<Self> {
+        match Self::openat(self.raw(), c) {
             Err(e) if create && e.raw_os_error() == Some(libc::ENOENT) => {
                 // SAFETY: valid dir fd and NUL-terminated name.
                 if unsafe { libc::mkdirat(self.raw(), c.as_ptr(), 0o777) } != 0 {
@@ -425,9 +514,96 @@ impl DirFd {
                         return Err(e);
                     }
                 }
-                Self::openat(self.raw(), &c).map_err(|e| refuse_link(e, at))
+                Self::openat(self.raw(), c)
             }
-            r => r.map_err(|e| refuse_link(e, at)),
+            r => r,
+        }
+    }
+
+    /// Whether `name` in this directory is a symbolic link, asked of the
+    /// directory held (`fstatat`, `AT_SYMLINK_NOFOLLOW`).
+    fn is_link(&self, c: &std::ffi::CStr) -> bool {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: valid dir fd, NUL-terminated name, st large enough.
+        let r = unsafe {
+            libc::fstatat(
+                self.raw(),
+                c.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // SAFETY: fstatat succeeded and filled st.
+        r == 0 && (unsafe { st.assume_init() }.st_mode & libc::S_IFMT) == libc::S_IFLNK
+    }
+
+    /// The link `name` in this directory, at `at`, followed by `follow`'s
+    /// rule ([`Follow`]): the directory its target resolves to, re-opened from
+    /// `/` by the strict walk, and that directory's real path.
+    fn follow_link(
+        &self,
+        c: &std::ffi::CStr,
+        at: &Path,
+        follow: &Follow,
+    ) -> std::io::Result<(Self, std::path::PathBuf)> {
+        use std::os::unix::ffi::OsStrExt;
+        let refuse = |why: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("'{}' is a link {why}: not followed", at.display()),
+            )
+        };
+        let owner = (follow.link_owner)(self, c)?;
+        if owner != 0 && owner != follow.dest_owner {
+            return Err(refuse(format!(
+                "owned by uid {owner}, neither root nor the destination's owner (uid {})",
+                follow.dest_owner
+            )));
+        }
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: valid dir fd, NUL-terminated name, buffer of the length given.
+        let n =
+            unsafe { libc::readlinkat(self.raw(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        buf.truncate(n as usize);
+        let target = Path::new(std::ffi::OsStr::from_bytes(&buf));
+        // A relative target is read from the directory the link sits in;
+        // `at` is that directory's real path and the link's name.
+        let abs = match at.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target.to_path_buf(),
+        };
+        let trusted = |link: &Path| matches!((follow.path_owner)(link), Some(u) if u == 0 || u == follow.dest_owner);
+        let resolved = resolve_trusting(&abs, trusted).ok_or_else(|| {
+            refuse(format!(
+                "to '{}', and a link on the way there is not root's or the destination \
+                 owner's, or it cannot be resolved",
+                abs.display()
+            ))
+        })?;
+        match judge_dest(resolved, follow.allowed_roots) {
+            DestPolicy::Allowed(real) => {
+                let dir = Self::open_abs(&real, false).map_err(|e| {
+                    refuse(format!(
+                        "to '{}', which cannot be opened as a directory ({e})",
+                        real.display()
+                    ))
+                })?;
+                Ok((dir, real))
+            }
+            DestPolicy::Denied { resolved, root } => Err(refuse(format!(
+                "to '{}', under '{root}', which is never a permitted destination",
+                resolved.display()
+            ))),
+            DestPolicy::NotAllowed(resolved) => Err(refuse(format!(
+                "to '{}', not under any [restore] allowed_roots ({}); to restore through \
+                 it, add '{}' to [restore] allowed_roots",
+                resolved.display(),
+                follow.allowed_roots.join(", "),
+                resolved.display()
+            ))),
         }
     }
 
@@ -457,10 +633,13 @@ impl DirFd {
 
     /// The directory `rel` (literal names only) under this one, made when
     /// missing. `at` names this directory, for the error.
-    fn descend(&self, rel: &Path, at: &Path) -> std::io::Result<Self> {
+    fn descend(&self, rel: &Path, at: &Path, follow: &Follow) -> std::io::Result<Self> {
         use std::path::Component;
+        // `at` is always the real path of the directory reached: a followed
+        // link moves it to where the link resolved.
         let mut at = at.to_path_buf();
         let mut dir: Option<Self> = None;
+        let mut follows = 0;
         for component in rel.components() {
             let Component::Normal(name) = component else {
                 return Err(std::io::Error::new(
@@ -469,7 +648,32 @@ impl DirFd {
                 ));
             };
             at.push(name);
-            let next = dir.as_ref().unwrap_or(self).child(name, true, &at)?;
+            let here = dir.as_ref().unwrap_or(self);
+            let c = c_name(name)?;
+            let next = match here.open_child(&c, true) {
+                // A link there answers ENOTDIR (O_DIRECTORY) or ELOOP
+                // (O_NOFOLLOW); only one the held directory says is a link
+                // is judged for following.
+                Err(e)
+                    if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
+                        && here.is_link(&c) =>
+                {
+                    follows += 1;
+                    if follows > MAX_FOLLOWS {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "'{}': more than {MAX_FOLLOWS} links followed on the way",
+                                at.display()
+                            ),
+                        ));
+                    }
+                    let (d, real) = here.follow_link(&c, &at, follow)?;
+                    at = real;
+                    d
+                }
+                r => r.map_err(|e| refuse_link(e, &at))?,
+            };
             dir = Some(next);
         }
         match dir {
@@ -583,6 +787,7 @@ pub fn restore_files(
     // whenever it appears (DirFd).
     let dest_fd = DirFd::open_abs(dest, true)
         .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
+    let follow = Follow::on_this_host(allowed_roots, &dest_fd)?;
 
     let mut files_restored: usize = 0;
     let mut bytes_restored: u64 = 0;
@@ -634,7 +839,7 @@ pub fn restore_files(
             errors.push(format!("Path traversal blocked: '{file_path}'"));
             continue;
         };
-        let dir = match dest_fd.descend(rel_dir, dest) {
+        let dir = match dest_fd.descend(rel_dir, dest, &follow) {
             Ok(d) => d,
             Err(e) => {
                 errors.push(format!("Refusing '{file_path}': {e}"));
@@ -794,7 +999,7 @@ where
     }
 
     // Fallback: recursive copy preserving directory structure
-    restore_snapshot_recursive(snapshot_path, dest, &start, progress)
+    restore_snapshot_recursive(snapshot_path, dest, allowed_roots, &start, progress)
 }
 
 /// Try to restore using `btrfs send | btrfs receive`.
@@ -858,6 +1063,7 @@ fn send_receive_outcome(
 fn restore_snapshot_recursive(
     snapshot_path: &Path,
     dest: &Path,
+    allowed_roots: &[String],
     start: &Instant,
     progress: &dyn ProgressCallback,
 ) -> Result<RestoreResult, Box<dyn std::error::Error>> {
@@ -868,6 +1074,7 @@ fn restore_snapshot_recursive(
     // Every write below goes through this fd (DirFd).
     let dest_fd = DirFd::open_abs(dest, false)
         .map_err(|e| format!("Cannot open the destination '{}': {e}", dest.display()))?;
+    let follow = Follow::on_this_host(allowed_roots, &dest_fd)?;
 
     // Count total entries first for progress reporting (best-effort)
     let total_estimate: u64 = WalkDir::new(snapshot_path)
@@ -908,7 +1115,7 @@ fn restore_snapshot_recursive(
         // The directory this entry is, or lands in, reached and made under
         // the destination's fd with no link followed (DirFd).
         if file_type.is_dir() {
-            if let Err(e) = dest_fd.descend(rel_path, dest) {
+            if let Err(e) = dest_fd.descend(rel_path, dest, &follow) {
                 errors.push(format!("Refusing '{}': {e}", rel_path.display()));
             }
             continue;
@@ -917,7 +1124,7 @@ fn restore_snapshot_recursive(
             errors.push(format!("Refusing '{}': no file name", rel_path.display()));
             continue;
         };
-        let dir = match dest_fd.descend(rel_dir, dest) {
+        let dir = match dest_fd.descend(rel_dir, dest, &follow) {
             Ok(d) => d,
             Err(e) => {
                 errors.push(format!("Refusing '{}': {e}", rel_path.display()));
@@ -1186,16 +1393,19 @@ mod tests {
     fn restore_snapshot_recursive_does_not_write_through_a_linked_directory_at_the_destination() {
         // O_NOFOLLOW guards only the final component; a planted link to a
         // DIRECTORY carried create_dir_all and every write under it out of
-        // the destination.
+        // the destination. Since mz3z a link may be followed into a granted
+        // root; one into a root that is not granted still refuses.
         let snap = TempDir::new().unwrap();
         write_file(&snap.path().join("door"), "x.txt", "payload");
         let outside = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
         std::os::unix::fs::symlink(outside.path(), dest.path().join("door")).unwrap();
+        let only_dest = vec![dest.path().canonicalize().unwrap().display().to_string()];
 
         let result = restore_snapshot_recursive(
             snap.path(),
             dest.path(),
+            &only_dest,
             &Instant::now(),
             &crate::progress::NullProgress,
         )
@@ -1209,7 +1419,7 @@ mod tests {
             result
                 .errors
                 .iter()
-                .any(|e| e.contains("is a link or not a directory")),
+                .any(|e| e.contains("not under any [restore] allowed_roots")),
             "the refusal must be REPORTED: {:?}",
             result.errors
         );
@@ -1233,6 +1443,7 @@ mod tests {
         let result = restore_snapshot_recursive(
             snap.path(),
             dest.path(),
+            &test_roots(),
             &Instant::now(),
             &crate::progress::NullProgress,
         )
@@ -1758,6 +1969,186 @@ mod tests {
         }
     }
 
+    // --- bd DAS-Backup-Manager-mz3z: which links a restore follows -------
+
+    /// A destination with `door` linked to `target`; the walk below it with
+    /// `roots` granted and the owners the seams answer.
+    fn walk_through_door(
+        dest: &Path,
+        roots: &[String],
+        link_uid: u32,
+        chain_uid: Option<u32>,
+        rel: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let dest = dest.canonicalize()?;
+        let fd = DirFd::open_abs(&dest, false)?;
+        let me = fs::metadata(&dest)?.uid();
+        let link_owner = |_: &DirFd, _: &std::ffi::CStr| Ok(link_uid);
+        let path_owner = |_: &Path| Some(chain_uid.unwrap_or(me));
+        let follow = Follow {
+            allowed_roots: roots,
+            dest_owner: me,
+            link_owner: &link_owner,
+            path_owner: &path_owner,
+        };
+        let dir = fd.descend(Path::new(rel), &dest, &follow)?;
+        // Where it landed, as the kernel sees the fd.
+        fs::read_link(format!("/proc/self/fd/{}", dir.raw()))
+    }
+
+    fn me() -> u32 {
+        // SAFETY: getuid cannot fail.
+        unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn a_link_the_destination_owner_made_into_a_granted_root_is_followed() {
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), dest.path().join("door")).unwrap();
+        let landed = walk_through_door(dest.path(), &test_roots(), me(), None, "door/sub").unwrap();
+        assert_eq!(landed, target.path().canonicalize().unwrap().join("sub"));
+        assert!(target.path().join("sub").is_dir(), "made under the target");
+        // A root-owned link is trusted too.
+        let landed = walk_through_door(dest.path(), &test_roots(), 0, None, "door").unwrap();
+        assert_eq!(landed, target.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_link_into_a_root_not_granted_is_refused_and_names_the_grant() {
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), dest.path().join("door")).unwrap();
+        let only_dest = vec![dest.path().canonicalize().unwrap().display().to_string()];
+        let err = walk_through_door(dest.path(), &only_dest, me(), None, "door").unwrap_err();
+        let want = format!(
+            "add '{}' to [restore] allowed_roots",
+            target.path().canonicalize().unwrap().display()
+        );
+        assert!(err.to_string().contains(&want), "{err}");
+    }
+
+    #[test]
+    fn a_link_into_a_denied_root_is_refused_whatever_is_granted() {
+        let dest = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/etc", dest.path().join("door")).unwrap();
+        let mut roots = test_roots();
+        roots.push("/".into());
+        let err = walk_through_door(dest.path(), &roots, me(), None, "door").unwrap_err();
+        assert!(
+            err.to_string().contains("never a permitted destination"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("add '"),
+            "no grant can allow it: {err}"
+        );
+    }
+
+    #[test]
+    fn a_link_another_user_owns_is_never_followed() {
+        // The fcmk case: a local user owning a directory under the
+        // destination plants a link there, into a root that IS granted.
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), dest.path().join("door")).unwrap();
+        let err =
+            walk_through_door(dest.path(), &test_roots(), 4242, None, "door/sub").unwrap_err();
+        assert!(err.to_string().contains("owned by uid 4242"), "{err}");
+        assert!(
+            !target.path().join("sub").exists(),
+            "nothing made through it"
+        );
+        // A link on the way to the target, owned by another user: refused too.
+        let mid = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), mid.path().join("hop")).unwrap();
+        std::fs::remove_file(dest.path().join("door")).unwrap();
+        std::os::unix::fs::symlink(mid.path().join("hop"), dest.path().join("door")).unwrap();
+        let err =
+            walk_through_door(dest.path(), &test_roots(), me(), Some(4242), "door").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not root's or the destination owner's"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_dangling_link_or_a_link_to_a_file_is_refused() {
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path().join("gone"), dest.path().join("door")).unwrap();
+        let err =
+            walk_through_door(dest.path(), &test_roots(), me(), None, "door/sub").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be opened as a directory"),
+            "{err}"
+        );
+        assert!(
+            !target.path().join("gone").exists(),
+            "never made through a link"
+        );
+        fs::write(target.path().join("file"), "x").unwrap();
+        std::fs::remove_file(dest.path().join("door")).unwrap();
+        std::os::unix::fs::symlink(target.path().join("file"), dest.path().join("door")).unwrap();
+        assert!(walk_through_door(dest.path(), &test_roots(), me(), None, "door").is_err());
+    }
+
+    #[test]
+    fn a_relative_link_resolves_from_where_it_sits_and_follows_are_bounded() {
+        let dest = TempDir::new().unwrap();
+        let base = dest.path().canonicalize().unwrap();
+        // dest/l0 -> t0, t0/l1 -> ../t1, ... : each hop relative to its own dir.
+        for i in 0..=MAX_FOLLOWS {
+            fs::create_dir(base.join(format!("t{i}"))).unwrap();
+        }
+        std::os::unix::fs::symlink("t0", base.join("l0")).unwrap();
+        for i in 1..=MAX_FOLLOWS {
+            std::os::unix::fs::symlink(format!("../t{i}"), base.join(format!("t{}/l{i}", i - 1)))
+                .unwrap();
+        }
+        let hops = |n: u32| {
+            (0..n)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let landed =
+            walk_through_door(&base, &test_roots(), me(), None, &hops(MAX_FOLLOWS)).unwrap();
+        assert_eq!(landed, base.join(format!("t{}", MAX_FOLLOWS - 1)));
+        let err = walk_through_door(&base, &test_roots(), me(), None, &hops(MAX_FOLLOWS + 1))
+            .unwrap_err();
+        assert!(err.to_string().contains("links followed"), "{err}");
+    }
+
+    #[test]
+    fn restore_files_writes_through_an_own_link_into_a_granted_root() {
+        let snap = TempDir::new().unwrap();
+        write_file(&snap.path().join("Music"), "song.flac", "audio");
+        let dest = TempDir::new().unwrap();
+        let relocated = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(relocated.path(), dest.path().join("Music")).unwrap();
+        let result = restore_files(
+            snap.path(),
+            &["Music/song.flac"],
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &crate::progress::NullProgress,
+        )
+        .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            fs::read_to_string(relocated.path().join("song.flac")).unwrap(),
+            "audio"
+        );
+        assert!(
+            dest.path().join("Music").is_symlink(),
+            "the link itself is left as it was"
+        );
+    }
+
     #[test]
     fn restore_files_does_not_write_through_a_symlink_planted_at_the_destination() {
         let snap = TempDir::new().unwrap();
@@ -1902,18 +2293,21 @@ mod tests {
     #[test]
     fn restore_files_does_not_write_through_a_linked_directory_at_the_destination() {
         // A link already at the destination (planted, or restored earlier as a
-        // link) must not carry a later member's write out of the destination.
+        // link) must not carry a later member's write out of the destination
+        // into a root that is not granted (bd mz3z: one into a granted root
+        // is followed — see restore_files_writes_through_an_own_link_...).
         let snap = TempDir::new().unwrap();
         write_file(&snap.path().join("door"), "x.txt", "payload");
         let outside = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
         std::os::unix::fs::symlink(outside.path(), dest.path().join("door")).unwrap();
+        let only_dest = vec![dest.path().canonicalize().unwrap().display().to_string()];
 
         let result = restore_files(
             snap.path(),
             &["door/x.txt"],
             dest.path(),
-            &test_roots(),
+            &only_dest,
             &test_sources(snap.path()),
             &Recorder::default(),
         )
@@ -1922,7 +2316,7 @@ mod tests {
         assert_eq!(result.files_restored, 0);
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
-            result.errors[0].contains("is a link or not a directory"),
+            result.errors[0].contains("not under any [restore] allowed_roots"),
             "{:?}",
             result.errors
         );
@@ -2168,9 +2562,14 @@ mod tests {
         let dest = TempDir::new().unwrap();
         let progress = Recorder::default();
 
-        let result =
-            restore_snapshot_recursive(snap.path(), dest.path(), &Instant::now(), &progress)
-                .unwrap();
+        let result = restore_snapshot_recursive(
+            snap.path(),
+            dest.path(),
+            &test_roots(),
+            &Instant::now(),
+            &progress,
+        )
+        .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.files_restored, 3, "two files and the symlink");
