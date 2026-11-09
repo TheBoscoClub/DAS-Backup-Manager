@@ -1239,11 +1239,11 @@ pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
 /// discovered (`.claude/rules/esp-safety.md`). Mounted elsewhere, it is left
 /// as it is; mounted at its own directory, an earlier reading left it, and
 /// it is taken down as a target an earlier job left is (bd jgm).
-pub fn read_recovery_esp(
+pub fn read_recovery_esp<T>(
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
-    read: &dyn Fn(&Path) -> Result<Vec<String>, String>,
-) -> Result<Vec<String>, String> {
+    read: &dyn Fn(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     read_recovery_esp_with(
         &SystemRunner,
         Path::new(ESP_MOUNT_ROOT),
@@ -1253,13 +1253,13 @@ pub fn read_recovery_esp(
     )
 }
 
-fn read_recovery_esp_with(
+fn read_recovery_esp_with<T>(
     runner: &dyn CommandRunner,
     root: &Path,
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
-    read: &dyn Fn(&Path) -> Result<Vec<String>, String>,
-) -> Result<Vec<String>, String> {
+    read: &dyn Fn(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     let pu = target
         .esp_partuuid
         .as_deref()
@@ -1307,7 +1307,7 @@ fn read_recovery_esp_with(
         .mode(0o700)
         .create(&dir)
         .map_err(|e| format!("{dir_s}: {e}"))?;
-    let gone = |r: Result<Vec<String>, String>| {
+    let gone = |r: Result<T, String>| {
         // Empty once unmounted; a directory left behind is only clutter.
         let _ = std::fs::remove_dir(&dir);
         r

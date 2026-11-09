@@ -5,7 +5,7 @@
         "age_basis": "last_applied_upgrade",
         "age_days": 19,
         "boot_problems": [],
-        "esp_unchecked": null,
+        "esp": null,
         "fstab_unchecked": null,
         "reasons": [],
         "stale": false,

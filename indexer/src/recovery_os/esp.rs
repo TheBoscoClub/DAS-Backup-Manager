@@ -14,11 +14,59 @@ use std::path::Path;
 /// a file on the ESP.
 const FILE_KEYS: [&str; 4] = ["linux", "initrd", "efi", "devicetree"];
 
+/// What a reading of an ESP found: how much it had to boot, and what would
+/// stop that boot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Findings {
+    /// `loader/entries/*.conf` read.
+    pub entries: usize,
+    /// `EFI/Linux/*.efi`, counted only when there is no entry.
+    pub unified: usize,
+    /// One line per file an entry names that the ESP does not hold, or the
+    /// one line saying there is nothing to boot.
+    pub problems: Vec<String>,
+}
+
+impl Findings {
+    /// The report's `ESP` row: a reading that found nothing wrong says what
+    /// it read, so it is never mistaken for one that never ran.
+    pub fn summary(&self) -> String {
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let read = if self.entries > 0 {
+            plural(self.entries, "loader entry", "loader entries")
+        } else {
+            format!(
+                "no loader entry, {}",
+                plural(
+                    self.unified,
+                    "unified kernel image",
+                    "unified kernel images"
+                )
+            )
+        };
+        if self.problems.is_empty() {
+            format!("checked: {read}, every file they name is there")
+        } else {
+            format!(
+                "checked: {read}, {} — see BOOT PROBLEM",
+                plural(self.problems.len(), "problem", "problems")
+            )
+        }
+    }
+}
+
+/// [`read_loader`]'s problems alone.
+#[cfg(test)]
+fn loader_problems(esp: &Path) -> Result<Vec<String>, String> {
+    read_loader(esp).map(|f| f.problems)
+}
+
 /// What would stop a boot from the ESP mounted at `esp`: each file a
 /// `loader/entries/*.conf` entry names that the ESP does not hold, and an
 /// ESP with no entry and no unified kernel image (`EFI/Linux/*.efi`) at all.
 /// `Err` when the ESP could not be read.
-pub fn loader_problems(esp: &Path) -> Result<Vec<String>, String> {
+pub fn read_loader(esp: &Path) -> Result<Findings, String> {
     let mut entries = names_in(esp, "loader/entries")?
         .into_iter()
         .filter(|n| n.to_ascii_lowercase().ends_with(".conf"))
@@ -27,8 +75,9 @@ pub fn loader_problems(esp: &Path) -> Result<Vec<String>, String> {
     if entries.is_empty() {
         let unified = names_in(esp, "EFI/Linux")?
             .iter()
-            .any(|n| n.to_ascii_lowercase().ends_with(".efi"));
-        return Ok(if unified {
+            .filter(|n| n.to_ascii_lowercase().ends_with(".efi"))
+            .count();
+        let problems = if unified > 0 {
             Vec::new()
         } else {
             vec![
@@ -36,9 +85,15 @@ pub fn loader_problems(esp: &Path) -> Result<Vec<String>, String> {
                  nothing to boot"
                     .to_string(),
             ]
+        };
+        return Ok(Findings {
+            entries: 0,
+            unified,
+            problems,
         });
     }
     let mut problems = Vec::new();
+    let count = entries.len();
     for name in entries {
         let rel = format!("loader/entries/{name}");
         let text = std::fs::read_to_string(esp.join(&rel)).map_err(|e| format!("{rel}: {e}"))?;
@@ -62,7 +117,11 @@ pub fn loader_problems(esp: &Path) -> Result<Vec<String>, String> {
             }
         }
     }
-    Ok(problems)
+    Ok(Findings {
+        entries: count,
+        unified: 0,
+        problems,
+    })
 }
 
 /// The names in the ESP directory `rel`; none when it does not exist.
@@ -269,6 +328,27 @@ mod tests {
         assert_eq!(loader_problems(d.path()).unwrap().len(), 1);
         write(d.path(), "EFI/Linux/linux-cachyos.efi", "x");
         assert_eq!(loader_problems(d.path()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn the_summary_says_what_was_read_whether_or_not_anything_is_missing() {
+        let d = esp();
+        let f = read_loader(d.path()).unwrap();
+        assert_eq!(
+            f.summary(),
+            "checked: 2 loader entries, every file they name is there"
+        );
+        std::fs::remove_file(d.path().join("amd-ucode.img")).unwrap();
+        assert_eq!(
+            read_loader(d.path()).unwrap().summary(),
+            "checked: 2 loader entries, 2 problems — see BOOT PROBLEM"
+        );
+        let u = tempfile::tempdir().unwrap();
+        write(u.path(), "EFI/Linux/linux-cachyos.efi", "x");
+        assert_eq!(
+            read_loader(u.path()).unwrap().summary(),
+            "checked: no loader entry, 1 unified kernel image, every file they name is there"
+        );
     }
 
     #[test]
