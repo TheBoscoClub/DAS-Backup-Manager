@@ -4050,7 +4050,9 @@ mod tests {
     /// existing table), returns at its `version >=
     /// 4`, records runs; its `rebuild_content_tables` resets the stamp and
     /// stamps 4. None of it touches coverage, and this binary then finds
-    /// the coverage rows where they were.
+    /// the coverage rows where they were. A schema-5 binary on a schema-6
+    /// database does the same and stamps 5; the next open here re-runs the
+    /// nullable rebuild, idempotent by the table's shape.
     #[test]
     fn an_older_binary_on_a_v5_database_works_and_leaves_coverage_alone() {
         let dir = tempfile::tempdir().unwrap();

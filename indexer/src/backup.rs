@@ -3933,6 +3933,22 @@ impl RecordHost for SystemRecordHost {
 mod tests {
     use super::*;
 
+    /// bd DAS-Backup-Manager-sp78.14: the usage line sums what was read and
+    /// counts what was not, never folding an unread target into the sum.
+    #[test]
+    fn usage_text_sums_the_read_targets_and_names_the_unread_ones() {
+        let usage: TargetUsage =
+            [("a".to_string(), Some(1000)), ("b".to_string(), Some(24))].into();
+        assert_eq!(usage_text(&usage), "1024 bytes");
+        let usage: TargetUsage = [
+            ("a".to_string(), Some(1000)),
+            ("b".to_string(), None),
+            ("c".to_string(), None),
+        ]
+        .into();
+        assert_eq!(usage_text(&usage), "1000 bytes (2 target(s) unreadable)");
+    }
+
     #[test]
     fn the_record_step_mounts_its_drives_read_only() {
         let mut drives = make_test_config();

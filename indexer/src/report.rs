@@ -358,15 +358,21 @@ pub fn format_report_from(
 
     // Throughput — simple summary from result data.
     r.push_str(&format!("\nTHROUGHPUT\n{thin}\n"));
-    if let Some(bytes) = result.bytes_sent.filter(|&b| b > 0)
-        && result.duration_secs > 0
-    {
-        let rate = bytes as f64 / result.duration_secs as f64;
-        r.push_str(&format!(
-            "  Total                    {} @ {}/s\n",
-            format_bytes(bytes),
-            format_bytes(rate as u64),
-        ));
+    if let Some(bytes) = result.bytes_sent.filter(|&b| b > 0) {
+        // Whole seconds: a send under one has no rate to give, but it sent.
+        if result.duration_secs > 0 {
+            let rate = bytes as f64 / result.duration_secs as f64;
+            r.push_str(&format!(
+                "  Total                    {} @ {}/s\n",
+                format_bytes(bytes),
+                format_bytes(rate as u64),
+            ));
+        } else {
+            r.push_str(&format!(
+                "  Total                    {} in under a second\n",
+                format_bytes(bytes)
+            ));
+        }
     } else if result.bytes_sent.is_none() {
         // A target read before the steps and not after (bd DAS-Backup-Manager-3lpr).
         r.push_str("  (not measured — a target could not be read after the steps)\n");
@@ -900,6 +906,42 @@ mod tests {
     fn format_bytes_fractional() {
         assert_eq!(format_bytes(1_610_612_736), "1.50 GiB");
         assert_eq!(format_bytes(2_684_354_560), "2.50 GiB");
+    }
+
+    /// bd DAS-Backup-Manager-sp78.14: the rate is bytes over seconds, and a
+    /// send that took under a second still says what it sent.
+    #[test]
+    fn the_throughput_line_says_the_rate_and_never_hides_a_quick_send() {
+        let with = |bytes: u64, secs: u64| {
+            let result = BackupResult {
+                success: true,
+                mode: BackupMode::Incremental,
+                snapshots_created: Some(1),
+                snapshots_sent: Some(1),
+                snapshots_cleaned: 0,
+                bytes_sent: Some(bytes),
+                boot: crate::backup::BootStep::NotSelected,
+                recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+                indexed: false,
+                report_sent: false,
+                errors: vec![],
+                duration_secs: secs,
+                coverage_message: String::new(),
+            };
+            format_report(&result, &Config::default())
+        };
+        let gib = 1_073_741_824;
+        let report = with(4 * gib, 4);
+        assert!(
+            report.contains("  Total                    4.00 GiB @ 1.00 GiB/s\n"),
+            "{report}"
+        );
+        let report = with(512 * 1024, 0);
+        assert!(
+            report.contains("  Total                    512.00 KiB in under a second\n"),
+            "{report}"
+        );
+        assert!(!report.contains("no data transferred"), "{report}");
     }
 
     #[test]

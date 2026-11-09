@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A send that took under a second is reported, not called "no data transferred"** (bd `DAS-Backup-Manager-sp78.14`): the CLI/GUI report's `THROUGHPUT` line now reads `Total  <size> in under a second` when the run's whole-second duration is 0; before, the bytes sent were dropped and the line said nothing was sent
 - **A recovery drive whose partitions `lsblk` lists as none is "not checked", not a drive with no partitions** (bd `DAS-Backup-Manager-sp78.19`): `drive_partition_ids` returned an empty set, so every `etc/fstab` entry on that drive became a false `BOOT PROBLEM`; it now says why the fstab and ESP were not checked
 
 - **A target an earlier job left mounted is taken down by the next job** (bd `DAS-Backup-Manager-jgm`): a failed unmount released the maintenance lock with the target still mounted, and the next job used it as found — with the earlier job's mount options (a `recovery-os record` job reused a read-write mount it should have opened read-only) — and left it mounted again
