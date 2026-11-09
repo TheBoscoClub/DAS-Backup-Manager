@@ -603,7 +603,7 @@ pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
 /// Find where a device partition is currently mounted, regardless of path.
 ///
 /// Resolves the target's serial to a block device, determines its partition
-/// based on role, then scans `/proc/mounts` for that device.  Returns the
+/// based on role, then scans `/proc/self/mountinfo` for that device.  Returns the
 /// actual mount path (which may be `/run/media/…` from udisks2, or the
 /// configured `/mnt/backup-…`, or wherever the kernel says it is).
 pub fn find_mount_for_device(serial: &str, role: &TargetRole) -> Option<String> {
@@ -621,7 +621,7 @@ pub fn find_mount_for_device_with(
 ) -> Option<String> {
     let dev = dev_of_serial(serial)?;
     let part = crate::mount::partition_device(&dev, role);
-    // Canonicalize the partition device so we match /proc/mounts entries that
+    // Canonicalize the partition device so we match mountinfo entries that
     // use the real path (e.g. /dev/sdk1) rather than a symlink.
     let canonical_part = std::fs::canonicalize(&part)
         .ok()
@@ -698,7 +698,7 @@ pub fn find_any_mount(configured_path: &str, serial: &str, role: &TargetRole) ->
     if cfg_path.exists() && is_mountpoint(cfg_path) {
         return Some(configured_path.to_string());
     }
-    // 2. Fall back to scanning /proc/mounts by device.
+    // 2. Fall back to scanning /proc/self/mountinfo by device.
     find_mount_for_device(serial, role)
 }
 
