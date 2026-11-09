@@ -3089,8 +3089,10 @@ compute_growth_stats() {
     local current_used="$2"
     local lookback_days="$3"
 
+    # No reading is "unknown", never the 0 a measured flat target gives
+    # (bd DAS-Backup-Manager-sp78.9).
     if [[ ! -f "$GROWTH_LOG" ]]; then
-        echo "0"
+        echo "unknown"
         return
     fi
 
@@ -3113,13 +3115,13 @@ compute_growth_stats() {
     done < "$GROWTH_LOG"
 
     if (( oldest_epoch == 0 )); then
-        echo "0"
+        echo "unknown"
         return
     fi
 
     local actual_days=$(( (now - oldest_epoch) / 86400 ))
     if (( actual_days <= 0 )); then
-        echo "0"
+        echo "unknown"
         return
     fi
 
@@ -3536,18 +3538,26 @@ generate_growth_section() {
         # The averages compare against the current reading; with none, they
         # are not computed rather than computed against 0.
         local current="${USAGE_AFTER[$mnt]:-}"
-        local avg_7d=0 avg_30d=0
+        local avg_7d=unknown avg_30d=unknown
         if [[ "$current" =~ ^[[:digit:]]+$ ]]; then
             avg_7d=$(compute_growth_stats "$mnt" "$current" 7)
             avg_30d=$(compute_growth_stats "$mnt" "$current" 30)
         fi
 
-        if (( avg_7d > 0 )); then
-            printf "    7-day avg:          %s/day\n" "$(format_bytes "$avg_7d")"
-        fi
-        if (( avg_30d > 0 )); then
-            printf "    30-day avg:         %s/day\n" "$(format_bytes "$avg_30d")"
-        fi
+        # "unknown": no history to average over — said so, never shown as a
+        # flat target's 0 (bd sp78.9). The runway below counts it as no rate.
+        local span avg
+        for span in 7 30; do
+            avg=$avg_7d
+            ((span == 30)) && avg=$avg_30d
+            if [[ "$avg" =~ ^[[:digit:]]+$ ]]; then
+                printf "    %-20s%s/day\n" "$span-day avg:" "$(format_bytes "$avg")"
+            else
+                printf "    %-20s%s\n" "$span-day avg:" "unknown (not enough growth history)"
+            fi
+        done
+        [[ "$avg_7d" =~ ^[[:digit:]]+$ ]] || avg_7d=0
+        [[ "$avg_30d" =~ ^[[:digit:]]+$ ]] || avg_30d=0
 
         # Capacity runway projection (cached avail bytes, captured while mounted)
         local avail_bytes="${AVAIL_BYTES[$mnt]:-0}"

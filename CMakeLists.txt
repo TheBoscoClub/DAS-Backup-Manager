@@ -333,6 +333,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_presence.sh
     )
     add_test(
+        NAME shell-growth-stats
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_growth_stats.sh
+    )
+    add_test(
         NAME shell-recovery-os-vm
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_os_vm.sh
     )
