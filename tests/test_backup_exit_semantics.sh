@@ -1830,6 +1830,9 @@ show_tail 3
 check "a foreign filesystem at the target's path: not unmounted before the abort" \
     "$(grep -c "was left mounted by an earlier job" "$STATE/out")" "0"
 check "a foreign filesystem at the target's path: never mounted over it" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "a foreign filesystem at the target's path: never unmounted, not even by cleanup()" \
+    "$(calls_for umount "$PRIMARY_MNT")" "0"
+check "a foreign filesystem at the target's path: still mounted" "$(left_mounted)" "$PRIMARY_MNT "
 check "a foreign filesystem at the target's path: what aborted" \
     "$(body_field 1 'What aborted')" "a mount at a target's path"
 check "a foreign filesystem at the target's path: why" \

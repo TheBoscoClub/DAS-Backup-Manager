@@ -1836,10 +1836,16 @@ subject_status() {
 # filesystem stays live, the state the "safe to disconnect" check exists to
 # catch. On a busy local btrfs `-f` is refused like the plain unmount
 # (measured on a loop device, 2026-11-09).
+# Target mount points found holding something other than the target before
+# this run mounted anything there: never unmounted by this run.
+FOREIGN_TARGET_MOUNTS=()
+
 take_down_leftover() {
     local label="$1"
     local mnt="${TARGET_MOUNTS[$label]}" err
     if ! mounted_is_target "$label"; then
+        # unmount_all() leaves it too, and counts it against "safe to disconnect".
+        FOREIGN_TARGET_MOUNTS+=("$mnt")
         log_error "ABORTING: $mnt is mounted, but not by target $label — not this run's to unmount"
         log_error "  - $IDENTITY_WHY"
         record_op "mount_targets" "FAIL" "$IDENTITY_WHY"
@@ -2786,6 +2792,13 @@ unmount_all() {
     local mnt why
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         mnt="${ALL_TARGET_MOUNTS[$i]}"
+        # Not the target and not this run's (take_down_leftover, bd jgm):
+        # left as found, and the DAS is not called safe to disconnect.
+        if [[ " ${FOREIGN_TARGET_MOUNTS[*]} " == *" $mnt "* ]]; then
+            log_error "  $mnt holds a filesystem that is not its target — left mounted, not this run's"
+            still_mounted+=("$mnt")
+            continue
+        fi
         probe_state "$mnt"
         why="$PROBE_WHY"
         case "$PROBE_STATE" in
