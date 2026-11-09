@@ -1480,7 +1480,29 @@ pub fn status_noting_until(
                         },
                         Err(why) => assessment.fstab_unchecked = Some(why.clone()),
                     }
-                    match esp(t, ids.as_ref().map_err(String::as_str)) {
+                    // The partitions are the disk under whatever is mounted
+                    // there: a target named by its filesystem has its ESP read
+                    // only once that filesystem is shown to be it (bd
+                    // DAS-Backup-Manager-sp78.21).
+                    let not_it = t
+                        .mount_uuid
+                        .as_deref()
+                        .and_then(|want| match before.as_deref() {
+                            Some(got) if got.eq_ignore_ascii_case(want) => None,
+                            Some(got) => Some(format!(
+                                "{} holds filesystem {got}, not this target's {want}",
+                                mount.display()
+                            )),
+                            None => Some(format!(
+                                "the filesystem at {} could not be told to be this target's {want}",
+                                mount.display()
+                            )),
+                        });
+                    let asked = match not_it {
+                        Some(why) => Some(Err(why)),
+                        None => esp(t, ids.as_ref().map_err(String::as_str)),
+                    };
+                    match asked {
                         Some(Ok(found)) => {
                             assessment.esp = Some(found.summary());
                             assessment.boot_problems.extend(found.problems);
@@ -4368,6 +4390,65 @@ mod tests {
         // A caller with no way to look shows no row.
         let entries = read(&listed, &|_, _| None);
         assert!(!format_section(&entries, &current_host()).contains("ESP  "));
+    }
+
+    #[test]
+    fn the_esp_is_asked_only_when_the_mount_is_shown_to_be_the_target() {
+        // bd DAS-Backup-Manager-sp78.21: the partitions listed are the disk
+        // under whatever is mounted there, so a target with a mount_uuid has
+        // its ESP read only when that filesystem is the target's.
+        let a = tempfile::tempdir().unwrap();
+        current_root(&a.path().join("@"));
+        let mut cfg = mirror_config(&[("A", a.path().to_str().unwrap())]);
+        cfg.targets[1].mount_uuid = Some("5eed0008-0000-4000-8000-000000000008".into());
+        cfg.targets[1].esp_partuuid = Some("5eed0025-0000-4000-8000-000000000025".into());
+        let read = |fs: &dyn Fn(&Path) -> Option<String>| {
+            let entries = status_noting_until(
+                &cfg,
+                &current_host(),
+                TODAY,
+                &|_| true,
+                fs,
+                &|_| Some(Ok(ids(&["PARTUUID=5eed0025-0000-4000-8000-000000000025"]))),
+                &|_, _| {
+                    Some(Ok(esp::Findings {
+                        entries: 1,
+                        unified: 0,
+                        problems: vec!["asked".into()],
+                    }))
+                },
+                &mut |_| {},
+                &|| false,
+            );
+            match &entries[0].report {
+                DriveReport::Inspected { assessment, .. } => assessment.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        // Another filesystem at the mount point: never asked.
+        let other = read(&|_| Some("5eed0099-0000-4000-8000-000000000099".into()));
+        assert!(other.boot_problems.is_empty(), "{other:?}");
+        assert!(
+            other
+                .esp
+                .as_deref()
+                .is_some_and(|e| e.starts_with("not checked:")
+                    && e.contains("5eed0099")
+                    && e.contains("5eed0008")),
+            "{other:?}"
+        );
+        // What is mounted cannot be told: never asked either.
+        let unknown = read(&|_| None);
+        assert!(unknown.boot_problems.is_empty(), "{unknown:?}");
+        assert!(
+            unknown
+                .esp
+                .as_deref()
+                .is_some_and(|e| e.starts_with("not checked:"))
+        );
+        // The target's own filesystem, in any case: asked.
+        let own = read(&|_| Some("5EED0008-0000-4000-8000-000000000008".into()));
+        assert_eq!(own.boot_problems, ["asked"], "{own:?}");
     }
 
     #[test]
