@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A recovery drive whose partitions `lsblk` lists as none is "not checked", not a drive with no partitions** (bd `DAS-Backup-Manager-sp78.19`): `drive_partition_ids` returned an empty set, so every `etc/fstab` entry on that drive became a false `BOOT PROBLEM`; it now says why the fstab and ESP were not checked
+
 - **A target an earlier job left mounted is taken down by the next job** (bd `DAS-Backup-Manager-jgm`): a failed unmount released the maintenance lock with the target still mounted, and the next job used it as found — with the earlier job's mount options (a `recovery-os record` job reused a read-write mount it should have opened read-only) — and left it mounted again
   - The next job that owns the maintenance lock checks the mount is the target (filesystem UUID, else drive serial), unmounts it — 5 tries 2 s apart, then one `umount -f` — and mounts it afresh, so it owns and gives back the mount it uses: `backup-run.sh` `mount_targets` (4.17.0), `mount::ensure_targets_mounted` (CLI/GUI backup, `walk`, `restore`, `backup boot-archive`, `recovery-os record`) and the scrub engine
   - One that will not come down even with `umount -f` refuses the job before it mounts anything: `backup-run.sh` aborts with 3 and one ABORTED report (`What aborted: a leftover mount`), so a supervisor never restarts into the same refusal; a filesystem at the path that is not the target is refused and never unmounted — not even by the abort's cleanup, which before this release took it down on the way out — and the DAS is then not called safe to disconnect (`a mount at a target's path`)
