@@ -607,6 +607,13 @@ if ! exec 9>"$LOCKFILE"; then
     echo "[ERROR] Cannot open the backup lock $LOCKFILE — could not start" >&2
     exit 1
 fi
+# flock works on a read-only descriptor, so a lock file anyone can open is one
+# anyone can hold, keeping the nightly backup and scrub waiting: root's alone
+# (bd DAS-Backup-Manager-qab). A regular file only; a failure is said, the lock
+# still works.
+if [[ -f "$LOCKFILE" && ! -L "$LOCKFILE" ]] && ! chmod 600 -- "$LOCKFILE"; then
+    echo "[WARN] Cannot make $LOCKFILE root's alone (0600): any local user can hold it" >&2
+fi
 lock_rc=0
 flock -n -E 75 9 || lock_rc=$?
 if ((lock_rc == 75)); then
@@ -890,6 +897,11 @@ acquire_maintenance_lock() {
     # the run does. Never `flock -u 8` while a child may hold the
     # description — that releases it for the child as well.
     exec 8<>"$MAINTENANCE_LOCKFILE"
+    # Root's alone: a lock file anyone can open is one anyone can hold (bd qab).
+    if [[ -f "$MAINTENANCE_LOCKFILE" && ! -L "$MAINTENANCE_LOCKFILE" ]] &&
+        ! chmod 600 -- "$MAINTENANCE_LOCKFILE"; then
+        log_warn "Cannot make $MAINTENANCE_LOCKFILE root's alone (0600): any local user can hold it"
+    fi
     if flock -n 8; then
         record_maintenance_holder
         return

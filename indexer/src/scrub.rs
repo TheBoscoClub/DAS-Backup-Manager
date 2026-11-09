@@ -766,12 +766,16 @@ impl FileLock {
                 detail: format!("cannot create lock directory: {e}"),
             })?;
         }
-        OpenOptions::new()
+        // Root's alone: flock works on a read-only descriptor, so a lock file
+        // anyone can open is one anyone can hold, keeping the nightly backup
+        // and scrub waiting (bd DAS-Backup-Manager-qab). 0600 for a new file;
+        // one an older version left 0644 is narrowed below.
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .mode(0o644)
+            .mode(0o600)
             .open(path)
             .map_err(|e| {
                 // `/run` is root-owned, so a permission error here almost
@@ -794,7 +798,18 @@ impl FileLock {
                     path: path.display().to_string(),
                     detail,
                 }
-            })
+            })?;
+        let narrow = |e: std::io::Error| ScrubError::Lock {
+            path: path.display().to_string(),
+            detail: format!("cannot make the lock file root's alone (0600): {e}"),
+        };
+        // A regular file only: never chmod a device node a path names.
+        let meta = file.metadata().map_err(narrow)?;
+        if meta.is_file() && meta.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(narrow)?;
+        }
+        Ok(file)
     }
 
     /// `Ok(false)` means, and only means, that another process holds the lock
@@ -2397,6 +2412,25 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd DAS-Backup-Manager-qab: flock works on a read-only descriptor, so a
+    /// lock file anyone can open is a lock anyone can hold, keeping the
+    /// nightly backup and scrub waiting. Root's alone: 0600, a new file and
+    /// one an older version left 0644.
+    #[test]
+    fn a_lock_file_is_root_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fresh = dir.path().join("fresh.lock");
+        drop(FileLock::try_acquire(&fresh).unwrap());
+        assert_eq!(mode(&fresh), 0o600, "a new lock file");
+        let old = dir.path().join("old.lock");
+        std::fs::write(&old, "").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(FileLock::try_acquire(&old).unwrap());
+        assert_eq!(mode(&old), 0o600, "an existing 0644 lock file is narrowed");
+    }
     use crate::progress::{NullProgress, TestProgress};
 
     /// These strings are what the operator reads in the scrub report and the

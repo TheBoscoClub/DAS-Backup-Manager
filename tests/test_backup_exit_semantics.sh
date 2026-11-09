@@ -192,7 +192,7 @@ esac
 # PATH: stubs, and a whitelist of harmless tools
 # ---------------------------------------------------------------------------
 mkdir -p "$BIN" "$SYSBIN"
-for tool in awk basename cat cut date dirname flock grep head mkdir mktemp mv \
+for tool in awk basename cat chmod cut date dirname flock grep head mkdir mktemp mv \
     rm rmdir sed setsid sleep sort tail timeout touch tr wc; do
     path="$(type -P "$tool")" || harness_broken "no $tool on this system"
     ln -s "$path" "$SYSBIN/$tool"
@@ -1780,6 +1780,10 @@ run_backup
 check "found mounted, clean run: exit status" "$RC" "0"
 show_tail 0
 check "found mounted, clean run: report status" "$(report_status)" "ALL OPERATIONS SUCCESSFUL"
+# Both locks root's alone after a run (bd DAS-Backup-Manager-qab): a lock file
+# anyone can open is one anyone can hold.
+check "found mounted, clean run: the backup lock is 0600" "$(stat -c %a "$RUN_DIR/das-backup.lock")" "600"
+check "found mounted, clean run: the maintenance lock is 0600" "$(stat -c %a "$RUN_DIR/das-maintenance.lock")" "600"
 check "found mounted, clean run: says it is used as found" "$(found_line nvme "$SOURCE_MNT")" "1"
 check "found mounted, clean run: not mounted again" "$(calls_for mount "$SOURCE_MNT")" "0"
 check "found mounted, clean run: never unmounted" "$(calls_for umount "$SOURCE_MNT")" "0"

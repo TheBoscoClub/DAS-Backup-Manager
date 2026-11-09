@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The index database is root's alone** (bd `DAS-Backup-Manager-pxl`): `/var/lib/das-backup/backup-index.db` was `0644`, so any local user could list the path of every file in every backup; `Database::open` now creates it `0600` and narrows an existing one, and its `-wal`/`-shm`, on the next open by root — every reader already runs as root (the backup, the D-Bus helper, the CLI)
+- **The DAS lock files are root's alone** (bd `DAS-Backup-Manager-qab`): `/run/das-*.lock` were `0644`, and `flock` works on a read-only descriptor, so any local user could hold the maintenance lock and keep the nightly backup and scrub waiting indefinitely
+  - `scrub::FileLock` (every Rust job), `backup-run.sh`, `backup-verify.sh` and `recovery-os-vm.sh` create them `0600` and narrow one an older version left `0644` (a regular file only — never a device node a path names); a failure to narrow is a warning, the lock still works
 - **A missing drive is a row in the backup report** (bd `DAS-Backup-Manager-uhi`): a RAID-1 target running on one leg used to leave one `RAID-1 degraded` line in the journal and an all-green email, and an absent recovery target turned the status red with no row naming it
   - `backup-run.sh` v4.16.0: every target gets a `Target <label>` row under BACKUP OPERATIONS — `OK` naming its drives, `WARN` for a degraded RAID-1 (status `COMPLETED WITH WARNINGS`, the run still exits 0), `FAIL` for a target with no drive and no mountable UUID; a target found only by its filesystem UUID is `OK`, the row naming the serials not seen
   - SMART STATUS has one row per configured serial on both paths (`backup-run.sh` and the Rust report's `render_capacity_and_smart`), a missing drive shown as `ABSENT`; it used to list only a target's first serial

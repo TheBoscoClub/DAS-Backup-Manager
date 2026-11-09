@@ -347,6 +347,10 @@ take_maintenance_lock() {
         log_warn "Cannot open $lock — skipping btrbk/usage inspection"
         return 1
     fi
+    # Root's alone: a lock file anyone can open is one anyone can hold (bd qab).
+    if [[ -f "$lock" && ! -L "$lock" ]] && ! chmod 600 -- "$lock"; then
+        log_warn "Cannot make $lock root's alone (0600): any local user can hold it"
+    fi
     if ! flock -n 8; then
         # Not "backup or scrub": every job that mounts the targets holds it.
         log_warn "DAS maintenance lock held by another job — skipping btrbk/usage inspection"

@@ -3113,6 +3113,10 @@ take_lock() {
         LOCK_FD=""
         refuse "cannot open $MAINTENANCE_LOCK"
     fi
+    # Root's alone: a lock file anyone can open is one anyone can hold (bd qab).
+    if [[ -f "$MAINTENANCE_LOCK" && ! -L "$MAINTENANCE_LOCK" ]] && ! chmod 600 -- "$MAINTENANCE_LOCK"; then
+        warn "cannot make $MAINTENANCE_LOCK root's alone (0600): any local user can hold it"
+    fi
     if ! flock -n "$LOCK_FD"; then
         holder="$(head -n 1 -- "$MAINTENANCE_LOCK" 2>/dev/null)" || holder=""
         exec {LOCK_FD}>&-

@@ -96,6 +96,21 @@ release_lock() { : >"$WORK/release"; wait "$HOLDER_PID"; HOLDER_PID=""; }
 check "free lock: the backup records itself" "$(cat "$WORK/record")" "backup-run.sh pid $$"
 check "free lock: it is really held" "$(cat "$WORK/state")" "held"
 
+# --- the lock file is root's alone (bd DAS-Backup-Manager-qab) ---------------
+# flock works on a read-only descriptor, so a lock file anyone can open is one
+# anyone can hold. Both openers narrow a file an older version left 0644.
+for opener in acquire_maintenance_lock "take_maintenance_lock $LOCK"; do
+    rm -f "${LOCK:?}"
+    : >"$LOCK"
+    chmod 644 "$LOCK"
+    (
+        # shellcheck disable=SC2086  # the opener and its argument, split on purpose
+        $opener >/dev/null || true
+    )
+    check "${opener%% *}: a 0644 lock file is narrowed to 0600" "$(stat -c %a "$LOCK")" "600"
+done
+rm -f "${LOCK:?}"
+
 # --- a waiting backup leaves the holder's record alone, and names it --------
 rm -f "${LOCK:?}"
 : >"$WORK/log"

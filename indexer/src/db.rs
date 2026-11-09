@@ -279,6 +279,15 @@ pub struct Database {
 
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
+        owner_only(path.as_ref()).map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                Some(format!(
+                    "cannot make {} readable by its owner only: {e}",
+                    path.as_ref().display()
+                )),
+            )
+        })?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
@@ -1699,9 +1708,67 @@ impl Drop for Database {
     }
 }
 
+/// Make the index at `path` its owner's alone (0600), creating it so when
+/// it is missing: it holds the path of every file in every backup (bd
+/// DAS-Backup-Manager-pxl). SQLite gives its `-wal` and `-shm` files the
+/// database's mode when it makes them; ones an older version left are
+/// narrowed too. An `:memory:` or empty path is left to SQLite.
+fn owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    let mut paths = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(suffix);
+        paths.push(p.into());
+    }
+    for p in paths {
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o077 != 0 => {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd DAS-Backup-Manager-pxl: the index holds the path of every file in
+    /// every backup, so it is the owner's alone — 0600, as is its WAL — and
+    /// an index left world-readable by an older version is narrowed on open.
+    #[test]
+    fn the_index_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        {
+            let db = Database::open(&path).unwrap();
+            assert_eq!(mode(&path), 0o600, "a new index");
+            db.conn
+                .execute_batch("CREATE TABLE IF NOT EXISTS t(x); INSERT INTO t VALUES (1);")
+                .unwrap();
+            let wal = dir.path().join("index.db-wal");
+            assert!(wal.exists());
+            assert_eq!(mode(&wal), 0o600, "its WAL");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Database::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600, "an existing 0644 index is narrowed");
+    }
 
     /// The two series produced by `interleaved_fixture`.
     const SERIES_A: &str = "projA\u{1f}projects";
