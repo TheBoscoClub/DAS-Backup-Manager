@@ -1,9 +1,12 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.1
+# Version: 4.17.2
 # Date: 2026-11-09
 #
 # Features:
+#   - A recovery drive's ESP a killed recovery-OS reading left mounted is
+#     released by unmount_all before the targets, and gates "safe to
+#     disconnect" if it stays (v4.17.2, bd DAS-Backup-Manager-s5jv.1).
 #   - A BOOT PROBLEM row from the drive's ESP counts as one from its fstab
 #     (v4.17.1, bd DAS-Backup-Manager-sp78.20): the WARN says "its boot may
 #     stop: see BOOT PROBLEM", and the row says which.
@@ -2752,6 +2755,9 @@ probe_state() { # probe_state <path>
 # The same budget as the Rust path (mount.rs UMOUNT_ATTEMPTS / _RETRY_PAUSE).
 UMOUNT_ATTEMPTS=5
 UMOUNT_RETRY_PAUSE=2
+# Where the recovery-OS reading mounts a recovery drive's own ESP, read-only,
+# one directory per target (mount::ESP_MOUNT_ROOT, bd DAS-Backup-Manager-sp78.20).
+ESP_MOUNT_ROOT="${DAS_ESP_MOUNT_ROOT:-/run/das-backup/esp}"
 
 # umount one DAS target, retrying while it is busy. Returns 0 once it is
 # unmounted, 1 after the last attempt failed; every failed attempt is logged
@@ -2795,6 +2801,35 @@ unmount_all() {
     # was skipped, the gate passed, and the run said the DAS could be
     # disconnected while a drive was mounted (bd DAS-Backup-Manager-jug6).
     local mnt why
+    # First, a recovery drive's ESP the recovery-OS reading left mounted under
+    # its own directory: only when that reading was killed mid-read (its bound
+    # fired). It holds the drive as surely as the target does, so it is
+    # released before the targets and, if it stays, gates the claim too (bd
+    # DAS-Backup-Manager-s5jv.1). Only this project's own directory is looked
+    # in, one level deep; nothing here finds an ESP.
+    for mnt in "${ESP_MOUNT_ROOT:?}"/*; do
+        [[ -d "$mnt" ]] || continue
+        probe_state "$mnt"
+        why="$PROBE_WHY"
+        case "$PROBE_STATE" in
+            mounted)
+                log_warn "  $mnt: a recovery drive's ESP left mounted by a recovery-OS reading — unmounting it"
+                if ! umount_with_retry "$mnt"; then
+                    log_error "  Failed to unmount $mnt"
+                    still_mounted+=("$mnt")
+                fi
+                ;;
+            not-mounted) ;;
+            *)
+                log_error "  Could not tell whether $mnt is mounted — $why; unmounting it anyway"
+                if umount_with_retry "$mnt"; then
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount then succeeded")
+                else
+                    not_known+=("could not tell whether $mnt is mounted — $why; umount failed too")
+                fi
+                ;;
+        esac
+    done
     for (( i=${#ALL_TARGET_MOUNTS[@]}-1; i>=0; i-- )); do
         mnt="${ALL_TARGET_MOUNTS[$i]}"
         # Not the target and not this run's (take_down_leftover, bd jgm):
@@ -3543,7 +3578,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.1
+  backup-run.sh v4.17.2
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

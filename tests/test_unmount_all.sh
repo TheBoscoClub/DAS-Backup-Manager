@@ -63,6 +63,12 @@ for fn in umount_with_retry unmount_all record_op mount_sources owns_source_moun
     eval "$body"
 done
 eval "$(grep -E '^UMOUNT_(ATTEMPTS|RETRY_PAUSE)=' "$SCRIPT")"
+# The ESP mount root, read from the script and held to the Rust constant
+# (one directory, both paths: bd DAS-Backup-Manager-s5jv.1); tests use their own.
+# shellcheck disable=SC2016 # the pattern matches the script's literal ${...}
+SCRIPT_ESP_ROOT="$(sed -n 's/^ESP_MOUNT_ROOT="\${DAS_ESP_MOUNT_ROOT:-\(.*\)}"$/\1/p' "$SCRIPT")"
+RUST_ESP_ROOT="$(sed -n 's/^pub const ESP_MOUNT_ROOT: &str = "\(.*\)";$/\1/p' "$(dirname "$SCRIPT")/../indexer/src/mount.rs")"
+ESP_MOUNT_ROOT="$WORK/esp"
 [[ "${UMOUNT_ATTEMPTS:-}" == "5" ]] || { echo "FAIL: UMOUNT_ATTEMPTS not 5 in backup-run.sh"; exit 1; }
 
 log_info() { echo "INFO: $*" >>"$WORK/log"; }
@@ -595,6 +601,30 @@ check "descriptor limit 3: nothing can be captured, so every answer is unknown" 
 # only, by its definition and by probe_state's one call.
 check "probe_mount_point is named in code only by its definition and by probe_state" \
     "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'probe_mount_point')" "2"
+
+# --- an ESP a killed recovery-OS reading left mounted (bd s5jv.1) ---------------
+check "esp root: the script's is the Rust constant" "$SCRIPT_ESP_ROOT" "$RUST_ESP_ROOT"
+check "esp root: it is set at all" "${SCRIPT_ESP_ROOT:+set}" "set"
+setup
+mkdir -p "$WORK/esp/system-recovery-A-2tb" "$WORK/esp/system-recovery-B-2tb"
+touch "$WORK/mounted/system-recovery-A-2tb"
+unmount_all
+check "esp left mounted: released" "$(calls "$WORK/esp/system-recovery-A-2tb") $(is_mounted "$WORK/esp/system-recovery-A-2tb")" "1 no"
+check "esp not mounted: never touched" "$(calls "$WORK/esp/system-recovery-B-2tb")" "0"
+check "esp released: the run is still OK" "${OP_STATUS[unmount]}" "OK"
+check "esp released: before its drive's target" \
+    "$(grep -nxF -- "$WORK/esp/system-recovery-A-2tb" "$WORK/umount_calls" | cut -d: -f1) $(grep -nxF -- /mnt/backup-system-recovery-A "$WORK/umount_calls" | cut -d: -f1)" "1 2"
+setup
+mkdir -p "$WORK/esp/system-recovery-A-2tb"
+touch "$WORK/mounted/system-recovery-A-2tb"
+echo 99 >"$WORK/busy/system-recovery-A-2tb"
+unmount_all || true
+check "esp that stays mounted: the DAS is not safe to disconnect" "${OP_STATUS[unmount]}" "FAIL"
+check "esp that stays mounted: named" "$(grep -c "still mounted: .*esp/system-recovery-A-2tb" <<<"${OP_STATUS[unmount_detail]:-}")" "1"
+setup
+rm -rf "${WORK:?}/esp"
+unmount_all
+check "no esp directory at all: nothing to do" "${OP_STATUS[unmount]}" "OK"
 
 if [[ $fails -eq 0 ]]; then
     echo "UNMOUNT RETRY SUITE GREEN"
