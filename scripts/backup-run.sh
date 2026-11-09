@@ -3143,6 +3143,8 @@ get_smart_summary() {
     health=$(smartctl -H "$dev" 2>/dev/null | grep -o "PASSED\|FAILED" || echo "UNKNOWN")
     temp=$(smartctl -A "$dev" 2>/dev/null | awk '/Temperature_Celsius/{print $10}' || echo "?")
     hours=$(smartctl -A "$dev" 2>/dev/null | awk '/Power_On_Hours/{print $10}' || echo "?")
+    # Some drives report the raw value as 19195h+28m+10.893s: the hours only.
+    hours="${hours%%h*}"
     serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || echo "?")
 
     echo "${health}|${temp}|${hours}|${serial}"
