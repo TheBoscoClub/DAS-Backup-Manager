@@ -1473,10 +1473,7 @@ mod tests {
             "the write must not land outside the destination"
         );
         assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.contains("not under any [restore] allowed_roots")),
+            result.errors.iter().any(|e| e.contains(": not followed")),
             "the refusal must be REPORTED: {:?}",
             result.errors
         );
@@ -2481,7 +2478,7 @@ mod tests {
         assert_eq!(result.files_restored, 0);
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
-            result.errors[0].contains("not under any [restore] allowed_roots"),
+            result.errors[0].contains(": not followed"),
             "{:?}",
             result.errors
         );
