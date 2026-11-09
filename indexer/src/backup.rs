@@ -2821,6 +2821,39 @@ fn run_backup_with(
     // find them refuses rather than mount them itself: this function used to
     // mount any it did not find, outside that guard, and nothing ever
     // unmounted them (bd DAS-Backup-Manager-7tx 3, -8cf).
+    // A failed sync left btrbk.conf as it was, and btrbk reads the file, not
+    // config.toml: when the two no longer agree, btrbk would act on whatever
+    // the file declares — every pair of it when everything is selected, which
+    // passes btrbk no filter. The run refuses then; while the file is still
+    // what config.toml renders, it goes on, so the configured subvolumes are
+    // still backed up (bd DAS-Backup-Manager-03j3).
+    if options.subvolume_sync.as_ref().is_some_and(|s| s.failed) {
+        let path = &config.general.btrbk_conf;
+        let current = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|file| {
+                btrbk_conf::render_btrbk_conf(config).map(|rendered| file == rendered)
+            });
+        match current {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "The subvolume sync failed and {path} is not what config.toml renders: \
+                     refusing to run btrbk on it (it would act on entries config.toml no \
+                     longer has). Fix what SUBVOLUME SYNC reports and run the backup again."
+                )
+                .into());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "The subvolume sync failed and {path} could not be compared with \
+                     config.toml ({e}): refusing to run btrbk on it."
+                )
+                .into());
+            }
+        }
+    }
+
     let unmounted = unmounted_source_volumes(config, &effective_sources, env.is_mountpoint);
     if !unmounted.is_empty() {
         return Err(format!(
@@ -7587,6 +7620,59 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("nonexistent/das/recovery")),
             "the unticked, absent target is not named to btrbk: {calls:?}"
+        );
+    }
+
+    /// bd DAS-Backup-Manager-03j3: a run whose sync failed goes on (the
+    /// configured subvolumes are still backed up), but btrbk reads the file,
+    /// not config.toml. When the file is no longer what config.toml renders,
+    /// btrbk would act on what it declares — unfiltered when everything is
+    /// selected — so the run refuses before btrbk; when it is, it goes on.
+    #[test]
+    fn a_failed_sync_runs_btrbk_only_on_a_btrbk_conf_that_config_toml_renders() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        let mut config = live_config();
+        config.general.btrbk_conf = conf.to_string_lossy().into_owned();
+        let options = BackupOptions {
+            subvolume_sync: Some(failed_sync()),
+            ..live_options()
+        };
+        let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
+
+        // Stale: an entry config.toml no longer has.
+        std::fs::write(&conf, "volume /old\n  subvolume @gone\n").unwrap();
+        let runner = Scripted::from_owned(vec![]);
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let err = run_backup_with(&config, &options, &TestProgress::new(), &host)
+            .expect_err("a stale btrbk.conf is refused")
+            .to_string();
+        assert!(err.contains("is not what config.toml renders"), "{err}");
+        assert!(
+            !runner.calls().iter().any(|c| c.contains("btrbk")),
+            "btrbk never ran: {:?}",
+            runner.calls()
+        );
+
+        // Current: the run goes on to btrbk.
+        std::fs::write(
+            &conf,
+            crate::btrbk_conf::render_btrbk_conf(&config).unwrap(),
+        )
+        .unwrap();
+        let runner = Scripted::from_owned(vec![]);
+        let host = StepEnv {
+            is_mountpoint: &nvme_mounted,
+            ..env(&runner)
+        };
+        let _ = run_backup_with(&config, &options, &TestProgress::new(), &host);
+        assert!(
+            runner.calls().iter().any(|c| c.contains("btrbk")),
+            "a current btrbk.conf reaches btrbk: {:?}",
+            runner.calls()
         );
     }
 
