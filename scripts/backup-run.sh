@@ -4076,6 +4076,13 @@ generate_abort_report() {
         why="${why%%$'\n'*}"
     fi
 
+    # A run that aborted after its sync: what the sync adopted or retired,
+    # and its coverage row, are this night's record too (bd sp78.12).
+    local sync_section=""
+    if [[ -n "${SUBVOL_SYNC_REPORT:-}" ]]; then
+        sync_section=$'\n'"$SUBVOL_SYNC_REPORT"$'\n'
+    fi
+
     cat <<-REPORT
 ===============================================================
   DAS Backup Report — $timestamp
@@ -4094,7 +4101,7 @@ ${why_more}  Backed up:         $backed_up
   Targets not seen:  $unseen
   History:           $history
   Log:               $LOG_FILE
-===============================================================
+${sync_section}===============================================================
 REPORT
 }
 

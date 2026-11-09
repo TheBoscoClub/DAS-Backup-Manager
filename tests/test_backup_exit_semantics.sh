@@ -1228,6 +1228,12 @@ knob mount_fails "$RECOVERY_MNT"
 run_backup
 expect_aborted "a target that fails to mount" "is NOT a mountpoint (mount failed silently in mount_targets)" \
     "target verification" "system-recovery-A-2tb (mirror): expected mounted but $RECOVERY_MNT is NOT a mountpoint"
+# It aborted after its sync: what the sync did, and its coverage row, are in
+# the ABORTED report too (bd DAS-Backup-Manager-sp78.12).
+check "a target that fails to mount: the ABORTED report carries SUBVOLUME SYNC" \
+    "$(grep -c '^SUBVOLUME SYNC$' "$WORK/lib/last-report.txt" 2>/dev/null || true)" "1"
+check "a target that fails to mount: and its coverage row" \
+    "$(grep -c '^SUBVOLUME COVERAGE: ' "$WORK/lib/last-report.txt" 2>/dev/null || true)" "1"
 
 fresh
 printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
