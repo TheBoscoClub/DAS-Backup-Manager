@@ -632,7 +632,11 @@ Before btrbk runs, the same sync step as
 .B "btrdasd subvol sync"
 adopts new subvolumes and retires vanished ones, and the run then uses the
 updated config.toml. A backup started from the GUI runs the same step. A sync
-failure does not stop the run; the run goes on with what is already configured,
+failure does not stop the run; the run goes on with what is already configured
+(only while
+.I btrbk.conf
+is still what config.toml renders: a file the failed sync left behind config.toml
+is refused before btrbk runs),
 is recorded as failed in the backup history and the report (which carries the
 .B "SUBVOLUME SYNC"
 section), and exits non-zero at the end. A target or source volume the run
@@ -1369,7 +1373,10 @@ Adopt new subvolumes and retire vanished ones. Every
 .B backup\-run.sh
 run calls this after verifying the source volumes and before btrbk, and
 .B "btrdasd backup run"
-calls it too, so creating a subvolume is enough to have it backed up.
+calls it too, so creating a subvolume is enough to have it backed up. Its
+report is text only:
+.B \-\-json
+is refused (exit 2) before anything runs.
 .PP
 Each subvolume that exists on a source volume and is not excluded gets a
 .I [[source.subvolumes]]

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`btrdasd subvol sync --json` is refused** (bd `DAS-Backup-Manager-sp78.3`): the flag was accepted and the text report printed anyway; with no JSON form, it now exits 2 before anything runs
+
 ## [0.7.23.3] - 2026-11-08
 
 ### Added

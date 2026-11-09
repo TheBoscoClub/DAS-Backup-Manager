@@ -2951,6 +2951,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 record_coverage,
             } => {
+                // Its report is text only; a flag accepted and ignored is a
+                // defect (fail-silent.md #4, bd DAS-Backup-Manager-sp78.3).
+                if json {
+                    eprintln!(
+                        "Error: subvol sync has no JSON output; run it without --json \
+                         (its report is the SUBVOLUME SYNC text the backup run reads)"
+                    );
+                    std::process::exit(2);
+                }
                 let coverage = if record_coverage {
                     buttered_dasd::adopt::CoverageMode::Record { db: &db }
                 } else {

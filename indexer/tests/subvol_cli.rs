@@ -307,6 +307,32 @@ fn subvol_sync_exits_one_when_a_volume_cannot_be_read_and_two_without_a_config()
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// bd DAS-Backup-Manager-sp78.3: `--json` was accepted and the text report
+/// printed anyway. With no JSON form, the flag is refused before anything runs.
+#[test]
+fn subvol_sync_refuses_json_and_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let db = dir.path().join("index.db");
+    let out = btrdasd(&[
+        "subvol",
+        "sync",
+        "--db",
+        db.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("subvol sync has no JSON output"), "{err}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing ran: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn subvol_expire_prints_nothing_and_exits_zero_when_nothing_is_retired() {
     let dir = tempfile::tempdir().unwrap();
