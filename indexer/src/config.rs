@@ -2080,6 +2080,31 @@ impl Config {
             ));
         }
 
+        // One volume under two spellings ('/vol' and '/vol/', '/vol/./x') is
+        // two volumes to sync, which groups by the string: every subvolume was
+        // adopted and sent twice (bd sp78.13). Sources may share a volume, so
+        // only different strings naming one path are refused. A symlinked
+        // spelling needs the filesystem and is not judged here.
+        let mut spellings: Vec<(&str, std::path::PathBuf)> = Vec::new();
+        for source in &self.sources {
+            let normal: std::path::PathBuf = Path::new(&source.volume).components().collect();
+            if let Some((other, _)) = spellings
+                .iter()
+                .find(|(raw, n)| *n == normal && *raw != source.volume.as_str())
+            {
+                errors.push(format!(
+                    "volumes '{other}' and '{}' are one path spelled two ways: write it the same \
+                     in every [[source]], or each subvolume is backed up twice",
+                    source.volume
+                ));
+            } else if !spellings
+                .iter()
+                .any(|(raw, _)| *raw == source.volume.as_str())
+            {
+                spellings.push((source.volume.as_str(), normal));
+            }
+        }
+
         // A label no [[target]] has renders the source with no target line:
         // nothing of it is backed up, without a word (bd sp78.8). Unlike the
         // scrub's labels, target_labels has no built-in default an older
@@ -2450,6 +2475,32 @@ mod tests {
         // A retired entry is not rendered and sends nowhere.
         let mut cfg = top_level_config(&source_with("x", "/vol", &[(".", Some("vol-toplevel"))]));
         cfg.sources[1].subvolumes[0].retired = Some("2026-10-01".into());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_one_volume_spelled_two_ways() {
+        // bd DAS-Backup-Manager-sp78.13: '/vol' and '/vol/' are one
+        // filesystem, but sync groups by the string, so every subvolume was
+        // adopted twice and sent twice.
+        let two = format!(
+            "{}{}{ONE_TARGET}",
+            source_with("a", "/vol", &[("@a", None)]),
+            source_with("b", "/vol/", &[("@b", None)])
+        );
+        let errors = Config::from_toml(&minimal_toml(&two)).unwrap().validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'/vol'") && errors[0].contains("'/vol/'"),
+            "{errors:?}"
+        );
+        // One spelling shared by two sources is how sync splits a volume: valid.
+        let same = format!(
+            "{}{}{ONE_TARGET}",
+            source_with("a", "/vol", &[("@a", None)]),
+            source_with("b", "/vol", &[("@b", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&same)).unwrap();
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
