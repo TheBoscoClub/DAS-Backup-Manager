@@ -1746,6 +1746,30 @@ fn owner_only(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// bd DAS-Backup-Manager-sp78.19: what `owner_only` leaves alone, and
+    /// what it does not swallow.
+    #[test]
+    fn owner_only_skips_sqlite_s_own_names_and_touches_only_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        // An empty path is SQLite's temporary database: nothing to open.
+        assert!(owner_only(Path::new("")).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        // A directory where the WAL would be is not the WAL: not narrowed.
+        let wal = dir.path().join("index.db-wal");
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        owner_only(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&wal), 0o755, "a directory is never chmodded");
+        // A sibling that cannot even be looked up is an error, not a pass:
+        // a 252-byte name fits, its 256-byte `-wal` does not.
+        let long = dir.path().join("d".repeat(252));
+        let err = owner_only(&long).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG), "{err}");
+    }
+
     /// bd DAS-Backup-Manager-pxl: the index holds the path of every file in
     /// every backup, so it is the owner's alone — 0600, as is its WAL — and
     /// an index left world-readable by an older version is narrowed on open.

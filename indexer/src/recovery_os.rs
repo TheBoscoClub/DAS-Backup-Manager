@@ -1323,29 +1323,44 @@ pub fn drive_partition_ids(mount: &Path) -> Option<Result<BTreeSet<String>, Stri
             Err(format!("{} exited with {}", args.join(" "), out.status))
         }
     };
-    Some((|| {
-        let mount = mount.to_str().ok_or("the mount path is not UTF-8")?;
-        let source = run(&["findmnt", "-n", "-o", "SOURCE", "--target", mount])?;
-        // A btrfs subvolume mount reads `/dev/sdX2[/@]`.
-        let dev = source.trim().split('[').next().unwrap_or("").to_string();
-        if dev.is_empty() {
-            return Err(format!("no device is mounted at {mount}"));
-        }
-        let disk = run(&["lsblk", "-n", "-d", "-o", "PKNAME", &dev])?;
-        let disk = disk.trim();
-        if disk.is_empty() {
-            return Err(format!("{dev} has no parent disk"));
-        }
-        let listed = run(&[
-            "lsblk",
-            "-n",
-            "-P",
-            "-o",
-            "LABEL,UUID,PARTUUID,PARTLABEL",
-            &format!("/dev/{disk}"),
-        ])?;
-        Ok(partition_ids(&listed))
-    })())
+    Some(drive_partition_ids_with(mount, &run))
+}
+
+/// [`drive_partition_ids`]'s reading, with `run` answering each command (its
+/// stdout, or why it failed): `findmnt` names the device mounted at `mount`,
+/// `lsblk` its parent disk, and `lsblk` again every name that disk's
+/// partitions carry. These names are what the ESP check's PARTUUID must be
+/// among before anything is mounted (bd DAS-Backup-Manager-sp78.20), so each
+/// step that cannot answer is an error, never an empty set.
+fn drive_partition_ids_with(
+    mount: &Path,
+    run: &dyn Fn(&[&str]) -> Result<String, String>,
+) -> Result<BTreeSet<String>, String> {
+    let mount = mount.to_str().ok_or("the mount path is not UTF-8")?;
+    let source = run(&["findmnt", "-n", "-o", "SOURCE", "--target", mount])?;
+    // A btrfs subvolume mount reads `/dev/sdX2[/@]`.
+    let dev = source.trim().split('[').next().unwrap_or("").to_string();
+    if dev.is_empty() {
+        return Err(format!("no device is mounted at {mount}"));
+    }
+    let disk = run(&["lsblk", "-n", "-d", "-o", "PKNAME", &dev])?;
+    let disk = disk.trim();
+    if disk.is_empty() {
+        return Err(format!("{dev} has no parent disk"));
+    }
+    let listed = run(&[
+        "lsblk",
+        "-n",
+        "-P",
+        "-o",
+        "LABEL,UUID,PARTUUID,PARTLABEL",
+        &format!("/dev/{disk}"),
+    ])?;
+    let ids = partition_ids(&listed);
+    if ids.is_empty() {
+        return Err(format!("lsblk named no partition of /dev/{disk}"));
+    }
+    Ok(ids)
 }
 
 /// The names in `lsblk -P -o LABEL,UUID,PARTUUID,PARTLABEL` output, each as
@@ -4088,6 +4103,98 @@ mod tests {
                 &have
             )
         );
+    }
+
+    /// One scripted answer: `<program> <last argument>` and its result.
+    type Answer<'a> = (&'a str, Result<&'a str, &'a str>);
+
+    /// A scripted host for [`drive_partition_ids_with`]: each command's
+    /// answer by its program and last argument, and every command asked.
+    fn scripted_ids(answers: &[Answer]) -> (Result<BTreeSet<String>, String>, Vec<String>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let run = |args: &[&str]| -> Result<String, String> {
+            let line = args.join(" ");
+            asked.borrow_mut().push(line.clone());
+            let key = format!("{} {}", args[0], args[args.len() - 1]);
+            answers
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, a)| a.map(str::to_string).map_err(str::to_string))
+                .unwrap_or_else(|| Err(format!("unscripted: {line}")))
+        };
+        let r = drive_partition_ids_with(Path::new("/mnt/r"), &run);
+        (r, asked.into_inner())
+    }
+
+    const LISTED: &str = "LABEL=\"RECOV-ESP-1\" UUID=\"ABCD-0003\" PARTUUID=\"5eed0025-0000-4000-8000-000000000025\" PARTLABEL=\"\"\n\
+                          LABEL=\"das-r\" UUID=\"5eed0008-0000-4000-8000-000000000008\" PARTUUID=\"5eed0026-0000-4000-8000-000000000026\" PARTLABEL=\"\"\n";
+
+    #[test]
+    fn the_drive_s_partitions_are_read_from_the_disk_under_the_mount() {
+        let (r, asked) = scripted_ids(&[
+            ("findmnt /mnt/r", Ok("/dev/sdx2[/@]\n")),
+            ("lsblk /dev/sdx2", Ok("sdx\n")),
+            ("lsblk /dev/sdx", Ok(LISTED)),
+        ]);
+        assert_eq!(
+            asked,
+            [
+                "findmnt -n -o SOURCE --target /mnt/r",
+                "lsblk -n -d -o PKNAME /dev/sdx2",
+                "lsblk -n -P -o LABEL,UUID,PARTUUID,PARTLABEL /dev/sdx",
+            ]
+        );
+        assert_eq!(
+            r,
+            Ok(ids(&[
+                "LABEL=RECOV-ESP-1",
+                "UUID=ABCD-0003",
+                "PARTUUID=5eed0025-0000-4000-8000-000000000025",
+                "LABEL=das-r",
+                "UUID=5eed0008-0000-4000-8000-000000000008",
+                "PARTUUID=5eed0026-0000-4000-8000-000000000026",
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_step_that_cannot_answer_is_an_error_never_an_empty_set() {
+        let ok_mount = ("findmnt /mnt/r", Ok("/dev/sdx2\n"));
+        let ok_disk = ("lsblk /dev/sdx2", Ok("sdx\n"));
+        let cases: [(&[Answer], &str); 6] = [
+            (
+                &[("findmnt /mnt/r", Err("findmnt exited with 1"))],
+                "findmnt exited with 1",
+            ),
+            (
+                &[("findmnt /mnt/r", Ok("\n"))],
+                "no device is mounted at /mnt/r",
+            ),
+            (
+                &[ok_mount, ("lsblk /dev/sdx2", Err("lsblk exited with 32"))],
+                "lsblk exited with 32",
+            ),
+            (
+                &[ok_mount, ("lsblk /dev/sdx2", Ok("\n"))],
+                "/dev/sdx2 has no parent disk",
+            ),
+            (
+                &[
+                    ok_mount,
+                    ok_disk,
+                    ("lsblk /dev/sdx", Err("lsblk exited with 1")),
+                ],
+                "lsblk exited with 1",
+            ),
+            (
+                &[ok_mount, ok_disk, ("lsblk /dev/sdx", Ok("\n"))],
+                "lsblk named no partition of /dev/sdx",
+            ),
+        ];
+        for (answers, want) in cases {
+            let (r, _) = scripted_ids(answers);
+            assert_eq!(r, Err(want.to_string()), "{answers:?}");
+        }
     }
 
     #[test]
