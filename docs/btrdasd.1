@@ -1047,9 +1047,11 @@ or
 component is rejected. A member is read only if its directory resolves inside
 the snapshot, so a link there cannot carry the read out. On the write side
 each directory under the destination is opened one name at a time without
-following a link; a link met there is followed only when root or the
-destination's owner owns it (and every link on the way to its target), and
-its target resolves to an existing directory under an
+following a link; below a destination a user owns, a link met there is
+followed only when that user owns it (never root, which owns the links a
+restore makes), every link on the way to its target is root's or that
+user's, and its target resolves to an existing directory that user owns,
+under an
 .B allowed_roots
 entry and no denied root: that directory is then opened by its real path. Any
 other link refuses the member, naming its target and, when a grant would

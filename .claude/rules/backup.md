@@ -130,11 +130,14 @@ through links root owns, bd `sp78.18`):
   made under a directory fd reached one name at a time, each opened `O_NOFOLLOW` (bd `fcmk`): a link on the
   way, planted or swapped in after the check, is refused; `btrfs receive` gets the held directory's
   `/proc/<pid>/fd/<n>` (bd `sp78.18`). The destination itself is always reached strictly.
-- **The one link followed** (bd `mz3z`, operator 2026-11-09): **below** the destination, a link owned by root or
-  by the destination's owner (read through the held fd, `fstatat`) whose target — every link on its way passing
-  the same owner test — resolves under an `allowed_roots` entry and no denied root, to an existing directory.
-  That directory is re-opened from `/` by the strict walk; the link is never traversed. Any other link is
-  refused, naming the target and, when a grant would allow it, the `allowed_roots` entry to add; at most 8 per walk.
+- **The one link followed** (bd `mz3z`, operator 2026-11-09): **below** a destination a user owns (one root
+  owns — the restore made it — follows none), a link that user owns (never root's: the restore makes root-owned
+  links itself, with targets from the snapshot), owner and target read from one inode (`O_PATH`), whose target —
+  every link on its way owned by root or that user — resolves under an `allowed_roots` entry and no denied root,
+  to an existing directory that user owns. That directory is re-opened from `/` by the strict walk; the link is
+  never traversed, and wherever a rename on the way lands the resolution, root writes only into a directory the
+  destination's owner owns. Any other link is refused, naming the target and, when a grant would allow it, the
+  `allowed_roots` entry to add; at most 8 per walk.
   Absolute or non-literal member paths are rejected.
 
 ## Email Reports

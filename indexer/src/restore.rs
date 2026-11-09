@@ -386,21 +386,34 @@ fn safe_member(file_path: &str) -> Result<&Path, String> {
 struct DirFd(std::os::fd::OwnedFd);
 
 /// When the walk below a destination may follow a link (bd
-/// DAS-Backup-Manager-mz3z): one owned by root or by the destination's owner
-/// whose target — every link on its way judged the same — resolves under an
-/// `allowed_roots` entry and no denied root, to an existing directory. That
-/// directory is then re-opened from `/` by the strict walk, so the link itself
-/// is never traversed. Any other link is refused, as before.
+/// DAS-Backup-Manager-mz3z): only below a destination a user owns (one root
+/// owns — made by the restore itself — follows none), only a link that user
+/// owns (never root's: the restore makes root-owned links itself, with
+/// targets from the snapshot), whose target — every link on its way owned by
+/// root or that user — resolves under an `allowed_roots` entry and no denied
+/// root, to an existing directory that user owns. That directory is then
+/// re-opened from `/` by the strict walk, so the link itself is never
+/// traversed and, wherever a rename on the way lands the resolution, root
+/// writes only into a directory the destination's owner owns. Any other link
+/// is refused, as before.
 struct Follow<'a> {
     allowed_roots: &'a [String],
     /// The owner of the destination's own root, held open by the restore.
     dest_owner: u32,
-    /// The owner of the link `name` in the directory held: `fstatat` with
-    /// `AT_SYMLINK_NOFOLLOW`, never by path. A seam for tests.
-    link_owner: &'a dyn Fn(&DirFd, &std::ffi::CStr) -> std::io::Result<u32>,
+    /// The owner and target of the link `name` in the directory held, read
+    /// from one inode (`O_PATH | O_NOFOLLOW`, then `fstat` and `readlinkat`):
+    /// never by path, never two lookups a rename could split. A seam.
+    link: &'a LinkAt<'a>,
     /// The owner of a link met on the way to a target, by path. A seam.
     path_owner: &'a dyn Fn(&Path) -> Option<u32>,
+    /// The owner of the directory a link resolved to, read through its fd. A
+    /// seam.
+    dir_owner: &'a dyn Fn(&DirFd) -> std::io::Result<u32>,
 }
+
+/// Reads the owner and target of the link `name` in a held directory.
+type LinkAt<'a> =
+    dyn Fn(&DirFd, &std::ffi::CStr) -> std::io::Result<(u32, std::path::PathBuf)> + 'a;
 
 /// How many links one walk below a destination may follow.
 const MAX_FOLLOWS: u32 = 8;
@@ -409,35 +422,69 @@ impl<'a> Follow<'a> {
     /// The policy for a restore into `dest`, held open: the real owner
     /// lookups.
     fn on_this_host(allowed_roots: &'a [String], dest: &DirFd) -> std::io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let dest_owner = std::fs::File::from(dest.0.try_clone()?).metadata()?.uid();
+        let dest_owner = dir_owner_of(dest)?;
         Ok(Self {
             allowed_roots,
             dest_owner,
-            link_owner: &link_owner_at,
+            link: &link_at,
             path_owner: &owner_of_link,
+            dir_owner: &dir_owner_of,
         })
     }
 }
 
-/// The owner of the link `name` in `dir`, read through the directory held
-/// (`fstatat`, `AT_SYMLINK_NOFOLLOW`): never by a path that could be swapped.
-fn link_owner_at(dir: &DirFd, name: &std::ffi::CStr) -> std::io::Result<u32> {
-    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: valid dir fd, NUL-terminated name, st large enough.
-    let r = unsafe {
-        libc::fstatat(
+/// The owner of the directory held.
+fn dir_owner_of(dir: &DirFd) -> std::io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::File::from(dir.0.try_clone()?).metadata()?.uid())
+}
+
+/// The owner and target of the link `name` in `dir`, both from the one inode
+/// opened `O_PATH | O_NOFOLLOW` through the directory held.
+fn link_at(dir: &DirFd, name: &std::ffi::CStr) -> std::io::Result<(u32, std::path::PathBuf)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: valid dir fd and NUL-terminated name; the fd is owned below.
+    let fd = unsafe {
+        libc::openat(
             dir.raw(),
             name.as_ptr(),
-            st.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
-    if r != 0 {
+    if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: fstatat succeeded and filled st.
-    Ok(unsafe { st.assume_init() }.st_uid)
+    // SAFETY: fd was just returned by openat and is owned by nobody else.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: valid fd, st large enough.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded and filled st.
+    let st = unsafe { st.assume_init() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a link",
+        ));
+    }
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: an O_PATH fd of a link with an empty name reads that link.
+    let n = unsafe {
+        libc::readlinkat(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    Ok((st.st_uid, std::ffi::OsStr::from_bytes(&buf).into()))
 }
 
 /// `name` as a C string: one path component, never empty, `.` or `..`.
@@ -546,29 +593,26 @@ impl DirFd {
         at: &Path,
         follow: &Follow,
     ) -> std::io::Result<(Self, std::path::PathBuf)> {
-        use std::os::unix::ffi::OsStrExt;
         let refuse = |why: String| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("'{}' is a link {why}: not followed", at.display()),
             )
         };
-        let owner = (follow.link_owner)(self, c)?;
-        if owner != 0 && owner != follow.dest_owner {
+        if follow.dest_owner == 0 {
+            return Err(refuse(
+                "below a destination root owns (the restore made it): no link there is followed"
+                    .into(),
+            ));
+        }
+        let (owner, target) = (follow.link)(self, c)?;
+        if owner != follow.dest_owner {
             return Err(refuse(format!(
-                "owned by uid {owner}, neither root nor the destination's owner (uid {})",
+                "owned by uid {owner}, not the destination's owner (uid {})",
                 follow.dest_owner
             )));
         }
-        let mut buf = vec![0u8; libc::PATH_MAX as usize];
-        // SAFETY: valid dir fd, NUL-terminated name, buffer of the length given.
-        let n =
-            unsafe { libc::readlinkat(self.raw(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        buf.truncate(n as usize);
-        let target = Path::new(std::ffi::OsStr::from_bytes(&buf));
+        let target = target.as_path();
         // A relative target is read from the directory the link sits in;
         // `at` is that directory's real path and the link's name.
         let abs = match at.parent() {
@@ -591,6 +635,19 @@ impl DirFd {
                         real.display()
                     ))
                 })?;
+                // The destination's owner may point a link only at a directory
+                // that is theirs or root's: a restore into another user's home
+                // must not let that user steer root's writes into a third
+                // user's directory under an allowed root.
+                let owner = (follow.dir_owner)(&dir)?;
+                if owner != follow.dest_owner {
+                    return Err(refuse(format!(
+                        "to '{}', a directory owned by uid {owner}, not the destination's \
+                         owner (uid {})",
+                        real.display(),
+                        follow.dest_owner
+                    )));
+                }
                 Ok((dir, real))
             }
             DestPolicy::Denied { resolved, root } => Err(refuse(format!(
@@ -1980,26 +2037,43 @@ mod tests {
         chain_uid: Option<u32>,
         rel: &str,
     ) -> std::io::Result<std::path::PathBuf> {
-        use std::os::unix::fs::MetadataExt;
+        walk_through_door_owned(dest, roots, link_uid, chain_uid, None, rel)
+    }
+
+    /// [`walk_through_door`], the target directory reported owned by
+    /// `target_uid` when given.
+    fn walk_through_door_owned(
+        dest: &Path,
+        roots: &[String],
+        link_uid: u32,
+        chain_uid: Option<u32>,
+        target_uid: Option<u32>,
+        rel: &str,
+    ) -> std::io::Result<std::path::PathBuf> {
         let dest = dest.canonicalize()?;
         let fd = DirFd::open_abs(&dest, false)?;
-        let me = fs::metadata(&dest)?.uid();
-        let link_owner = |_: &DirFd, _: &std::ffi::CStr| Ok(link_uid);
-        let path_owner = |_: &Path| Some(chain_uid.unwrap_or(me));
+        // The real link's target, the owner the test says.
+        let link = |d: &DirFd, c: &std::ffi::CStr| link_at(d, c).map(|(_, t)| (link_uid, t));
+        let path_owner = |_: &Path| Some(chain_uid.unwrap_or(OWN));
+        let dir_owner = |_: &DirFd| Ok(target_uid.unwrap_or(OWN));
         let follow = Follow {
             allowed_roots: roots,
-            dest_owner: me,
-            link_owner: &link_owner,
+            dest_owner: OWN,
+            link: &link,
             path_owner: &path_owner,
+            dir_owner: &dir_owner,
         };
         let dir = fd.descend(Path::new(rel), &dest, &follow)?;
         // Where it landed, as the kernel sees the fd.
         fs::read_link(format!("/proc/self/fd/{}", dir.raw()))
     }
 
+    /// The destination's owner in these walks: a user, whoever runs the suite
+    /// (CI's container runs it as root).
+    const OWN: u32 = 1000;
+
     fn me() -> u32 {
-        // SAFETY: getuid cannot fail.
-        unsafe { libc::getuid() }
+        OWN
     }
 
     #[test]
@@ -2010,9 +2084,14 @@ mod tests {
         let landed = walk_through_door(dest.path(), &test_roots(), me(), None, "door/sub").unwrap();
         assert_eq!(landed, target.path().canonicalize().unwrap().join("sub"));
         assert!(target.path().join("sub").is_dir(), "made under the target");
-        // A root-owned link is trusted too.
-        let landed = walk_through_door(dest.path(), &test_roots(), 0, None, "door").unwrap();
-        assert_eq!(landed, target.path().canonicalize().unwrap());
+        // A root-owned link is not: the restore makes those itself, its
+        // target taken from the snapshot (review of mz3z).
+        let err = walk_through_door(dest.path(), &test_roots(), 0, None, "door").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("owned by uid 0, not the destination's owner"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2072,6 +2151,77 @@ mod tests {
                 .contains("not root's or the destination owner's"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_link_into_another_user_s_directory_is_refused_even_in_a_granted_root() {
+        // A restore into bob's home; bob's own link into alice's directory
+        // under /home must not steer root's writes there.
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), dest.path().join("door")).unwrap();
+        let err = walk_through_door_owned(
+            dest.path(),
+            &test_roots(),
+            me(),
+            None,
+            Some(4242),
+            "door/sub",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("a directory owned by uid 4242"),
+            "{err}"
+        );
+        assert!(!target.path().join("sub").exists(), "nothing made there");
+        // Nor root's: a rename on the way could land the resolution there.
+        assert!(
+            walk_through_door_owned(dest.path(), &test_roots(), me(), None, Some(0), "door")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn below_a_destination_root_owns_no_link_is_followed() {
+        // The restore makes a missing destination as root: nobody chose a
+        // link under it.
+        let dest = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(target.path(), dest.path().join("door")).unwrap();
+        let base = dest.path().canonicalize().unwrap();
+        let fd = DirFd::open_abs(&base, false).unwrap();
+        let link = |d: &DirFd, c: &std::ffi::CStr| link_at(d, c).map(|(_, t)| (0, t));
+        let root_owned = |_: &Path| Some(0);
+        let dir_owner = |_: &DirFd| Ok(0);
+        let roots = test_roots();
+        let follow = Follow {
+            allowed_roots: &roots,
+            dest_owner: 0,
+            link: &link,
+            path_owner: &root_owned,
+            dir_owner: &dir_owner,
+        };
+        let Err(err) = fd.descend(Path::new("door"), &base, &follow) else {
+            panic!("a link below a root-owned destination was followed");
+        };
+        assert!(
+            err.to_string().contains("below a destination root owns"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_link_s_owner_and_target_come_from_one_inode() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/somewhere/else", dir.path().join("l")).unwrap();
+        fs::write(dir.path().join("f"), "x").unwrap();
+        let fd = DirFd::open_abs(&dir.path().canonicalize().unwrap(), false).unwrap();
+        let (uid, target) = link_at(&fd, c"l").unwrap();
+        // SAFETY: getuid cannot fail.
+        assert_eq!(uid, unsafe { libc::getuid() });
+        assert_eq!(target, Path::new("/somewhere/else"));
+        assert!(link_at(&fd, c"f").is_err(), "a file is not a link");
+        assert!(link_at(&fd, c"missing").is_err());
     }
 
     #[test]
@@ -2138,14 +2288,29 @@ mod tests {
             &crate::progress::NullProgress,
         )
         .unwrap();
+        assert!(
+            dest.path().join("Music").is_symlink(),
+            "the link itself is left as it was"
+        );
+        // SAFETY: getuid cannot fail.
+        if unsafe { libc::getuid() } == 0 {
+            // A suite run as root (CI's container): the destination is
+            // root's, so no link below it is followed.
+            assert!(!relocated.path().join("song.flac").exists());
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("below a destination root owns")),
+                "{:?}",
+                result.errors
+            );
+            return;
+        }
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(
             fs::read_to_string(relocated.path().join("song.flac")).unwrap(),
             "audio"
-        );
-        assert!(
-            dest.path().join("Music").is_symlink(),
-            "the link itself is left as it was"
         );
     }
 
