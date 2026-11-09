@@ -74,15 +74,36 @@ fn command_status_within(program: &str, args: &[&str], limit: Duration) -> Resul
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
+    // Its stderr is kept for the error, never printed: a refusal the caller
+    // then recovers from (a RefuseManualStop unit restarted by signal) printed
+    // systemd's "Operation refused" above the line saying it worked (bd
+    // DAS-Backup-Manager-sp78.16). A thread drains it, so a child that writes
+    // much cannot block on a full pipe while this waits.
     let mut child = std::process::Command::new(program)
         .args(args)
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{command} could not be run: {e}"))?;
+    let drain = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut text);
+            text
+        })
+    });
+    let said = move || {
+        drain
+            .and_then(|t| t.join().ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(": {t}"))
+            .unwrap_or_default()
+    };
     let deadline = std::time::Instant::now() + limit;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("{command} exited with {status}")),
+            Ok(Some(status)) => return Err(format!("{command} exited with {status}{}", said())),
             Ok(None) if std::time::Instant::now() >= deadline => {
                 // Already returning an error; a kill that fails means it exited.
                 let _ = child.kill();
@@ -3595,6 +3616,20 @@ auth = "starttls""#,
         assert_eq!(
             command_status_within("sh", &["-c", "exit 3"], Duration::from_secs(5)),
             Err("sh -c exit 3 exited with exit status: 3".to_string())
+        );
+        // Its stderr is the error's, not the terminal's: systemctl's own
+        // "Operation refused" used to print above the line saying the
+        // fallback restart worked (bd DAS-Backup-Manager-sp78.16).
+        assert_eq!(
+            command_status_within(
+                "sh",
+                &["-c", "echo '  Operation refused  ' >&2; exit 4"],
+                Duration::from_secs(5)
+            ),
+            Err(
+                "sh -c echo '  Operation refused  ' >&2; exit 4 exited with exit status: 4: Operation refused"
+                    .to_string()
+            )
         );
         let err = command_status_within("/nonexistent/6wt-command", &[], Duration::from_secs(5))
             .unwrap_err();
