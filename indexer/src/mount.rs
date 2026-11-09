@@ -1264,7 +1264,9 @@ fn read_recovery_esp_with(
         .esp_partuuid
         .as_deref()
         .ok_or("no `esp_partuuid` is configured for this target")?;
-    let spec = format!("PARTUUID={pu}");
+    // lsblk and libblkid write a PARTUUID in lower case; a tag lookup is
+    // exact, so the key is asked for as they write it.
+    let spec = format!("PARTUUID={}", pu.to_ascii_lowercase());
     let listed = crate::config::is_partuuid(pu)
         && drive_ids.iter().any(|id| {
             id.split_once('=')
@@ -4699,6 +4701,31 @@ mod tests {
             Ok(vec![]),
         );
         assert!(r.is_err() && runner.calls().is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn an_upper_case_key_is_asked_for_in_lower_case() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified()]);
+        let (r, _) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(&ESP_PU.to_uppercase())),
+            Ok(vec![]),
+        );
+        assert_eq!(r, Ok(vec![]));
+        let spec = format!("PARTUUID={ESP_PU}");
+        assert!(
+            argvs(&runner, "mount")[0].contains(&spec),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(
+            argvs(&runner, "findmnt")[0].contains(&spec),
+            "{:?}",
+            runner.calls()
+        );
     }
 
     #[test]
