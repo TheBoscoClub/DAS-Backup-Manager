@@ -3187,6 +3187,7 @@ Total to scrub:   401.28MiB\n";
             role: TargetRole::Primary,
             retention: Retention::default(),
             display_name: label.into(),
+            esp_partuuid: None,
         });
         config
     }
@@ -3418,6 +3419,7 @@ Total to scrub:   401.28MiB\n";
                 role: crate::config::TargetRole::Primary,
                 retention: crate::config::Retention::default(),
                 display_name: String::new(),
+                esp_partuuid: None,
             });
         }
         let scrubbed = std::sync::Mutex::new(Vec::new());

@@ -155,6 +155,7 @@ fn config_for(fs: &Loopback, snapshot_name: &str) -> (Config, tempfile::NamedTem
         role: buttered_dasd::config::TargetRole::Primary,
         retention: Default::default(),
         display_name: "Loopback".into(),
+        esp_partuuid: None,
     }];
     (cfg, conf)
 }

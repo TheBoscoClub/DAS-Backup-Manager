@@ -2057,6 +2057,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             role: crate::config::TargetRole::Primary,
             retention: crate::config::Retention::default(),
             display_name: label.to_string(),
+            esp_partuuid: None,
         }
     }
 

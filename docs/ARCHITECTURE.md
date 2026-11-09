@@ -468,7 +468,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `restore` | allowed_roots[] | Where a restore may write (an unoverridable denylist is checked first) |
 | `recovery_os` | max_age_days | Age past which a mirror target's own OS is reported STALE (`btrdasd recovery-os`) |
 | `source[]` | label, volume, device, snapshot_dir, target_subdirs[], target_labels[], subvolumes[] (name, manual_only, snapshot_name, adopted, retired) | BTRFS sources; `adopted` / `retired` dates are written by the backup run; empty `target_labels` = every target |
-| `target[]` | label, serials[], mount_uuid, mount, role (primary/mirror), display_name, retention (daily, weekly, monthly, yearly) | Backup targets; mounted by `mount_uuid` when set, else by serial |
+| `target[]` | label, serials[], mount_uuid, mount, role (primary/mirror), display_name, esp_partuuid (mirror only), retention (daily, weekly, monthly, yearly) | Backup targets; mounted by `mount_uuid` when set, else by serial; a mirror's `esp_partuuid` names its own ESP for the recovery-OS reading's read-only loader check |
 | `email` | enabled, smtp_host, smtp_port, from, to | Email reports |
 | `gui` | enabled (bool) | GUI installation toggle |
 
@@ -681,13 +681,14 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `health` | `src/health.rs` | ~2250 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `maintenance` | `src/maintenance.rs` | ~1500 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
-| `mount` | `src/mount.rs` | ~4090 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` |
+| `mount` | `src/mount.rs` | ~4900 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()`, the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`) |
 | `progress` | `src/progress.rs` | ~770 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~650 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
-| `recovery_os` | `src/recovery_os.rs` | ~5800 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |
+| `recovery_os` | `src/recovery_os.rs` | ~6400 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |
 | `recovery_os::boot` | `src/recovery_os/boot.rs` | ~11150 | Whether booting a recovery OS would run btrbk, and when: the units its boot starts, what they run (shell scripts included), its cron, and the btrbk config each would use, down to one verdict (`will`, `may`, `no`) |
 | `recovery_os::hold_disk` | `src/recovery_os/hold_disk.rs` | ~760 | `btrdasd recovery-os hold-disk`: the `O_EXCL` claim on a whole recovery disk that keeps the host from mounting it while `scripts/recovery-os-vm.sh` has lent it to that drive's `recovery-os-updater-<label>` VM; held until SIGTERM/SIGINT/SIGHUP |
 | `recovery_os::panel` | `src/recovery_os/panel.rs` | ~3100 | The drive panel's rules and `RecoveryOsStatus` document: per drive the record, history, schedule (`pending`, `fired`, `running`, `missed`) and session, each with its own `history_error`/`schedule_error`/`session_error` key when its read failed; the generated `das-recovery-os-update-<label\|both>.{service,timer}` pair and the validation of a schedule |
+| `recovery_os::esp` | `src/recovery_os/esp.rs` | ~300 | The files a recovery drive's `loader/entries/*.conf` name that its ESP, mounted read-only by `mount::read_recovery_esp`, does not hold: `BOOT PROBLEM` rows |
 | `recovery_os::lines` | `src/recovery_os/lines.rs` | ~230 | The parser of the script's `PROGRESS`/`OUTPUT`/`RESULT`/`DRIVE` lines |
 | `recovery_os::session` | `src/recovery_os/session.rs` | ~1290 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
 | `report` | `src/report.rs` | ~1640 | Backup report formatting, and the `Mailer` seam every report send (backup, scrub, doctor) goes through; `MAILX` runs `mailx`, and refuses in a test build |
@@ -744,10 +745,10 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1497 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust unit tests | 1522 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
 | Rust CLI + setup tests | 296 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 42 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 62 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (29), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
 | Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
-| **Total** | **1897 Rust (1908 incl. manual) + 55 Qt** | |
+| **Total** | **1922 Rust (1933 incl. manual) + 55 Qt** | |

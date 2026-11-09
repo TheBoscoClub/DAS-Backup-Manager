@@ -2847,6 +2847,7 @@ mod tests {
             role,
             retention: Retention::default(),
             display_name: label.to_string(),
+            esp_partuuid: None,
         };
         let cfg = Config {
             targets: vec![

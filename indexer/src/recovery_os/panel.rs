@@ -1087,6 +1087,7 @@ pub(crate) mod tests {
             role: TargetRole::Mirror,
             retention: Retention::default(),
             display_name: format!("Drive {label}"),
+            esp_partuuid: None,
         }
     }
 

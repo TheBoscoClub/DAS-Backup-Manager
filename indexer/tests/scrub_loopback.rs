@@ -302,6 +302,7 @@ fn rig_config(rig: &Rig) -> Config {
         role: TargetRole::Primary,
         retention: Retention::default(),
         display_name: "loopback rig".into(),
+        esp_partuuid: None,
     });
     config.scrub.targets = vec!["loopback-rig".into()];
     config

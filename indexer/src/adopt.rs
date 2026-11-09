@@ -1268,6 +1268,7 @@ mod tests {
                 ..Default::default()
             },
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 

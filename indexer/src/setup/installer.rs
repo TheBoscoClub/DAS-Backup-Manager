@@ -1878,6 +1878,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 
@@ -2444,6 +2445,7 @@ auth = "starttls""#,
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
 
         let config_path = base.join("etc/das-backup/config.toml");

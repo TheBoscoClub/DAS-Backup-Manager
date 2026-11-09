@@ -644,6 +644,7 @@ pub(crate) mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
         config
     }
@@ -1067,6 +1068,7 @@ pub(crate) mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
         config
     }

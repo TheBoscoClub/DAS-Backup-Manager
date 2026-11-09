@@ -1165,6 +1165,7 @@ mod tests {
             role,
             retention: Default::default(),
             display_name: String::new(),
+            esp_partuuid: None,
         };
         cfg.targets = vec![target("big", TargetRole::Primary)];
         assert!(!drift_from_listings(&cfg, &listings).not_clean());

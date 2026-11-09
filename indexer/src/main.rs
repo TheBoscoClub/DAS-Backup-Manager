@@ -1596,6 +1596,7 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 &health::is_mountpoint,
                 &ros::mounted_uuid,
                 &ros::drive_partition_ids,
+                &ros::check_esp,
                 &mut |n| eprintln!("recovery-os: {n}"),
             );
             if json {
@@ -3755,6 +3756,7 @@ mod tests {
             role: TargetRole::Primary,
             retention: Retention::default(),
             display_name: label.to_string(),
+            esp_partuuid: None,
         }
     }
 

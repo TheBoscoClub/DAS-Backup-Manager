@@ -861,6 +861,7 @@ mod tests {
             role,
             retention,
             display_name: String::new(),
+            esp_partuuid: None,
         };
         let mut c = Config {
             targets: vec![

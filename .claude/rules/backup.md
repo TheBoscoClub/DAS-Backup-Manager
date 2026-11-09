@@ -78,7 +78,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   values: `local-installation.md`).
 - Recovery drives (`role = "mirror"`) are independent bootable copies, **not** RAID mirrors of each other. Their OS
   under `@` is read-only checked (stale, or btrbk running at its boot, is WARN); rebuilt by
-  `recovery-os-vm.sh provision`; the host never writes to the drive.
+  `recovery-os-vm.sh provision`; the host never writes to the drive. Its ESP, named by `esp_partuuid`, is
+  mounted read-only for the reading and each missing loader-entry file is a BOOT PROBLEM (bd `sp78.20`).
 - Boot archives: 60-day retention by default (`[boot].archive_retention_days`), pruned by `boot-archive-cleanup.sh`
   at the end of every `backup-run.sh` run (not CLI/GUI runs) while targets are still mounted.
 

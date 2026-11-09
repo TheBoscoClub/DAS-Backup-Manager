@@ -243,6 +243,7 @@ mod tests {
                 yearly: 4,
             },
             display_name: "22TB Primary (Bay 2)".to_string(),
+            esp_partuuid: None,
         });
         config.targets.push(Target {
             label: "system-recovery-B-2tb".to_string(),
@@ -258,6 +259,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
         config
     }

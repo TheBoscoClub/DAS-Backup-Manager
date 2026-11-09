@@ -4094,6 +4094,7 @@ mod tests {
                     yearly: 4,
                 },
                 display_name: "Test 22TB".into(),
+                esp_partuuid: None,
             }],
             // Unreachable: a test never names the live relay's port, so not
             // even a broken guard could hand it a report (bd 1x76).
@@ -8747,6 +8748,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: "Recovery A (independent OS)".into(),
+            esp_partuuid: None,
         });
 
         let progress = TestProgress::new();
@@ -8815,6 +8817,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: "Recovery A (independent OS)".into(),
+            esp_partuuid: None,
         });
         (config, conf)
     }

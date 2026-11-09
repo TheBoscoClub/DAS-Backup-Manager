@@ -160,6 +160,7 @@ impl Rig {
                 ..Default::default()
             },
             display_name: "Loopback".into(),
+            esp_partuuid: None,
         }];
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
         std::fs::write(&rig.btrbk_conf, render_btrbk_conf(&cfg).unwrap()).unwrap();

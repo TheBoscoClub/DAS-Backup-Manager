@@ -566,6 +566,7 @@ fn list_in_root(root: &Path, rel: &str) -> Result<Vec<String>, ReadErr> {
 }
 
 mod boot;
+pub mod esp;
 
 /// The `WARNING` line for an OS whose boot would, or may, run btrbk —
 /// [`RecoveryOs::btrbk_at_boot`], read by [`inspect`] — or `None` when that
@@ -998,6 +999,13 @@ pub struct Assessment {
     /// not; shown, never a problem by itself.
     #[serde(default)]
     pub fstab_unchecked: Option<String>,
+    /// Why the drive's own ESP was not read for the files its loader entries
+    /// name ([`esp::loader_problems`], whose findings are `boot_problems`),
+    /// when it was not: no `esp_partuuid`, a PARTUUID the drive does not
+    /// list, a mount that failed (bd DAS-Backup-Manager-sp78.20). Shown,
+    /// never a problem by itself.
+    #[serde(default)]
+    pub esp_unchecked: Option<String>,
 }
 
 impl Assessment {
@@ -1140,6 +1148,7 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         // Filled in by the reading, which knows the drive ([`fstab_problems`]).
         boot_problems: Vec::new(),
         fstab_unchecked: None,
+        esp_unchecked: None,
     }
 }
 
@@ -1220,6 +1229,33 @@ pub fn inspect_drive(
 /// (`LABEL=`, `UUID=`, `PARTUUID=`, `PARTLABEL=`), or why they could not be
 /// listed; `None` when the caller has no way to look (a test's fixture).
 pub type DriveIds = dyn Fn(&Path) -> Option<Result<BTreeSet<String>, String>>;
+
+/// What a recovery drive's own ESP says about its boot: the files its
+/// loader entries name that it lacks, or why it could not be read. Handed
+/// the target and the drive's partitions ([`DriveIds`]), or why they could
+/// not be listed; `None` when the caller has no way to look (a test's
+/// fixture). [`check_esp`] on this machine (bd DAS-Backup-Manager-sp78.20).
+pub type EspCheck = dyn Fn(
+    &crate::config::Target,
+    Result<&BTreeSet<String>, &str>,
+) -> Option<Result<Vec<String>, String>>;
+
+/// [`EspCheck`] on this machine: the target's ESP mounted read-only by
+/// [`crate::mount::read_recovery_esp`] and read by
+/// [`esp::loader_problems`].
+pub fn check_esp(
+    target: &crate::config::Target,
+    ids: Result<&BTreeSet<String>, &str>,
+) -> Option<Result<Vec<String>, String>> {
+    Some(match ids {
+        // Unlisted partitions cannot show the key names this drive's ESP.
+        Err(why) if target.esp_partuuid.is_some() => {
+            Err(format!("the drive's partitions could not be listed: {why}"))
+        }
+        Err(_) => Err("no `esp_partuuid` is configured for this target".into()),
+        Ok(ids) => crate::mount::read_recovery_esp(target, ids, &esp::loader_problems),
+    })
+}
 
 /// That OS's `etc/fstab`, read as the boot record reads its inputs.
 fn read_fstab(root: &Path) -> Result<Option<String>, String> {
@@ -1382,6 +1418,7 @@ pub fn status_noting(
         is_mounted,
         fs_uuid,
         drive_ids,
+        &|_, _| None,
         note,
         &|| false,
     )
@@ -1389,7 +1426,9 @@ pub fn status_noting(
 
 /// [`status_noting`], asking `stop` before each drive: once it answers true
 /// no further drive is read, and the drives read so far are returned
-/// ([`record_within`] discards them; bd DAS-Backup-Manager-ay0n).
+/// ([`record_within`] discards them; bd DAS-Backup-Manager-ay0n). Each drive
+/// whose partitions were listed also has its ESP read by `esp`, inside its
+/// reading, so a stop never leaves it mounted.
 #[allow(clippy::too_many_arguments)]
 pub fn status_noting_until(
     cfg: &Config,
@@ -1398,6 +1437,7 @@ pub fn status_noting_until(
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
     drive_ids: &DriveIds,
+    esp: &EspCheck,
     note: &mut dyn FnMut(String),
     stop: &dyn Fn() -> bool,
 ) -> Vec<DriveEntry> {
@@ -1417,15 +1457,18 @@ pub fn status_noting_until(
                 if let DriveReport::Inspected { assessment, .. } = &mut entry.report
                     && let Some(ids) = drive_ids(mount)
                 {
-                    match ids {
+                    match &ids {
                         Ok(ids) => match read_fstab(&root) {
-                            Ok(Some(text)) => {
-                                assessment.boot_problems = fstab_problems(&text, &ids)
-                            }
+                            Ok(Some(text)) => assessment.boot_problems = fstab_problems(&text, ids),
                             Ok(None) => {}
                             Err(why) => assessment.fstab_unchecked = Some(why),
                         },
-                        Err(why) => assessment.fstab_unchecked = Some(why),
+                        Err(why) => assessment.fstab_unchecked = Some(why.clone()),
+                    }
+                    match esp(t, ids.as_ref().map_err(String::as_str)) {
+                        Some(Ok(problems)) => assessment.boot_problems.extend(problems),
+                        Some(Err(why)) => assessment.esp_unchecked = Some(why),
+                        None => {}
                     }
                 }
                 let after = fs_uuid(mount);
@@ -1668,6 +1711,9 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                 }
                 if let Some(why) = &assessment.fstab_unchecked {
                     out.push_str(&row("Fstab", &format!("not checked: {why}")));
+                }
+                if let Some(why) = &assessment.esp_unchecked {
+                    out.push_str(&row("ESP", &format!("not checked: {why}")));
                 }
                 out.push_str(&row("Result", &verdict(assessment)));
             }
@@ -1955,11 +2001,13 @@ pub fn status_run_with(
         is_mounted,
         fs_uuid,
         &|_| None,
+        &|_, _| None,
         &mut |_| {},
     )
 }
 
-/// [`status_run_with`], with [`status_noting`]'s per-drive notes.
+/// [`status_run_with`], with [`status_noting`]'s per-drive notes and each
+/// drive's ESP read by `esp`.
 #[allow(clippy::too_many_arguments)]
 pub fn status_run_noting(
     cfg: &Config,
@@ -1970,9 +2018,20 @@ pub fn status_run_noting(
     is_mounted: &dyn Fn(&Path) -> bool,
     fs_uuid: &dyn Fn(&Path) -> Option<String>,
     drive_ids: &DriveIds,
+    esp: &EspCheck,
     note: &mut dyn FnMut(String),
 ) -> StatusRun {
-    let entries = status_noting(cfg, host, today, is_mounted, fs_uuid, drive_ids, note);
+    let entries = status_noting_until(
+        cfg,
+        host,
+        today,
+        is_mounted,
+        fs_uuid,
+        drive_ids,
+        esp,
+        note,
+        &|| false,
+    );
     let state_error = state_file.and_then(|p| write_state(p, &entries, now_epoch).err());
     let code = if state_error.is_some() {
         2
@@ -2077,7 +2136,7 @@ pub fn classify(entries: &[DriveEntry], state_error: Option<&str>) -> (RecordSta
             why.push("btrbk may run at boot");
         }
         if assessments().any(|a| !a.boot_problems.is_empty()) {
-            why.push("its boot may stop: fstab names a partition the drive lacks");
+            why.push("its boot may stop: see BOOT PROBLEM");
         }
         return (
             RecordStatus::Warn,
@@ -2220,6 +2279,7 @@ pub fn record(cfg: &Config, state_file: &Path, note: &mut dyn FnMut(String)) -> 
             &crate::health::is_mountpoint,
             &mounted_uuid,
             &drive_partition_ids,
+            &check_esp,
             note,
             stop,
         )
@@ -4100,6 +4160,119 @@ mod tests {
     }
 
     #[test]
+    fn the_status_reading_reads_each_drive_s_esp_and_shows_what_it_found() {
+        let a = tempfile::tempdir().unwrap();
+        current_root(&a.path().join("@"));
+        let mut cfg = mirror_config(&[("A", a.path().to_str().unwrap())]);
+        // [0] is the primary.
+        cfg.targets[1].esp_partuuid = Some("5eed0025-0000-4000-8000-000000000025".into());
+        let read = |drive_ids: &DriveIds, esp: &EspCheck| {
+            status_noting_until(
+                &cfg,
+                &current_host(),
+                TODAY,
+                &|_| true,
+                &no_uuid,
+                drive_ids,
+                esp,
+                &mut |_| {},
+                &|| false,
+            )
+        };
+        let assessment = |e: &[DriveEntry]| match &e[0].report {
+            DriveReport::Inspected { assessment, .. } => assessment.clone(),
+            other => panic!("{other:?}"),
+        };
+        let listed = |_: &Path| Some(Ok(ids(&["PARTUUID=5eed0025-0000-4000-8000-000000000025"])));
+        // The ESP lacks a file an entry names: a boot problem, exit 1, WARN.
+        // It is handed this target and this drive's partitions.
+        let entries = read(&listed, &|t, ids| {
+            Some(Ok(vec![format!(
+                "loader entry x.conf names initrd /amd-ucode.img, which this drive's ESP does \
+                 not have: that entry does not boot [{} {:?} {:?}]",
+                t.label,
+                t.esp_partuuid,
+                ids.map(|i| i.len())
+            )]))
+        });
+        assert!(
+            assessment(&entries).boot_problems[0]
+                .ends_with("[A Some(\"5eed0025-0000-4000-8000-000000000025\") Ok(1)]"),
+            "{:?}",
+            assessment(&entries)
+        );
+        let a1 = assessment(&entries);
+        assert_eq!(a1.boot_problems.len(), 1, "{a1:?}");
+        assert_eq!(a1.esp_unchecked, None);
+        assert_eq!(exit_code(&entries), 1);
+        let section = format_section(&entries, &current_host());
+        assert!(
+            section.contains("BOOT PROBLEM        loader entry x.conf names initrd /amd-ucode.img"),
+            "{section}"
+        );
+        let (status, detail) = classify(&entries, None);
+        assert_eq!(status, RecordStatus::Warn);
+        assert!(detail.contains("its boot may stop"), "{detail}");
+        // Not read: said, never a problem by itself.
+        let entries = read(&listed, &|_, _| {
+            Some(Err("no `esp_partuuid` is configured".into()))
+        });
+        let a2 = assessment(&entries);
+        assert!(a2.boot_problems.is_empty());
+        assert_eq!(exit_code(&entries), 0);
+        assert!(
+            format_section(&entries, &current_host())
+                .contains("ESP                 not checked: no `esp_partuuid` is configured"),
+            "{}",
+            format_section(&entries, &current_host())
+        );
+        assert_eq!(classify(&entries, None).0, RecordStatus::Ok);
+        // The partitions could not be listed: the check is still asked, and
+        // told why.
+        let entries = read(&|_| Some(Err("lsblk exited with 1".into())), &|_, ids| {
+            Some(Err(format!("unlisted: {}", ids.unwrap_err())))
+        });
+        assert_eq!(
+            assessment(&entries).esp_unchecked.as_deref(),
+            Some("unlisted: lsblk exited with 1")
+        );
+        // A caller with no way to look shows no row.
+        let entries = read(&listed, &|_, _| None);
+        assert!(!format_section(&entries, &current_host()).contains("ESP  "));
+    }
+
+    #[test]
+    fn check_esp_says_why_without_a_key_or_a_partition_list_and_never_mounts() {
+        let cfg = mirror_config(&[("A", "/nonexistent/r/A")]);
+        let mut t = cfg.targets[1].clone();
+        let none = check_esp(&t, Err("lsblk exited with 1"))
+            .unwrap()
+            .unwrap_err();
+        assert!(none.contains("esp_partuuid"), "{none}");
+        let none = check_esp(&t, Ok(&ids(&[]))).unwrap().unwrap_err();
+        assert!(none.contains("esp_partuuid"), "{none}");
+        t.esp_partuuid = Some("5eed0025-0000-4000-8000-000000000025".into());
+        let unlisted = check_esp(&t, Err("lsblk exited with 1"))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            unlisted.contains("could not be listed: lsblk exited with 1"),
+            "{unlisted}"
+        );
+        // A drive that does not list it: refused before any command runs.
+        let foreign = check_esp(
+            &t,
+            Ok(&ids(&["PARTUUID=5eed0099-0000-4000-8000-000000000099"])),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            foreign.contains("not a partition of this drive"),
+            "{foreign}"
+        );
+    }
+
+    #[test]
     fn os_root_is_the_at_subvolume_of_the_mount() {
         assert_eq!(os_root("/mnt/r"), PathBuf::from("/mnt/r/@"));
     }
@@ -4188,6 +4361,7 @@ mod tests {
             &is_mounted,
             &no_uuid,
             &|_| None,
+            &|_, _| None,
             &mut |n| notes.push(n),
         );
         assert_eq!(run.entries.len(), 2);
@@ -6037,6 +6211,7 @@ mod tests {
             &|_| true,
             &|_| None,
             &|_| None,
+            &|_, _| None,
             &mut |n| {
                 // Told to stop while A is read.
                 stopped.set(true);

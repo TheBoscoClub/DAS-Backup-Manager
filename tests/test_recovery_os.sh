@@ -163,12 +163,29 @@ printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    BOOT PROBLEM        etc/fstab mounts /
 rc=0; check_recovery_os run || rc=$?
 check "boot problem: returns 0" "$rc" "0"
 check "boot problem: WARN" "${OP_STATUS[recovery_os]}" "WARN"
-check "boot problem: detail says the boot may stop" "${OP_STATUS[recovery_os_detail]}" "its boot may stop: fstab names a partition the drive lacks — see RECOVERY OS in the report"
-check "boot problem: the log line says so" "$(grep -c '^WARN: A recovery OS may not boot: its fstab names a partition the drive lacks' "$WORK/log")" "1"
+check "boot problem: detail says the boot may stop" "${OP_STATUS[recovery_os_detail]}" "its boot may stop: see BOOT PROBLEM — see RECOVERY OS in the report"
+check "boot problem: the log line says so" "$(grep -c '^WARN: A recovery OS may not boot — see BOOT PROBLEM in RECOVERY OS in the report' "$WORK/log")" "1"
+
 check "boot warning: the WARNING row reaches the report" "$(grep -c "^    WARNING             $boot_warning\$" <<<"$report")" "1"
 check "boot warning: the run is still recorded as SUCCESS" "$(run_status)" "SUCCESS"
 check "boot warning: the subject says so" "$(subject_status)" "SUCCESS WITH WARNINGS"
 check "boot warning: the drive counts as inspected, not unmounted" "$(grep -c 'not mounted' <<<"${OP_STATUS[recovery_os_detail]}" || true)" "0"
+
+# --- a boot problem from the drive's ESP: a file a loader entry names is
+# missing (bd DAS-Backup-Manager-sp78.20) — the same row, the same words.
+reset
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    BOOT PROBLEM        loader entry linux-cachyos.conf names initrd /amd-ucode.img, which this drive'"'"'s ESP does not have: that entry does not boot\n    Result              current\n' >"$WORK/out"; echo 1 >"$WORK/rc"
+rc=0; check_recovery_os run || rc=$?
+check "esp problem: returns 0" "$rc" "0"
+check "esp problem: WARN" "${OP_STATUS[recovery_os]}" "WARN"
+check "esp problem: detail says the boot may stop" "${OP_STATUS[recovery_os_detail]}" "its boot may stop: see BOOT PROBLEM — see RECOVERY OS in the report"
+
+# --- an ESP not checked is shown, never a WARN by itself ---------------------
+reset
+# shellcheck disable=SC2016 # the backticks are the report's own text
+printf 'RECOVERY OS\n  A  (/mnt/a/@)\n    ESP                 not checked: no `esp_partuuid` is configured for this target\n    Result              current\n' >"$WORK/out"; echo 0 >"$WORK/rc"
+rc=0; check_recovery_os run || rc=$?
+check "esp not checked: OK" "${OP_STATUS[recovery_os]}" "OK"
 
 # Stale and warned at once: both said, in that order, one log line each.
 reset

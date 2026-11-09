@@ -27,6 +27,12 @@ wizard's hook prompt were deleted. **No code path here can generate an ESP sync 
 A host-ESP mirror is a different system — never conflate the two: it must hardcode its paths, have no
 discovery loop, cross-check label against mount, and refuse any device not on the expected bus class.
 
+### The one ESP mount this project makes
+
+The recovery-OS reading mounts a mirror target's own ESP **read-only** (bd `sp78.20`), only by that target's
+`esp_partuuid`, only when the drive itself lists that PARTUUID, never over or beside another mount of it:
+`mount::read_recovery_esp`. No other code path mounts an ESP; never add one that finds it any other way.
+
 ### Identification
 
 Identify by serial/PARTUUID, never by device path (USB-attached; paths vary on reconnect). Mount points of the

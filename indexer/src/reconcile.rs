@@ -484,6 +484,7 @@ mod tests {
                 yearly: 1,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 

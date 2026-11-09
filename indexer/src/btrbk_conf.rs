@@ -754,6 +754,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
         config
     }
@@ -860,6 +861,7 @@ mod tests {
             role,
             retention,
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 

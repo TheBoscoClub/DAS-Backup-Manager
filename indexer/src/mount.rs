@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::panic::RefUnwindSafe;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
@@ -1218,6 +1219,159 @@ fn verify_write_targets_with(
             "Refusing to run btrbk — backup target verification failed:\n  - {}",
             violations.join("\n  - ")
         ))
+    }
+}
+
+/// Where a recovery drive's ESP is mounted while it is read: one directory
+/// per target under this one (bd DAS-Backup-Manager-sp78.20).
+pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
+
+/// The one mount this project makes of an ESP (bd DAS-Backup-Manager-sp78.20):
+/// a mirror target's own ESP, the partition its `esp_partuuid` names, mounted
+/// read-only at [`ESP_MOUNT_ROOT`]`/<label>` for `read`, then unmounted.
+/// `drive_ids` are the names `lsblk` gives this drive's partitions
+/// (`PARTUUID=…` among them). `Ok` is what `read` found; `Err` says why the
+/// ESP was not read, or that it was read and could not be unmounted.
+///
+/// The configured PARTUUID is a claim, not an identity: it is mounted only
+/// when the drive itself lists it, so a mistyped or copied key — the host's
+/// `EFI` — is refused before anything is asked of the host. Never
+/// discovered (`.claude/rules/esp-safety.md`). Mounted elsewhere, it is left
+/// as it is; mounted at its own directory, an earlier reading left it, and
+/// it is taken down as a target an earlier job left is (bd jgm).
+pub fn read_recovery_esp(
+    target: &crate::config::Target,
+    drive_ids: &std::collections::BTreeSet<String>,
+    read: &dyn Fn(&Path) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    read_recovery_esp_with(
+        &SystemRunner,
+        Path::new(ESP_MOUNT_ROOT),
+        target,
+        drive_ids,
+        read,
+    )
+}
+
+fn read_recovery_esp_with(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    target: &crate::config::Target,
+    drive_ids: &std::collections::BTreeSet<String>,
+    read: &dyn Fn(&Path) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let pu = target
+        .esp_partuuid
+        .as_deref()
+        .ok_or("no `esp_partuuid` is configured for this target")?;
+    let spec = format!("PARTUUID={pu}");
+    let listed = crate::config::is_partuuid(pu)
+        && drive_ids.iter().any(|id| {
+            id.split_once('=')
+                .is_some_and(|(k, v)| k == "PARTUUID" && v.eq_ignore_ascii_case(pu))
+        });
+    if !listed {
+        return Err(format!(
+            "{spec} is not a partition of this drive — not mounted"
+        ));
+    }
+    let dir = root.join(esp_dir_name(&target.label));
+    let dir_s = dir
+        .to_str()
+        .ok_or("the ESP's mount directory is not UTF-8")?;
+
+    // Where that partition is mounted now: findmnt exits 1 when nowhere.
+    let out = runner
+        .output(Command::new("findmnt").args(["-n", "-o", "TARGET", "-S", &spec]))
+        .map_err(|e| format!("findmnt failed to run: {e}"))?;
+    match out.status.code() {
+        Some(0) => {
+            for there in String::from_utf8_lossy(&out.stdout).lines() {
+                if there != dir_s {
+                    return Err(format!(
+                        "{spec} is mounted at {there} — left as it is, not read"
+                    ));
+                }
+            }
+            take_down_leftover_with(runner, dir_s, &crate::progress::NullProgress)
+                .map_err(|why| format!("{spec} was left mounted at {dir_s}: {why}"))?;
+        }
+        Some(1) => {}
+        _ => return Err(exit_why("findmnt", out.status)),
+    }
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("{dir_s}: {e}"))?;
+    let gone = |r: Result<Vec<String>, String>| {
+        // Empty once unmounted; a directory left behind is only clutter.
+        let _ = std::fs::remove_dir(&dir);
+        r
+    };
+    // 32: not a mount point (util-linux); anything else is no answer.
+    match runner.status(Command::new("mountpoint").args(["-q", dir_s])) {
+        Ok(s) if s.code() == Some(32) => {}
+        Ok(s) if s.success() => {
+            return Err(format!(
+                "{dir_s} is already a mount point — not mounted over"
+            ));
+        }
+        Ok(s) => return gone(Err(exit_why("mountpoint", s))),
+        Err(e) => return gone(Err(format!("mountpoint failed to run: {e}"))),
+    }
+    match runner.status(Command::new("mount").args([
+        "-t",
+        "vfat",
+        "-o",
+        "ro,nodev,nosuid,noexec,noatime",
+        &spec,
+        dir_s,
+    ])) {
+        Ok(s) if s.success() => {}
+        Ok(s) => return gone(Err(exit_why("mount", s))),
+        Err(e) => return gone(Err(format!("mount failed to run: {e}"))),
+    }
+
+    // Read only what is shown to be that partition.
+    let found = runner
+        .output(Command::new("findmnt").args(["-n", "-o", "PARTUUID", "--mountpoint", dir_s]))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let read = match found {
+        Some(f) if f.eq_ignore_ascii_case(pu) => read(&dir),
+        Some(f) => Err(format!("{dir_s} holds PARTUUID={f}, not {spec} — not read")),
+        None => Err(format!(
+            "what is mounted at {dir_s} could not be told — not read"
+        )),
+    };
+    match umount_retrying(runner, dir_s, |_| {}) {
+        Ok(()) => gone(read),
+        Err(why) => Err(format!(
+            "{spec} is still mounted at {dir_s} after {UMOUNT_ATTEMPTS} attempts ({why}); \
+             the next reading takes it down"
+        )),
+    }
+}
+
+/// A target's label as one safe file name under [`ESP_MOUNT_ROOT`].
+fn esp_dir_name(label: &str) -> String {
+    let name: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        format!("_{name}")
+    } else {
+        name
     }
 }
 
@@ -4212,6 +4366,7 @@ mod tests {
                 yearly: 1,
             },
             display_name: label.into(),
+            esp_partuuid: None,
         }
     }
 
@@ -4392,5 +4547,349 @@ mod tests {
             require_released(&held),
             Err("still mounted: /mnt/t".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A recovery drive's ESP (bd DAS-Backup-Manager-sp78.20)
+    // -----------------------------------------------------------------------
+
+    const ESP_PU: &str = "5eed0025-0000-4000-8000-000000000025";
+
+    fn esp_target(partuuid: Option<&str>) -> Target {
+        Target {
+            label: "recovery-a".into(),
+            serial: String::new(),
+            serials: vec!["SERIAL04".into()],
+            mount_uuid: Some("5eed0008-0000-4000-8000-000000000008".into()),
+            mount: "/mnt/recovery-a".into(),
+            role: TargetRole::Mirror,
+            retention: Retention::default(),
+            display_name: String::new(),
+            esp_partuuid: partuuid.map(str::to_string),
+        }
+    }
+
+    /// The drive's partitions as `lsblk` names them; the ESP's PARTUUID in
+    /// upper case, as some tools print it.
+    fn esp_drive_ids() -> std::collections::BTreeSet<String> {
+        [
+            "LABEL=RECOV-ESP-1".to_string(),
+            "UUID=ABCD-0003".into(),
+            format!("PARTUUID={}", ESP_PU.to_uppercase()),
+            "UUID=5eed0008-0000-4000-8000-000000000008".into(),
+            "PARTUUID=5eed0026-0000-4000-8000-000000000026".into(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Runs the ESP reading against `runner`, under a scratch root, with a
+    /// reader that records the directory it was handed.
+    fn read_esp(
+        runner: &ScriptedRunner,
+        root: &Path,
+        target: &Target,
+        answer: Result<Vec<String>, String>,
+    ) -> (Result<Vec<String>, String>, Vec<PathBuf>) {
+        let seen = Mutex::new(Vec::new());
+        let read = |dir: &Path| {
+            seen.lock().unwrap().push(dir.to_path_buf());
+            answer.clone()
+        };
+        let r = read_recovery_esp_with(runner, root, target, &esp_drive_ids(), &read);
+        (r, seen.into_inner().unwrap())
+    }
+
+    fn argvs(runner: &ScriptedRunner, program: &str) -> Vec<Vec<String>> {
+        runner
+            .calls()
+            .into_iter()
+            .filter(|c| c.argv[0] == program)
+            .map(|c| c.argv)
+            .collect()
+    }
+
+    /// `findmnt -o PARTUUID` on the ESP's directory answers this partition,
+    /// so the mount is shown to be it.
+    fn verified() -> (&'static str, Reply) {
+        (
+            "PARTUUID",
+            Reply::Exit {
+                code: 0,
+                stdout: leak(format!("{ESP_PU}\n")),
+                stderr: "",
+            },
+        )
+    }
+
+    /// `findmnt -S` and `mountpoint -q` find nothing: the ESP is mounted
+    /// nowhere and its directory is no mount point.
+    fn unmounted_host() -> [(&'static str, Reply); 2] {
+        [("-S", Reply::exit(1)), ("-q", Reply::exit(32))]
+    }
+
+    #[test]
+    fn the_esp_is_mounted_read_only_read_and_unmounted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified()]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec!["a problem".into()]),
+        );
+        let dir = scratch.path().join("recovery-a");
+        let dir_s = dir.to_str().unwrap();
+        assert_eq!(r, Ok(vec!["a problem".to_string()]));
+        assert_eq!(seen, vec![dir.clone()]);
+        let spec = format!("PARTUUID={ESP_PU}");
+        assert_eq!(
+            argvs(&runner, "mount"),
+            vec![vec![
+                "mount".to_string(),
+                "-t".into(),
+                "vfat".into(),
+                "-o".into(),
+                "ro,nodev,nosuid,noexec,noatime".into(),
+                spec,
+                dir_s.into(),
+            ]]
+        );
+        assert_eq!(
+            argvs(&runner, "umount"),
+            vec![vec!["umount".to_string(), dir_s.into()]]
+        );
+        assert!(
+            !dir.exists(),
+            "its directory is removed once it is unmounted"
+        );
+    }
+
+    #[test]
+    fn a_partuuid_this_drive_does_not_list_is_never_mounted() {
+        // The host's EFI, copied into the key by mistake: refused before
+        // the host is asked anything.
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = ScriptedRunner::succeeding();
+        let host_efi = "5eed0099-0000-4000-8000-000000000099";
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(host_efi)),
+            Ok(vec![]),
+        );
+        let why = r.unwrap_err();
+        assert!(
+            why.contains(host_efi) && why.contains("not a partition of this drive"),
+            "{why}"
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(seen.is_empty());
+        // The drive's own second partition is listed, but is no PARTUUID of
+        // a key that is malformed.
+        let (r, _) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some("RECOV-ESP-1")),
+            Ok(vec![]),
+        );
+        assert!(r.is_err() && runner.calls().is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn a_target_without_the_key_is_not_checked_and_nothing_is_run() {
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = ScriptedRunner::succeeding();
+        let (r, seen) = read_esp(&runner, scratch.path(), &esp_target(None), Ok(vec![]));
+        assert!(r.unwrap_err().contains("esp_partuuid"));
+        assert!(runner.calls().is_empty() && seen.is_empty());
+    }
+
+    #[test]
+    fn an_esp_mounted_elsewhere_is_left_as_it_is_and_not_read() {
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = ScriptedRunner::with_rules(&[(
+            "-S",
+            Reply::Exit {
+                code: 0,
+                stdout: "/media/someone\n",
+                stderr: "",
+            },
+        )]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        let why = r.unwrap_err();
+        assert!(why.contains("/media/someone"), "{why}");
+        assert!(argvs(&runner, "mount").is_empty() && argvs(&runner, "umount").is_empty());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn something_else_mounted_on_its_directory_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        let runner =
+            ScriptedRunner::with_rules(&[("-S", Reply::exit(1)), ("-q", Reply::ok()), verified()]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        assert!(r.unwrap_err().contains("already a mount point"));
+        assert!(argvs(&runner, "mount").is_empty() && argvs(&runner, "umount").is_empty());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn an_esp_an_earlier_reading_left_mounted_is_taken_down_and_mounted_afresh() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("recovery-a");
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{}\n", dir.display())),
+                    stderr: "",
+                },
+            ),
+            ("-q", Reply::exit(32)),
+            verified(),
+        ]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        assert_eq!(r, Ok(vec![]));
+        assert_eq!(seen.len(), 1);
+        let calls: Vec<String> = runner
+            .calls()
+            .into_iter()
+            .filter(|c| c.argv[0] == "mount" || c.argv[0] == "umount")
+            .map(|c| c.argv[0].clone())
+            .collect();
+        assert_eq!(calls, ["umount", "mount", "umount"]);
+    }
+
+    #[test]
+    fn a_leftover_that_will_not_come_down_is_not_mounted_over() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("recovery-a");
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{}\n", dir.display())),
+                    stderr: "",
+                },
+            ),
+            ("umount", Reply::exit(32)),
+        ]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        assert!(r.unwrap_err().contains("umount -f"));
+        assert!(argvs(&runner, "mount").is_empty() && seen.is_empty());
+    }
+
+    #[test]
+    fn a_failed_read_still_unmounts() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified()]);
+        let (r, _) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Err("loader/entries: I/O error".into()),
+        );
+        assert_eq!(r, Err("loader/entries: I/O error".to_string()));
+        assert_eq!(argvs(&runner, "umount").len(), 1);
+    }
+
+    #[test]
+    fn a_mount_that_is_not_the_esp_is_unmounted_unread() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[
+            s,
+            q,
+            (
+                "PARTUUID",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "5eed0026-0000-4000-8000-000000000026\n",
+                    stderr: "",
+                },
+            ),
+        ]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        assert!(r.unwrap_err().contains("5eed0026"));
+        assert!(seen.is_empty());
+        assert_eq!(argvs(&runner, "umount").len(), 1);
+    }
+
+    #[test]
+    fn a_failed_mount_is_not_read_and_its_directory_removed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, ("mount", Reply::exit(32))]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        assert!(r.unwrap_err().contains("mount exited with code 32"));
+        assert!(seen.is_empty() && argvs(&runner, "umount").is_empty());
+        assert!(!scratch.path().join("recovery-a").exists());
+    }
+
+    #[test]
+    fn an_esp_left_mounted_after_its_reading_says_so() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified(), ("umount", Reply::exit(32))]);
+        let (r, _) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        let why = r.unwrap_err();
+        assert!(why.contains("still mounted"), "{why}");
+        assert_eq!(argvs(&runner, "umount").len(), UMOUNT_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn a_label_that_is_no_safe_file_name_does_not_escape_the_root() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified()]);
+        let mut t = esp_target(Some(ESP_PU));
+        t.label = "../../etc".into();
+        let (_, seen) = read_esp(&runner, scratch.path(), &t, Ok(vec![]));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].parent(), Some(scratch.path()), "{seen:?}");
     }
 }

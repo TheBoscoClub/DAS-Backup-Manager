@@ -495,6 +495,13 @@ pub struct Target {
     pub retention: Retention,
     #[serde(default)]
     pub display_name: String,
+    /// The PARTUUID of a `role = "mirror"` drive's own ESP. When set, the
+    /// recovery-OS reading mounts exactly that partition read-only and checks
+    /// that every file its loader entries name is there (bd
+    /// DAS-Backup-Manager-sp78.20); never discovered, and refused unless the
+    /// drive itself lists it. Unset: the reading shows `ESP  not checked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp_partuuid: Option<String>,
 }
 
 impl Target {
@@ -541,6 +548,8 @@ struct TargetRaw {
     retention: Retention,
     #[serde(default)]
     display_name: String,
+    #[serde(default)]
+    esp_partuuid: Option<String>,
 }
 
 impl From<TargetRaw> for Target {
@@ -563,6 +572,7 @@ impl From<TargetRaw> for Target {
             role: raw.role,
             retention: raw.retention,
             display_name: raw.display_name,
+            esp_partuuid: raw.esp_partuuid,
         }
     }
 }
@@ -730,6 +740,17 @@ pub fn unknown_key_warnings(text: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// A GPT partition GUID as `lsblk` and `/dev/disk/by-partuuid` write it:
+/// 8-4-4-4-12 hex digits, either case.
+pub fn is_partuuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Every key this version reads, in the shape of a config: a config with
 /// every optional key set, serialised, plus the legacy `serial` it reads and
 /// never writes.
@@ -762,6 +783,7 @@ fn key_schema() -> toml::Table {
         role: TargetRole::Primary,
         retention: Retention::default(),
         display_name: String::new(),
+        esp_partuuid: Some(String::new()),
     });
     let mut schema: toml::Table = c
         .to_toml()
@@ -2159,6 +2181,23 @@ impl Config {
                     tgt.label
                 ));
             }
+            // The recovery-OS reading mounts exactly this partition (bd
+            // DAS-Backup-Manager-sp78.20): only a mirror has one to read, and
+            // only a PARTUUID names it — a label is renameable, a vfat UUID is
+            // not unique enough to stake a mount on.
+            if let Some(pu) = &tgt.esp_partuuid {
+                if tgt.role != TargetRole::Mirror {
+                    errors.push(format!(
+                        "Target '{}' (index {i}) sets `esp_partuuid`, which only a `role = \"mirror\"` target uses",
+                        tgt.label
+                    ));
+                } else if !is_partuuid(pu) {
+                    errors.push(format!(
+                        "Target '{}' (index {i}): `esp_partuuid` {pu:?} is not a PARTUUID (8-4-4-4-12 hex digits)",
+                        tgt.label
+                    ));
+                }
+            }
         }
 
         if self.email.enabled {
@@ -2693,6 +2732,53 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_an_esp_partuuid_only_on_a_mirror_and_only_as_a_partuuid() {
+        let with = |role: &str, key: &str| {
+            let target = ONE_TARGET
+                .replace("role = \"primary\"", &format!("role = \"{role}\""))
+                .replace("mount = ", &format!("{key}mount = "));
+            let extra = format!("{}{target}", source_with("s", "/vol", &[("a", None)]));
+            Config::from_toml(&minimal_toml(&extra)).unwrap()
+        };
+        let good = "esp_partuuid = \"5eed0025-0000-4000-8000-000000000025\"\n";
+        let cfg = with("mirror", good);
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        assert_eq!(
+            cfg.targets[0].esp_partuuid.as_deref(),
+            Some("5eed0025-0000-4000-8000-000000000025")
+        );
+        // Written back only when set.
+        let written = toml::to_string(&cfg).unwrap();
+        assert!(written.contains("esp_partuuid"), "{written}");
+        assert!(
+            !toml::to_string(&with("mirror", ""))
+                .unwrap()
+                .contains("esp_partuuid")
+        );
+
+        // On a primary it would be accepted and ignored: refused.
+        let errors = with("primary", good).validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("esp_partuuid") && errors[0].contains("mirror"),
+            "{errors:?}"
+        );
+
+        // Not a PARTUUID: a label, a vfat UUID, a path — refused.
+        for bad in [
+            "RECOV-ESP-1",
+            "ABCD-0003",
+            "/dev/sdb1",
+            "5eed0025-0000-4000-8000-00000000002",
+            "",
+        ] {
+            let errors = with("mirror", &format!("esp_partuuid = \"{bad}\"\n")).validate();
+            assert_eq!(errors.len(), 1, "{bad}: {errors:?}");
+            assert!(errors[0].contains("esp_partuuid"), "{bad}: {errors:?}");
+        }
+    }
+
+    #[test]
     fn validate_rejects_two_targets_sharing_a_mount_and_dot_boot_components() {
         let second = ONE_TARGET
             .replace("serial = \"X\"", "serial = \"Y\"")
@@ -3045,6 +3131,7 @@ mod tests {
             role: TargetRole::Primary,
             retention: Retention::default(),
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 
@@ -3153,6 +3240,7 @@ mod tests {
                 yearly: 4,
             },
             display_name: "22TB Primary (Bay 2)".into(),
+            esp_partuuid: None,
         });
         cfg.email.enabled = true;
         cfg.email.smtp_host = "127.0.0.1".into();
@@ -3349,6 +3437,7 @@ daily = 7
                 yearly: 1,
             },
             display_name: "22TB RAID-1 Primary".into(),
+            esp_partuuid: None,
         };
         let s = toml::to_string(&original).expect("serialize");
         // Legacy `serial = ` line MUST NOT appear in canonical output
@@ -3390,6 +3479,7 @@ daily = 7
             role: TargetRole::Primary,
             retention: Retention::default(),
             display_name: String::new(),
+            esp_partuuid: None,
         });
         let errors = cfg.validate();
         assert!(
@@ -3425,6 +3515,7 @@ daily = 7
             role: TargetRole::Primary,
             retention: Retention::default(),
             display_name: String::new(),
+            esp_partuuid: None,
         });
         let errors = cfg.validate();
         assert!(

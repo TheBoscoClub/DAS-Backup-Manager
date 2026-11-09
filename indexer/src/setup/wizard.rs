@@ -603,6 +603,7 @@ fn step_targets(
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         });
     }
 
@@ -1293,6 +1294,7 @@ mod tests {
                 yearly: 0,
             },
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 

@@ -1,9 +1,12 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.0
+# Version: 4.17.1
 # Date: 2026-11-09
 #
 # Features:
+#   - A BOOT PROBLEM row from the drive's ESP counts as one from its fstab
+#     (v4.17.1, bd DAS-Backup-Manager-sp78.20): the WARN says "its boot may
+#     stop: see BOOT PROBLEM", and the row says which.
 #   - A target an earlier job left mounted is taken down (v4.17.0, bd
 #     DAS-Backup-Manager-jgm): take_down_leftover checks it is the target
 #     (mounted_is_target, shared with verify_targets_before_btrbk), unmounts
@@ -1749,10 +1752,12 @@ check_recovery_os() {
                 log_warn "btrbk may run when a recovery OS boots — see RECOVERY OS in the report"
             fi
             # A BOOT PROBLEM row: its fstab names a partition the drive does
-            # not have, so that OS would not boot (bd DAS-Backup-Manager-ac82).
+            # not have (bd DAS-Backup-Manager-ac82), or its ESP lacks a file a
+            # loader entry names (bd DAS-Backup-Manager-sp78.20), so that OS
+            # may not boot. The row says which.
             if (( boot_problems > 0 )); then
-                why="${why:+$why; }its boot may stop: fstab names a partition the drive lacks"
-                log_warn "A recovery OS may not boot: its fstab names a partition the drive lacks — see RECOVERY OS in the report"
+                why="${why:+$why; }its boot may stop: see BOOT PROBLEM"
+                log_warn "A recovery OS may not boot — see BOOT PROBLEM in RECOVERY OS in the report"
             fi
             if [[ -z "$why" ]]; then
                 why="needs attention"
@@ -3538,7 +3543,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.0
+  backup-run.sh v4.17.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

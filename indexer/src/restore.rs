@@ -1630,6 +1630,7 @@ mod tests {
             role: crate::config::TargetRole::Primary,
             retention: crate::config::Retention::default(),
             display_name: String::new(),
+            esp_partuuid: None,
         }
     }
 
