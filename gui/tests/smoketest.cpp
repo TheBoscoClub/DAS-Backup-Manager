@@ -112,6 +112,13 @@ private Q_SLOTS:
         jobs.started(QStringLiteral("job-3"));
         QCOMPARE(jobs.ownerChanged(QStringLiteral(":1.9"), QString()),
                  QStringList{QStringLiteral("job-3")});
+        // A job refused at once can finish before the reply that names it
+        // arrives: it is never opened, so a later restart does not report
+        // it as ended without a result.
+        HelperJobs early;
+        early.finished(QStringLiteral("job-4"));
+        early.started(QStringLiteral("job-4"));
+        QCOMPARE(early.ownerChanged(QStringLiteral(":1.9"), QString()), QStringList{});
         QVERIFY(HelperJobs::endedSummary().contains(QStringLiteral("helper")));
         QVERIFY(HelperJobs::endedSummary().contains(QStringLiteral("history")));
     }

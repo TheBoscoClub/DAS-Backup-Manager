@@ -16,8 +16,18 @@
 class HelperJobs
 {
 public:
-    void started(const QString &jobId) { m_open.insert(jobId); }
-    void finished(const QString &jobId) { m_open.remove(jobId); }
+    // The helper starts a job before it replies with its id, so a job refused
+    // at once can finish before it is started here: that one is never opened.
+    void started(const QString &jobId)
+    {
+        if (!m_finishedEarly.remove(jobId))
+            m_open.insert(jobId);
+    }
+    void finished(const QString &jobId)
+    {
+        if (!m_open.remove(jobId))
+            m_finishedEarly.insert(jobId);
+    }
 
     // The bus name's owner changed from `oldOwner` to `newOwner` (either
     // empty for none). A name that had an owner and lost it, or passed to
@@ -26,6 +36,9 @@ public:
     QStringList ownerChanged(const QString &oldOwner, const QString &newOwner)
     {
         Q_UNUSED(newOwner)
+        // A JobFinished goes to every client, so ids of other clients' jobs
+        // land here too: any change of owner forgets them all.
+        m_finishedEarly.clear();
         if (oldOwner.isEmpty() || m_open.isEmpty())
             return {};
         QStringList ended(m_open.cbegin(), m_open.cend());
@@ -45,4 +58,6 @@ public:
 
 private:
     QSet<QString> m_open;
+    // Finished before their start reply arrived; each waits for that reply.
+    QSet<QString> m_finishedEarly;
 };
