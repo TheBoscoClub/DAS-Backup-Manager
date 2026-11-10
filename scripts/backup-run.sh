@@ -2321,6 +2321,7 @@ run_btrbk() {
             ps_tee=${ps[1]}
         else
             log_warn "no temp file for btrbk's transaction log — snapshot counts are UNKNOWN, not zero"
+            BTRBK_RUN_LOG_OK="false"
             ps_tee=0
             rc=0
             btrbk -c "$DAS_BTRBK_CONF" --format=raw run || rc=$?
@@ -2328,6 +2329,7 @@ run_btrbk() {
         if [[ -n "$log" ]]; then
             if (( ps_tee != 0 )); then
                 log_warn "tee exited $ps_tee while keeping btrbk's transaction log — snapshot counts are UNKNOWN, not zero"
+                BTRBK_RUN_LOG_OK="false"
             else
                 parse_btrbk_run_log "$log"
             fi
