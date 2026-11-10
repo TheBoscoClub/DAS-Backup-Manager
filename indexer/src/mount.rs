@@ -1560,7 +1560,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// What a scripted command does when it is "run".
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     enum Reply {
         Exit {
             code: i32,
@@ -5162,6 +5162,61 @@ mod tests {
         let mut guard = MountGuard::new(ScriptedRunner::succeeding());
         guard.note_esp(&primary, root);
         guard.note_esp(&esp_target(None), root);
+        assert!(guard.esps.is_empty());
+    }
+
+    /// What `findmnt -S` says decides what is released: 1 is "mounted
+    /// nowhere" (nothing to do, nothing held); any other failure, or no
+    /// findmnt at all, cannot tell, so the directory counts as still mounted
+    /// and the job fails — nothing is unmounted on a guess (bd s5jv.2).
+    #[test]
+    fn an_esp_findmnt_cannot_answer_for_is_never_unmounted_and_fails_the_job() {
+        let root = Path::new("/run/das-backup/esp");
+        let dir = "/run/das-backup/esp/recovery-a".to_string();
+        let spec = leak(format!("PARTUUID={ESP_PU}"));
+        for (reply, still) in [
+            (Reply::exit(1), Vec::<String>::new()),
+            (Reply::exit(2), vec![dir.clone()]),
+            (Reply::CannotRun, vec![dir.clone()]),
+        ] {
+            let runner = ScriptedRunner::with_rules(&[(spec, reply.clone())]);
+            let mut guard = MountGuard::new(runner.clone());
+            guard.note_esp(&esp_target(Some(ESP_PU)), root);
+            assert_eq!(guard.unmount(&Recorder::default()), still, "{reply:?}");
+            assert!(
+                argvs(&runner, "umount").is_empty(),
+                "{reply:?}: {:?}",
+                runner.calls()
+            );
+        }
+    }
+
+    /// Under a handed-down lock the parent (`backup-run.sh`) releases the
+    /// ESPs itself in `unmount_all`; an owned hold notes them (bd s5jv.2).
+    #[test]
+    fn only_an_owned_hold_notes_the_mirrors_esps_for_release() {
+        let scratch = Scratch::new();
+        scratch.touch("dev/sdb2");
+        let mnt = scratch.path("mnt/a");
+        let mut t = target("recovery-a", "SER-A", &mnt, TargetRole::Mirror);
+        t.esp_partuuid = Some(ESP_PU.into());
+        let config = config_with(vec![t], Vec::new());
+        let host = Host {
+            devices: vec![("SER-A".into(), scratch.path("dev/sdb"))],
+            ..Host::default()
+        };
+        let guard = host
+            .mount_targets(&config, &Recorder::default(), &ScriptedRunner::succeeding())
+            .unwrap();
+        assert_eq!(guard.esps.len(), 1);
+        let guard = host
+            .mount_targets_held(
+                &config,
+                &Recorder::default(),
+                &ScriptedRunner::succeeding(),
+                &MaintenanceHeld::delegated_for_test(),
+            )
+            .unwrap();
         assert!(guard.esps.is_empty());
     }
 

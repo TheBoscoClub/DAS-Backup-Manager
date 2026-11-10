@@ -1262,20 +1262,28 @@ pub fn check_esp(
             Err(format!("the drive's partitions could not be listed: {why}"))
         }
         Err(_) => Err("no `esp_partuuid` is configured for this target".into()),
-        Ok(ids) => {
-            let reading = crate::mount::read_recovery_esp(target, ids, &esp::read_loader);
-            match (reading.read, reading.left_mounted) {
-                (Ok(found), left_mounted) => Ok(esp::Findings {
-                    left_mounted,
-                    ..found
-                }),
-                // Not read and not taken down: said in one line, and the
-                // job's own unmount releases it (bd s5jv.2).
-                (Err(why), Some(left)) => Err(format!("{why}; {left}")),
-                (Err(why), None) => Err(why),
-            }
-        }
+        Ok(ids) => esp_findings(crate::mount::read_recovery_esp(
+            target,
+            ids,
+            &esp::read_loader,
+        )),
     })
+}
+
+/// A reading of the ESP as the `ESP` row reads it: what was found, with why
+/// the ESP is still mounted when it could not be taken down after (bd
+/// DAS-Backup-Manager-s5jv.2).
+fn esp_findings(reading: crate::mount::EspReading<esp::Findings>) -> Result<esp::Findings, String> {
+    match (reading.read, reading.left_mounted) {
+        (Ok(found), left_mounted) => Ok(esp::Findings {
+            left_mounted,
+            ..found
+        }),
+        // Not read and not taken down: said in one line, and the job's own
+        // unmount releases it.
+        (Err(why), Some(left)) => Err(format!("{why}; {left}")),
+        (Err(why), None) => Err(why),
+    }
 }
 
 /// That OS's `etc/fstab`, read as the boot record reads its inputs.
@@ -4316,6 +4324,34 @@ mod tests {
         assert!(
             format_section(&entries, &host("7.2"))
                 .contains("Fstab               not checked: lsblk exited with 1")
+        );
+    }
+
+    #[test]
+    fn a_reading_left_mounted_keeps_its_findings_and_says_why() {
+        let found = esp::Findings {
+            entries: 2,
+            unified: 0,
+            problems: vec!["p".into()],
+            left_mounted: None,
+        };
+        let reading = |read: Result<esp::Findings, String>, left: Option<&str>| {
+            esp_findings(crate::mount::EspReading {
+                read,
+                left_mounted: left.map(str::to_string),
+            })
+        };
+        assert_eq!(reading(Ok(found.clone()), None), Ok(found.clone()));
+        let kept = reading(Ok(found.clone()), Some("still mounted")).unwrap();
+        assert_eq!(kept.left_mounted.as_deref(), Some("still mounted"));
+        assert_eq!(kept.problems, found.problems);
+        assert_eq!(
+            reading(Err("not read".into()), Some("still mounted")),
+            Err("not read; still mounted".into())
+        );
+        assert_eq!(
+            reading(Err("not read".into()), None),
+            Err("not read".into())
         );
     }
 
