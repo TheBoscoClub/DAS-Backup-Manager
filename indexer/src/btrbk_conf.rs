@@ -483,6 +483,11 @@ pub enum ConfigEdit<T> {
     Busy(String),
 }
 
+/// What an edit records as the singleton's holder (`config edit pid 4242`):
+/// `backup-run.sh` reads it and waits for the edit instead of skipping its run
+/// (bd DAS-Backup-Manager-al9) — keep the two in step.
+pub const CONFIG_EDIT_JOB: &str = "config edit";
+
 /// Run `edit` — a read-modify-write of `config.toml` and `btrbk.conf` — holding
 /// the backup singleton (`/run/das-backup.lock` in production) from before its
 /// read until it returns, without waiting for it (bd DAS-Backup-Manager-lxw).
@@ -503,7 +508,9 @@ pub fn edit_config_under_backup_lock<T>(
     lock: &Path,
     edit: impl FnOnce() -> T,
 ) -> Result<ConfigEdit<T>, String> {
-    match crate::scrub::FileLock::try_acquire(lock).map_err(|e| e.to_string())? {
+    match crate::backup::SingletonHeld::try_acquire_at(lock, CONFIG_EDIT_JOB)
+        .map_err(|e| e.to_string())?
+    {
         None => Ok(ConfigEdit::Busy(config_busy_line(lock))),
         // `_held` is dropped as the arm ends, after `edit`.
         Some(_held) => Ok(ConfigEdit::Done(edit())),
@@ -1257,6 +1264,45 @@ enabled = false
         assert!(!ran.get(), "the edit ran while the singleton was held");
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
         assert!(config_busy_line(&lock).contains("Try again when it finishes"));
+        drop(held);
+    }
+
+    #[test]
+    fn a_config_edit_records_itself_as_the_singletons_holder_and_empties_it_after() {
+        // bd DAS-Backup-Manager-al9: backup-run.sh waits for a config edit
+        // that holds the singleton rather than skipping its day.
+        let (_dir, config_path, lock) = edit_fixture();
+        let outcome = edit_config_under_backup_lock(&lock, || {
+            (
+                std::fs::read_to_string(&lock).unwrap(),
+                set_incremental(&config_path, "05:55"),
+            )
+        })
+        .unwrap();
+        let ConfigEdit::Done((during, saved)) = outcome else {
+            panic!("the singleton was free");
+        };
+        assert_eq!(saved, Ok(()));
+        assert_eq!(
+            during,
+            format!("{CONFIG_EDIT_JOB} pid {}\n", std::process::id())
+        );
+        assert!(during.starts_with("config edit pid "));
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "");
+    }
+
+    #[test]
+    fn a_refused_config_edit_leaves_the_holders_record_alone() {
+        let (_dir, config_path, lock) = edit_fixture();
+        let held = crate::backup::SingletonHeld::try_acquire_at(&lock, "btrdasd backup run")
+            .unwrap()
+            .unwrap();
+        let record = format!("btrdasd backup run pid {}\n", std::process::id());
+        let outcome =
+            edit_config_under_backup_lock(&lock, || set_incremental(&config_path, "05:55"))
+                .unwrap();
+        assert_eq!(outcome, ConfigEdit::Busy(config_busy_line(&lock)));
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), record);
         drop(held);
     }
 

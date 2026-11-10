@@ -721,7 +721,7 @@ failed; a failure of it fails the run. The boot-archive pruner runs only in
 .BR backup\-run.sh .
 .PP
 If another backup already holds the singleton lock, the command prints that it
-declines and exits 0; it waits for a running scrub. A run that could not start
+declines, naming the holder the lock file records, and exits 0; it waits for a running scrub. A run that could not start
 (nothing selected, a label the configuration lacks, or the locks cannot be taken) exits 1, having mounted and run
 nothing. A run that began \(em it took the locks \(em and then stopped on a
 target's or a source's state (no target would mount, a target or a source

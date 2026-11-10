@@ -1,9 +1,18 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.6
+# Version: 4.18.0
 # Date: 2026-11-10
 #
 # Features:
+#   - The singleton lock names its holder (v4.18.0, bd DAS-Backup-Manager-al9):
+#     every holder of /run/das-backup.lock records itself in it, as the
+#     maintenance lock's holders do, and this run opens it `<>` so one that
+#     does not get it never empties the record. A run that finds it held by
+#     setup or a config edit WAITS for it, up to SINGLETON_WAIT_SECS (900 s),
+#     instead of losing the day's backup; held by a backup it skips, as
+#     before; held by nobody it can name, it skips and says that this run did
+#     NOT happen. Still exit 0 for every skip, 1 when the lock cannot be
+#     opened or taken (tests/test_singleton_holder.sh).
 #   - A recovery drive's ESP a killed recovery-OS reading left mounted is
 #     released by unmount_all before the targets, and gates "safe to
 #     disconnect" if it stays (v4.17.2, bd DAS-Backup-Manager-s5jv.1).
@@ -613,29 +622,138 @@ set -euo pipefail
 # (bd DAS-Backup-Manager-ismb). `-E 75` gives "held" a status no failure
 # returns: util-linux flock exits 64, 65 or 71 for its own errors, but a flock
 # that answers 1 to everything must not read as "held".
+#
+# Whoever holds the singleton records itself in the lock file, as every holder
+# of the maintenance lock does (bd DAS-Backup-Manager-al9): `backup-run.sh pid
+# N`, `btrdasd backup run pid N`, `btrdasd setup --upgrade pid N`, `config edit
+# pid N`. A run that finds the lock held reads it, so a skip is never anonymous
+# and a day's backup is not lost to a short hold by setup or a configuration
+# edit:
+#   - a backup holds it (backup-run.sh, btrdasd backup ..., recovery-os
+#     record): this run is redundant, skip, exit 0;
+#   - setup or a config edit holds it: wait for the lock, for at most
+#     SINGLETON_WAIT_SECS, saying who it waits for, then go on; if the wait
+#     runs out, skip, exit 0, saying so;
+#   - nothing recorded, unreadable, or the recorded process has gone: skip as
+#     before, but say that this run did not happen — never a silent skip.
+# The file is opened `<>`, never `>`: `>` would empty the holder's record on
+# open, before this run holds anything (the maintenance lock's fix, v4.9.0).
 LOCKFILE="/run/das-backup.lock"
-if ! exec 9>"$LOCKFILE"; then
-    echo "[ERROR] Cannot open the backup lock $LOCKFILE — could not start" >&2
-    exit 1
-fi
-# flock works on a read-only descriptor, so a lock file anyone can open is one
-# anyone can hold, keeping the nightly backup and scrub waiting: root's alone
-# (bd DAS-Backup-Manager-qab). A regular file only; a failure is said, the lock
-# still works.
-if [[ -f "$LOCKFILE" && ! -L "$LOCKFILE" ]] && ! chmod 600 -- "$LOCKFILE"; then
-    echo "[WARN] Cannot make $LOCKFILE root's alone (0600): any local user can hold it" >&2
-fi
-lock_rc=0
-flock -n -E 75 9 || lock_rc=$?
-if ((lock_rc == 75)); then
-    echo "[INFO] Another das-backup run holds $LOCKFILE — skipping this invocation" >&2
-    exit 0
-elif ((lock_rc != 0)); then
-    echo "[ERROR] Cannot lock $LOCKFILE (flock exit $lock_rc) — could not start" >&2
-    exit 1
-fi
+# 15 minutes: setup holds the lock only while it writes (seconds, longer when
+# an upgrade restarts the helper) and a config edit for the edit; a hold longer than the bound is something else, and a
+# backup that began hours late helps nobody.
+SINGLETON_WAIT_SECS=900
+
+# Read the record of who holds the singleton into SINGLETON_HOLDER_KIND
+# (setup, config, backup or unknown) and SINGLETON_HOLDER_TEXT (what to say).
+# The record is read up to three times, 0.2 s apart, while it is empty: its
+# holder takes the lock before it writes its record. First line only, without
+# control characters, at most 200 characters. Display only: a file that cannot
+# be read reads as nothing recorded.
+read_singleton_holder() {
+    local line="" pid tries=0
+    while :; do
+        line=""
+        if [[ -r "$LOCKFILE" ]]; then
+            IFS= read -r line <"$LOCKFILE" || true
+        fi
+        line="${line//[[:cntrl:]]/}"
+        line="${line:0:200}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -n "$line" || $tries -ge 2 ]]; then
+            break
+        fi
+        tries=$((tries + 1))
+        sleep 0.2
+    done
+    SINGLETON_HOLDER_KIND="unknown"
+    if [[ -z "$line" ]]; then
+        SINGLETON_HOLDER_TEXT="an unknown holder (nothing recorded)"
+        return
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
+        SINGLETON_HOLDER_TEXT="an unknown holder (last recorded: $line)"
+    elif [[ ! -d "/proc/$pid" ]]; then
+        SINGLETON_HOLDER_TEXT="an unknown holder (the last recorded holder, $line, is no longer running)"
+    else
+        SINGLETON_HOLDER_TEXT="$line"
+        case "$line" in
+            "btrdasd setup"*) SINGLETON_HOLDER_KIND="setup" ;;
+            "config edit"*) SINGLETON_HOLDER_KIND="config" ;;
+            *) SINGLETON_HOLDER_KIND="backup" ;;
+        esac
+    fi
+}
+
+# Record this run as the holder of the singleton. Called only while holding
+# it. Display only: a failed write is said, and the run goes on.
+record_singleton_holder() {
+    if ! printf 'backup-run.sh pid %s\n' "$$" >"$LOCKFILE"; then
+        echo "[WARN] Could not record this run as the holder of $LOCKFILE" >&2
+    fi
+}
+
+# Empty this run's record, while fd 9 still holds the lock, so a finished run
+# is never named as the holder. Emptied, never removed: the file is the lock.
+# Called only by cleanup(), the EXIT trap, once the lock is this run's (which
+# it always is: the trap is installed after acquire_singleton_lock). Display
+# only: a reader then sees that the recorded pid has gone.
+# shellcheck disable=SC2329  # called by cleanup(); see clear_maintenance_holder
+clear_singleton_holder() {
+    if ! : >"$LOCKFILE"; then
+        echo "[WARN] Could not empty the holder record in $LOCKFILE" >&2
+    fi
+}
+
+acquire_singleton_lock() {
+    if ! exec 9<>"$LOCKFILE"; then
+        echo "[ERROR] Cannot open the backup lock $LOCKFILE — could not start" >&2
+        exit 1
+    fi
+    # flock works on a read-only descriptor, so a lock file anyone can open is
+    # one anyone can hold, keeping the nightly backup and scrub waiting: root's
+    # alone (bd DAS-Backup-Manager-qab). A regular file only; a failure is
+    # said, the lock still works.
+    if [[ -f "$LOCKFILE" && ! -L "$LOCKFILE" ]] && ! chmod 600 -- "$LOCKFILE"; then
+        echo "[WARN] Cannot make $LOCKFILE root's alone (0600): any local user can hold it" >&2
+    fi
+    local lock_rc=0
+    flock -n -E 75 9 || lock_rc=$?
+    if ((lock_rc == 75)); then
+        read_singleton_holder
+        case "$SINGLETON_HOLDER_KIND" in
+            backup)
+                echo "[INFO] Another das-backup run holds $LOCKFILE ($SINGLETON_HOLDER_TEXT) — skipping this invocation" >&2
+                exit 0
+                ;;
+            setup | config)
+                echo "[INFO] $LOCKFILE is held by $SINGLETON_HOLDER_TEXT — waiting up to ${SINGLETON_WAIT_SECS}s for it" >&2
+                lock_rc=0
+                flock -w "$SINGLETON_WAIT_SECS" -E 75 9 || lock_rc=$?
+                if ((lock_rc == 75)); then
+                    read_singleton_holder
+                    echo "[WARN] $LOCKFILE still held after ${SINGLETON_WAIT_SECS}s ($SINGLETON_HOLDER_TEXT) — skipping this invocation: this backup did NOT run" >&2
+                    exit 0
+                fi
+                ;;
+            *)
+                echo "[WARN] $LOCKFILE is held but its holder is not known ($SINGLETON_HOLDER_TEXT) — skipping this invocation: if no backup is running, this one did NOT run" >&2
+                exit 0
+                ;;
+        esac
+    fi
+    if ((lock_rc != 0)); then
+        echo "[ERROR] Cannot lock $LOCKFILE (flock exit $lock_rc) — could not start" >&2
+        exit 1
+    fi
+    record_singleton_holder
+}
+acquire_singleton_lock
 # FD 9 stays open for the rest of the script; lock auto-releases when the
-# process exits (FD 9 closes), no explicit unlock needed.
+# process exits (FD 9 closes), no explicit unlock needed. cleanup() empties the
+# holder record first (clear_singleton_holder).
 
 # Path of the blocking maintenance lock shared with the scrub engine
 # (indexer/src/scrub.rs MAINTENANCE_LOCK_PATH). MUST match exactly — this is
@@ -3623,7 +3741,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.6
+  backup-run.sh v4.18.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -4334,6 +4452,7 @@ cleanup() {
         if [[ "$CLEANUP_ARMED" == "true" ]]; then
             clear_maintenance_holder
         fi
+        clear_singleton_holder
         exit "$rc"
     fi
 
@@ -4360,6 +4479,7 @@ cleanup() {
     # anything to clean up: it exits silently, 1 (or a signal's code).
     # bd DAS-Backup-Manager-oeo.
     if [[ "$CLEANUP_ARMED" != "true" ]]; then
+        clear_singleton_holder
         exit "$status"
     fi
 
@@ -4397,6 +4517,7 @@ cleanup() {
 
     unmount_all
     clear_maintenance_holder
+    clear_singleton_holder
 
     # Explicit exit, not fallthrough: the run's status ($status) is the
     # process's final exit code, never whatever unmount_all's last internal

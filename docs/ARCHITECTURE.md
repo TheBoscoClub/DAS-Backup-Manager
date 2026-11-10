@@ -96,7 +96,7 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ singleton lock (/run/das-backup.lock: held → skip, exit 0; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
+         ├──▶ singleton lock (/run/das-backup.lock: held by a backup → skip, exit 0; held by setup or a config edit → wait ≤ 15 min, then go on or skip; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
          │                                   (one already mounted, as fstab mounts a data volume, is used as found)
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, edits config.toml in place when the plan changes it (unknown keys and comments kept), and btrbk.conf whenever it differs from what config.toml renders to

@@ -26,11 +26,61 @@ use std::time::UNIX_EPOCH;
 /// running two backups over one set of targets.
 pub const BACKUP_LOCK_PATH: &str = "/run/das-backup.lock";
 
+/// The backup singleton, held, with this process recorded in the lock file as
+/// its holder (`btrdasd setup --upgrade pid 4242`) — as the maintenance lock
+/// does — and the record emptied again on drop, while the lock is still held.
+/// A run that finds the lock held reads it: `backup-run.sh` waits for setup
+/// or a configuration edit and skips for a backup, and every refusal can say
+/// who it met (bd DAS-Backup-Manager-al9). Every holder of the file takes it
+/// through here; a holder that did not record itself reads as unknown.
+#[derive(Debug)]
+pub struct SingletonHeld {
+    lock: scrub::FileLock,
+}
+
+impl SingletonHeld {
+    /// Take the singleton at `path` without waiting and record `job` (and this
+    /// process's pid) as its holder; `Ok(None)` when another holds it, whose
+    /// record is left as it is.
+    pub fn try_acquire_at(path: &Path, job: &str) -> Result<Option<Self>, scrub::ScrubError> {
+        let Some(lock) = scrub::FileLock::try_acquire(path)? else {
+            return Ok(None);
+        };
+        // Display only: a record that cannot be written costs the name, never
+        // the lock. Said, so the missing name has a reason.
+        if let Err(e) = lock.write_note(&format!("{job} pid {}\n", std::process::id())) {
+            eprintln!(
+                "warning: could not record {job} as the holder of {}: {e}",
+                path.display()
+            );
+        }
+        Ok(Some(Self { lock }))
+    }
+
+    /// The lock file.
+    pub fn path(&self) -> &Path {
+        self.lock.path()
+    }
+}
+
+impl Drop for SingletonHeld {
+    fn drop(&mut self) {
+        // Emptied while still held: once released, the next holder may
+        // already have written its own. Display only.
+        if let Err(e) = self.lock.clear_note() {
+            eprintln!(
+                "warning: could not empty the holder record in {}: {e}",
+                self.lock.path().display()
+            );
+        }
+    }
+}
+
 /// Both locks a manual backup holds, released on drop — maintenance first
 /// (fields drop in declaration order).
 pub struct BackupLocks {
     maintenance: MaintenanceHeld,
-    _singleton: scrub::FileLock,
+    _singleton: SingletonHeld,
 }
 
 impl HoldsMaintenance for BackupLocks {
@@ -73,15 +123,15 @@ pub enum BackupLockAttempt {
 ///
 /// Acquisition order is singleton then maintenance, the same order used
 /// everywhere else; that shared order is what keeps the set deadlock-free.
-/// `job` (`btrdasd backup send`) is recorded in the maintenance lock file as
-/// its holder.
+/// `job` (`btrdasd backup send`) is recorded in both lock files as the holder
+/// (bd DAS-Backup-Manager-al9).
 pub fn acquire_manual_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
     job: &str,
     progress: &dyn ProgressCallback,
 ) -> Result<BackupLockAttempt, scrub::ScrubError> {
-    let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
+    let Some(singleton) = SingletonHeld::try_acquire_at(singleton_path, job)? else {
         return Ok(BackupLockAttempt::AlreadyRunning);
     };
     // A job that can be cancelled (the GUI's) stops waiting when it is; the
@@ -105,6 +155,23 @@ pub fn acquire_manual_locks_at(
         maintenance,
         _singleton: singleton,
     })))
+}
+
+/// What the CLI says when it declines because the singleton at `path` is held,
+/// naming the holder as it recorded itself (bd DAS-Backup-Manager-al9): the
+/// holder is not always a backup — `btrdasd setup` and a configuration edit
+/// hold it too.
+pub fn declined_line_at(path: &Path) -> String {
+    format!(
+        "A backup is already running — declining ({} is held by {}).",
+        path.display(),
+        crate::maintenance::holder_of(path)
+    )
+}
+
+/// [`declined_line_at`] for the production singleton.
+pub fn declined_line() -> String {
+    declined_line_at(Path::new(BACKUP_LOCK_PATH))
 }
 
 /// Take the manual-backup locks at their production paths.
@@ -4145,10 +4212,11 @@ pub fn try_record_locks_at(
     maintenance_path: &Path,
     job: &str,
 ) -> Result<Result<Box<dyn HoldsMaintenance>, String>, scrub::ScrubError> {
-    let Some(singleton) = scrub::FileLock::try_acquire(singleton_path)? else {
+    let Some(singleton) = SingletonHeld::try_acquire_at(singleton_path, job)? else {
         return Ok(Err(format!(
-            "a backup is running ({} is held); it records the recovery drives it mounts",
-            singleton_path.display()
+            "a backup is running ({} is held by {}); it records the recovery drives it mounts",
+            singleton_path.display(),
+            crate::maintenance::holder_of(singleton_path)
         )));
     };
     let Some(maintenance) = MaintenanceHeld::try_acquire_at(maintenance_path, job)? else {
@@ -4417,6 +4485,117 @@ mod tests {
             BackupLockAttempt::AlreadyRunning => {}
             BackupLockAttempt::Acquired(_) => panic!("two backups acquired at once"),
         }
+    }
+
+    #[test]
+    fn manual_backup_records_itself_as_the_singletons_holder_and_empties_it_on_release() {
+        // bd DAS-Backup-Manager-al9: backup-run.sh reads this record to tell a
+        // backup (skip) from setup or a config edit (wait).
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let maintenance = dir.path().join("maintenance.lock");
+        let progress = crate::progress::NullProgress;
+        let locks = match acquire_manual_locks_at(
+            &singleton,
+            &maintenance,
+            "btrdasd backup run",
+            &progress,
+        )
+        .unwrap()
+        {
+            BackupLockAttempt::Acquired(locks) => locks,
+            BackupLockAttempt::AlreadyRunning => panic!("declined with nothing held"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(&singleton).unwrap(),
+            format!("btrdasd backup run pid {}\n", std::process::id()),
+        );
+        assert_eq!(
+            crate::maintenance::holder_of(&singleton),
+            format!("btrdasd backup run pid {}", std::process::id()),
+        );
+        drop(locks);
+        assert_eq!(
+            std::fs::read_to_string(&singleton).unwrap(),
+            "",
+            "a finished job is never named as the holder"
+        );
+        assert!(scrub::FileLock::try_acquire(&singleton).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_cli_declining_line_names_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let held = SingletonHeld::try_acquire_at(&singleton, "btrdasd setup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            declined_line_at(&singleton),
+            format!(
+                "A backup is already running — declining ({} is held by btrdasd setup pid {}).",
+                singleton.display(),
+                std::process::id()
+            )
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_declined_manual_backup_leaves_the_holders_record_alone() {
+        // Every opener is `truncate(false)`: a job that does not get the lock
+        // must not empty the record of the one that has it.
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let maintenance = dir.path().join("maintenance.lock");
+        let held = SingletonHeld::try_acquire_at(&singleton, "btrdasd setup --upgrade")
+            .unwrap()
+            .expect("fixture must hold the singleton");
+        let record = format!("btrdasd setup --upgrade pid {}\n", std::process::id());
+
+        let progress = crate::progress::NullProgress;
+        assert!(matches!(
+            acquire_manual_locks_at(&singleton, &maintenance, "btrdasd backup run", &progress)
+                .unwrap(),
+            BackupLockAttempt::AlreadyRunning
+        ));
+        assert_eq!(std::fs::read_to_string(&singleton).unwrap(), record);
+        assert!(
+            SingletonHeld::try_acquire_at(&singleton, "config edit")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&singleton).unwrap(), record);
+        drop(held);
+    }
+
+    #[test]
+    fn recovery_os_record_locks_record_the_job_and_a_refusal_names_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("backup.lock");
+        let maintenance = dir.path().join("maintenance.lock");
+        let locks = try_record_locks_at(&singleton, &maintenance, "btrdasd recovery-os record")
+            .unwrap()
+            .expect("free locks");
+        assert_eq!(
+            std::fs::read_to_string(&singleton).unwrap(),
+            format!("btrdasd recovery-os record pid {}\n", std::process::id()),
+        );
+        let why = match try_record_locks_at(&singleton, &maintenance, "btrdasd recovery-os record")
+            .unwrap()
+        {
+            Err(why) => why,
+            Ok(_) => panic!("two holders of one singleton"),
+        };
+        assert!(
+            why.contains(&format!(
+                "held by btrdasd recovery-os record pid {}",
+                std::process::id()
+            )),
+            "{why}"
+        );
+        drop(locks);
+        assert_eq!(std::fs::read_to_string(&singleton).unwrap(), "");
     }
 
     #[test]

@@ -1462,7 +1462,7 @@ fn run_manual_step_cli(
     };
     match outcome {
         backup::ManualStepOutcome::Declined => {
-            println!("A backup is already running — declining.");
+            println!("{}", backup::declined_line());
             Ok(())
         }
         backup::ManualStepOutcome::Done(done) => {
@@ -2490,7 +2490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let exit_code = outcome.exit_code();
                 let result = match outcome {
                     backup::BackupJobOutcome::Declined => {
-                        println!("A backup is already running — declining.");
+                        println!("{}", backup::declined_line());
                         return Ok(());
                     }
                     // Could not start (1) or began and stopped on a target's or
@@ -2550,7 +2550,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match backup::acquire_manual_locks("btrdasd backup boot-archive", &progress)? {
                         BackupLockAttempt::Acquired(locks) => locks,
                         BackupLockAttempt::AlreadyRunning => {
-                            println!("A backup is already running — declining.");
+                            println!("{}", backup::declined_line());
                             return Ok(());
                         }
                     };

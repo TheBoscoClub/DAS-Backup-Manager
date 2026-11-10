@@ -352,6 +352,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maintenance_lock.sh
     )
     add_test(
+        NAME shell-singleton-holder
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_singleton_holder.sh
+    )
+    add_test(
         NAME shell-recovery-state-sync
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_recovery_state_sync.sh
     )

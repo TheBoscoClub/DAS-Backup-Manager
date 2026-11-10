@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backup the timer starts while `btrdasd setup` or a configuration edit holds the singleton lock waits for it instead of losing the day** (bd `DAS-Backup-Manager-al9`): `backup-run.sh` took `/run/das-backup.lock` without waiting and skipped, exit 0, when it was held, so a few seconds of `setup --upgrade` cost a night's backup and nothing flagged the missing day
+  - Every holder of the singleton now records itself in the lock file as the maintenance lock's holders do (`backup-run.sh pid N`, `btrdasd backup run pid N`, `btrdasd recovery-os record pid N`, `btrdasd setup --upgrade pid N`, `config edit pid N`) and empties the record before releasing it — `backup::SingletonHeld`, used by `acquire_manual_locks_at`, `try_record_locks_at`, setup's `take_setup_locks` and `edit_config_under_backup_lock`
+  - `backup-run.sh` opens the lock `<>`, not `>`, so a run that does not get it no longer empties the holder's record; held by setup or a config edit it waits up to 900 s (`SINGLETON_WAIT_SECS`), saying whom, then goes on; held by a backup it skips as before, naming it; with no record, no pid or a pid that has gone it skips as before but now says on stderr that this backup did NOT run — `backup-run.sh` 4.18.0, `tests/test_singleton_holder.sh`
+  - `btrdasd setup`'s refusal and the CLI's "A backup is already running — declining" line now name the holder the lock file records; the GUI's decline text is unchanged
+  - Not done here: a doctor or scrub catch-up timer firing inside setup's hold still defers that run (bd `DAS-Backup-Manager-al9` note of 2026-10-03)
+
 - **A backup report no longer says success beside a run whose history row failed to write** (bd `DAS-Backup-Manager-4cww`): the report is written and mailed before the row, as in the script, so a failed `host.record` failed the job while the saved report still read as recorded; the report is now written and mailed again with the failure in its errors, as `report_unrecorded_run` does in `backup-run.sh` — `backup::run_backup_job`
 
 - **A failed `backup snapshot` / `send` no longer hides a source left mounted, or the reverse** (bd `DAS-Backup-Manager-r1tr`): the CLI arms returned the step's error before checking that the sources were released (`counted?` before `require_released`) and returned the unmount error alone on a failed sync; both errors are now in the one message, joined as the helper's jobs do (`mount::fail_if_still_mounted`)

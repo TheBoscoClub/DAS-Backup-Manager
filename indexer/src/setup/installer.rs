@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use buttered_dasd::maintenance::MaintenanceHeld;
-use buttered_dasd::scrub::FileLock;
 
 use crate::setup::config::Config;
 use crate::setup::templates::{GeneratedFiles, SCRUB_IO_CLASS, SCRUB_IO_LEVEL, SCRUB_NICE};
@@ -1174,7 +1173,7 @@ pub struct SetupLocks {
     // Dropped in declaration order: the maintenance lock — its record emptied
     // first — then the singleton, the reverse of taking them.
     _maintenance: MaintenanceHeld,
-    _backup: FileLock,
+    _backup: buttered_dasd::backup::SingletonHeld,
 }
 
 /// How setup found its two locks.
@@ -1191,7 +1190,12 @@ enum SetupLockAttempt {
 /// the point: setup is run by hand, and a backup can run for hours. A lock
 /// file that cannot be opened is an error, never a free lock.
 fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt, String> {
-    let Some(backup) = FileLock::try_acquire(&site.backup).map_err(|e| e.to_string())? else {
+    // `job` (`btrdasd setup --upgrade`) is recorded in the singleton too:
+    // `backup-run.sh` reads it and waits for setup instead of skipping its run
+    // (bd DAS-Backup-Manager-al9) — jobs here start with "btrdasd setup".
+    let Some(backup) = buttered_dasd::backup::SingletonHeld::try_acquire_at(&site.backup, job)
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(SetupLockAttempt::Busy(backup_held_line(&site.backup)));
     };
     let Some(maintenance) =
@@ -1209,17 +1213,19 @@ fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt,
     }))
 }
 
-/// What setup says, and stops at, when the backup singleton at `path` is held.
-/// The singleton carries no record of its holder — `backup-run.sh` opens it
-/// with `>`, which would empty one — so this names what takes it.
+/// What setup says, and stops at, when the backup singleton at `path` is held,
+/// naming its holder as it recorded itself (bd DAS-Backup-Manager-al9): a
+/// backup — `backup-run.sh`, or `btrdasd backup` from the CLI or the GUI,
+/// which hold it from the start, while they wait for the DAS maintenance lock
+/// too — another `btrdasd setup`, or a configuration edit.
 fn backup_held_line(path: &Path) -> String {
     format!(
-        "Refused, nothing written or removed: {} is held, so a backup is running — \
-         backup-run.sh, or btrdasd backup from the CLI or the GUI, which hold it from the \
-         start, while they wait for the DAS maintenance lock too — or another btrdasd setup \
-         is. A running backup reads the scripts and btrbk.conf that setup rewrites. Run setup \
-         again once it has finished (exit {SETUP_REFUSED_EXIT}).",
-        path.display()
+        "Refused, nothing written or removed: {} is held by {}, so a backup, another btrdasd \
+         setup or a configuration edit is running. A running backup reads the scripts and \
+         btrbk.conf that setup rewrites. Run setup again once it has finished (exit \
+         {SETUP_REFUSED_EXIT}).",
+        path.display(),
+        buttered_dasd::maintenance::holder_of(path)
     )
 }
 
@@ -1879,6 +1885,7 @@ fn uninstall_all_with(
 mod tests {
     use super::*;
     use crate::setup::config::*;
+    use buttered_dasd::scrub::FileLock;
     use std::os::unix::fs::PermissionsExt;
 
     /// The helper restart is bounded by the unit's own timeouts, never by a
@@ -4105,11 +4112,10 @@ auth = "starttls""#,
         assert_eq!(
             run.warnings,
             vec![format!(
-                "Refused, nothing written or removed: {} is held, so a backup is running — \
-                 backup-run.sh, or btrdasd backup from the CLI or the GUI, which hold it from \
-                 the start, while they wait for the DAS maintenance lock too — or another \
-                 btrdasd setup is. A running backup reads the scripts and btrbk.conf that \
-                 setup rewrites. Run setup again once it has finished (exit 75).",
+                "Refused, nothing written or removed: {} is held by an unknown holder, so a \
+                 backup, another btrdasd setup or a configuration edit is running. A running \
+                 backup reads the scripts and btrbk.conf that setup rewrites. Run setup again \
+                 once it has finished (exit 75).",
                 run.backup_lock.display()
             )]
         );
@@ -4469,9 +4475,47 @@ auth = "starttls""#,
             "a job that finds the maintenance lock held can say it is setup"
         );
 
+        // And the singleton names setup, so a backup that finds it held waits
+        // for setup instead of skipping its day (bd DAS-Backup-Manager-al9).
+        assert_eq!(
+            std::fs::read_to_string(&locks.site.backup).unwrap(),
+            format!("btrdasd setup --upgrade pid {}\n", std::process::id()),
+        );
+
         drop(taken);
         assert_eq!(locks.state(), BOTH_FREE);
         assert_eq!(locks.record(), "");
+        assert_eq!(
+            std::fs::read_to_string(&locks.site.backup).unwrap(),
+            "",
+            "the singleton's record is emptied, never left naming a finished setup"
+        );
+    }
+
+    #[test]
+    fn setup_refused_by_the_singleton_names_its_holder_and_leaves_its_record() {
+        let locks = ScratchLocks::new();
+        let backup = buttered_dasd::backup::SingletonHeld::try_acquire_at(
+            &locks.site.backup,
+            "btrdasd backup run",
+        )
+        .unwrap()
+        .unwrap();
+        let record = format!("btrdasd backup run pid {}\n", std::process::id());
+
+        match take_setup_locks(&locks.site, "btrdasd setup").unwrap() {
+            SetupLockAttempt::Busy(why) => assert!(
+                why.contains("is held by btrdasd backup run pid"),
+                "names the holder: {why}"
+            ),
+            SetupLockAttempt::Taken(_) => panic!("the singleton is held"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&locks.site.backup).unwrap(),
+            record,
+            "a refused setup must not empty the holder's record"
+        );
+        drop(backup);
     }
 
     #[test]
