@@ -961,7 +961,25 @@ pub fn upgrade(
             ],
         )
     };
-    let systemctl = |args: &[&str]| command_status_within(SYSTEMCTL, args, HELPER_RESTART_LIMIT);
+    let unit_timeout = |property: &str| {
+        command_stdout(
+            SYSTEMCTL,
+            &[
+                "show",
+                &format!("--property={property}"),
+                "--value",
+                HELPER_UNIT,
+            ],
+        )
+        .unwrap_or_default()
+    };
+    let systemctl = |args: &[&str]| {
+        let limit = helper_restart_limit(
+            &unit_timeout("TimeoutStopUSec"),
+            &unit_timeout("TimeoutStartUSec"),
+        );
+        command_status_within(SYSTEMCTL, args, limit)
+    };
     let retire = |say: &mut dyn FnMut(String)| {
         super::retired_units::remove_retired_units(Path::new(RETIRE_ROOT), say)
     };
@@ -1260,10 +1278,66 @@ enum HelperRestart {
 /// helper to stop on SIGTERM, then sends SIGKILL and waits for the processes to
 /// go, and gives the new one `TimeoutStartSec` to claim its bus name. The unit
 /// sets neither, so they are the manager's defaults: 90 s each upstream, which
-/// is 270 s even allowing a second stop timeout for the SIGKILL wait; 300 s
-/// covers it. On the author's host they are 10 s and 15 s, and this is a
-/// backstop that never fires.
-const HELPER_RESTART_LIMIT: Duration = Duration::from_secs(300);
+/// is 270 s even allowing a second stop timeout for the SIGKILL wait. An
+/// override can set them longer, or `infinity`, so the bound is read from the
+/// unit itself ([`helper_restart_limit`], bd DAS-Backup-Manager-hoh): two
+/// stop timeouts, one start timeout and [`HELPER_RESTART_MARGIN`], never less
+/// than [`HELPER_RESTART_FLOOR`]; `infinity` or a value that cannot be read
+/// waits [`HELPER_RESTART_CAP`], so not knowing makes the wait longer, never
+/// shorter.
+const HELPER_RESTART_FLOOR: Duration = Duration::from_secs(300);
+
+/// Added to the unit's own timeouts: systemd's job handling and the bus-name
+/// claim take a moment beyond them.
+const HELPER_RESTART_MARGIN: Duration = Duration::from_secs(30);
+
+/// The wait when the unit's timeouts are `infinity` or cannot be read. A
+/// restart still running after it is reported as failed, and the upgrade's
+/// locks are let go with the helper perhaps still the old one: setup says so.
+const HELPER_RESTART_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// How long a `systemctl try-restart` of the helper may take under setup's
+/// locks, from the unit's `TimeoutStopUSec` and `TimeoutStartUSec` as
+/// `systemctl show --value` prints them. See [`HELPER_RESTART_FLOOR`].
+fn helper_restart_limit(stop: &str, start: &str) -> Duration {
+    match (systemd_span(stop), systemd_span(start)) {
+        (Some(stop), Some(start)) => {
+            (stop * 2 + start + HELPER_RESTART_MARGIN).max(HELPER_RESTART_FLOOR)
+        }
+        _ => HELPER_RESTART_CAP,
+    }
+}
+
+/// A time span as systemd prints one (`10s`, `1min 30s`, `500ms`, `2d`),
+/// whole seconds and below dropped to the millisecond. `None` for
+/// `infinity`, for nothing, and for anything it does not recognise — a
+/// bound must never come from a guess.
+fn systemd_span(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    if text == "0" {
+        return Some(Duration::ZERO);
+    }
+    if text.is_empty() || text == "infinity" {
+        return None;
+    }
+    let mut total = Duration::ZERO;
+    for part in text.split_whitespace() {
+        let digits = part.bytes().take_while(u8::is_ascii_digit).count();
+        let (number, unit) = part.split_at(digits);
+        let number: u64 = number.parse().ok()?;
+        let micros: u64 = match unit {
+            "us" => 1,
+            "ms" => 1_000,
+            "s" => 1_000_000,
+            "min" => 60_000_000,
+            "h" => 3_600_000_000,
+            "d" => 86_400_000_000,
+            _ => return None,
+        };
+        total += Duration::from_micros(number.checked_mul(micros)?);
+    }
+    Some(Duration::from_millis(total.as_millis() as u64))
+}
 
 /// The D-Bus helper's unit.
 const HELPER_UNIT: &str = "btrdasd-helper.service";
@@ -1278,8 +1352,8 @@ struct HelperHost<'a> {
     /// The unit's `RefuseManualStop`, as `systemctl show --value` prints it
     /// (`yes` or `no`). Read only when a `try-restart` was refused.
     refuses_manual_stop: &'a dyn Fn() -> Result<String, String>,
-    /// `systemctl`, one invocation per call — bounded by
-    /// [`HELPER_RESTART_LIMIT`] on the host.
+    /// `systemctl`, one invocation per call — bounded on the host by the
+    /// unit's own timeouts ([`helper_restart_limit`]).
     systemctl: UnitRunner<'a>,
 }
 
@@ -1806,6 +1880,50 @@ mod tests {
     use super::*;
     use crate::setup::config::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The helper restart is bounded by the unit's own timeouts, never by a
+    /// fixed figure an override could outlast (bd DAS-Backup-Manager-hoh):
+    /// two stop timeouts (SIGTERM, then the SIGKILL wait), one start timeout
+    /// and a margin, never less than the old 300 s; `infinity` or a value
+    /// that cannot be read waits the documented cap — longer, never shorter.
+    #[test]
+    fn the_helper_restart_waits_as_long_as_the_units_own_timeouts() {
+        let secs = |stop: &str, start: &str| helper_restart_limit(stop, start).as_secs();
+        assert_eq!(secs("10s", "15s"), 300, "the shipped unit: the 300 s floor");
+        assert_eq!(secs("1min 30s", "1min 30s"), 300, "upstream defaults");
+        assert_eq!(secs("5min", "2min"), 2 * 300 + 120 + 30);
+        assert_eq!(
+            secs("2min 30s", "500ms"),
+            2 * 150 + 30,
+            "rounded down to whole seconds"
+        );
+        assert_eq!(
+            secs("1h", "15s"),
+            2 * 3600 + 15 + 30,
+            "longer than the cap: its own"
+        );
+        let cap = HELPER_RESTART_CAP.as_secs();
+        assert_eq!(secs("infinity", "15s"), cap);
+        assert_eq!(secs("10s", "infinity"), cap);
+        assert_eq!(secs("", "15s"), cap, "unread");
+        assert_eq!(secs("ten seconds", "15s"), cap, "unparseable");
+        assert_eq!(secs("10x", "15s"), cap, "unknown unit");
+    }
+
+    #[test]
+    fn a_systemd_time_span_is_read_in_every_unit_it_prints() {
+        let d = |s: &str| systemd_span(s).map(|d| d.as_millis());
+        assert_eq!(d("10s"), Some(10_000));
+        assert_eq!(d("1min 30s"), Some(90_000));
+        assert_eq!(d("1h 2min 3s 4ms"), Some(3_723_004));
+        assert_eq!(d("2d"), Some(172_800_000));
+        assert_eq!(d("750us"), Some(0));
+        assert_eq!(d("0"), Some(0));
+        assert_eq!(d("infinity"), None);
+        assert_eq!(d(""), None);
+        assert_eq!(d("s"), None);
+        assert_eq!(d("5 s"), None, "a number without its unit");
+    }
 
     /// Install into a throwaway prefix and hand back the paths used.
     fn install_into(dir: &Path) -> (PathBuf, PathBuf) {

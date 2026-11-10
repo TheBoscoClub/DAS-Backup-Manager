@@ -43,6 +43,7 @@
 #include <optional>
 
 #include "../src/dbusclient.h"
+#include "../src/helperjobs.h"
 #include "../src/recoverystatus.h"
 #include "../src/recoverypanel.h"
 #include "../src/filemodel.h"
@@ -92,6 +93,27 @@ private Q_SLOTS:
         QFETCH(qint64, bytes);
         QFETCH(QString, expected);
         QCOMPARE(FileModel::formatSize(bytes), expected);
+    }
+
+    // --- A helper restart ends the jobs it was running (bd hoh) ------------
+
+    void aHelperRestartEndsEveryOpenJobWithoutAResult()
+    {
+        // The old helper exits without a JobFinished for the jobs it ran (an
+        // upgrade restarts it): the GUI must not wait for one forever.
+        HelperJobs jobs;
+        jobs.started(QStringLiteral("job-1"));
+        jobs.started(QStringLiteral("job-2"));
+        jobs.finished(QStringLiteral("job-1"));
+        QCOMPARE(jobs.ownerChanged(QString(), QStringLiteral(":1.5")), QStringList{});
+        QCOMPARE(jobs.ownerChanged(QStringLiteral(":1.5"), QStringLiteral(":1.9")),
+                 QStringList{QStringLiteral("job-2")});
+        QCOMPARE(jobs.ownerChanged(QStringLiteral(":1.9"), QString()), QStringList{});
+        jobs.started(QStringLiteral("job-3"));
+        QCOMPARE(jobs.ownerChanged(QStringLiteral(":1.9"), QString()),
+                 QStringList{QStringLiteral("job-3")});
+        QVERIFY(HelperJobs::endedSummary().contains(QStringLiteral("helper")));
+        QVERIFY(HelperJobs::endedSummary().contains(QStringLiteral("history")));
     }
 
     // --- D-Bus error mapping ----------------------------------------------

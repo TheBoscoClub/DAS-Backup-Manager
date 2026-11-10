@@ -8,6 +8,7 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusReply>
+#include <QDBusServiceWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTimer>
@@ -75,6 +76,13 @@ DBusClient::DBusClient(QObject *parent)
     bus.connect(ServiceName, ObjectPath, InterfaceName,
                 QStringLiteral("JobFinished"),
                 this, SLOT(onJobFinished(QString,bool,QString)));
+
+    // A restarted helper (an upgrade) ends its jobs without a JobFinished:
+    // when the name loses its owner, the open jobs are over (bd hoh).
+    auto *ownerWatch = new QDBusServiceWatcher(
+        ServiceName, bus, QDBusServiceWatcher::WatchForOwnerChange, this);
+    connect(ownerWatch, &QDBusServiceWatcher::serviceOwnerChanged,
+            this, &DBusClient::onHelperOwnerChanged);
 }
 
 DBusClient::~DBusClient() = default;
@@ -459,7 +467,17 @@ void DBusClient::onJobLog(const QString &jobId, const QString &level,
 void DBusClient::onJobFinished(const QString &jobId, bool success,
                                 const QString &summary)
 {
+    m_jobs.finished(jobId);
     Q_EMIT jobFinished(jobId, success, summary);
+}
+
+void DBusClient::onHelperOwnerChanged(const QString &service, const QString &oldOwner,
+                                      const QString &newOwner)
+{
+    Q_UNUSED(service)
+    const QStringList ended = m_jobs.ownerChanged(oldOwner, newOwner);
+    for (const QString &jobId : ended)
+        Q_EMIT jobFinished(jobId, false, HelperJobs::endedSummary());
 }
 
 // --- Recovery drives ---
@@ -605,6 +623,7 @@ void DBusClient::callAsync(const QString &method, const QList<QVariant> &args,
                                  mapDBusError(reply.error().name(),
                                               reply.error().message()));
         } else {
+            m_jobs.started(reply.value());
             Q_EMIT jobStarted(reply.value(), operation);
         }
         w->deleteLater();

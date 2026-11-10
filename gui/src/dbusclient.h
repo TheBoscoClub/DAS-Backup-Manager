@@ -1,5 +1,7 @@
 #pragma once
 
+#include "helperjobs.h"
+
 #include <QObject>
 #include <QPair>
 #include <QString>
@@ -120,6 +122,10 @@ Q_SIGNALS:
     void recoveryOsConsoleResult(const QString &label, const QString &path);
 
 private Q_SLOTS:
+    // The helper's bus name changed owner: the jobs it was running are over
+    // (helperjobs.h, bd DAS-Backup-Manager-hoh).
+    void onHelperOwnerChanged(const QString &service, const QString &oldOwner,
+                              const QString &newOwner);
     void onJobProgress(const QString &jobId, const QString &stage,
                        int percent, const QString &message);
     void onJobLog(const QString &jobId, const QString &level,
@@ -144,4 +150,5 @@ private:
     QDBusInterface *m_slowInterface = nullptr;
     bool m_available = false;
     QString m_unavailableReason;
+    HelperJobs m_jobs;
 };
