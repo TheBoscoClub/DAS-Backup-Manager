@@ -32,6 +32,7 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
 - `btrdasd backup run` exits 0 / 3 / 1 by the script's rule (`BackupJobOutcome::exit_code`); an aborted
   run records a failed row; a report neither saved nor mailed fails the run before the row is written.
 - A failed `host.record` fails the job, never only warns.
+- The report is written before the row (as in the script); a failed row writes and mails it again saying so (`report_unrecorded_run` on the script path).
 - `backup run` does the script's USB link check, `growth.log` and `throughput.jsonl` lines (`run_steps`); the boot-archive pruner stays script-only.
 - Retired-subvolume expiry runs only when the selection is everything (`selection_is_everything`: no btrbk filter); a narrower run records SKIP, a failed sync makes it a dry run, a failure fails the run.
 - `backup run` records the selected recovery OSes it mounted (`recovery-os.json`, bd `58c8`), one rule

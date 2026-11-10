@@ -3800,6 +3800,18 @@ pub fn run_backup_job(
             progress.on_log(LogLevel::Error, &msg);
             result.errors.push(msg);
             result.success = false;
+            // The report above was written before the row, so it reads as
+            // if the run were recorded. Write and send it again saying it
+            // was not, as `backup-run.sh` does (`report_unrecorded_run`, bd
+            // DAS-Backup-Manager-4cww).
+            let again = host.report(&config, &options, &result, captured, progress);
+            result.report_sent = result.report_sent || again.emailed;
+            if let Some(why) = again.lost() {
+                progress.on_log(
+                    LogLevel::Warning,
+                    &format!("The report saying this run is not recorded was not saved: {why}"),
+                );
+            }
         }
     }
     if let Some(sync) = &options.subvolume_sync {
@@ -10934,6 +10946,43 @@ Legend:
                 .iter()
                 .any(|(l, m)| *l == LogLevel::Error && m == "history not recorded: disk full")
         );
+    }
+
+    #[test]
+    fn a_record_that_fails_is_in_the_saved_report_too() {
+        // The report is written before the row, as in the script; a row that
+        // then fails is said in a second copy, as `report_unrecorded_run` does
+        // (bd DAS-Backup-Manager-4cww).
+        let host = FakeHost {
+            record_fails: true,
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(!outcome.success(), "{outcome:?}");
+        let texts = host.report_texts.lock().unwrap();
+        assert_eq!(texts.len(), 2, "{:?}", host.steps());
+        assert!(!texts[0].contains("history not recorded"), "{}", texts[0]);
+        assert!(
+            texts[1].contains("history not recorded: disk full"),
+            "{}",
+            texts[1]
+        );
+        assert_eq!(
+            host.steps()
+                .iter()
+                .filter(|s| ["report", "record"].contains(&s.as_str()))
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["report", "record", "report"]
+        );
+    }
+
+    #[test]
+    fn a_record_that_works_writes_the_report_once() {
+        let host = FakeHost::default();
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "{outcome:?}");
+        assert_eq!(host.report_texts.lock().unwrap().len(), 1);
     }
 
     #[test]

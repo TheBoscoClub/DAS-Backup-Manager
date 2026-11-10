@@ -45,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A backup report no longer says success beside a run whose history row failed to write** (bd `DAS-Backup-Manager-4cww`): the report is written and mailed before the row, as in the script, so a failed `host.record` failed the job while the saved report still read as recorded; the report is now written and mailed again with the failure in its errors, as `report_unrecorded_run` does in `backup-run.sh` — `backup::run_backup_job`
+
 - **The USB link check no longer passes a Gen1 link, reads every enclosure device, runs on a quiet night and says why in the report** (bd `DAS-Backup-Manager-7qe`): the check failed only below 5000 Mbit/s, so a USB 3.2 Gen2 enclosure that fell back to Gen1 (5000, half its rated link) passed; it read only the first device whose product matched; it sat inside the branch for a run that wrote something, so a night with nothing new never checked the bus; and its FAIL reached the journal but no row of the email
   - New `[das].expected_link_mbit_s` (default `10000`, USB 3.2 Gen2; a Gen1 enclosure sets `5000`): below it is a FAIL, exported to the script as `DAS_EXPECTED_LINK_MBIT_S`
   - Every USB device whose product contains `[das].model_pattern` is read and the slowest is the link's speed, in the log and `throughput.jsonl`; a pattern no device matches is a WARN naming it
