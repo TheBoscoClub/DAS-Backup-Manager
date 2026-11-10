@@ -198,7 +198,7 @@ esac
 # ---------------------------------------------------------------------------
 mkdir -p "$BIN" "$SYSBIN"
 for tool in awk basename cat chmod cut date dirname flock grep head mkdir mktemp mv \
-    rm rmdir sed setsid sleep sort tail timeout touch tr wc; do
+    rm rmdir sed setsid sleep sort tail tee timeout touch tr wc; do
     path="$(type -P "$tool")" || harness_broken "no $tool on this system"
     ln -s "$path" "$SYSBIN/$tool"
 done
@@ -291,17 +291,8 @@ case " $* " in
         echo "ERROR: Failed to fetch subvolume detail (stub)" >&2
         exit "$rc"
     fi
-    if [[ " $* " == *" --format=raw "* ]]; then
-        if [[ -f "$S/knobs/raw_unparsed" ]]; then
-            # Fields this script's parser does not know (bd oi0, 06p).
-            echo "format=\"latest\" snapshot_path='/v/.btrbk-snapshots/root-.20261004T0300' target_path='/t/nvme/root-.20261004T0300'"
-        else
-            echo "format=\"latest\" snapshot_subvolume='/v/.btrbk-snapshots/root-.20261004T0300' target_subvolume='/t/nvme/root-.20261004T0300'"
-        fi
-    else
-        echo "SOURCE_SUBVOLUME SNAPSHOT_SUBVOLUME STATUS TARGET_SUBVOLUME"
-        echo "/v/@ /v/.btrbk-snapshots/root-.20261004T0300 - /t/nvme/root-.20261004T0300"
-    fi
+    echo "SOURCE_SUBVOLUME SNAPSHOT_SUBVOLUME STATUS TARGET_SUBVOLUME"
+    echo "/v/@ /v/.btrbk-snapshots/root-.20261004T0300 - /t/nvme/root-.20261004T0300"
     ;;
 *" run "* | *" dryrun "*)
     mode=run
@@ -314,6 +305,18 @@ case " $* " in
         echo "$$" >"$S/btrbk_stub.pid"
         : >"$S/btrbk_started"
         sleep 30
+    fi
+    # The live run is `--format=raw run`: btrbk prints its transaction log
+    # (bd 17x). The knob run_log picks what it holds: normal (default) one
+    # snapshot and one send, nothing_sent, cut (no finished row), none.
+    if [[ "$mode" == run ]]; then
+        row() { printf "format=\"transaction\" time='1' localtime='2026-10-04T03:00:00+0000' type='%s' status='%s' duration='' target_url='/t/x' source_url='/v/x' parent_url='' message=''\n" "$1" "$2"; }
+        case "$(knob run_log normal)" in
+        normal) row startup v0.32.7; row snapshot success; row send-receive success; row finished success ;;
+        nothing_sent) row startup v0.32.7; row snapshot success; row finished success ;;
+        cut) row startup v0.32.7; row snapshot success ;;
+        none) ;;
+        esac
     fi
     exit "$(knob "btrbk_${mode}_rc" 0)"
     ;;
@@ -1192,22 +1195,48 @@ expect_completed "a FAIL without btrbk failing (recovery OS check)" 3 "FAILURES 
 # status and the report, so a counter failure reads FAILURES DETECTED in the
 # report, the history and the exit status alike — and the report says which.
 fresh
-knob list_rc 1 # btrbk ran, but `btrbk list latest` failed
+knob run_log none # btrbk exited 0 and printed no transaction log
 run_backup
-expect_completed "the snapshot counts unknown (btrbk list latest failed)" 3 "FAILURES DETECTED" failure
+expect_completed "the snapshot counts unknown (no transaction log)" 3 "FAILURES DETECTED" failure
 check "counts unknown: the report names it" \
-    "$(grep -c '^  Snapshot counts       FAIL  (btrbk list latest failed; counts unknown)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts       FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' "$WORK/lib/last-report.txt")" "1"
 check "counts unknown: recorded unknown" "$(vector_has --counts-unknown)" "yes"
 check "counts unknown: btrbk itself succeeded" "$(grep -c 'btrbk completed' "$STATE/out")" "1"
+check "counts unknown: warned once" \
+    "$(grep -c 'transaction log has no startup and finished row' "$STATE/out")" "1"
+check "counts unknown: the throughput never says nothing was sent" \
+    "$(grep -c 'nothing sent' "$WORK/lib/last-report.txt" || true)" "0"
 
 fresh
-knob raw_unparsed 1 # btrbk's raw listing holds no field the parser knows
+knob run_log cut # a log with no finished row
 run_backup
-expect_completed "the snapshot counts unparsed" 3 "FAILURES DETECTED" failure
-check "counts unparsed: the report names it" \
-    "$(grep -c '^  Snapshot counts       FAIL  (raw output present but no fields parsed; counts unknown)$' "$WORK/lib/last-report.txt")" "1"
-check "counts unparsed: warned once" \
-    "$(grep -c 'no snapshot_subvolume/target_subvolume fields parsed' "$STATE/out")" "1"
+expect_completed "the snapshot counts unknown (log cut before its finished row)" 3 "FAILURES DETECTED" failure
+check "cut log: recorded unknown" "$(vector_has --counts-unknown)" "yes"
+
+# What THIS run did, not each pair's latest snapshot (bd 17x): a run that sent
+# nothing says so, in the counts and in the throughput.
+fresh
+knob run_log nothing_sent
+run_backup
+expect_completed "a run that sent nothing" 0 "ALL OPERATIONS SUCCESSFUL" success
+check "nothing sent: the counts row" \
+    "$(grep -c '^  Snapshot counts       OK  (1 created, 0 sent)$' "$WORK/lib/last-report.txt")" "1"
+check "nothing sent: recorded as a measured 0" "$(vector_value --snaps-sent)" "0"
+check "nothing sent: the throughput lines say so" \
+    "$(grep -c 'nothing sent' "$WORK/lib/last-report.txt")" "$(grep -c '^  [^ ].* nothing sent' "$WORK/lib/last-report.txt")"
+check "nothing sent: at least one such line" \
+    "$([[ $(grep -c 'nothing sent' "$WORK/lib/last-report.txt") -ge 1 ]] && echo yes || echo no)" "yes"
+
+# `btrbk list latest` feeds the LATEST SNAPSHOTS section only: its failure no
+# longer touches the counts or the run's status.
+fresh
+knob list_rc 1
+run_backup
+expect_completed "btrbk list latest failed: the counts come from the log" 0 "ALL OPERATIONS SUCCESSFUL" success
+check "list latest failed: the counts row" \
+    "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
+check "list latest failed: the report section says unavailable" \
+    "$(grep -c 'unavailable: btrbk list latest failed' "$WORK/lib/last-report.txt")" "1"
 
 # The history row is written after the report, and a record that fails is a
 # FAIL (bd 6wt): the report is sent again, and the run exits 3.

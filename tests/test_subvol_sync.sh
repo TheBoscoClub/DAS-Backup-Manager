@@ -13,7 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup monotonic_secs create_target_dirs make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk parse_btrbk_run_log cleanup monotonic_secs create_target_dirs make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -245,8 +245,11 @@ echo "PLANNED" >"$WORK/render_out"
 sync_subvolumes run
 check "real run: no --render-btrbk-conf" "$(grep -c -- '--render-btrbk-conf' "$WORK/calls" || true)" "0"
 check "real run: no temp file made" "$(find "$TMPDIR" -name 'das-backup-dryrun-btrbk.*' | wc -l)" "0"
+tmp_before="$(find "$TMPDIR" -type f | wc -l)"
 run_btrbk run
-check "real run: btrbk run reads the real conf" "$(cat "$WORK/btrbk_calls")" "-c $DAS_BTRBK_CONF run"
+check "real run: btrbk run reads the real conf, as a raw transaction log (bd 17x)" "$(cat "$WORK/btrbk_calls")" "-c $DAS_BTRBK_CONF --format=raw run"
+check "real run: a btrbk that printed no log leaves the counts unknown" "$BTRBK_RUN_LOG_OK" "false"
+check "real run: its log file is removed" "$(find "$TMPDIR" -type f | wc -l)" "$tmp_before"
 rm -f "${WORK:?}/render_out"
 unset -f btrbk
 unset TMPDIR

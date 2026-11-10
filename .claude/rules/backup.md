@@ -147,6 +147,11 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 **[scoped]** `backup-cli-gui.md` — selection-only btrbk filters, no mounting, truthful counts and exit codes.
 
+## Snapshot Counts Are This Run's (bd `17x`)
+
+- `backup-run.sh` runs `btrbk --format=raw run` and counts the `snapshot` / `send-receive` `status='success'` rows of its transaction log (`parse_btrbk_run_log`); `list latest` feeds LATEST SNAPSHOTS only.
+- No `startup` and `finished` row ⇒ counts unknown (`--counts-unknown`, `btrbk_counters` FAIL), never 0; only a measured 0 sent makes a throughput line say `nothing sent`.
+
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 
 **Never invoke `btrbk` against a target path that is not a real mountpoint backed by the expected DAS

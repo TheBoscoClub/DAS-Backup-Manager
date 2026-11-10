@@ -1,9 +1,20 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.18.0
+# Version: 4.19.0
 # Date: 2026-11-10
 #
 # Features:
+#   - The snapshot counts are what THIS run did (v4.19.0, bd
+#     DAS-Backup-Manager-17x): the live run is `btrbk --format=raw run`, its
+#     raw TRANSACTION LOG kept in the journal and in a run-scoped temp file,
+#     and created / sent are the log's snapshot / send-receive rows that
+#     succeeded (parse_btrbk_run_log), where they were read from `btrbk list
+#     latest` — each pair's latest snapshot, whatever the run did. A log
+#     without both its startup and its finished row leaves the counts unknown
+#     (--counts-unknown, btrbk_counters FAIL), never 0. A measured 0 sent
+#     makes each target's throughput line say `nothing sent`, with no rate;
+#     otherwise the capacity-delta wording stands. `list latest` still feeds
+#     LATEST SNAPSHOTS. btrbk's exit status is unchanged.
 #   - The singleton lock names its holder (v4.18.0, bd DAS-Backup-Manager-al9):
 #     every holder of /run/das-backup.lock records itself in it, as the
 #     maintenance lock's holders do, and this run opens it `<>` so one that
@@ -895,7 +906,6 @@ declare -A CAPACITY_PCT=()
 declare -A AVAIL_BYTES=()
 REPORT_TARGETS=()
 BTRBK_LATEST=""
-BTRBK_LATEST_RAW=""
 
 # Track whether backup run has been recorded (prevents double-recording)
 BACKUP_RUN_RECORDED="false"
@@ -909,11 +919,16 @@ BACKUP_FORCE_FULL="false"
 # cleanup() no-ops immediately (unmount_all/record_backup_run_in_db already
 # ran in main()'s own body for a clean run). bd DAS-Backup-Manager-oeo.
 SCRIPT_COMPLETED="false"
-# "true" once capture_report_data() has read the snapshot counters, "false"
-# when that read failed, so an empty RAW is not read as "nothing was sent"
-# (bd nsp c4). Empty until then: a run that ends before the read records its
-# counts as unknown, never as 0 (bd DAS-Backup-Manager-6wt).
-BTRBK_LATEST_RAW_OK=""
+# "true" once run_btrbk() has read btrbk's raw transaction log of THIS run and
+# found its startup and finished rows, "false" when it could not (no log, or
+# one cut before its finished row), so a missing log is not read as "nothing
+# was sent" (bd nsp c4). Empty until then: a run that ends before the read
+# records its counts as unknown, never as 0 (bd DAS-Backup-Manager-6wt, 17x).
+# BTRBK_RUN_CREATED / BTRBK_RUN_SENT hold the counts, meaningful only while
+# this is "true".
+BTRBK_RUN_LOG_OK=""
+BTRBK_RUN_CREATED=""
+BTRBK_RUN_SENT=""
 # The snapshot counts this run reports, as record-run arguments — set by
 # decide_run_counts (bd DAS-Backup-Manager-bzw).
 RUN_COUNTS=()
@@ -2288,14 +2303,98 @@ run_btrbk() {
             log_error "btrbk dryrun failed"
         fi
     else
-        if btrbk -c "$DAS_BTRBK_CONF" run; then
+        # `--format=raw` makes btrbk print its TRANSACTION LOG on stdout, one
+        # row per action; tee keeps it in the journal as it always was and in a
+        # run-scoped file the counts are read from afterwards (bd 17x). btrbk's
+        # own exit status is read from PIPESTATUS, in the `&&`/`||` list that
+        # keeps `set -e` from ending the run on a nonzero one.
+        local log rc ps_tee
+        local -a ps
+        log=""
+        if ! log="$(mktemp)"; then
+            log=""
+        fi
+        if [[ -n "$log" ]]; then
+            btrbk -c "$DAS_BTRBK_CONF" --format=raw run | tee "$log" \
+                && ps=("${PIPESTATUS[@]}") || ps=("${PIPESTATUS[@]}")
+            rc=${ps[0]}
+            ps_tee=${ps[1]}
+        else
+            log_warn "no temp file for btrbk's transaction log — snapshot counts are UNKNOWN, not zero"
+            ps_tee=0
+            rc=0
+            btrbk -c "$DAS_BTRBK_CONF" --format=raw run || rc=$?
+        fi
+        if [[ -n "$log" ]]; then
+            if (( ps_tee != 0 )); then
+                log_warn "tee exited $ps_tee while keeping btrbk's transaction log — snapshot counts are UNKNOWN, not zero"
+            else
+                parse_btrbk_run_log "$log"
+            fi
+            rm -f "${log:?}"
+        fi
+        if (( rc == 0 )); then
             record_op "btrbk" "OK"
             log_info "btrbk completed"
         else
-            record_op "btrbk" "FAIL" "exit code $?"
+            record_op "btrbk" "FAIL" "exit code $rc"
             log_error "btrbk failed"
         fi
     fi
+}
+
+# parse_btrbk_run_log <file>: what THIS run did, from btrbk's raw transaction
+# log (`btrbk --format=raw run`, 0.32.7 print_formatted "transaction": one row
+# `format="transaction" time=... type='T' status='S' ... message='M'` per action,
+# values single-quoted, a quote inside a value written '\'', so a value cannot
+# carry a field of its own). Sets BTRBK_RUN_CREATED = rows type 'snapshot' with
+# status 'success', BTRBK_RUN_SENT = rows type 'send-receive' with status
+# 'success', and BTRBK_RUN_LOG_OK=true; only a log with both a type 'startup'
+# and a type 'finished' row counts (finished may say partial: what succeeded
+# still counts). Anything else leaves BTRBK_RUN_LOG_OK=false, the counts unknown:
+# an empty or cut log says nothing about what was done, and 0 would be a
+# measurement (fail-silent.md, always a defect 1). The row's own FIRST type and
+# status fields are read, so a status of a later field never counts. The
+# Rust twin is backup::parse_snapshot_transaction_log (bd s5jv.6).
+parse_btrbk_run_log() {
+    local file=$1 line rest t st started="" finished="" created=0 sent=0
+    BTRBK_RUN_LOG_OK="false"
+    BTRBK_RUN_CREATED=""
+    BTRBK_RUN_SENT=""
+    if [[ -r "$file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ $line == 'format="transaction" '* ]] || continue
+            t="" st=""
+            if [[ $line == *"type='"* ]]; then
+                rest=${line#*"type='"}
+                t=${rest%%"'"*}
+            fi
+            if [[ $line == *"status='"* ]]; then
+                rest=${line#*"status='"}
+                st=${rest%%"'"*}
+            fi
+            case "$t" in
+                startup) started=1 ;;
+                finished) finished=1 ;;
+                snapshot) if [[ "$st" == success ]]; then created=$((created + 1)); fi ;;
+                send-receive) if [[ "$st" == success ]]; then sent=$((sent + 1)); fi ;;
+            esac
+        done <"$file"
+    fi
+    if [[ -n "$started" && -n "$finished" ]]; then
+        BTRBK_RUN_LOG_OK="true"
+        BTRBK_RUN_CREATED=$created
+        BTRBK_RUN_SENT=$sent
+    else
+        log_warn "btrbk's transaction log has no startup and finished row — snapshot counts are UNKNOWN, not zero"
+    fi
+    return 0
+}
+
+# run_sent_nothing: true only when this run's sent count was MEASURED as 0.
+# Unknown (no log, a cut log, never read) is not "nothing sent".
+run_sent_nothing() {
+    [[ "$BTRBK_RUN_LOG_OK" == "true" && "$BTRBK_RUN_SENT" == "0" ]]
 }
 
 # latest_boot_snapshot <listing> <snapshot_name> <subdirs, comma-separated>:
@@ -3204,28 +3303,10 @@ capture_report_data() {
     fi
     [[ -z "${latest_err:-}" ]] || rm -f "${latest_err:?}"
 
-    # Machine-readable copy for the DB counters. The human table's STATUS column
-    # is presentation, not API: btrbk 0.32.7 renders it as "-" for every row and
-    # the "up-to-date" string the counters grepped for no longer appears at all,
-    # which silently zeroed snaps_created/snaps_sent on every run from
-    # 2026-06-26 onward (bd DAS-Backup-Manager-oi0). `--format=raw` emits named
-    # key='value' fields instead, so the counters no longer depend on how btrbk
-    # chooses to lay out a table.
-    #
-    # The status is captured rather than discarded: an empty RAW because the
-    # command FAILED and an empty RAW because nothing was sent both used to
-    # collapse into "0 created, 0 sent" alongside a --success DB row.
-    # bd DAS-Backup-Manager-nsp (c4).
-    local raw_err
-    raw_err="$(mktemp)"
-    if BTRBK_LATEST_RAW=$(btrbk -c "$DAS_BTRBK_CONF" --format=raw list latest 2>"$raw_err"); then
-        BTRBK_LATEST_RAW_OK="true"
-    else
-        BTRBK_LATEST_RAW_OK="false"
-        BTRBK_LATEST_RAW=""
-        log_warn "btrbk list latest failed — snapshot counters are UNKNOWN, not zero: $(tr '\n' ' ' <"$raw_err")"
-    fi
-    [[ -z "${raw_err:-}" ]] || rm -f "${raw_err:?}"
+    # The snapshot COUNTS are not read from this listing: it shows each pair's
+    # latest snapshot, whatever this run did, so it could never say "nothing
+    # was sent". They come from btrbk's own transaction log of the run
+    # (run_btrbk, parse_btrbk_run_log; bd DAS-Backup-Manager-17x).
 }
 
 # Log throughput report for all targets
@@ -3313,7 +3394,17 @@ log_throughput() {
         # A capacity delta, not what btrbk sent: retention prunes in the same
         # window, so a night that sent plenty can read as space freed (bd
         # DAS-Backup-Manager-17x: 128 received, "no new data" on all three).
-        if (( delta < 0 )); then
+        # Only a MEASURED 0 sent (btrbk's transaction log) says nothing was
+        # sent, and then no rate is claimed.
+        if run_sent_nothing; then
+            if (( delta < 0 )); then
+                log_info "  $name: nothing sent; used space fell $(format_bytes $(( -delta ))) (retention)"
+            elif (( delta == 0 )); then
+                log_info "  $name: nothing sent (used space unchanged)"
+            else
+                log_info "  $name: nothing sent; used space grew $(format_bytes $delta) (not from this run's sends)"
+            fi
+        elif (( delta < 0 )); then
             log_info "  $name: used space fell $(format_bytes $(( -delta ))) (retention freed more than was written; what btrbk sent is not measured)"
         elif (( delta == 0 )); then
             log_info "  $name: used space unchanged (what btrbk sent is not measured)"
@@ -3325,7 +3416,7 @@ log_throughput() {
         fi
     done
 
-    if (( total_written > 0 && elapsed > 0 )); then
+    if (( total_written > 0 && elapsed > 0 )) && ! run_sent_nothing; then
         local total_rate=$(( total_written / elapsed ))
         log_info "  ─────────────────────────────────────"
         log_info "  Total: $(format_bytes $total_written) @ $(format_bytes $total_rate)/s"
@@ -3749,7 +3840,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.18.0
+  backup-run.sh v4.19.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -3769,8 +3860,19 @@ generate_throughput_section() {
         local delta=$(( after - before ))
         total_written=$(( total_written + delta ))
 
-        # A capacity delta, not what btrbk sent (bd 17x; log_throughput).
-        if (( delta < 0 )); then
+        # A capacity delta, not what btrbk sent (bd 17x; log_throughput); a
+        # measured 0 sent says so, with no rate.
+        if run_sent_nothing; then
+            if (( delta < 0 )); then
+                printf "  %-24s nothing sent; used space fell %s (retention)\n" \
+                    "$name" "$(format_bytes $(( -delta )))"
+            elif (( delta == 0 )); then
+                printf "  %-24s nothing sent (used space unchanged)\n" "$name"
+            else
+                printf "  %-24s nothing sent; used space grew %s (not from this run's sends)\n" \
+                    "$name" "$(format_bytes $delta)"
+            fi
+        elif (( delta < 0 )); then
             printf "  %-24s used space fell %s (retention freed more than was written; what btrbk sent is not measured)\n" \
                 "$name" "$(format_bytes $(( -delta )))"
         elif (( delta == 0 )); then
@@ -3783,7 +3885,7 @@ generate_throughput_section() {
         fi
     done
 
-    if (( total_written > 0 && elapsed > 0 )); then
+    if (( total_written > 0 && elapsed > 0 )) && ! run_sent_nothing; then
         local total_rate=$(( total_written / elapsed ))
         printf "  ─────────────────────────────────────\n"
         printf "  %-24s %s @ %s/s\n" "Total" "$(format_bytes $total_written)" "$(format_bytes $total_rate)"
@@ -4031,59 +4133,39 @@ send_report() {
 # RECORD BACKUP RUN IN DATABASE
 # ============================================================================
 
-# The snapshot counts this run reports, into RUN_COUNTS, from the
-# `btrbk --format=raw list latest` output capture_report_data() cached while
-# the targets were still mounted (after unmount_all a live listing shows every
-# target's STATUS as `-`, bd DAS-Backup-Manager-ecg) — and their report row:
+# The snapshot counts this run reports, into RUN_COUNTS, from btrbk's own
+# TRANSACTION LOG of this run (run_btrbk keeps it; parse_btrbk_run_log reads
+# it: snapshot and send-receive rows that succeeded) — and their report row:
 # btrbk_counters OK with the counts when they are known, FAIL when they are
-# not. The row reads N/A until this has run, like every other row: its default
-# used to be "OK (counted)", so a report built before the counts were decided
-# would have read as a success (bd DAS-Backup-Manager-d1r, round 3: M6).
+# not. They are what THIS run did: the `btrbk list latest` they came from
+# before (bd 17x) showed each pair's latest snapshot whatever the run did, so
+# a night that sent nothing read "N sent". The row reads N/A until this has
+# run, like every other row: its default used to be "OK (counted)", so a
+# report built before the counts were decided would have read as a success
+# (bd DAS-Backup-Manager-d1r, round 3: M6).
 #
 # main() calls this after capture_report_data and BEFORE run_status() and
 # generate_report(): a counter failure must read FAILURES DETECTED in the
 # report and be no --success in the history, as it makes the run exit 3. It
 # was decided only inside record_run_args, after both were fixed, so the email
 # said ALL OPERATIONS SUCCESSFUL (bd DAS-Backup-Manager-bzw). record_run_args
-# calls it again for the vector — the same answer, and the warning once.
+# calls it again for the vector — the same answer.
 #
 # A count that is not known is said as --counts-unknown and stored as NULL,
 # never as a number: a 0 reads as "nothing was sent", and the -1 this used
 # to send (bd nsp c4/c5) was refused by record-run's parser as an unknown
-# option, so the run was not recorded at all. Unknown when the listing was
-# never read (the run ended before capture_report_data, so its state is
-# still the empty starting value), when it failed, and when its output held
-# no field this parser knows (btrbk renamed its raw fields: bd oi0, 06p).
-# A listing that succeeded with no output is a measured 0.
+# option, so the run was not recorded at all. Unknown when the log was never
+# read (the run ended before btrbk finished) and when it has no startup and
+# finished row. A log with both and no snapshot or send row is a measured 0.
 decide_run_counts() {
     RUN_COUNTS=(--counts-unknown)
-    local snaps_created snaps_sent
-    case "$BTRBK_LATEST_RAW_OK" in
+    case "$BTRBK_RUN_LOG_OK" in
         true)
-            if [[ -z "$BTRBK_LATEST_RAW" ]]; then
-                RUN_COUNTS=(--snaps-created 0 --snaps-sent 0)
-                record_op "btrbk_counters" "OK" "0 created, 0 sent"
-            else
-                # One source subvolume yields one snapshot, replicated to N
-                # targets, so the two counts are genuinely different numbers.
-                snaps_created=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
-                    | grep -o "snapshot_subvolume='[^']*'" | sort -u | grep -c . || true)
-                snaps_sent=$(printf '%s\n' "$BTRBK_LATEST_RAW" \
-                    | grep -c "target_subvolume='[^']" || true)
-                if (( snaps_created == 0 && snaps_sent == 0 )); then
-                    if [[ "${OP_STATUS[btrbk_counters]:-}" != "FAIL" ]]; then
-                        log_warn "btrbk produced output but no snapshot_subvolume/target_subvolume fields parsed —"
-                        log_warn "  the --format=raw field names have probably changed. Counts recorded as unknown."
-                    fi
-                    record_op "btrbk_counters" "FAIL" "raw output present but no fields parsed; counts unknown"
-                else
-                    RUN_COUNTS=(--snaps-created "$snaps_created" --snaps-sent "$snaps_sent")
-                    record_op "btrbk_counters" "OK" "$snaps_created created, $snaps_sent sent"
-                fi
-            fi
+            RUN_COUNTS=(--snaps-created "$BTRBK_RUN_CREATED" --snaps-sent "$BTRBK_RUN_SENT")
+            record_op "btrbk_counters" "OK" "$BTRBK_RUN_CREATED created, $BTRBK_RUN_SENT sent"
             ;;
         false)
-            record_op "btrbk_counters" "FAIL" "btrbk list latest failed; counts unknown"
+            record_op "btrbk_counters" "FAIL" "btrbk transaction log incomplete (no startup or finished row); counts unknown"
             ;;
         *)
             record_op "btrbk_counters" "FAIL" "not read — the run ended before the snapshot counters were taken"

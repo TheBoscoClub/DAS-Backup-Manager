@@ -1024,21 +1024,23 @@ Default:
 .BR incremental .
 .TP
 .BI \-\-snaps\-created " N"
-Number of snapshots created. Required unless
+Number of snapshots created by this run (btrbk's transaction log, not each pair's latest snapshot). Required unless
 .B \-\-counts\-unknown
 is given.
 .TP
 .BI \-\-snaps\-sent " N"
-Number of snapshots sent to targets. Required unless
+Number of snapshots sent to targets by this run; 0 is a measured nothing sent. Required unless
 .B \-\-counts\-unknown
 is given.
 .TP
 .B \-\-counts\-unknown
 The run could not count its snapshots \(em for
 .BR backup\-run.sh ,
-.B "btrbk list latest"
-failed, listed no field it knows, or the run ended before the counters were
-read. Both counts are recorded as unknown. Not with
+btrbk's transaction log had no
+.I startup
+and
+.I finished
+row, or the run ended before it was read. Both counts are recorded as unknown. Not with
 .B \-\-snaps\-created
 or
 .BR \-\-snaps\-sent .

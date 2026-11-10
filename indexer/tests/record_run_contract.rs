@@ -1,7 +1,7 @@
 //! The contract between `scripts/backup-run.sh` and `btrdasd backup record-run`
 //! (bd DAS-Backup-Manager-6wt).
 //!
-//! A failed backup run left no `backup_runs` row. When `btrbk list latest`
+//! A failed backup run left no `backup_runs` row. When btrbk's transaction log
 //! failed, the script passed `--snaps-created -1 --snaps-sent -1`; clap read
 //! `-1` as an option it did not know and refused the whole call; the script
 //! logged the refusal as non-fatal. The history then showed the previous
@@ -19,13 +19,13 @@ use std::process::{Command, Output};
 
 /// Runs `record_run_args` from the script after `$setup` and prints the vector
 /// NUL-separated, so no argument can be split or joined on the way out.
-/// `BTRBK_LATEST_RAW_OK` starts at the script's own initial value — the value an
-/// abort before `capture_report_data` leaves behind.
+/// `BTRBK_RUN_LOG_OK` starts at the script's own initial value — the value an
+/// abort before btrbk's log was read leaves behind.
 const HARNESS: &str = r#"
 set -euo pipefail
 script="$1" setup="$2" status="$3" full="$4"
 extract() { sed -n "/^$1() {/,/^}/p" "$script"; }
-for fn in decide_run_counts record_run_args record_op note_abort usage_delta; do
+for fn in decide_run_counts parse_btrbk_run_log record_run_args record_op note_abort usage_delta; do
     body="$(extract "$fn")"
     if [[ -z "$body" ]]; then
         echo "HARNESS BROKEN: $fn() not found in $script" >&2
@@ -38,10 +38,9 @@ declare -A OP_STATUS=() USAGE_BEFORE=() USAGE_AFTER=()
 ALL_TARGET_MOUNTS=()
 BTRBK_START_TIME=0
 BTRBK_END_TIME=0
-BTRBK_LATEST_RAW=""
-init="$(grep -m1 '^BTRBK_LATEST_RAW_OK=' "$script")" || true
+init="$(grep -m1 '^BTRBK_RUN_LOG_OK=' "$script")" || true
 if [[ -z "$init" ]]; then
-    echo "HARNESS BROKEN: no BTRBK_LATEST_RAW_OK= line in $script" >&2
+    echo "HARNESS BROKEN: no BTRBK_RUN_LOG_OK= line in $script" >&2
     exit 3
 fi
 eval "$init"
@@ -137,19 +136,21 @@ fn record_as_the_script_does(db: &Path, state: &str, status: &str, full: &str) -
     vector
 }
 
-/// Two source subvolumes, each sent to two targets, plus one row whose target
-/// is not present (`target_subvolume=''`) — `btrbk --format=raw list latest` as
-/// btrbk 0.32.7 prints it (`print_formatted`, `latest` → `raw`).
-const RAW_LISTING: &str = "\
-format=\"latest\" type='snapshot' source_url='/.btrfs-nvme/@' source_host='' source_port='' source_subvolume='/.btrfs-nvme/@' snapshot_subvolume='/.btrfs-nvme/.btrbk-snapshots/root-.20261003T0300' snapshot_name='root-' status='' target_url='/mnt/backup-22tb/nvme/root-.20261003T0300' target_host='' target_port='' target_subvolume='/mnt/backup-22tb/nvme/root-.20261003T0300' target_type='send-receive' source_rsh='' target_rsh=''
-format=\"latest\" type='snapshot' source_url='/.btrfs-nvme/@' source_host='' source_port='' source_subvolume='/.btrfs-nvme/@' snapshot_subvolume='/.btrfs-nvme/.btrbk-snapshots/root-.20261003T0300' snapshot_name='root-' status='' target_url='/mnt/backup-system-recovery-B/nvme/root-.20261003T0300' target_host='' target_port='' target_subvolume='/mnt/backup-system-recovery-B/nvme/root-.20261003T0300' target_type='send-receive' source_rsh='' target_rsh=''
-format=\"latest\" type='snapshot' source_url='/.btrfs-nvme/@home' source_host='' source_port='' source_subvolume='/.btrfs-nvme/@home' snapshot_subvolume='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' snapshot_name='home' status='' target_url='/mnt/backup-22tb/nvme/home.20261003T0300' target_host='' target_port='' target_subvolume='/mnt/backup-22tb/nvme/home.20261003T0300' target_type='send-receive' source_rsh='' target_rsh=''
-format=\"latest\" type='snapshot' source_url='/.btrfs-nvme/@home' source_host='' source_port='' source_subvolume='/.btrfs-nvme/@home' snapshot_subvolume='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' snapshot_name='home' status='' target_url='/mnt/backup-system-recovery-B/nvme/home.20261003T0300' target_host='' target_port='' target_subvolume='/mnt/backup-system-recovery-B/nvme/home.20261003T0300' target_type='send-receive' source_rsh='' target_rsh=''
-format=\"latest\" type='snapshot' source_url='/.btrfs-nvme/@home' source_host='' source_port='' source_subvolume='/.btrfs-nvme/@home' snapshot_subvolume='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' snapshot_name='home' status='' target_url='' target_host='' target_port='' target_subvolume='' target_type='' source_rsh='' target_rsh=''
+/// `btrbk --format=raw run`'s transaction log as btrbk 0.32.7 prints it
+/// (`print_formatted("transaction")`): two snapshots, four sends, a delete.
+const RUN_LOG: &str = "\
+format=\"transaction\" time='1' localtime='2026-10-03T03:00:00+0000' type='startup' status='v0.32.7' duration='' target_url='' source_url='' parent_url='' message='0.32.7'
+format=\"transaction\" time='2' localtime='2026-10-03T03:00:01+0000' type='snapshot' status='success' duration='1' target_url='/.btrfs-nvme/.btrbk-snapshots/root-.20261003T0300' source_url='/.btrfs-nvme/@' parent_url='' message=''
+format=\"transaction\" time='3' localtime='2026-10-03T03:00:02+0000' type='snapshot' status='success' duration='1' target_url='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' source_url='/.btrfs-nvme/@home' parent_url='' message=''
+format=\"transaction\" time='4' localtime='2026-10-03T03:00:03+0000' type='send-receive' status='success' duration='9' target_url='/mnt/backup-22tb/nvme/root-.20261003T0300' source_url='/.btrfs-nvme/.btrbk-snapshots/root-.20261003T0300' parent_url='' message=''
+format=\"transaction\" time='5' localtime='2026-10-03T03:00:04+0000' type='send-receive' status='success' duration='9' target_url='/mnt/backup-system-recovery-B/nvme/root-.20261003T0300' source_url='/.btrfs-nvme/.btrbk-snapshots/root-.20261003T0300' parent_url='' message=''
+format=\"transaction\" time='6' localtime='2026-10-03T03:00:05+0000' type='send-receive' status='success' duration='9' target_url='/mnt/backup-22tb/nvme/home.20261003T0300' source_url='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' parent_url='' message=''
+format=\"transaction\" time='7' localtime='2026-10-03T03:00:06+0000' type='send-receive' status='success' duration='9' target_url='/mnt/backup-system-recovery-B/nvme/home.20261003T0300' source_url='/.btrfs-nvme/.btrbk-snapshots/home.20261003T0300' parent_url='' message=''
+format=\"transaction\" time='8' localtime='2026-10-03T03:00:07+0000' type='delete' status='success' duration='1' target_url='/mnt/backup-22tb/nvme/root-.20260920T0300' source_url='' parent_url='' message=''
+format=\"transaction\" time='9' localtime='2026-10-03T03:00:08+0000' type='finished' status='success' duration='8' target_url='' source_url='' parent_url='' message=''
 ";
 
-/// Script state for a run that went through `capture_report_data` and read
-/// `RAW_LISTING`: two snapshots, four sends, 3096 bytes, 516 s.
+/// Script state for a run that read `RUN_LOG` with the script's own parser: two snapshots, four sends, 3096 bytes, 516 s.
 fn normal_state() -> String {
     format!(
         "ALL_TARGET_MOUNTS=(/mnt/backup-22tb /mnt/backup-system-recovery-B)
@@ -157,15 +158,14 @@ USAGE_BEFORE=([/mnt/backup-22tb]=1000 [/mnt/backup-system-recovery-B]=500)
 USAGE_AFTER=([/mnt/backup-22tb]=4096 [/mnt/backup-system-recovery-B]=500)
 BTRBK_START_TIME=1000
 BTRBK_END_TIME=1516
-BTRBK_LATEST_RAW_OK=true
-BTRBK_LATEST_RAW=\"$(cat <<'RAW'
-{RAW_LISTING}RAW
-)\""
+parse_btrbk_run_log <(cat <<'RAW'
+{RUN_LOG}RAW
+)"
     )
 }
 
 /// The live 2026-10-02 failure: recovery drive A absent, btrbk exit 10,
-/// `btrbk list latest` failed, so the counters could not be read.
+/// btrbk's transaction log was unusable, so the counters could not be read.
 const UNKNOWN_COUNT_STATE: &str = "ALL_TARGET_MOUNTS=(/mnt/backup-22tb)
 USAGE_BEFORE=([/mnt/backup-22tb]=1000)
 USAGE_AFTER=([/mnt/backup-22tb]=1000)
@@ -173,7 +173,7 @@ BTRBK_START_TIME=1000
 BTRBK_END_TIME=1516
 OP_STATUS[btrbk]=FAIL
 OP_STATUS[btrbk_detail]='exit code 10'
-BTRBK_LATEST_RAW_OK=false";
+BTRBK_RUN_LOG_OK=false";
 
 #[test]
 fn a_normal_run_is_recorded_with_its_counts() {
@@ -229,7 +229,7 @@ fn a_run_whose_counts_are_unknown_is_recorded_with_null_counts() {
         errors,
         vec![
             "btrbk: exit code 10",
-            "btrbk_counters: btrbk list latest failed; counts unknown"
+            "btrbk_counters: btrbk transaction log incomplete (no startup or finished row); counts unknown"
         ]
     );
 }
@@ -294,8 +294,8 @@ BTRBK_END_TIME=1060";
 
 #[test]
 fn a_run_that_ended_before_the_counters_were_read_is_recorded_with_null_counts() {
-    // The abort path: cleanup() records the run, but capture_report_data never
-    // ran, so BTRBK_LATEST_RAW_OK still holds the script's initial value. Before
+    // The abort path: cleanup() records the run, but btrbk's log was never
+    // read, so BTRBK_RUN_LOG_OK still holds the script's initial value. Before
     // 6wt that value was "true" and the row read 0 created, 0 sent.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
@@ -329,7 +329,7 @@ fn an_aborted_run_is_recorded_as_failed_with_what_stopped_it() {
     // bd DAS-Backup-Manager-2my: cleanup() records a run that aborted before
     // its report. abort_reason() left what stopped it in ABORT_WHAT/ABORT_REASON
     // (two violations here, so two lines), note_abort() turned that into an
-    // `aborted` FAIL, and capture_report_data never ran: the counts are unknown
+    // `aborted` FAIL, and btrbk's log was never read: the counts are unknown
     // and btrbk ran for 0 s.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
