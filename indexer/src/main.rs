@@ -1292,6 +1292,7 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             stale: usize,
             undelivered: usize,
             targets_failed: usize,
+            targets_absent: usize,
         },
     }
     serde_json::to_string(&match outcome {
@@ -1303,6 +1304,7 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             stale: dr.stale.len(),
             undelivered: dr.undelivered.len(),
             targets_failed: dr.targets_failed.len(),
+            targets_absent: dr.targets_absent.len(),
         },
     })
 }
@@ -4264,7 +4266,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         }
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0}"#
+            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0,"targets_absent":0}"#
         );
     }
 
@@ -4274,6 +4276,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             volumes_checked: 1,
             targets_checked: 1,
             targets_failed: vec![("small".into(), "not mounted".into())],
+            targets_absent: vec!["spare".into()],
             undelivered: vec![doctor::UndeliveredPair {
                 target: "big".into(),
                 source_label: "ssd".into(),
@@ -4287,7 +4290,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         };
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1}"#
+            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1,"targets_absent":1}"#
         );
     }
 

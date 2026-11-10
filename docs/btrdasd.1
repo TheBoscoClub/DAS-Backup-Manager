@@ -2931,7 +2931,11 @@ with its newest snapshot's date, or that it has none: btrbk can skip a pair
 and still exit 0, and this is where that shows. A target that cannot be
 verified, mounted or listed is reported under
 .B "TARGETS NOT CHECKED"
-and none of its pairs is taken as up to date. Nothing is written to a target.
+and none of its pairs is taken as up to date. A target whose drive is not
+attached (an unplugged recovery drive, the enclosure off) is listed under
+.B "TARGETS NOT ATTACHED (not checked)"
+and is not a failure: none of its pairs is taken as up to date either, but an
+absent target is a valid state. Nothing is written to a target.
 .PP
 .B Locking:
 non-blocking only \(em a drift check that finds either its own singleton lock

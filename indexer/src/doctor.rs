@@ -323,6 +323,10 @@ pub struct DriftReport {
     /// Targets it could not read — `(label, reason)`: verified, mounted and
     /// listed, or none of its pairs is known to be delivered.
     pub targets_failed: Vec<(String, String)>,
+    /// Targets whose drive is not attached (`mount::target_attached`): not
+    /// checked, never fresh, and not a failure — an absent target is a valid
+    /// state, as it is for the backup run.
+    pub targets_absent: Vec<String>,
     /// Pairs `btrbk.conf` declares whose target holds no snapshot newer than
     /// `[doctor].max_snapshot_age_days`.
     pub undelivered: Vec<UndeliveredPair>,
@@ -391,24 +395,29 @@ pub struct UndeliveredPair {
 pub struct DeliveryCheck {
     pub targets_checked: usize,
     pub targets_failed: Vec<(String, String)>,
+    pub targets_absent: Vec<String>,
     pub undelivered: Vec<UndeliveredPair>,
 }
 
 /// The delivery check: every target holds a snapshot of every pair
 /// `btrbk.conf` declares for it, newer than `[doctor].max_snapshot_age_days`
 /// (bd DAS-Backup-Manager-sp78.7). Pure: `today` is a day number
-/// ([`civil_days`]), `verify` proves a target is the real, mounted drive and
-/// `list_dir` reads a directory on it.
+/// ([`civil_days`]), `attached` says whether the target's drive is present
+/// at all, `verify` proves a target is the real, mounted drive and `list_dir`
+/// reads a directory on it.
 ///
 /// A pair's snapshots on a target are the entries `<snapshot name>.<timestamp>`
 /// of its directory; the newest of them is its delivery. A target is checked
 /// only when a declared pair goes to it, and only once it is verified: a
 /// target that cannot be verified, or whose directory cannot be listed
 /// (anything but "no such directory", which is a pair never sent), is a
-/// failure and none of its pairs is reported fresh or stale.
+/// failure and none of its pairs is reported fresh or stale. A target whose
+/// drive is not attached is neither checked nor a failure: it is listed as
+/// absent, and none of its pairs is reported fresh either.
 pub fn delivery_check(
     config: &Config,
     today: i64,
+    attached: &dyn Fn(&crate::config::Target) -> bool,
     verify: &dyn Fn(&crate::config::Target) -> Result<(), String>,
     list_dir: &dyn Fn(&Path) -> std::io::Result<Vec<String>>,
 ) -> DeliveryCheck {
@@ -422,6 +431,10 @@ pub fn delivery_check(
     }
     let mut out = DeliveryCheck::default();
     for target in targets {
+        if !attached(target) {
+            out.targets_absent.push(target.label.clone());
+            continue;
+        }
         if let Err(why) = verify(target) {
             out.targets_failed.push((target.label.clone(), why));
             continue;
@@ -648,19 +661,29 @@ fn perform_drift_check(
     report
 }
 
-/// Every target a declared pair goes to, once, as a failure whose reason is
-/// `why`: what the delivery check reports when no target could be mounted.
-fn unmounted_targets(config: &Config, why: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// Every target a declared pair goes to, once, when no target could be
+/// mounted: one whose drive is attached is a failure whose reason is `why`;
+/// one whose drive is not attached is absent, not a failure. Returns
+/// `(failed, absent)`.
+fn unmounted_targets(
+    config: &Config,
+    why: &str,
+    attached: &dyn Fn(&crate::config::Target) -> bool,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut absent: Vec<String> = Vec::new();
     for pair in crate::btrbk_conf::declared_pairs(config) {
-        if !out.iter().any(|(label, _)| *label == pair.target.label) {
-            out.push((
-                pair.target.label.clone(),
-                format!("no target could be mounted: {why}"),
-            ));
+        let label = &pair.target.label;
+        if failed.iter().any(|(l, _)| l == label) || absent.contains(label) {
+            continue;
+        }
+        if attached(pair.target) {
+            failed.push((label.clone(), format!("no target could be mounted: {why}")));
+        } else {
+            absent.push(label.clone());
         }
     }
-    out
+    (failed, absent)
 }
 
 /// The delivery check against the real targets (bd DAS-Backup-Manager-sp78.7):
@@ -669,8 +692,8 @@ fn unmounted_targets(config: &Config, why: &str) -> Vec<(String, String)> {
 /// that keeps a bare mount point from being read as an empty drive), list
 /// what the declared pairs' directories hold, unmount. Nothing is written to
 /// a target. With no declared pair there is nothing to check and no target is
-/// mounted; when no target can be mounted, every target a pair goes to is a
-/// failure.
+/// mounted; when no target can be mounted, every target a pair goes to whose
+/// drive is attached is a failure, and the rest are absent.
 fn perform_delivery_check(
     config: &Config,
     progress: &dyn ProgressCallback,
@@ -688,13 +711,15 @@ fn perform_delivery_check(
     let mut guard = match mount::ensure_targets_mounted(config, progress, held) {
         Ok(guard) => guard,
         Err(e) => {
-            report.targets_failed = unmounted_targets(config, &e.to_string());
+            (report.targets_failed, report.targets_absent) =
+                unmounted_targets(config, &e.to_string(), &mount::target_attached);
             return;
         }
     };
     let check = delivery_check(
         config,
         local_today(),
+        &mount::target_attached,
         &|t| {
             mount::verify_write_targets(
                 std::slice::from_ref(t),
@@ -711,6 +736,7 @@ fn perform_delivery_check(
     report.left_mounted.extend(guard.unmount(progress));
     report.targets_checked = check.targets_checked;
     report.targets_failed.extend(check.targets_failed);
+    report.targets_absent = check.targets_absent;
     report.undelivered = check.undelivered;
 }
 
@@ -853,6 +879,17 @@ pub fn format_report(report: &DriftReport) -> String {
         r.push_str(
             "\n  A target that could not be read is never taken as up to date: none of its\n  \
              pairs was checked.\n",
+        );
+    }
+
+    if !report.targets_absent.is_empty() {
+        r.push_str(&format!("\nTARGETS NOT ATTACHED (not checked)\n{thin}\n"));
+        for label in &report.targets_absent {
+            r.push_str(&format!("  {label}\n"));
+        }
+        r.push_str(
+            "\n  Their drives are not attached, so none of their pairs was checked. Attach\n  \
+             one and run the check again to read it.\n",
         );
     }
 
@@ -1408,6 +1445,7 @@ mod tests {
         let out = delivery_check(
             cfg,
             today(),
+            &|_: &Target| true,
             &|t: &Target| {
                 verified.borrow_mut().push(t.label.clone());
                 if unverified.contains(&t.label.as_str()) {
@@ -1454,8 +1492,10 @@ mod tests {
     }
 
     #[test]
-    fn when_no_target_mounts_every_target_a_pair_goes_to_fails_once() {
-        let failed = unmounted_targets(&delivery_config(&[]), "no drive");
+    fn when_no_target_mounts_every_attached_target_a_pair_goes_to_fails_once() {
+        let attached = |_: &Target| true;
+        let (failed, absent) = unmounted_targets(&delivery_config(&[]), "no drive", &attached);
+        assert!(absent.is_empty());
         assert_eq!(
             failed,
             vec![
@@ -1469,10 +1509,11 @@ mod tests {
                 ),
             ]
         );
-        let narrowed = unmounted_targets(&delivery_config(&["small"]), "no drive");
+        let (narrowed, _) = unmounted_targets(&delivery_config(&["small"]), "no drive", &attached);
         assert_eq!(narrowed.len(), 1, "{narrowed:?}");
         assert_eq!(narrowed[0].0, "small");
-        assert!(unmounted_targets(&Config::default(), "x").is_empty());
+        let (none, none_absent) = unmounted_targets(&Config::default(), "x", &attached);
+        assert!(none.is_empty() && none_absent.is_empty());
     }
 
     #[test]
@@ -1637,6 +1678,72 @@ mod tests {
             "{why}"
         );
         assert!(out.undelivered.is_empty(), "{out:?}");
+    }
+
+    /// A drive that is not attached (an unplugged recovery drive, the
+    /// enclosure off) is not checked and is never fresh, but it is not a
+    /// failure: an absent target is a valid state, and exit 3 every week
+    /// would leave das-backup-doctor.service failed for a supervisor to
+    /// restart into the same absence (backup.md, Supervisor Interaction).
+    #[test]
+    fn a_target_that_is_not_attached_is_not_checked_and_not_a_failure() {
+        let read = RefCell::new(Vec::new());
+        let verified = RefCell::new(Vec::new());
+        let dirs = both_fresh();
+        let out = delivery_check(
+            &delivery_config(&[]),
+            today(),
+            &|t: &Target| t.label != "small",
+            &|t: &Target| {
+                verified.borrow_mut().push(t.label.clone());
+                Ok(())
+            },
+            &|p: &Path| {
+                read.borrow_mut().push(p.display().to_string());
+                match dirs.get(p.to_str().unwrap()) {
+                    Some(Ok(names)) => Ok(names.iter().map(|n| n.to_string()).collect()),
+                    Some(Err(kind)) => Err(std::io::Error::new(*kind, "scripted")),
+                    None => panic!("unscripted directory {}", p.display()),
+                }
+            },
+        );
+        assert_eq!(out.targets_absent, ["small"]);
+        assert!(out.targets_failed.is_empty(), "{out:?}");
+        assert_eq!(out.targets_checked, 1);
+        assert_eq!(
+            *verified.borrow(),
+            ["big"],
+            "an absent drive is never verified"
+        );
+        assert_eq!(*read.borrow(), ["/mnt/big/nvme"], "nor read");
+        assert!(out.undelivered.is_empty(), "{out:?}");
+        let report = DriftReport {
+            targets_absent: out.targets_absent.clone(),
+            ..DriftReport::default()
+        };
+        assert!(!report.could_not_examine(), "absent is not exit 3");
+        let text = format_report(&report);
+        assert!(
+            text.contains("TARGETS NOT ATTACHED (not checked)") && text.contains("small"),
+            "{text}"
+        );
+    }
+
+    /// No target could be mounted at all: each one whose drive is not
+    /// attached is absent; one whose drive is attached failed to mount.
+    #[test]
+    fn with_nothing_mounted_an_attached_target_failed_and_the_rest_are_absent() {
+        let (failed, absent) = unmounted_targets(&delivery_config(&[]), "boom", &|t: &Target| {
+            t.label == "big"
+        });
+        assert_eq!(
+            failed,
+            vec![(
+                "big".to_string(),
+                "no target could be mounted: boom".to_string()
+            )]
+        );
+        assert_eq!(absent, ["small"]);
     }
 
     #[test]

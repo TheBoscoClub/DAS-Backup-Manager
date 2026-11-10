@@ -30,7 +30,8 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
 - **Delivery is the doctor's check, never coverage's or the nightly run's** (bd `sp78.7`, operator 2026-11-09):
   `doctor::delivery_check` lists each verified target's directory for every pair `btrbk.conf` declares; a pair
   with no `<snapshot name>.<timestamp>` newer than `[doctor].max_snapshot_age_days` (default 3) is UNDELIVERED
-  (exit 1), and a target that could not be verified, mounted or listed is TARGETS NOT CHECKED (exit 3), never fresh.
+  (exit 1); an attached target that could not be verified, mounted or listed is TARGETS NOT CHECKED (exit 3), never fresh;
+  a target whose drive is not attached (`mount::target_attached`) is TARGETS NOT ATTACHED, never fresh, never exit 3.
 - **Coverage changes no exit code.** A check that cannot run is WARN `not checked: …`; the one FAIL is
   `backup-run.sh` reading no recognised `SUBVOLUME COVERAGE:` row from a sync that returned 0 or 1. The row
   is `STATUS  (detail)`, two spaces, on both paths: script and binary ship together.

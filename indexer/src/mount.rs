@@ -16,7 +16,7 @@ use std::process::{Command, ExitStatus, Output};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{Config, TargetRole};
+use crate::config::{Config, Target, TargetRole};
 use crate::health;
 use crate::maintenance::MaintenanceHeld;
 use crate::progress::ProgressCallback;
@@ -579,6 +579,52 @@ pub fn ensure_targets_mounted(
     ensure_targets_mounted_with(config, progress, held, &HOST_PROBES, Arc::new(SystemRunner))
 }
 
+/// Where a target's drive is, found the way [`ensure_targets_mounted`] mounts
+/// it: by the configured serials, and by `mount_uuid` when one is set. Only
+/// identities the config names are looked up; nothing is enumerated.
+struct Located<'a> {
+    serials: Vec<String>,
+    serial_dev: Option<String>,
+    uuid: Option<&'a str>,
+    /// `mount_uuid`, when a configured serial is present or a filesystem with
+    /// that UUID is on this host.
+    by_uuid: Option<&'a str>,
+    /// The partition a present serial's role names, when it exists.
+    part_dev: Option<String>,
+}
+
+fn locate_target<'a>(target: &'a Target, probes: &MountProbes<'_>) -> Located<'a> {
+    let serials = target.effective_serials();
+    let serial_dev = serials.iter().find_map(|s| (probes.device_from_serial)(s));
+    let uuid = target.mount_uuid.as_deref().filter(|u| !u.is_empty());
+    let by_uuid = uuid.filter(|u| serial_dev.is_some() || (probes.device_for_uuid)(u).is_some());
+    let part_dev = serial_dev
+        .as_deref()
+        .map(|dev| partition_device(dev, &target.role))
+        .filter(|p| Path::new(p).exists());
+    Located {
+        serials,
+        serial_dev,
+        uuid,
+        by_uuid,
+        part_dev,
+    }
+}
+
+/// Whether `target`'s drive is attached to this host: what
+/// [`ensure_targets_mounted`] needs to mount it at all. `false` is the state
+/// it skips with a warning; a check that treats a target as absent must use
+/// this, never a mount that failed, so "not attached" and "would not mount"
+/// stay apart.
+pub fn target_attached(target: &Target) -> bool {
+    target_attached_with(target, &HOST_PROBES)
+}
+
+fn target_attached_with(target: &Target, probes: &MountProbes<'_>) -> bool {
+    let found = locate_target(target, probes);
+    found.by_uuid.is_some() || found.part_dev.is_some()
+}
+
 /// [`ensure_targets_mounted`] against an explicit host: `probes` answers what
 /// is mounted and where the drives are, `runner` executes `mount`.
 fn ensure_targets_mounted_with(
@@ -726,15 +772,13 @@ fn ensure_targets_mounted_with(
         // the legacy route: the first configured serial present, and the
         // partition its role names. Only identities the config names are
         // looked up; nothing is enumerated.
-        let serials = target.effective_serials();
-        let serial_dev = serials.iter().find_map(|s| (probes.device_from_serial)(s));
-        let uuid = target.mount_uuid.as_deref().filter(|u| !u.is_empty());
-        let by_uuid =
-            uuid.filter(|u| serial_dev.is_some() || (probes.device_for_uuid)(u).is_some());
-        let part_dev = serial_dev
-            .as_deref()
-            .map(|dev| partition_device(dev, &target.role));
-        let part_dev = part_dev.filter(|p| Path::new(p).exists());
+        let Located {
+            serials,
+            serial_dev,
+            uuid,
+            by_uuid,
+            part_dev,
+        } = locate_target(target, probes);
 
         if by_uuid.is_none() && part_dev.is_none() {
             let why = match (uuid, &serial_dev) {
@@ -2746,6 +2790,41 @@ mod tests {
             runner.calls()[mounts..],
             [status_call(&["umount", &good_mnt])]
         );
+    }
+
+    /// `target_attached` answers what the mount loop decides: a drive whose
+    /// serial or `mount_uuid` is found is attached; one with neither is not —
+    /// and the answer mounts nothing (the doctor's delivery check reads it).
+    #[test]
+    fn a_target_is_attached_only_when_its_serial_or_uuid_is_found() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/p");
+        let gone = target("primary", "SER-GONE", &mnt, TargetRole::Primary);
+        let mut by_uuid = gone.clone();
+        by_uuid.mount_uuid = Some("5eed0016-0000-4000-8000-000000000016".into());
+        let runner = ScriptedRunner::succeeding();
+        let host = Host {
+            uuids: vec![(
+                "5eed0016-0000-4000-8000-000000000016".into(),
+                "/dev/sdz".into(),
+            )],
+            ..Host::default()
+        };
+        host.with_probes(&runner, |probes| {
+            assert!(!target_attached_with(&gone, probes), "no serial, no uuid");
+            assert!(
+                target_attached_with(&by_uuid, probes),
+                "its uuid is on the host"
+            );
+        });
+        let absent = Host::default();
+        absent.with_probes(&runner, |probes| {
+            assert!(
+                !target_attached_with(&by_uuid, probes),
+                "uuid not on the host"
+            );
+        });
+        assert!(runner.calls().is_empty(), "asking mounts nothing");
     }
 
     #[test]
