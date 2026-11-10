@@ -1910,10 +1910,11 @@ mod tests {
             "longer than the cap: its own"
         );
         let cap = HELPER_RESTART_CAP.as_secs();
+        assert_eq!(cap, 30 * 60, "the documented cap is 30 minutes");
         assert_eq!(secs("infinity", "15s"), cap);
         assert_eq!(secs("10s", "infinity"), cap);
         assert_eq!(secs("", "15s"), cap, "unread");
-        assert_eq!(secs("ten seconds", "15s"), cap, "unparseable");
+        assert_eq!(secs("ten seconds", "15s"), cap, "unparsable");
         assert_eq!(secs("10x", "15s"), cap, "unknown unit");
     }
 

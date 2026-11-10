@@ -95,6 +95,16 @@ exclude_re = [
     # `civil_days`, which are mutated and tested.
     "replace perform_delivery_check with \\(\\)",
     "replace local_today -> i64 with (0|1|-1)",
+    # `SystemBackupHost`'s `sync_manual`, `snapshot` and `send`, the CLI's
+    # `run_manual_step_cli` and `declined_line` are the production shell of
+    # `backup snapshot` / `backup send` (bd r1tr): the real mount, btrbk and
+    # /run lock, and the printing of the outcome. Their order, errors and
+    # every decision are `run_manual_step` against the fake host, which is
+    # mutated and tested; the shell was run end to end on test-vm-cachyos
+    # 2026-11-10 (bd r1tr, s5jv.6, s5jv.10). Only whole-body replacements.
+    "replace <impl BackupJobHost for SystemBackupHost>::(sync_manual|snapshot|send) -> ",
+    "replace run_manual_step_cli -> ",
+    "replace declined_line -> String with ",
     # `btrfs_uuid_for_serial` binds its core to the host: the real
     # `/dev/disk/by-id` lookup and the real `blkid`. A test can only tell it
     # from `None` with a real drive attached. Only the whole-body replacement
