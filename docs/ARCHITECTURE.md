@@ -360,9 +360,10 @@ backup_runs  (id PK, timestamp, success, mode, snaps_created, snaps_sent, bytes_
 target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_count)
 coverage_state    (id PK = 1, first_recorded, last_recorded, checks)   -- schema v5: no row = no record yet
 coverage_baseline (volume, subvolume, target, target_identity, source_label, first_covered,
-                   last_covered, dropped_since, dropped_checks, drop_rule,
+                   last_covered, dropped_since, dropped_checks, drop_rule, subvol_uuid,
                    PK(volume, subvolume, target))  -- the pairs scheduled at the last recorded run, and
-                                                  -- dropped ones until restored, gone or accepted
+                                                  -- dropped ones until restored, gone or accepted;
+                                                  -- v7: subvol_uuid follows a renamed subvolume
 coverage_accepted (id PK, volume, subvolume, target, drop_rule, dropped_since, accepted_at)  -- accept log
 ```
 

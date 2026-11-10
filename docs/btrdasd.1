@@ -3267,7 +3267,8 @@ sudo btrdasd setup \-\-force
 .TP
 .I /var/lib/das\-backup/backup\-index.db
 SQLite database with FTS5 content index, backup history and the subvolume
-coverage record (schema 5).
+coverage record (schema 5; each pair's subvolume by its own btrfs UUID
+since schema 7).
 .TP
 .I /etc/das\-backup/config.toml
 Main configuration file for sources, targets, schedule, and email settings.

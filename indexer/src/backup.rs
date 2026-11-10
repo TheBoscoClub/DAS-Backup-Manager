@@ -9081,7 +9081,7 @@ Legend:
                 0,
                 "abc /\n".into(),
             ),
-            ("btrfs subvolume list /ssd".into(), 0, list),
+            ("btrfs subvolume list -u /ssd".into(), 0, list),
         ])
     }
 

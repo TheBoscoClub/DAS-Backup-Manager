@@ -6,7 +6,7 @@
 //! This module inverts that: every subvolume found on a source volume gets an
 //! entry, unless an exclusion names it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -107,19 +107,76 @@ pub fn excluding_pattern<'a>(path: &str, patterns: &'a [String]) -> Option<&'a s
         .map(String::as_str)
 }
 
-/// Subvolume paths from `btrfs subvolume list` output. Each line reads
-/// `ID 256 gen 100 top level 5 path <path>`; the path is everything after
-/// the first ` path `, because a path may itself contain spaces. Only lines
-/// that start with `ID ` count — an error or warning that happens to contain
-/// ` path ` must not become a phantom subvolume — and a line with nothing
-/// after ` path ` is ignored.
-pub fn parse_subvolume_paths(stdout: &str) -> Vec<String> {
+/// One row of `btrfs subvolume list -u`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSubvolume {
+    pub path: String,
+    /// The subvolume's own UUID; `None` when the row carries none (`-`, an
+    /// older format) or one that is not a UUID.
+    pub uuid: Option<String>,
+}
+
+/// Whether `text` is a canonical hyphenated UUID.
+fn is_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// Rows of `btrfs subvolume list -u` output. Each line reads
+/// `ID 256 gen 100 top level 5 uuid <uuid> path <path>`; the path is
+/// everything after the first ` path `, because a path may itself contain
+/// spaces (or the word `uuid`), so the UUID is read only from the text before
+/// that marker. Only lines that start with `ID ` count — an error or warning
+/// that happens to contain ` path ` must not become a phantom subvolume — and
+/// a line with nothing after ` path ` is ignored.
+pub fn parse_subvolume_list(stdout: &str) -> Vec<ListedSubvolume> {
     stdout
         .lines()
         .filter(|line| line.starts_with("ID "))
         .filter_map(|line| line.split_once(" path "))
-        .map(|(_, path)| path.to_string())
-        .filter(|path| !path.is_empty())
+        .filter(|(_, path)| !path.is_empty())
+        .map(|(head, path)| {
+            let mut fields = head.split_whitespace();
+            let uuid = fields
+                .by_ref()
+                .find(|f| *f == "uuid")
+                .and_then(|_| fields.next())
+                .filter(|u| is_uuid(u))
+                .map(str::to_string);
+            ListedSubvolume {
+                path: path.to_string(),
+                uuid,
+            }
+        })
+        .collect()
+}
+
+/// Subvolume paths from `btrfs subvolume list` output
+/// ([`parse_subvolume_list`] without the UUIDs).
+pub fn parse_subvolume_paths(stdout: &str) -> Vec<String> {
+    parse_subvolume_list(stdout)
+        .into_iter()
+        .map(|l| l.path)
+        .collect()
+}
+
+/// Each listed path's UUID, for the rows that have one. A UUID that two paths
+/// carry (a cloned filesystem; no btrfs filesystem does it by itself) names
+/// neither, and a row with none stays out: nothing downstream may treat a
+/// missing UUID as a match.
+fn uuids_of(listed: &[ListedSubvolume]) -> BTreeMap<String, String> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for u in listed.iter().filter_map(|l| l.uuid.as_deref()) {
+        *seen.entry(u).or_default() += 1;
+    }
+    listed
+        .iter()
+        .filter_map(|l| Some((&l.path, l.uuid.as_ref()?)))
+        .filter(|(_, u)| seen.get(u.as_str()) == Some(&1))
+        .map(|(p, u)| (p.clone(), u.clone()))
         .collect()
 }
 
@@ -129,6 +186,11 @@ pub fn parse_subvolume_paths(stdout: &str) -> Vec<String> {
 pub struct VolumeListing {
     pub volume: String,
     pub subvolumes: Result<Vec<String>, String>,
+    /// Each listed subvolume's own btrfs UUID, by path (bd
+    /// DAS-Backup-Manager-sp78.5). A subvolume the listing gave no usable UUID
+    /// for (`-`, malformed, or one UUID on two paths) is absent: no UUID is
+    /// never a covered pair.
+    pub uuids: BTreeMap<String, String>,
 }
 
 /// An empty listing is treated as a failed one. Every configured volume holds
@@ -145,6 +207,7 @@ pub fn normalize_listing(volume: &str, listed: Result<Vec<String>, String>) -> V
     VolumeListing {
         volume: volume.to_string(),
         subvolumes,
+        uuids: BTreeMap::new(),
     }
 }
 
@@ -570,6 +633,7 @@ pub fn list_volume(
     volume: &str,
     device: &str,
 ) -> VolumeListing {
+    let mut uuids = BTreeMap::new();
     let listed = (|| {
         if !is_mountpoint(Path::new(volume)) {
             return Err(format!("{volume} is not mounted"));
@@ -602,10 +666,13 @@ pub fn list_volume(
                 "{volume} is mounted at subvolume '{fsroot}', not at the filesystem's top level"
             ));
         }
-        let out = run_stdout(runner, "btrfs", &["subvolume", "list", volume])?;
-        Ok(parse_subvolume_paths(&out))
+        let out = run_stdout(runner, "btrfs", &["subvolume", "list", "-u", volume])?;
+        let rows = parse_subvolume_list(&out);
+        uuids = uuids_of(&rows);
+        Ok(rows.into_iter().map(|l| l.path).collect())
     })();
     let mut listing = normalize_listing(volume, listed);
+    listing.uuids = uuids;
     // `btrfs subvolume list` never prints id 5. The checks above proved the
     // path is the filesystem's top level, so it is there — added only after
     // an empty listing has already been refused, never in its place.
@@ -1216,6 +1283,36 @@ mod tests {
         );
     }
 
+    const U1: &str = "5eed0001-0000-4000-8000-000000000001";
+    const U2: &str = "5eed0002-0000-4000-8000-000000000002";
+    const U3: &str = "5eed0003-0000-4000-8000-000000000003";
+
+    #[test]
+    fn list_volume_reads_each_subvolumes_own_uuid_and_never_guesses_one() {
+        let rows = format!(
+            "ID 256 gen 100 top level 5 uuid {U1} path @a\n\
+             ID 257 gen 100 top level 5 uuid {U2} path My Films/uuid x\n\
+             ID 258 gen 100 top level 5 uuid - path no-uuid\n\
+             ID 259 gen 100 top level 5 uuid not-a-uuid path malformed\n\
+             ID 260 gen 100 top level 5 uuid {U3} path twin1\n\
+             ID 261 gen 100 top level 5 uuid {U3} path twin2\n\
+             ID 262 gen 100 top level 5 path older-format\n"
+        );
+        let r = Scripted::new(&[
+            ("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /\n"),
+            ("btrfs subvolume list -u /ssd", 0, &rows),
+        ]);
+        let l = list_volume(&r, &mounted, "/ssd", "UUID=abc");
+        assert_eq!(l.subvolumes.as_ref().unwrap().len(), 8, "{l:?}");
+        // Only what the listing said, per path. A UUID on two paths (a
+        // cloned filesystem) names neither; a missing one stays missing.
+        let want: BTreeMap<String, String> = [("@a", U1), ("My Films/uuid x", U2)]
+            .into_iter()
+            .map(|(p, u)| (p.to_string(), u.to_string()))
+            .collect();
+        assert_eq!(l.uuids, want);
+    }
+
     #[test]
     fn empty_listing_is_a_failed_listing() {
         let l = normalize_listing("/vol", Ok(Vec::new()));
@@ -1291,6 +1388,7 @@ mod tests {
         VolumeListing {
             volume: volume.into(),
             subvolumes: Ok(names.iter().map(|s| s.to_string()).collect()),
+            uuids: BTreeMap::new(),
         }
     }
 
@@ -1496,6 +1594,7 @@ mod tests {
             VolumeListing {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
+                uuids: BTreeMap::new(),
             },
             listing("/hdd", &["media", "media/video"]),
         ];
@@ -1748,7 +1847,7 @@ mod tests {
                 0,
                 format!("{uuid} /\n"),
             ),
-            (format!("btrfs subvolume list {volume}"), 0, list),
+            (format!("btrfs subvolume list -u {volume}"), 0, list),
         ]
     }
 
@@ -1855,7 +1954,7 @@ mod tests {
     fn list_volume_reports_a_failed_or_empty_btrfs_listing() {
         let r = Scripted::new(&[
             ("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /\n"),
-            ("btrfs subvolume list /ssd", 1, ""),
+            ("btrfs subvolume list -u /ssd", 1, ""),
         ]);
         assert!(
             list_volume(&r, &mounted, "/ssd", "UUID=abc")
@@ -2839,7 +2938,7 @@ mod tests {
         let lists = r
             .calls()
             .iter()
-            .filter(|c| *c == "btrfs subvolume list /ssd")
+            .filter(|c| *c == "btrfs subvolume list -u /ssd")
             .count();
         assert_eq!(lists, 1, "{:?}", r.calls());
     }
@@ -3172,6 +3271,7 @@ mod tests {
             VolumeListing {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
+                uuids: BTreeMap::new(),
             },
             listing("/hdd", &["media"]),
         ];

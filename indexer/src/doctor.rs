@@ -722,6 +722,7 @@ mod tests {
         VolumeListing {
             volume: volume.into(),
             subvolumes,
+            uuids: std::collections::BTreeMap::new(),
         }
     }
 

@@ -16,7 +16,10 @@ use std::time::Duration;
 /// 6 — `backup_runs.bytes_sent` is NULL when the run could not measure it: a
 ///     run stopped while btrbk ran, a target read once and not twice
 ///     (bd DAS-Backup-Manager-3lpr).
-pub const SCHEMA_VERSION: i64 = 6;
+/// 7 — `coverage_baseline.subvol_uuid`: the pair's subvolume by its own btrfs
+///     UUID, so a rename is followed (bd DAS-Backup-Manager-sp78.5). NULL on
+///     a row an earlier binary wrote.
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -213,6 +216,7 @@ CREATE TABLE IF NOT EXISTS coverage_baseline (
     dropped_since   TEXT,                  -- NULL = covered
     dropped_checks  INTEGER NOT NULL DEFAULT 0 CHECK (dropped_checks >= 0),
     drop_rule       TEXT,                  -- the last "why:" text
+    subvol_uuid     TEXT,                  -- the subvolume's own btrfs UUID; NULL = not known
     PRIMARY KEY (volume, subvolume, target),
     CHECK ((dropped_since IS NULL) = (drop_rule IS NULL)),
     CHECK ((dropped_since IS NULL) = (dropped_checks = 0))
@@ -338,12 +342,30 @@ impl Database {
         // v3 -> v4: an unknown run count can be stored, as NULL.
         // v5 -> v6: so can an unknown byte count — the same rebuild.
         Self::migrate_backup_runs_nullable(conn)?;
+        // v6 -> v7: coverage_baseline.subvol_uuid. COVERAGE_SQL made it on a
+        // new table; an older one gets it here, idempotent by the column.
+        Self::add_coverage_column(conn, "subvol_uuid")?;
         // v4 -> v5: coverage_* tables, made by COVERAGE_SQL's IF NOT EXISTS;
         // the stamp advances below. An older database re-runs the steps above,
         // each idempotent by the table's shape. An older binary on a newer
         // database returns at its own `version >= N` and never touches what
         // it does not know.
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Add a nullable TEXT column to `coverage_baseline` when an older table
+    /// lacks it. Existing rows read NULL, which every reader treats as "not
+    /// known", never as a match.
+    fn add_coverage_column(conn: &Connection, column: &str) -> Result<(), rusqlite::Error> {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('coverage_baseline') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE coverage_baseline ADD COLUMN {column} TEXT;"
+            ))?;
+        }
         Ok(())
     }
 
@@ -1433,6 +1455,12 @@ pub struct CoverageRow {
     pub dropped_checks: u32,
     /// The latest "why" for a dropped pair.
     pub drop_rule: Option<String>,
+    /// The subvolume's own btrfs UUID, as the last read listing gave it, so a
+    /// rename is followed and not read as one gone and one new (bd
+    /// DAS-Backup-Manager-sp78.5). `None` for a row recorded before that, a
+    /// top level (which has none) or a listing that gave none: such a row
+    /// is paired by path alone.
+    pub subvol_uuid: Option<String>,
 }
 
 /// The one-row summary of the recorded checks.
@@ -1496,12 +1524,22 @@ fn read_baseline(conn: &Connection) -> SqlResult<Option<Baseline>> {
     let Some(state) = state else {
         return Ok(None);
     };
+    // A schema-5/6 table read read-only is never migrated: it has no UUID
+    // column, and every row then reads "not known".
+    let uuid_column = if conn
+        .prepare("SELECT 1 FROM pragma_table_info('coverage_baseline') WHERE name = 'subvol_uuid'")?
+        .exists([])?
+    {
+        "subvol_uuid"
+    } else {
+        "NULL"
+    };
     let rows = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT volume, subvolume, target, target_identity, source_label, first_covered,
-                    last_covered, dropped_since, dropped_checks, drop_rule
-             FROM coverage_baseline ORDER BY volume, subvolume, target",
-        )?
+                    last_covered, dropped_since, dropped_checks, drop_rule, {uuid_column}
+             FROM coverage_baseline ORDER BY volume, subvolume, target"
+        ))?
         .query_map([], |r| {
             Ok(CoverageRow {
                 volume: r.get(0)?,
@@ -1514,6 +1552,7 @@ fn read_baseline(conn: &Connection) -> SqlResult<Option<Baseline>> {
                 dropped_since: r.get(7)?,
                 dropped_checks: u32_from_sql(r, 8)?,
                 drop_rule: r.get(9)?,
+                subvol_uuid: r.get(10)?,
             })
         })?
         .collect::<SqlResult<_>>()?;
@@ -1604,8 +1643,8 @@ impl Database {
                 let mut insert = tx.prepare(
                     "INSERT INTO coverage_baseline (volume, subvolume, target, target_identity,
                          source_label, first_covered, last_covered, dropped_since,
-                         dropped_checks, drop_rule)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                         dropped_checks, drop_rule, subvol_uuid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )?;
                 for r in &rows {
                     insert.execute(rusqlite::params![
@@ -1618,7 +1657,8 @@ impl Database {
                         r.last_covered,
                         r.dropped_since,
                         i64::from(r.dropped_checks),
-                        r.drop_rule
+                        r.drop_rule,
+                        r.subvol_uuid
                     ])?;
                 }
             }
@@ -3985,6 +4025,7 @@ mod tests {
             dropped_since: dropped.then(|| "2026-10-02".into()),
             dropped_checks: u32::from(dropped),
             drop_rule: dropped.then(|| "excluded".into()),
+            subvol_uuid: None,
         }
     }
 
@@ -4006,7 +4047,7 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_current_schema_with_the_coverage_tables() {
         let db = Database::open(":memory:").unwrap();
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(tables(&db.conn), COVERAGE_TABLES);
         assert_eq!(
@@ -4092,6 +4133,51 @@ mod tests {
         assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(db.coverage_baseline().unwrap(), before);
         assert_eq!(run_rows(&db.conn).len(), 1);
+    }
+
+    /// A schema-6 database has no `subvol_uuid` column. Read read-only it is
+    /// never migrated and every row reads "no UUID"; opened for writing it
+    /// gains the column once, keeps its rows as they were, and a later
+    /// record stores UUIDs (bd DAS-Backup-Manager-sp78.5).
+    #[test]
+    fn a_v6_coverage_table_reads_no_uuids_then_gains_the_column_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        let before = {
+            let db = seeded(
+                &path,
+                vec![cov_row("@a", "big", false), cov_row("@b", "big", true)],
+            );
+            db.conn
+                .execute_batch("ALTER TABLE coverage_baseline DROP COLUMN subvol_uuid;")
+                .unwrap();
+            db.conn.pragma_update(None, "user_version", 6i64).unwrap();
+            db.coverage_baseline().unwrap()
+        };
+        // seeded rows carry no UUID, so the table as a schema-6 binary left
+        // it reads the same.
+        assert_eq!(read_coverage_read_only(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), 6, "a read-only read migrates nothing");
+        drop(conn);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
+        assert_eq!(db.coverage_baseline().unwrap(), before, "rows as they were");
+        let uuid = "5eed0001-0000-4000-8000-000000000001";
+        db.record_coverage(|b| {
+            let mut rows = b.unwrap().rows;
+            rows[0].subvol_uuid = Some(uuid.into());
+            ((), rows, state(3))
+        })
+        .unwrap();
+        assert_eq!(
+            db.coverage_baseline().unwrap().unwrap().rows[0].subvol_uuid,
+            Some(uuid.into())
+        );
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.conn.total_changes(), 0, "a second open writes nothing");
     }
 
     #[test]

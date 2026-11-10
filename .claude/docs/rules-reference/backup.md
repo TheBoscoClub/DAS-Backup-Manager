@@ -391,7 +391,12 @@ a WARN `not checked`, and no backup exit code changes; only a missing or unrecog
 script is a FAIL (fail-silent "always a defect" #6). No WARN-to-FAIL escalation. GUI accept is `sp78.4`.
 
 **The pair and the record.** A pair is `(Source.volume, SubvolConfig.name, Target.label)`; the source label
-and the snapshot name are not part of it, so renaming either says nothing. Schema 5 adds `coverage_state`
+and the snapshot name are not part of it, so renaming either says nothing. Since schema 7 a row also holds its
+subvolume's own btrfs UUID (`btrfs subvolume list -u`, the field before ` path `), and a recorded row whose
+UUID a read listing shows at another path moves there first (`coverage::follow_renames`): a rename is one
+pair, and `mv @a @b` with `@b` excluded is a DROP `renamed from '@a'; …`. A row with no UUID (older record,
+top level, a listing that gave none or gave one to two paths) is paired by path, never as covered; rows the
+listing confirms claim a name before path-only ones, so two rows never end on one pair. Schema 5 adds `coverage_state`
 (one row: first and last recorded date, number of recorded checks; no row = no record yet),
 `coverage_baseline` (every pair intended at the last recorded check, plus every dropped pair not yet
 restored, gone or accepted; `CHECK`s keep a row either wholly covered or wholly dropped) and
@@ -405,7 +410,7 @@ advances); a schema-4 binary returns at its own `version >= 4` and never sees th
 | Situation | Outcome |
 |:--|:--|
 | No `[[source]]` names the volume | DROP: `no [[source]] names volume V any more (last in source 'L')` |
-| Volume read, subvolume not on it (never `.`) | GONE: row removed, counted, no warning |
+| Volume read, subvolume not on it by path or UUID (never `.`) | GONE: row removed, counted, no warning |
 | No live entry; `plan.unplaceable` has it | DROP: `could not be placed — see COULD NOT BE PLACED: …` |
 | No live entry; a retired one exists | DROP: `its entry in source 'S' is retired although it is still on disk` |
 | No live entry; skipped by a pattern | DROP: `excluded by pattern 'P' (built-in, [subvolumes].exclude, [doctor].exclude — every list holding it)` |
