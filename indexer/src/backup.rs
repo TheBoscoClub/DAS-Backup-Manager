@@ -263,6 +263,32 @@ pub struct BackupOptions {
     pub subvolume_sync: Option<SyncSection>,
 }
 
+impl BackupOptions {
+    /// The options of a GUI backup (the helper's BackupRun): exactly the
+    /// lists the GUI ticked and exactly its steps. D-Bus cannot say "not
+    /// specified", and the GUI always sends its ticks, so both lists are
+    /// `Some` — an empty one is a selection of nothing, refused by the job
+    /// ([`empty_selection`]), never `None`, which would mean all (bd
+    /// DAS-Backup-Manager-3npi). Here, not in the zbus method, so it is tested.
+    pub fn from_gui(
+        mode: BackupMode,
+        sources: Vec<String>,
+        targets: Vec<String>,
+        dry_run: bool,
+        steps: RunSteps,
+    ) -> Self {
+        let mut options = Self {
+            mode: Some(mode),
+            sources: Some(sources),
+            targets: Some(targets),
+            dry_run,
+            ..Default::default()
+        };
+        steps.apply(&mut options);
+        options
+    }
+}
+
 /// What a boot-step failure is prefixed with in a run's `errors`.
 pub const BOOT_ERROR_PREFIX: &str = "Boot subvolumes: ";
 
@@ -5232,6 +5258,50 @@ Legend:
         .apply(&mut options);
         assert_eq!(options.steps, BtrbkSteps::SendOnly);
         assert!(options.boot_archive && !options.index_after && options.email_report);
+    }
+
+    /// The helper's BackupRun builds its options here (bd
+    /// DAS-Backup-Manager-3npi): the GUI's tick lists are always `Some`, an
+    /// empty one included — a selection of nothing, which the job refuses —
+    /// and never `None`, which would mean every source or every target.
+    #[test]
+    fn gui_options_keep_the_ticks_and_an_empty_list_is_a_selection_of_nothing() {
+        let steps = RunSteps {
+            btrbk: BtrbkSteps::SnapshotOnly,
+            boot_archive: false,
+            index: true,
+            email: false,
+        };
+        let o = BackupOptions::from_gui(
+            BackupMode::Full,
+            vec!["nvme".into()],
+            vec!["primary".into(), "small".into()],
+            true,
+            steps,
+        );
+        assert_eq!(o.mode, Some(BackupMode::Full));
+        assert_eq!(o.sources, Some(vec!["nvme".to_string()]));
+        assert_eq!(
+            o.targets,
+            Some(vec!["primary".to_string(), "small".to_string()])
+        );
+        assert!(o.dry_run);
+        assert_eq!(o.steps, BtrbkSteps::SnapshotOnly);
+        assert!(!o.boot_archive && o.index_after && !o.email_report);
+        assert!(o.subvolume_sync.is_none());
+
+        for (sources, targets) in [
+            (vec![], vec!["primary".into()]),
+            (vec!["nvme".into()], vec![]),
+        ] {
+            let o =
+                BackupOptions::from_gui(BackupMode::Incremental, sources, targets, false, steps);
+            assert!(o.sources.is_some() && o.targets.is_some(), "{o:?}");
+            assert!(
+                empty_selection(&o).is_some(),
+                "an empty tick list is refused, never widened to all: {o:?}"
+            );
+        }
     }
 
     #[test]

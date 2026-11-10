@@ -1054,18 +1054,9 @@ impl HelperInterface {
         let steps =
             backup::RunSteps::from_entries(step_entries(steps)).map_err(fdo::Error::InvalidArgs)?;
         let config = load_config()?;
-        let mut options = BackupOptions {
-            mode: Some(mode),
-            // An `as` argument cannot say "not specified", and the GUI always
-            // lists its ticks: an empty list is a selection of nothing and
-            // the job refuses it (backup::empty_selection) — never "all".
-            sources: Some(sources),
-            targets: Some(targets),
-            dry_run,
-            ..Default::default()
-        };
-        // Snapshot, send, boot archive, index and email: exactly the ticks.
-        steps.apply(&mut options);
+        // Exactly the GUI's ticks; an empty list is a selection of nothing,
+        // never "all" (BackupOptions::from_gui, tested there).
+        let options = BackupOptions::from_gui(mode, sources, targets, dry_run, steps);
 
         let job_id = new_job_id();
         let progress = job_progress(&self.conn, &job_id);

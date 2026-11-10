@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New key `[doctor].max_snapshot_age_days`, default 3, at least 1 (`0` is refused by validation)
   - A target whose drive is attached but cannot be verified, mounted or listed is `TARGETS NOT CHECKED`, exit 3 — never read as fresh; one whose drive is not attached (an unplugged recovery drive, the enclosure off) is `TARGETS NOT ATTACHED (not checked)` and not a failure, so `das-backup-doctor.service` (`SuccessExitStatus=1`) does not fail every week a drive is away for a supervisor to restart into the same absence — `mount::target_attached`, the mount loop's own presence decision; `doctor --json` gains `undelivered`, `targets_failed` and `targets_absent`; the generated `das-backup-doctor.service` comment names both
 
+### Changed
+
+- **The GUI backup's options are built by a tested library constructor** (bd `DAS-Backup-Manager-3npi`): the D-Bus helper's `BackupRun` built `BackupOptions` inside its zbus method, which no test reaches, so a regression passing `None` (every source, every target) for the GUI's tick lists would have gone unseen; it now calls `BackupOptions::from_gui`, whose test pins both lists as `Some` (an empty one refused by `empty_selection`, never widened to all) and each tick reaching its own step
+
 ### Removed
 
 - **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
