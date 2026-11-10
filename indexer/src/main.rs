@@ -2489,8 +2489,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // aborted, 1 could not start: the doctor's rule (bd `vzsu`).
                 let exit_code = outcome.exit_code();
                 let result = match outcome {
-                    backup::BackupJobOutcome::Declined => {
-                        println!("{}", backup::declined_line());
+                    backup::BackupJobOutcome::Declined(line) => {
+                        println!("{line}");
                         return Ok(());
                     }
                     // Could not start (1) or began and stopped on a target's or

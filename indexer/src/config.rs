@@ -847,9 +847,14 @@ fn unknown_keys_in(path: &str, v: &toml::Value, known: &toml::Value, out: &mut V
     }
 }
 
-/// Keys an earlier version read and this one has removed: `(key, why)`.
-/// Warned about by name, so an old file is not told it holds a typo.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
+/// Keys an earlier version read and this one has removed: `(table, key, why)`,
+/// `table` being the path of the table that held the key with its array
+/// indices left out (`source.subvolumes`). Warned about by name, and only in
+/// that table, so an old file is not told it holds a typo, and a key of the
+/// same name elsewhere is not told it was removed (bd
+/// DAS-Backup-Manager-s5jv.4).
+const REMOVED_KEYS: &[(&str, &str, &str)] = &[(
+    "source.subvolumes",
     // bd DAS-Backup-Manager-9ry (operator 2026-11-09): the renderer and
     // backup-run.sh never read it, so it kept nothing out of a backup.
     "manual_only",
@@ -857,7 +862,12 @@ const REMOVED_KEYS: &[(&str, &str)] = &[(
 )];
 
 fn unknown_key_line(path: &str, key: &str, known: &toml::Table) -> String {
-    if let Some((_, why)) = REMOVED_KEYS.iter().find(|(k, _)| *k == key) {
+    // `path` is `<table path>.<key>`, indices included (`source[0].subvolumes[1]`).
+    let table = strip_indices(path.strip_suffix(key).unwrap_or(path).trim_end_matches('.'));
+    if let Some((_, _, why)) = REMOVED_KEYS
+        .iter()
+        .find(|(t, k, _)| *t == table && *k == key)
+    {
         return format!("{path} is no longer read: {why}");
     }
     let nearest = known
@@ -869,6 +879,22 @@ fn unknown_key_line(path: &str, key: &str, known: &toml::Table) -> String {
         Some((_, k)) => format!("{path} is not a key this version reads (did you mean {k}?)"),
         None => format!("{path} is not a key this version reads"),
     }
+}
+
+/// `path` without its `[n]` array indices: `source[0].subvolumes[1]` is
+/// `source.subvolumes`.
+fn strip_indices(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut skipping = false;
+    for c in path.chars() {
+        match c {
+            '[' => skipping = true,
+            ']' => skipping = false,
+            _ if !skipping => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Levenshtein distance: single-character insertions, deletions and
@@ -1037,8 +1063,8 @@ mod surgical {
                 _ => Vec::new(),
             };
             for entry in &mut entries {
-                for (key, _) in super::REMOVED_KEYS {
-                    if entry.contains_key(key) {
+                for (table, key, _) in super::REMOVED_KEYS {
+                    if *table == "source.subvolumes" && entry.contains_key(key) {
                         remove_key(*entry, key);
                     }
                 }
@@ -4989,6 +5015,34 @@ enabled = false
         );
     }
 
+    /// bd DAS-Backup-Manager-s5jv.4: a removed key is told as removed only
+    /// where it used to be read — a subvolume entry — not wherever the name
+    /// turns up.
+    #[test]
+    fn manual_only_outside_a_subvolume_entry_is_an_unknown_key_not_a_removed_one() {
+        let text = minimal_toml(&format!(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             manual_only = true\n[[source.subvolumes]]\nname = \"@a\"\nmanual_only = true\n{ONE_TARGET}"
+        ))
+        .replace("[general]\n", "[general]\nmanual_only = 1\n");
+        let warnings = unknown_key_warnings(&text).unwrap();
+        assert!(
+            warnings.contains(&"general.manual_only is not a key this version reads".to_string()),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.contains(&"source[0].manual_only is not a key this version reads".to_string()),
+            "{warnings:?}"
+        );
+        // Positive control: the entry's own key is still the removed one.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("source[0].subvolumes[0].manual_only is no longer read")),
+            "{warnings:?}"
+        );
+    }
+
     /// bd DAS-Backup-Manager-9ry: a save takes the removed key out of every
     /// subvolume entry, changed or not — table and inline — so the warning
     /// stops; the entry's other unknown keys stay.
@@ -5006,6 +5060,26 @@ enabled = false
         assert!(text.contains("future_inline = 1"), "{text}");
         assert!(text.contains("future = 2"), "{text}");
         assert_eq!(unknown_key_warnings(&text).unwrap().len(), 2, "{text}");
+    }
+
+    /// bd DAS-Backup-Manager-s5jv.4: the GUI's whole-text save goes through
+    /// `save_text`, which must take the removed key out as a structured save
+    /// does, with the operator's other text kept.
+    #[test]
+    fn a_text_save_drops_manual_only_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let typed = pinned(&minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [{ name = \"@\", manual_only = false, future_inline = 1 }]\n\
+             [[source]]\nlabel = \"t\"\nvolume = \"/vol2\"\ndevice = \"/dev/sdb\"\n\
+             [[source.subvolumes]]\nname = \"@a\"\nmanual_only = true\nfuture = 2\n",
+        ));
+        Config::save_text(&typed, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("manual_only"), "{text}");
+        assert!(text.contains("future_inline = 1"), "{text}");
+        assert!(text.contains("future = 2"), "{text}");
     }
 
     /// The Backup panel's contract: gui/tests/fixtures/panel-config.json IS

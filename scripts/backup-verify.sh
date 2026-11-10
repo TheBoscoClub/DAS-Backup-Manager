@@ -1,7 +1,14 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.1.3
-# Date: 2026-10-05
+# Version: 3.2.0
+# Date: 2026-11-10
+#
+# 3.2.0: no command runs at the top level any more. The configuration load,
+# the drive map and the globals ran there, before main(), so a copy over this
+# file in place while the load ran (the `btrdasd config dump-env` it waits for)
+# had bash read the new file's bytes next; they are load_configuration(),
+# called by main(), and the file is function definitions and the last line
+# (bd DAS-Backup-Manager-896; tests/test_verify_rewrite.sh).
 #
 # 3.1.3: a sector-count attribute is a number only if it is ASCII digits:
 # report_sector_attr() matches [[:digit:]], not [0-9], which under en_US.UTF-8
@@ -41,56 +48,66 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
 # ============================================================================
-
-# Load configuration from config.toml via btrdasd
-BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
-DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
-if [[ -x "$BTRDASD_BIN" ]]; then
-    eval "$("$BTRDASD_BIN" config dump-env --config "$DAS_CONFIG")"
-else
-    echo "ERROR: btrdasd not found at $BTRDASD_BIN" >&2
-    exit 1
-fi
-
-# Build drive map from config targets (serial -> display name).
 #
-# Keyed on every member serial from DAS_TARGET_n_SERIALS, not just the legacy
-# single-anchor DAS_TARGET_n_SERIAL. A RAID-1 target has two member drives and
-# the anchor names only one of them, so the partner rendered as "Unknown" in
-# the SMART table while its health was being read perfectly well — the map was
-# what was wrong, not the measurement (bd DAS-Backup-Manager-5b1).
-declare -A DRIVE_MAP=()
-for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
-    serials_var="DAS_TARGET_${i}_SERIALS"
-    serial_var="DAS_TARGET_${i}_SERIAL"
-    name_var="DAS_TARGET_${i}_DISPLAY_NAME"
-    label_var="DAS_TARGET_${i}_LABEL"
+# Nothing below runs at the top level: bash reads a script as it runs, so a
+# command at the top level that a rewrite of this file (a plain `cp`, `btrdasd
+# setup --upgrade`) lands during would have bash read the new file's bytes
+# next. The load runs in load_configuration(), called by main(), and the last
+# line starts main (bd DAS-Backup-Manager-896; tests/test_verify_rewrite.sh).
 
-    display="${!name_var:-}"
-    [[ -n "$display" ]] || display="${!label_var:-}"
+load_configuration() {
+    local btrdasd_bin="${BTRDASD_BIN:-/usr/bin/btrdasd}"
+    local das_config="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+    if [[ -x "$btrdasd_bin" ]]; then
+        eval "$("$btrdasd_bin" config dump-env --config "$das_config")"
+    else
+        echo "ERROR: btrdasd not found at $btrdasd_bin" >&2
+        exit 1
+    fi
 
-    # Fall back to the anchor when SERIALS is absent (config written by a
-    # pre-0.7.13 btrdasd), so an older config still maps its one drive.
-    read -ra target_serials <<< "${!serials_var:-${!serial_var:-}}"
-    for serial in "${target_serials[@]}"; do
-        [[ -n "$serial" ]] || continue
-        DRIVE_MAP[$serial]="$display"
+    # Build drive map from config targets (serial -> display name).
+    #
+    # Keyed on every member serial from DAS_TARGET_n_SERIALS, not just the
+    # legacy single-anchor DAS_TARGET_n_SERIAL. A RAID-1 target has two member
+    # drives and the anchor names only one of them, so the partner rendered as
+    # "Unknown" in the SMART table while its health was being read perfectly
+    # well — the map was what was wrong, not the measurement (bd
+    # DAS-Backup-Manager-5b1).
+    declare -gA DRIVE_MAP=()
+    local i serials_var serial_var name_var label_var display serial
+    local -a target_serials
+    for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
+        serials_var="DAS_TARGET_${i}_SERIALS"
+        serial_var="DAS_TARGET_${i}_SERIAL"
+        name_var="DAS_TARGET_${i}_DISPLAY_NAME"
+        label_var="DAS_TARGET_${i}_LABEL"
+
+        display="${!name_var:-}"
+        [[ -n "$display" ]] || display="${!label_var:-}"
+
+        # Fall back to the anchor when SERIALS is absent (config written by a
+        # pre-0.7.13 btrdasd), so an older config still maps its one drive.
+        read -ra target_serials <<< "${!serials_var:-${!serial_var:-}}"
+        for serial in "${target_serials[@]}"; do
+            [[ -n "$serial" ]] || continue
+            DRIVE_MAP[$serial]="$display"
+        done
     done
-done
 
-# Expected DAS drives (detected by USB transport)
-DAS_DEVICES=()
+    # Expected DAS drives (detected by USB transport)
+    DAS_DEVICES=()
 
-# Set by check_smart_health when any drive fails or cannot be read. main()
-# exits nonzero on it so this script can be used as a gate.
-SMART_FAILED=false
+    # Set by check_smart_health when any drive fails or cannot be read. main()
+    # exits nonzero on it so this script can be used as a gate.
+    SMART_FAILED=false
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+    # Colors
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+}
 
 # ============================================================================
 # FUNCTIONS
@@ -516,6 +533,7 @@ main() {
     echo "  Date: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "========================================"
 
+    load_configuration
     check_root
     detect_das_drives
     check_smart_health

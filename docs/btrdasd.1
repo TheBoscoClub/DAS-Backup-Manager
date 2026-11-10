@@ -499,7 +499,8 @@ every job that mounts a backup target holds the second. If either is held,
 setup writes and removes nothing, says on standard error which lock is held
 and, for the second, by whom, and exits 75; run it again once that job has
 finished. The questions of the wizard and of an uninstall come first: the locks
-are taken once they are answered.
+are taken once they are answered; a wizard refused then asks whether to wait
+and try again, keeping its answers.
 .B \-\-force
 reads the configuration only once it holds them;
 .B \-\-modify

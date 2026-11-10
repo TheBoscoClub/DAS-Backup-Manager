@@ -3506,6 +3506,9 @@ pub trait BackupJobHost {
         &self,
         progress: &dyn ProgressCallback,
     ) -> Result<Option<Box<dyn HoldsMaintenance>>, String>;
+    /// What the job says when `acquire_locks` found the singleton held: the
+    /// holder as it recorded itself.
+    fn declined_line(&self) -> String;
     fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release>;
     /// The subvolume sync, and the config the rest of the run uses —
     /// `before` when the config cannot be reloaded after sync.
@@ -3663,8 +3666,10 @@ pub fn run_manual_step(
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum BackupJobOutcome {
-    /// Another backup holds the singleton lock — declined, not queued.
-    Declined,
+    /// The singleton lock is held — by another backup, or by setup or a
+    /// config edit — so the job declined rather than queued; the line names
+    /// the holder (bd DAS-Backup-Manager-896).
+    Declined(String),
     /// The job never began: the selection was refused, or the locks could not
     /// be taken. Nothing was mounted, run or recorded — the cases in which
     /// `backup-run.sh` exits 1.
@@ -3694,7 +3699,7 @@ impl BackupJobOutcome {
     /// usually still be there on the next start; **1** it could not start.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Declined => 0,
+            Self::Declined(_) => 0,
             Self::CouldNotStart(_) => 1,
             Self::Aborted(_) => 3,
             Self::Ran(result) if result.success => 0,
@@ -3706,7 +3711,7 @@ impl BackupJobOutcome {
     /// the GUI shows when the job finishes.
     pub fn finish_line(&self, dry_run: bool) -> (bool, String) {
         match self {
-            Self::Declined => (false, "A backup is already running — declined".to_string()),
+            Self::Declined(line) => (false, line.clone()),
             Self::CouldNotStart(why) | Self::Aborted(why) => (false, why.clone()),
             Self::Ran(result) => {
                 let mut line = backup_summary(result, dry_run);
@@ -3864,7 +3869,7 @@ pub fn run_backup_job(
     let started = std::time::Instant::now();
     let locks = match host.acquire_locks(progress) {
         Ok(Some(locks)) => locks,
-        Ok(None) => return BackupJobOutcome::Declined,
+        Ok(None) => return BackupJobOutcome::Declined(host.declined_line()),
         // Cancelled while it waited: it holds nothing, mounted nothing.
         Err(_) if cut_short(progress) => {
             return BackupJobOutcome::CouldNotStart(CANCELLED_WAITING.into());
@@ -4058,6 +4063,10 @@ impl BackupJobHost for SystemBackupHost {
             Ok(BackupLockAttempt::AlreadyRunning) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn declined_line(&self) -> String {
+        declined_line_at(&self.singleton_lock)
     }
 
     fn mount_sources(&self, config: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release> {
@@ -4539,6 +4548,37 @@ mod tests {
             )
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_gui_job_declined_by_setup_says_setup_holds_the_lock_not_a_backup() {
+        // The GUI's finish text for a job that met a held singleton names its
+        // holder, as the CLI's line does (bd DAS-Backup-Manager-896).
+        let dir = tempfile::tempdir().unwrap();
+        let host = SystemBackupHost {
+            config_path: dir.path().join("config.toml"),
+            singleton_lock: dir.path().join("backup.lock"),
+            maintenance_lock: dir.path().join("maintenance.lock"),
+            job: "btrdasd-helper BackupRun job".into(),
+            mailer: std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
+        };
+        let _held = SingletonHeld::try_acquire_at(&host.singleton_lock, "btrdasd setup --upgrade")
+            .unwrap()
+            .unwrap();
+        let outcome = run_backup_job(
+            &host,
+            make_test_config(),
+            BackupOptions::default(),
+            &TestProgress::new(),
+        );
+        assert!(matches!(outcome, BackupJobOutcome::Declined(_)));
+        let (ok, line) = outcome.finish_line(false);
+        assert!(!ok);
+        assert!(line.contains("btrdasd setup --upgrade pid"), "{line}");
+        assert!(
+            line.contains(&host.singleton_lock.display().to_string()),
+            "{line}"
+        );
     }
 
     #[test]
@@ -10222,6 +10262,9 @@ Legend:
                 got.then(|| Box::new(MaintenanceHeld::assumed()) as Box<dyn HoldsMaintenance>)
             })
         }
+        fn declined_line(&self) -> String {
+            "declined by the fake holder".into()
+        }
         fn mount_sources(&self, _: &Config, progress: &dyn ProgressCallback) -> Box<dyn Release> {
             self.step("mount sources");
             self.maybe_cancel("mount sources", progress);
@@ -10955,11 +10998,11 @@ Legend:
             ..Default::default()
         };
         let (outcome, _) = job(&host, false);
-        assert!(matches!(outcome, BackupJobOutcome::Declined));
+        assert!(matches!(outcome, BackupJobOutcome::Declined(_)));
         assert_eq!(host.steps(), vec!["locks"]);
         assert_eq!(
             outcome.finish_line(false),
-            (false, "A backup is already running — declined".to_string())
+            (false, "declined by the fake holder".to_string())
         );
     }
 
@@ -11048,7 +11091,7 @@ Legend:
         let ran = |success| BackupJobOutcome::Ran(result_with(success, 1, 1, 0));
         // 0: ran clean, or another backup was running and this one declined.
         assert_eq!(ran(true).exit_code(), 0);
-        assert_eq!(BackupJobOutcome::Declined.exit_code(), 0);
+        assert_eq!(BackupJobOutcome::Declined(String::new()).exit_code(), 0);
         // 3: began and something failed, or aborted on a target's or a source's state.
         assert_eq!(ran(false).exit_code(), 3);
         assert_eq!(BackupJobOutcome::Aborted("x".into()).exit_code(), 3);
