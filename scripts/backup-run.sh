@@ -739,8 +739,16 @@ acquire_singleton_lock() {
                 fi
                 ;;
             *)
-                echo "[WARN] $LOCKFILE is held but its holder is not known ($SINGLETON_HOLDER_TEXT) — skipping this invocation: if no backup is running, this one did NOT run" >&2
-                exit 0
+                # The holder may have emptied its record and let go between
+                # the flock above and the read: one more try takes a lock
+                # that is free by now, never a skip of a backup that could
+                # run (al9 review).
+                lock_rc=0
+                flock -n -E 75 9 || lock_rc=$?
+                if ((lock_rc == 75)); then
+                    echo "[WARN] $LOCKFILE is held but its holder is not known ($SINGLETON_HOLDER_TEXT) — skipping this invocation: if no backup is running, this one did NOT run" >&2
+                    exit 0
+                fi
                 ;;
         esac
     fi

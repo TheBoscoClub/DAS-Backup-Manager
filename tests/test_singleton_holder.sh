@@ -201,6 +201,28 @@ check "recorded pid gone: says the holder is no longer running" "$(has "$WORK/ou
 check "recorded pid gone: is not waited for" "$(has "$WORK/out" "waiting up to")" "0"
 release_lock
 
+# --- the holder lets go between this run's flock and its read of the record --
+# The record reads empty then, and the lock is already free: one more try
+# takes it, never a skip of a backup that could run (al9 review).
+rm -f "${LOCK:?}"
+hold_lock ""
+rc=0
+(
+    eval "real_$(declare -f read_singleton_holder)"
+    read_singleton_holder() {
+        : >"$WORK/release"
+        until flock -n "$LOCK" true; do command sleep 0.05; done
+        real_read_singleton_holder
+    }
+    acquire_singleton_lock
+    record >"$WORK/rec"
+) >"$WORK/out" 2>&1 || rc=$?
+wait "$HOLDER_PID"
+HOLDER_PID=""
+check "released during the read: exit status" "$rc" "0"
+check "released during the read: the run takes the lock and records itself" "$(cat "$WORK/rec" 2>/dev/null)" "backup-run.sh pid $$"
+check "released during the read: no 'did NOT run' line" "$(has "$WORK/out" "did NOT run")" "0"
+
 # --- a lock file that cannot be opened is "could not start", exit 1 ----------
 rm -rf "${LOCK:?}"
 mkdir "$LOCK"
