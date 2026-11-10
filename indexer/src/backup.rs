@@ -3474,6 +3474,120 @@ pub trait BackupJobHost {
     ) -> ReportDelivery;
     /// Add the run to `backup_runs`.
     fn record(&self, config: &Config, result: &BackupResult) -> Result<(), String>;
+    /// The first step of a manual `snapshot` / `send` ([`sync_for_manual_step`]):
+    /// `btrbk.conf` brought into line, and the config the step then uses.
+    /// Unlike [`BackupJobHost::sync`] it records no coverage, and a failed one
+    /// stops the step.
+    fn sync_manual(
+        &self,
+        before: &Config,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Config, String>;
+    /// `btrdasd backup snapshot`'s step: the snapshots of `sources` (`None`:
+    /// all), as [`create_snapshots`].
+    fn snapshot(
+        &self,
+        config: &Config,
+        sources: Option<&[String]>,
+        progress: &dyn ProgressCallback,
+    ) -> Result<usize, String>;
+    /// `btrdasd backup send`'s step: the snapshots sent to `targets` (none:
+    /// all), as [`send_snapshots`] — snapshots sent and bytes.
+    fn send(
+        &self,
+        config: &Config,
+        targets: &[String],
+        progress: &dyn ProgressCallback,
+    ) -> Result<(usize, u64), String>;
+}
+
+/// The step `btrdasd backup snapshot` or `send` runs ([`run_manual_step`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualStep {
+    /// The sources selected; `None`: all.
+    Snapshot { sources: Option<Vec<String>> },
+    /// The targets selected; empty: all.
+    Send { targets: Vec<String> },
+}
+
+/// What a manual step got done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualStepDone {
+    Snapshots(usize),
+    Sent { snapshots: usize, bytes: u64 },
+}
+
+/// How a manual step ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualStepOutcome {
+    /// Another backup holds the singleton lock — declined, not queued.
+    Declined,
+    /// The step ran and everything it mounted was given back.
+    Done(ManualStepDone),
+    /// Anything went wrong: the locks, the sync, a mount, the step, or a
+    /// mount left behind. `why` carries every error; `done` is what the step
+    /// still got done, when it finished and only a mount was left.
+    Failed {
+        done: Option<ManualStepDone>,
+        why: String,
+    },
+}
+
+/// `btrdasd backup snapshot` / `send`, one function for the CLI: the locks,
+/// the sources mounted, `btrbk.conf` synced (a failed sync stops the step), a
+/// send's targets mounted, the step, and what was mounted given back. Each
+/// error is kept: a step that failed *and* left a mount behind says both
+/// (bd DAS-Backup-Manager-r1tr).
+pub fn run_manual_step(
+    host: &dyn BackupJobHost,
+    config: &Config,
+    step: &ManualStep,
+    progress: &dyn ProgressCallback,
+) -> ManualStepOutcome {
+    let failed = |why: String| ManualStepOutcome::Failed { done: None, why };
+    let locks = match host.acquire_locks(progress) {
+        Ok(Some(locks)) => locks,
+        Ok(None) => return ManualStepOutcome::Declined,
+        Err(e) => return failed(e),
+    };
+    let mut sources = host.mount_sources(config, progress);
+    // With the sources mounted and before the targets are: btrbk.conf is
+    // brought into line first, because a send of everything passes btrbk no
+    // filter. A failed sync stops the step, with the sources given back.
+    let synced = match host.sync_manual(config, progress) {
+        Ok(synced) => synced,
+        Err(why) => {
+            let still = sources.release(progress);
+            return failed(with_still_mounted(why, &still));
+        }
+    };
+    let (done, mut still_mounted) = match step {
+        ManualStep::Snapshot { sources: selected } => (
+            host.snapshot(&synced, selected.as_deref(), progress)
+                .map(ManualStepDone::Snapshots),
+            Vec::new(),
+        ),
+        ManualStep::Send { targets } => {
+            match host.mount_targets(&synced, progress, locks.maintenance()) {
+                Err(why) => (Err(why), Vec::new()),
+                Ok(mut mounted) => {
+                    let done = host
+                        .send(&synced, targets, progress)
+                        .map(|(snapshots, bytes)| ManualStepDone::Sent { snapshots, bytes });
+                    (done, mounted.release(progress))
+                }
+            }
+        }
+    };
+    still_mounted.extend(sources.release(progress));
+    match (done, mount::still_mounted_error(&still_mounted)) {
+        (Ok(done), None) => ManualStepOutcome::Done(done),
+        (Ok(done), Some(left)) => ManualStepOutcome::Failed {
+            done: Some(done),
+            why: left,
+        },
+        (Err(why), _) => failed(with_still_mounted(why, &still_mounted)),
+    }
 }
 
 /// How a backup job ended.
@@ -3962,6 +4076,32 @@ impl BackupJobHost for SystemBackupHost {
         crate::report::record_backup_run(&db, result)
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    fn sync_manual(
+        &self,
+        before: &Config,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Config, String> {
+        sync_for_manual_step(&self.config_path, before, progress)
+    }
+
+    fn snapshot(
+        &self,
+        config: &Config,
+        sources: Option<&[String]>,
+        progress: &dyn ProgressCallback,
+    ) -> Result<usize, String> {
+        create_snapshots(config, sources, progress).map_err(|e| e.to_string())
+    }
+
+    fn send(
+        &self,
+        config: &Config,
+        targets: &[String],
+        progress: &dyn ProgressCallback,
+    ) -> Result<(usize, u64), String> {
+        send_snapshots(config, None, targets, false, progress).map_err(|e| e.to_string())
     }
 }
 
@@ -9770,6 +9910,10 @@ Legend:
         second_target: bool,
         /// The target labels each `mount_targets` call was asked to mount.
         mounted: std::sync::Mutex<Vec<Vec<String>>>,
+        /// What the manual steps do (bd r1tr).
+        manual_sync: Result<(), String>,
+        snapshot_step: Result<usize, String>,
+        send_step: Result<(usize, u64), String>,
     }
 
     /// A clean coverage check, as a recorded backup run with nothing dropped
@@ -9828,6 +9972,9 @@ Legend:
                 sync_coverage: Some(clean_coverage()),
                 second_target: false,
                 mounted: std::sync::Mutex::new(Vec::new()),
+                manual_sync: Ok(()),
+                snapshot_step: Ok(3),
+                send_step: Ok((2, 10)),
             }
         }
     }
@@ -10026,6 +10173,34 @@ Legend:
             } else {
                 Ok(())
             }
+        }
+        fn sync_manual(&self, before: &Config, _: &dyn ProgressCallback) -> Result<Config, String> {
+            self.step(&format!("sync manual before={}", before.general.version));
+            self.manual_sync.clone()?;
+            let mut config = make_test_config();
+            config.general.version = "after-sync".into();
+            Ok(config)
+        }
+        fn snapshot(
+            &self,
+            config: &Config,
+            sources: Option<&[String]>,
+            _: &dyn ProgressCallback,
+        ) -> Result<usize, String> {
+            self.step(&format!(
+                "snapshot ({}, {sources:?})",
+                config.general.version
+            ));
+            self.snapshot_step.clone()
+        }
+        fn send(
+            &self,
+            config: &Config,
+            targets: &[String],
+            _: &dyn ProgressCallback,
+        ) -> Result<(usize, u64), String> {
+            self.step(&format!("send ({}, {targets:?})", config.general.version));
+            self.send_step.clone()
         }
     }
 
@@ -10946,6 +11121,189 @@ Legend:
                 .iter()
                 .any(|(l, m)| *l == LogLevel::Error && m == "history not recorded: disk full")
         );
+    }
+
+    // --- run_manual_step: `backup snapshot` / `send` (bd r1tr) --------------
+
+    fn manual(host: &FakeHost, step: ManualStep) -> ManualStepOutcome {
+        run_manual_step(host, &make_test_config(), &step, &TestProgress::new())
+    }
+
+    fn snapshot_step() -> ManualStep {
+        ManualStep::Snapshot {
+            sources: Some(vec!["root".into()]),
+        }
+    }
+
+    fn send_step() -> ManualStep {
+        ManualStep::Send {
+            targets: vec!["primary-22tb".into()],
+        }
+    }
+
+    #[test]
+    fn a_snapshot_step_syncs_after_the_mount_and_before_the_step() {
+        let host = FakeHost::default();
+        let outcome = manual(&host, snapshot_step());
+        assert_eq!(
+            outcome,
+            ManualStepOutcome::Done(ManualStepDone::Snapshots(3))
+        );
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount sources",
+                "sync manual before=0.6.0",
+                "snapshot (after-sync, Some([\"root\"]))",
+                "release sources",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_send_step_syncs_before_the_targets_are_mounted_and_before_the_step() {
+        let host = FakeHost::default();
+        let outcome = manual(&host, send_step());
+        assert_eq!(
+            outcome,
+            ManualStepOutcome::Done(ManualStepDone::Sent {
+                snapshots: 2,
+                bytes: 10
+            })
+        );
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount sources",
+                "sync manual before=0.6.0",
+                "mount targets (after-sync)",
+                "send (after-sync, [\"primary-22tb\"])",
+                "release targets",
+                "release sources",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_reaches_no_step_and_still_gives_the_sources_back() {
+        for step in [snapshot_step(), send_step()] {
+            let host = FakeHost {
+                manual_sync: Err("sync broke".into()),
+                ..Default::default()
+            };
+            let outcome = manual(&host, step.clone());
+            assert_eq!(
+                outcome,
+                ManualStepOutcome::Failed {
+                    done: None,
+                    why: "sync broke".into()
+                },
+                "{step:?}"
+            );
+            assert_eq!(
+                host.steps(),
+                [
+                    "locks",
+                    "mount sources",
+                    "sync manual before=0.6.0",
+                    "release sources"
+                ],
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_and_a_source_left_mounted_are_both_said() {
+        let host = FakeHost {
+            manual_sync: Err("sync broke".into()),
+            sources_left: vec!["/mnt/src".into()],
+            ..Default::default()
+        };
+        let ManualStepOutcome::Failed { done, why } = manual(&host, send_step()) else {
+            panic!("a failed sync is a failure")
+        };
+        assert_eq!(done, None);
+        assert_eq!(why, "sync broke; still mounted: /mnt/src");
+    }
+
+    #[test]
+    fn a_step_error_and_a_source_left_mounted_are_both_said() {
+        let host = FakeHost {
+            snapshot_step: Err("btrbk failed".into()),
+            sources_left: vec!["/mnt/src".into()],
+            ..Default::default()
+        };
+        let ManualStepOutcome::Failed { done, why } = manual(&host, snapshot_step()) else {
+            panic!("a step error is a failure")
+        };
+        assert_eq!(done, None);
+        assert_eq!(why, "btrbk failed; still mounted: /mnt/src");
+        let host = FakeHost {
+            send_step: Err("send failed".into()),
+            targets: Ok(vec!["/mnt/t".into()]),
+            sources_left: vec!["/mnt/src".into()],
+            ..Default::default()
+        };
+        let ManualStepOutcome::Failed { why, .. } = manual(&host, send_step()) else {
+            panic!("a step error is a failure")
+        };
+        assert_eq!(why, "send failed; still mounted: /mnt/t, /mnt/src");
+    }
+
+    #[test]
+    fn a_step_that_worked_beside_a_mount_left_behind_keeps_what_it_did() {
+        let host = FakeHost {
+            sources_left: vec!["/mnt/src".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            manual(&host, snapshot_step()),
+            ManualStepOutcome::Failed {
+                done: Some(ManualStepDone::Snapshots(3)),
+                why: "still mounted: /mnt/src".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_target_that_will_not_mount_stops_the_send_and_gives_the_sources_back() {
+        let host = FakeHost {
+            targets: Err("no such drive".into()),
+            ..Default::default()
+        };
+        let ManualStepOutcome::Failed { done, why } = manual(&host, send_step()) else {
+            panic!("a mount failure is a failure")
+        };
+        assert_eq!(done, None);
+        assert!(why.contains("no such drive"), "{why}");
+        let steps = host.steps();
+        assert!(!steps.iter().any(|s| s.starts_with("send ")), "{steps:?}");
+        assert_eq!(steps.last().unwrap(), "release sources", "{steps:?}");
+    }
+
+    #[test]
+    fn a_declined_lock_does_nothing_and_a_lock_error_is_a_failure() {
+        let host = FakeHost {
+            locks: Ok(false),
+            ..Default::default()
+        };
+        assert_eq!(manual(&host, snapshot_step()), ManualStepOutcome::Declined);
+        assert_eq!(host.steps(), ["locks"]);
+        let host = FakeHost {
+            locks: Err("permission denied".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            manual(&host, send_step()),
+            ManualStepOutcome::Failed {
+                done: None,
+                why: "permission denied".into()
+            }
+        );
+        assert_eq!(host.steps(), ["locks"]);
     }
 
     #[test]

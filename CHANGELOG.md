@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The GUI backup's options are built by a tested library constructor** (bd `DAS-Backup-Manager-3npi`): the D-Bus helper's `BackupRun` built `BackupOptions` inside its zbus method, which no test reaches, so a regression passing `None` (every source, every target) for the GUI's tick lists would have gone unseen; it now calls `BackupOptions::from_gui`, whose test pins both lists as `Some` (an empty one refused by `empty_selection`, never widened to all) and each tick reaching its own step
 
+- **`backup snapshot` and `backup send` run through one tested library step** (bd `DAS-Backup-Manager-r1tr`): the CLI arms each did locks, mount sources, sync, mount targets, the step and the unmount inline, so deleting the send arm's sync left every test green; both now call `backup::run_manual_step` on `BackupJobHost` (new `sync_manual`, `snapshot` and `send` steps), whose tests pin the order, that a failed sync reaches no step and still releases the sources, and that a declined lock does nothing
+  - The D-Bus helper exposes no snapshot or send method (only `BackupRun`), so only the CLI was affected
+
 ### Removed
 
 - **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
@@ -46,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A backup report no longer says success beside a run whose history row failed to write** (bd `DAS-Backup-Manager-4cww`): the report is written and mailed before the row, as in the script, so a failed `host.record` failed the job while the saved report still read as recorded; the report is now written and mailed again with the failure in its errors, as `report_unrecorded_run` does in `backup-run.sh` — `backup::run_backup_job`
+
+- **A failed `backup snapshot` / `send` no longer hides a source left mounted, or the reverse** (bd `DAS-Backup-Manager-r1tr`): the CLI arms returned the step's error before checking that the sources were released (`counted?` before `require_released`) and returned the unmount error alone on a failed sync; both errors are now in the one message, joined as the helper's jobs do (`mount::fail_if_still_mounted`)
 
 - **The USB link check no longer passes a Gen1 link, reads every enclosure device, runs on a quiet night and says why in the report** (bd `DAS-Backup-Manager-7qe`): the check failed only below 5000 Mbit/s, so a USB 3.2 Gen2 enclosure that fell back to Gen1 (5000, half its rated link) passed; it read only the first device whose product matched; it sat inside the branch for a run that wrote something, so a night with nothing new never checked the bus; and its FAIL reached the journal but no row of the email
   - New `[das].expected_link_mbit_s` (default `10000`, USB 3.2 Gen2; a Gen1 enclosure sets `5000`): below it is a FAIL, exported to the script as `DAS_EXPECTED_LINK_MBIT_S`

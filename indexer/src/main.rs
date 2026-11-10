@@ -1434,6 +1434,50 @@ fn backup_run_exit(code: i32) -> Option<i32> {
     (code != 0).then_some(code)
 }
 
+/// `backup snapshot` / `send`: the one library step (locks, sources, sync,
+/// targets, step, unmount — `backup::run_manual_step`, the order tested there)
+/// and what it prints. A step that did its work but left a mount behind prints
+/// what it did, then fails.
+fn run_manual_step_cli(
+    config_path: &Path,
+    cfg: &Config,
+    job: &str,
+    step: &backup::ManualStep,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let progress = CliProgress;
+    let outcome = backup::run_manual_step(
+        &backup::SystemBackupHost::new(config_path, job),
+        cfg,
+        step,
+        &progress,
+    );
+    let say = |done: backup::ManualStepDone| match done {
+        backup::ManualStepDone::Snapshots(count) => println!("Created {count} snapshots"),
+        backup::ManualStepDone::Sent { snapshots, bytes } => {
+            println!(
+                "Sent {snapshots} snapshots ({})",
+                report::format_bytes(bytes)
+            );
+        }
+    };
+    match outcome {
+        backup::ManualStepOutcome::Declined => {
+            println!("A backup is already running — declining.");
+            Ok(())
+        }
+        backup::ManualStepOutcome::Done(done) => {
+            say(done);
+            Ok(())
+        }
+        backup::ManualStepOutcome::Failed { done, why } => {
+            if let Some(done) = done {
+                say(done);
+            }
+            Err(why.into())
+        }
+    }
+}
+
 /// A `--sources` / `--targets` flag as the selection the run is given: no flag
 /// is "not specified" (all); a flag that names something is exactly that. A
 /// flag that names nothing real (`--targets ''`) arrives as a list holding an
@@ -2479,68 +2523,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BackupAction::Snapshot { config, sources } => {
                 let cfg = Config::load(&config)?;
-                let progress = CliProgress;
-                // Manual backups mount and unmount the DAS filesystems, so they
-                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let _locks =
-                    match backup::acquire_manual_locks("btrdasd backup snapshot", &progress)? {
-                        BackupLockAttempt::Acquired(locks) => locks,
-                        BackupLockAttempt::AlreadyRunning => {
-                            println!("A backup is already running — declining.");
-                            return Ok(());
-                        }
-                    };
-                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                // As `backup run` does, with the sources mounted: btrbk.conf is
-                // brought into line first (a failed sync stops the step).
-                let counted = backup::sync_for_manual_step(&config, &cfg, &progress)
-                    .map_err(Box::<dyn std::error::Error>::from)
-                    .and_then(|cfg| {
-                        buttered_dasd::backup::create_snapshots(
-                            &cfg,
-                            flag_selection(sources).as_deref(),
-                            &progress,
-                        )
-                    });
-                let sources_still_mounted = source_guard.unmount(&progress);
-                let count = counted?;
-                println!("Created {count} snapshots");
-                mount::require_released(&sources_still_mounted)?;
+                run_manual_step_cli(
+                    &config,
+                    &cfg,
+                    "btrdasd backup snapshot",
+                    &backup::ManualStep::Snapshot {
+                        sources: flag_selection(sources),
+                    },
+                )?;
             }
             BackupAction::Send { config, targets } => {
                 let cfg = Config::load(&config)?;
-                let progress = CliProgress;
-                // Manual backups mount and unmount the DAS filesystems, so they
-                // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
-                let locks = match backup::acquire_manual_locks("btrdasd backup send", &progress)? {
-                    BackupLockAttempt::Acquired(locks) => locks,
-                    BackupLockAttempt::AlreadyRunning => {
-                        println!("A backup is already running — declining.");
-                        return Ok(());
-                    }
-                };
-                let mut source_guard = mount::ensure_sources_mounted(&cfg, &progress);
-                // As `backup run` does, with the sources mounted and before the
-                // targets are: btrbk.conf is brought into line first, because
-                // a send of everything passes btrbk no filter. A failed sync
-                // stops the step, with the sources given back.
-                let cfg = match backup::sync_for_manual_step(&config, &cfg, &progress) {
-                    Ok(cfg) => cfg,
-                    Err(why) => {
-                        let still = source_guard.unmount(&progress);
-                        mount::require_released(&still)?;
-                        return Err(why.into());
-                    }
-                };
-                let mut guard =
-                    mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
-                let result =
-                    buttered_dasd::backup::send_snapshots(&cfg, None, &targets, false, &progress);
-                let mut still_mounted = guard.unmount(&progress);
-                still_mounted.extend(source_guard.unmount(&progress));
-                let (sent, bytes) = result?;
-                println!("Sent {sent} snapshots ({})", report::format_bytes(bytes));
-                mount::require_released(&still_mounted)?;
+                run_manual_step_cli(
+                    &config,
+                    &cfg,
+                    "btrdasd backup send",
+                    &backup::ManualStep::Send { targets },
+                )?;
             }
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;

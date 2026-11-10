@@ -21,6 +21,8 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
   mount (exit 1) — never dropped, never widened to "all". The GUI's D-Bus lists included.
 - `backup snapshot` and `backup send` sync `btrbk.conf` first, as `run` does; a failed sync stops them.
   `run` goes on after a failed sync only while `btrbk.conf` is still what `config.toml` renders (bd `03j3`).
+- `backup snapshot` and `backup send` are one library function, `backup::run_manual_step` (locks, mount sources, sync, mount targets for a send, step, release); the CLI only prints its outcome.
+- A manual step that fails and leaves a mount behind reports both errors; one that worked beside a mount left behind prints what it did, then fails.
 - The run mounts **nothing** itself: each `MountGuard` gives back exactly what it mounted;
   `run_backup` only refuses an unmounted selected source.
 - The job mounts only the selected targets (none named → all; `selected_targets_only`, bd `u8kk`).

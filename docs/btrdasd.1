@@ -818,6 +818,8 @@ Like
 it first syncs
 .I btrbk.conf
 with the subvolumes on the mounted sources, and stops if the sync fails.
+A step that fails and leaves a source mounted says both, and a step that
+worked but left a mount behind prints what it did, then fails.
 btrbk is run with
 .BR \-\-preserve\-snapshots :
 it reads no target, so one that is not mounted does not fail the step, and it
@@ -856,6 +858,8 @@ a send of every source and target passes btrbk no filter, so it would
 otherwise trust a
 .I btrbk.conf
 that may be out of date.
+The targets are mounted after the sync, and a step that fails and leaves a
+mount behind says both.
 .PP
 .B btrdasd backup send
 .RB [ \-\-config
