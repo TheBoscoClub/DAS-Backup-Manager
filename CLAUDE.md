@@ -13,7 +13,7 @@ DAS backup manager: btrbk orchestration, SQLite FTS5 content indexing, KDE Plasm
 
 - **Backup DB**: `/var/lib/das-backup/backup-index.db`
 - **Config**: `/etc/das-backup/config.toml` (source of truth); `/etc/btrbk/btrbk.conf` is generated from it — never hand-edit
-- **Email**: local relay `127.0.0.1:25`, unauthenticated; this project stores **no** mail credential — `.claude/rules/backup.md` §Email Reports
+- **Email**: local relay `127.0.0.1:25`, unauthenticated; this project stores **no** mail credential — `.claude/rules/backup-email.md`
 - **Growth log**: `/var/lib/das-backup/growth.log`
 
 ## Build
@@ -30,7 +30,12 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 
 - `esp-safety.md` — **CRITICAL**: recovery-drive ESPs
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
-- `backup.md` — btrbk, DAS, boot archival, email, exit codes, locks, supervisor interaction
+- `backup.md` — btrbk, install interlock, nested subvolumes, DAS, targets, exit codes, supervisor, mount guard, locks
+- `backup-coverage.md` — **[scoped: coverage/adopt/subvol, backup-run.sh]** subvolume coverage check
+- `backup-boot-archive.md` — **[scoped: backup-run.sh, backup.rs, forget.rs]** boot subvolume archival, pruner
+- `backup-restore.md` — **[scoped: restore code, config.rs]** restore destination policy
+- `backup-email.md` — **[scoped: backup-run.sh, report.rs, scrub.rs]** email reports
+- `backup-cli-gui.md` — **[scoped: backup.rs, main.rs, helper, gui/]** CLI/GUI selection and truthful records
 - `fail-silent.md` — which error suppressions are legitimate here
 - `test-safety.md` — task cap, no self-calling stubs, no real mailer in tests
 - `tracking.md` — where a new bd issue goes; orphan check

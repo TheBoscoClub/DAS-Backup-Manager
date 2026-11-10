@@ -20,10 +20,8 @@ never mounts a drive the VM holds.
 
 ### Incident behind these rules
 
-A pacman hook that discovered ESPs by label/filesystem mirrored the host ESP onto every ESP it found and
-destroyed both recovery ESPs. The hook came from this project's own `render_esp_hook()`
-(`indexer/src/setup/templates.rs`), regenerated on every `setup --upgrade`; it, `EspHooks`/`HookType` and the
-wizard's hook prompt were deleted. **No code path here can generate an ESP sync hook — keep it that way.**
+The hook in the global rule's 2026-03-05 incident came from this project's own `render_esp_hook()`
+(`indexer/src/setup/templates.rs`); it, `EspHooks`/`HookType` and the wizard's hook prompt were deleted. **No code path here can generate an ESP sync hook — keep it that way.**
 A host-ESP mirror is a different system — never conflate the two: it must hardcode its paths, have no
 discovery loop, cross-check label against mount, and refuse any device not on the expected bus class.
 
@@ -33,8 +31,7 @@ The recovery-OS reading mounts a mirror target's own ESP **read-only** (bd `sp78
 `esp_partuuid`, only when the drive itself lists that PARTUUID, never over or beside another mount of it:
 `mount::read_recovery_esp`. No other code path mounts an ESP; never add one that finds it any other way.
 
-### Identification
+### Target mounts
 
-Identify by serial/PARTUUID, never by device path (USB-attached; paths vary on reconnect). Mount points of the
-targets are mounted by `backup-run.sh` / `btrdasd` only, hidden from udisks2 by a generated ignore rule
+The targets are mounted by `backup-run.sh` / `btrdasd` only, hidden from udisks2 by a generated ignore rule
 (`sudo btrdasd setup --check`).

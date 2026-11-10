@@ -49,18 +49,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 ## Subvolume Coverage
 
-- **One rule, both paths** (bd `sp78.1`): every sync compares the `(volume, subvolume, target)` pairs
-  `config.toml` schedules with the last backup run's record — `adopt::sync_subvolumes` → `coverage::check`,
-  never a second copy. Intent, never delivery.
-- **Only a real backup run records** (`--record-coverage`, `SystemBackupHost::sync`); a dry run, a hand
-  `subvol sync` and `backup snapshot|send` write nothing and never create a database.
-- A recorded pair no longer scheduled and still on disk is a **WARN naming the rule that dropped it**, every
-  run until restored, gone from disk, or accepted per pair (`btrdasd subvol coverage accept`), never per
-  pattern. A subvolume gone from a volume that was read is retirement, never a WARN.
-- **Coverage changes no exit code.** A check that cannot run is WARN `not checked: …`; the one FAIL is
-  `backup-run.sh` reading no recognised `SUBVOLUME COVERAGE:` row from a sync that returned 0 or 1. The row
-  is `STATUS  (detail)`, two spaces, on both paths: script and binary ship together.
-- **No test reaches the host's index database**: every test sync names its own `--db` or `CoverageMode` path.
+**[scoped]** `backup-coverage.md` — the `(volume, subvolume, target)` coverage check.
 
 ## DAS Enclosure
 
@@ -92,23 +81,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 ## Boot Subvolume Archival
 
-- Snapshot live `@`/`@home` read-only to `@.archive.<TS>` / `@home.archive.<TS>`, **then** replace the
-  live subvolume from the latest btrbk snapshot. Archive failed ⇒ replacement skipped — the only copy
-  of the outgoing subvolume is never destroyed.
-- Two code paths, kept symmetric: bash `update_boot_subvolumes()` (`scripts/backup-run.sh`) and Rust
-  `archive_boot_with` (`indexer/src/backup.rs`). **Both locate the replacement BEFORE deleting anything**;
-  none found is a WARN.
-- **One classification, both paths** (bd woq, dtm): an absence is WARN; anything meant to work that did
-  not is FAIL and fails the run (exit 3); every check runs before the first mutation. An incremental run
-  creates a missing boot subvolume, never replaces one; only a full run (or `backup boot-archive`)
-  archives and replaces.
-- The boot step validates its own input (`Config::boot_input_errors`; `Config::load` does not) before any btrfs call.
-- **Snapshot names are read from `/etc/btrbk/btrbk.conf`, never re-derived**
-  (`forget::live_subvol_snapshot_names()`). Unreadable ⇒ whole step FAILs.
-- **Both paths, and the pruner, skip `role=mirror` targets entirely** — recovery drives carry their own
-  OS under `@`/`@home`. Ordinary btrbk send/receive to them is unaffected.
-- The pruner deletes only `@.archive.*` / `@home.archive.*` past retention on non-mirror targets.
-  Old archives already on the mirrors are left for manual review, never auto-removed.
+**[scoped]** `backup-boot-archive.md` — archiving and replacing `@`/`@home`, the pruner.
 
 ### Delete vs mutate — send/receive chain safety
 
@@ -119,49 +92,11 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 ## Restore Destination Policy (since 0.7.20.0)
 
-Checked before any directory is created, both roots compared **after resolution** (an allowed root only
-through links root owns, bd `sp78.18`):
-
-- **`[restore] allowed_roots`** in `config.toml` — default `/home`, `/tmp`. Widen it there, not in code;
-  grant a subdirectory, never `/srv` itself.
-- **`RESTORE_DENIED_ROOTS`** (`indexer/src/config.rs`) is checked first and **no configuration can
-  override it** — system paths plus served roots `/srv/http` and `/srv/ftp`.
-- **No copied file or link goes through a link, but one kind is followed.** Every write of the copy paths is
-  made under a directory fd reached one name at a time, each opened `O_NOFOLLOW` (bd `fcmk`): a link on the
-  way, planted or swapped in after the check, is refused; `btrfs receive` gets the held directory's
-  `/proc/<pid>/fd/<n>` (bd `sp78.18`). The destination itself is always reached strictly.
-- **The one link followed** (bd `mz3z`, operator 2026-11-09): **below** a destination a user owns (one root
-  owns — the restore made it — follows none), a link that user owns (never root's: the restore makes root-owned
-  links itself, with targets from the snapshot), owner and target read from one inode (`O_PATH`), whose target —
-  every link on its way owned by root or that user — resolves under an `allowed_roots` entry and no denied root,
-  to an existing directory that user owns. That directory is re-opened from `/` by the strict walk; the link is
-  never traversed, and wherever a rename on the way lands the resolution, root writes only into a directory the
-  destination's owner owns. Any other link is refused, naming the target and, when a grant would allow it, the
-  `allowed_roots` entry to add; at most 8 per walk.
-  Absolute or non-literal member paths are rejected.
+**[scoped]** `backup-restore.md` — `allowed_roots`, denied roots, the one followed link; **read it before granting a restore root on the host**.
 
 ## Email Reports
 
-- **THIS PROJECT HOLDS NO MAIL CREDENTIAL and must never acquire one.** Reports go unauthenticated and plain (no TLS) over
-  loopback to a local relay (`127.0.0.1:25`), which authenticates upstream by **envelope sender**. Never
-  copy a relay or provider key into any project or system config.
-- Both consumers read `[email]` from `config.toml`: `send_report()` in `scripts/backup-run.sh` and
-  `send_email_report_with_kind()` in `indexer/src/report.rs`. `[email].from` selects the relay
-  credential, so it must be the relay's configured sender (e.g. `das-backup@example.org`). `DAS_REPORT_TO` / `DAS_REPORT_FROM` override for testing.
-- **Every Rust report send goes through `report::Mailer`**: production sends through `report::MAILX`
-  (`SystemBackupHost::new` and `run_scrub_pass` take no mailer, so no caller can pass another), tests a
-  recording mailer; nothing else spawns `mailx`, and in a test build `MAILX` refuses before it spawns;
-  neither shipped binary (the D-Bus helper included) carries the refusal (bd `1x76`, `test-safety.md`).
-- **`smtp-auth=none` is REQUIRED on every mailx invocation**, or s-nail aborts with exit 4.
-- **Never redirect mailx stderr to `/dev/null`.**
-- **Every mailx send is bounded** (`timeout -k 10 60`) and runs with the lock fds closed, so a relay that
-  keeps trickling bytes costs the report, not the run.
-- The report is written to `$LAST_REPORT` before any send; a failed write is logged and the not-emailed
-  lines name the journal. With email off, an unsavable report is a FAIL
-  (exit 3, `report:` in the row). **One rule on both paths** (bd `dlpr`): failed email beside a saved
-  report is a WARN, run status stands; saved nowhere and mailed nowhere is a FAIL.
-- Diagnose with `journalctl -u das-backup`, `journalctl -u postfix`, `mailq`. `status=sent` means the
-  provider accepted it, not that it reached the inbox.
+**[scoped]** `backup-email.md` — relay, `report::Mailer`, `smtp-auth=none`, bounded sends; **read it before diagnosing a missing report**.
 
 ## Content Indexer
 
@@ -210,26 +145,7 @@ through links root owns, bd `sp78.18`):
 
 ## The CLI/GUI Backup Touches Only What Was Selected, And Mounts Nothing Itself (bd `7tx`)
 
-- btrbk gets **only** the selected (subvolume, target) pairs, one `<target dir>/<snapshot_name>` filter
-  each — never a volume path, never a source filter beside a target filter (filters are a union). No
-  filter only when the selection IS everything.
-- **An empty selection, or a label the configuration lacks, is refused** before the first lock or
-  mount (exit 1) — never dropped, never widened to "all". The GUI's D-Bus lists included.
-- `backup snapshot` and `backup send` sync `btrbk.conf` first, as `run` does; a failed sync stops them.
-  `run` goes on after a failed sync only while `btrbk.conf` is still what `config.toml` renders (bd `03j3`).
-- The run mounts **nothing** itself: each `MountGuard` gives back exactly what it mounted;
-  `run_backup` only refuses an unmounted selected source.
-- Never re-render `btrbk.conf` per run to narrow the targets (it shifts other targets' retention).
-
-## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
-
-- A count a failed step could not take is `None` (NULL / `unknown` / `null`), never `0`.
-- `btrdasd backup run` exits 0 / 3 / 1 by the script's rule (`BackupJobOutcome::exit_code`); an aborted
-  run records a failed row; a report neither saved nor mailed fails the run before the row is written.
-- A failed `host.record` fails the job, never only warns.
-- `backup run` records the selected recovery OSes it mounted (`recovery-os.json`, bd `58c8`), one rule
-  with `check_recovery_os`: STALE/WARNING is WARN; unreadable, unwritable or timed out is FAIL.
-  `btrdasd recovery-os record` does it without a backup.
+**[scoped]** `backup-cli-gui.md` — selection-only btrbk filters, no mounting, truthful counts and exit codes.
 
 ## Bare-Mountpoint Guard — REQUIRED in `backup-run.sh`
 
