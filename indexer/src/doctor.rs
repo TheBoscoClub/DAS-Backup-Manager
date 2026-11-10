@@ -723,6 +723,7 @@ mod tests {
             volume: volume.into(),
             subvolumes,
             uuids: std::collections::BTreeMap::new(),
+            fs_uuid: None,
         }
     }
 

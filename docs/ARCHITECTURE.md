@@ -361,9 +361,10 @@ target_usage (id PK, timestamp, target_label, total_bytes, used_bytes, snapshot_
 coverage_state    (id PK = 1, first_recorded, last_recorded, checks)   -- schema v5: no row = no record yet
 coverage_baseline (volume, subvolume, target, target_identity, source_label, first_covered,
                    last_covered, dropped_since, dropped_checks, drop_rule, subvol_uuid,
-                   PK(volume, subvolume, target))  -- the pairs scheduled at the last recorded run, and
+                   volume_uuid, PK(volume, subvolume, target))  -- the pairs scheduled at the last recorded run, and
                                                   -- dropped ones until restored, gone or accepted;
-                                                  -- v7: subvol_uuid follows a renamed subvolume
+                                                  -- v7: subvol_uuid follows a renamed subvolume;
+                                                  -- v8: volume_uuid a volume mounted elsewhere
 coverage_accepted (id PK, volume, subvolume, target, drop_rule, dropped_since, accepted_at)  -- accept log
 ```
 

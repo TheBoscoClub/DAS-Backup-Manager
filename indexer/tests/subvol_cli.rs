@@ -743,6 +743,7 @@ fn seeded_coverage_db(dir: &Path) -> std::path::PathBuf {
         dropped_checks: u32::from(dropped),
         drop_rule: dropped.then(|| "excluded by pattern '@b'".into()),
         subvol_uuid: None,
+        volume_uuid: None,
     };
     Database::open(&path)
         .unwrap()

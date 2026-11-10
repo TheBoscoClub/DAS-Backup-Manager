@@ -191,6 +191,11 @@ pub struct VolumeListing {
     /// for (`-`, malformed, or one UUID on two paths) is absent: no UUID is
     /// never a covered pair.
     pub uuids: BTreeMap<String, String>,
+    /// The filesystem UUID `findmnt` reported for the volume once it matched
+    /// the configured device (bd DAS-Backup-Manager-sp78.6): what the volume
+    /// is, whatever path it is mounted at. `None` when the volume was not
+    /// verified, so a listing that failed never names a filesystem.
+    pub fs_uuid: Option<String>,
 }
 
 /// An empty listing is treated as a failed one. Every configured volume holds
@@ -208,6 +213,7 @@ pub fn normalize_listing(volume: &str, listed: Result<Vec<String>, String>) -> V
         volume: volume.to_string(),
         subvolumes,
         uuids: BTreeMap::new(),
+        fs_uuid: None,
     }
 }
 
@@ -634,6 +640,7 @@ pub fn list_volume(
     device: &str,
 ) -> VolumeListing {
     let mut uuids = BTreeMap::new();
+    let mut fs_uuid = None;
     let listed = (|| {
         if !is_mountpoint(Path::new(volume)) {
             return Err(format!("{volume} is not mounted"));
@@ -669,10 +676,16 @@ pub fn list_volume(
         let out = run_stdout(runner, "btrfs", &["subvolume", "list", "-u", volume])?;
         let rows = parse_subvolume_list(&out);
         uuids = uuids_of(&rows);
+        fs_uuid = Some(uuid.to_string());
         Ok(rows.into_iter().map(|l| l.path).collect())
     })();
     let mut listing = normalize_listing(volume, listed);
     listing.uuids = uuids;
+    // Named only for a volume that was read: a listing that failed, or was
+    // refused as empty, concludes nothing about what the volume is.
+    if listing.subvolumes.is_ok() {
+        listing.fs_uuid = fs_uuid;
+    }
     // `btrfs subvolume list` never prints id 5. The checks above proved the
     // path is the filesystem's top level, so it is there — added only after
     // an empty listing has already been refused, never in its place.
@@ -1314,6 +1327,31 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_volume_names_its_filesystem_and_a_failed_one_names_none() {
+        let r = scripted(vec![healthy("/ssd", "abc", &["@"])]);
+        assert_eq!(
+            list_volume(&r, &mounted, "/ssd", "UUID=abc").fs_uuid,
+            Some("abc".to_string())
+        );
+        // Wrong filesystem, unmounted, mounted below the top level, an
+        // unreadable listing: nothing is concluded about what the volume is.
+        let r = scripted(vec![healthy("/ssd", "other", &["@"])]);
+        assert_eq!(list_volume(&r, &mounted, "/ssd", "UUID=abc").fs_uuid, None);
+        let r = Scripted::new(&[]);
+        assert_eq!(
+            list_volume(&r, &unmounted, "/ssd", "UUID=abc").fs_uuid,
+            None
+        );
+        let r = Scripted::new(&[("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /@\n")]);
+        assert_eq!(list_volume(&r, &mounted, "/ssd", "UUID=abc").fs_uuid, None);
+        let r = Scripted::new(&[
+            ("findmnt -n -o UUID,FSROOT --target /ssd", 0, "abc /\n"),
+            ("btrfs subvolume list -u /ssd", 1, ""),
+        ]);
+        assert_eq!(list_volume(&r, &mounted, "/ssd", "UUID=abc").fs_uuid, None);
+    }
+
+    #[test]
     fn empty_listing_is_a_failed_listing() {
         let l = normalize_listing("/vol", Ok(Vec::new()));
         assert_eq!(l.volume, "/vol");
@@ -1389,6 +1427,7 @@ mod tests {
             volume: volume.into(),
             subvolumes: Ok(names.iter().map(|s| s.to_string()).collect()),
             uuids: BTreeMap::new(),
+            fs_uuid: None,
         }
     }
 
@@ -1595,6 +1634,7 @@ mod tests {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
                 uuids: BTreeMap::new(),
+                fs_uuid: None,
             },
             listing("/hdd", &["media", "media/video"]),
         ];
@@ -3272,6 +3312,7 @@ mod tests {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
                 uuids: BTreeMap::new(),
+                fs_uuid: None,
             },
             listing("/hdd", &["media"]),
         ];

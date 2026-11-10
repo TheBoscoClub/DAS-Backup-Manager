@@ -394,8 +394,11 @@ script is a FAIL (fail-silent "always a defect" #6). No WARN-to-FAIL escalation.
 and the snapshot name are not part of it, so renaming either says nothing. Since schema 7 a row also holds its
 subvolume's own btrfs UUID (`btrfs subvolume list -u`, the field before ` path `), and a recorded row whose
 UUID a read listing shows at another path moves there first (`coverage::follow_renames`): a rename is one
-pair, and `mv @a @b` with `@b` excluded is a DROP `renamed from '@a'; …`. A row with no UUID (older record,
-top level, a listing that gave none or gave one to two paths) is paired by path, never as covered; rows the
+pair, and `mv @a @b` with `@b` excluded is a DROP `renamed from '@a'; …`. The volume is followed first the
+same way: a row's filesystem UUID (`volume_uuid`, schema 8; the `findmnt` UUID `list_volume` verified against
+the device) held by exactly one read volume, not at the row's own path, moves the row to that volume path
+(`coverage::volume_now`); a drop there reads `volume moved from '<old>'; …`. A row with no UUID (older record,
+top level, a listing that gave none or gave one to two paths, a filesystem two read volumes hold) is paired by path, never as covered; rows the
 listing confirms claim a name before path-only ones, so two rows never end on one pair. Schema 5 adds `coverage_state`
 (one row: first and last recorded date, number of recorded checks; no row = no record yet),
 `coverage_baseline` (every pair intended at the last recorded check, plus every dropped pair not yet

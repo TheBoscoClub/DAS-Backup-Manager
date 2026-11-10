@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every listing reads `btrfs subvolume list -u`; a recorded pair holds its subvolume's UUID (schema 7: nullable `coverage_baseline.subvol_uuid`, added on the first open, existing rows keep NULL) and moves to the path that UUID is now at before the comparison — a rename that sync adopts is one pair, one into an excluded name is a drop (`renamed from '@a'; excluded by pattern …`) — `coverage::follow_renames`, `adopt::parse_subvolume_list`
   - A row with no UUID (recorded earlier, a top level, a volume read without UUIDs, a UUID two paths carry) is paired by path as before and never counts as covered by a missing UUID; the next recorded run stamps it; two rows never end on one pair
 
+- **A source volume moved to another mount path on the same filesystem is the same pairs** (bd `DAS-Backup-Manager-sp78.6`): coverage keyed the volume by `[[source]].volume` as configured, so after the path changed every old pair read `no [[source]] names volume … any more` and every new one was new, until `subvol coverage accept --all`
+  - A recorded pair holds its volume's filesystem UUID — the one `list_volume` already verifies with `findmnt` (schema 8: nullable `coverage_baseline.volume_uuid`, added on the first open) — and moves to the one read volume that reports it, never when two read volumes hold the same filesystem or the row's own path still does — `VolumeListing::fs_uuid`, `coverage::volume_now`
+  - A drop on a moved volume says so (`volume moved from '<old path>'; …`); a row with no filesystem UUID is paired by path as before and stamped by the next recorded run
+
 ### Removed
 
 - **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
