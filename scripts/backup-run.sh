@@ -1,6 +1,6 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.5
+# Version: 4.17.6
 # Date: 2026-11-10
 #
 # Features:
@@ -2661,7 +2661,19 @@ run_archive_cleanup() {
     else
         local exit_code=$?
         log_warn "Boot archive cleanup failed (non-fatal): $cleanup_output"
-        record_op "archive_cleanup" "FAIL" "exit code $exit_code"
+        # The report says which target failed and why — the pruner's own
+        # [ERROR] lines, colour and prefix taken off, "; " between them — not
+        # only the exit code, which left the journal the one place that knew
+        # (bd DAS-Backup-Manager-3ft3).
+        local why="" err_line
+        while IFS= read -r err_line; do
+            [[ "$err_line" == *"[ERROR]"* ]] || continue
+            err_line="${err_line#*\[ERROR\]}"
+            err_line="${err_line#$'\e[0m'}"
+            err_line="${err_line#"${err_line%%[! ]*}"}"
+            [[ -z "$err_line" ]] || why+="${why:+; }$err_line"
+        done <<<"$cleanup_output"
+        record_op "archive_cleanup" "FAIL" "exit code $exit_code${why:+: $why}"
     fi
 }
 
@@ -3611,7 +3623,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.5
+  backup-run.sh v4.17.6
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

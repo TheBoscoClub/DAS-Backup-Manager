@@ -453,7 +453,18 @@ check "reader, a dry run whose pruner ran for real: FAIL" "$(status_of "$verdict
 fresh
 for mode in dryrun real; do
     verdict="$(read_back "$mode")"
-    check "reader, $mode, the pruner failed (no listing): FAIL by its exit status" "$verdict" "FAIL|exit code 1"
+    check "reader, $mode, the pruner failed (no listing): FAIL by its exit status" "$(status_of "$verdict")" "FAIL"
+    # The report says which target and why, not only "exit code 1" (bd 3ft3).
+    case "$verdict" in
+    "FAIL|exit code 1: [label-primary] Failed to list subvolumes: "*"; [label-primary] Target NOT pruned - state unknown; "*) why=named ;;
+    *) why="$verdict" ;;
+    esac
+    check "reader, $mode, the pruner failed (no listing): the detail names the target and the reason" "$why" "named"
+    case "$verdict" in
+    *$'\e'* | *"[ERROR]"*) bare=no ;;
+    *) bare=yes ;;
+    esac
+    check "reader, $mode, the pruner failed: the detail carries no colour codes or log prefixes" "$bare" "yes"
 done
 
 # ---------------------------------------------------------------------------
@@ -478,8 +489,8 @@ check "... the skip's own wording is not used" "$(said "Skipping $PRIMARY")" "0"
 run_pruner C --dryrun
 check "probe error on the primary, dry run: the pruner exits 1 too" "$RC" "1"
 for mode in dryrun real; do
-    check "reader, $mode, a target the pruner could not tell: FAIL by its exit status" \
-        "$(read_back "$mode")" "FAIL|exit code 1"
+    check "reader, $mode, a target the pruner could not tell: FAIL, the detail naming the target and why (bd 3ft3)" \
+        "$(read_back "$mode")" "FAIL|exit code 1: Could not tell whether $PRIMARY is mounted — mountpoint: $PRIMARY: Input/output error (exit 1); $PRIMARY NOT pruned - state unknown; Boot archive cleanup FAILED: 0 deletion error(s), 1 target(s) not examined."
 done
 read_back real >/dev/null
 check "reader, the warning carries the pruner's own words" \
