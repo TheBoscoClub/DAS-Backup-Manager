@@ -858,8 +858,10 @@ a send of every source and target passes btrbk no filter, so it would
 otherwise trust a
 .I btrbk.conf
 that may be out of date.
-The targets are mounted after the sync, and a step that fails and leaves a
-mount behind says both.
+The targets are mounted after the sync, and only those
+.B \-\-targets
+names (none named: all); an unnamed target is never mounted.
+A step that fails and leaves a mount behind says both.
 .PP
 .B btrdasd backup send
 .RB [ \-\-config

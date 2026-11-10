@@ -3635,7 +3635,10 @@ pub fn run_manual_step(
             Vec::new(),
         ),
         ManualStep::Send { targets } => {
-            match host.mount_targets(&synced, progress, locks.maintenance()) {
+            // Only the targets the send names are mounted (none named: all),
+            // the rule of the job (bd DAS-Backup-Manager-s5jv.10, `u8kk`).
+            let to_mount = targets_named_only(&synced, (!targets.is_empty()).then_some(targets));
+            match host.mount_targets(&to_mount, progress, locks.maintenance()) {
                 Err(why) => (Err(why), Vec::new()),
                 Ok(mut mounted) => {
                     let done = host
@@ -4006,8 +4009,13 @@ pub fn run_backup_job(
 /// DAS-Backup-Manager-u8kk). Not specified: every target. Every selected
 /// label is in the configuration (`unknown_label`, checked before the locks).
 fn selected_targets_only(config: &Config, options: &BackupOptions) -> Config {
+    targets_named_only(config, options.targets.as_deref())
+}
+
+/// `config` with only the targets `named` names (`None`: every target).
+fn targets_named_only(config: &Config, named: Option<&[String]>) -> Config {
     let mut selected = config.clone();
-    if let Some(named) = &options.targets {
+    if let Some(named) = named {
         selected.targets.retain(|t| named.contains(&t.label));
     }
     selected
@@ -10358,6 +10366,12 @@ Legend:
             self.manual_sync.clone()?;
             let mut config = make_test_config();
             config.general.version = "after-sync".into();
+            if self.second_target {
+                let mut recovery = config.targets[0].clone();
+                recovery.label = "recovery-a".into();
+                recovery.role = TargetRole::Mirror;
+                config.targets.push(recovery);
+            }
             Ok(config)
         }
         fn snapshot(
@@ -11363,6 +11377,30 @@ Legend:
                 "release sources",
             ]
         );
+    }
+
+    #[test]
+    fn a_send_step_mounts_only_the_targets_it_names() {
+        // An unnamed target gets no send, so it gets no mount either (bd
+        // DAS-Backup-Manager-s5jv.10, the rule of u8kk). None named: all.
+        for (named, mounted) in [
+            (vec!["primary-22tb".to_string()], vec!["primary-22tb"]),
+            (vec![], vec!["primary-22tb", "recovery-a"]),
+        ] {
+            let host = FakeHost {
+                second_target: true,
+                ..Default::default()
+            };
+            let step = ManualStep::Send {
+                targets: named.clone(),
+            };
+            let outcome = manual(&host, step);
+            assert!(
+                matches!(outcome, ManualStepOutcome::Done(_)),
+                "{named:?}: {outcome:?}"
+            );
+            assert_eq!(*host.mounted.lock().unwrap(), vec![mounted], "{named:?}");
+        }
     }
 
     #[test]

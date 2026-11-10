@@ -25,7 +25,7 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
 - A manual step that fails and leaves a mount behind reports both errors; one that worked beside a mount left behind prints what it did, then fails.
 - The run mounts **nothing** itself: each `MountGuard` gives back exactly what it mounted;
   `run_backup` only refuses an unmounted selected source.
-- The job mounts only the selected targets (none named → all; `selected_targets_only`, bd `u8kk`).
+- The job, and `backup send`, mount only the selected targets (none named → all; `selected_targets_only` / `targets_named_only`, bd `u8kk`, `s5jv.10`).
 - Never re-render `btrbk.conf` per run to narrow the targets (it shifts other targets' retention).
 
 ## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
