@@ -252,7 +252,11 @@ jobs:
   # 1165 a shard, at about 31 s each on the runner (26 s build + 5 s test, up
   # from 9.9 s as the crate grew): about 10 hours a shard. The runs of
   # 2026-10-26, 11-02 and 11-09 were all cancelled at timeout-minutes 300 with
-  # nothing archived. Hence eight shards: about 437 each, about 3.8 hours.
+  # nothing archived. Hence twelve shards: about 292 each, about 2.5 hours.
+  # Not eight (3.8 hours): mutant count and cost per mutant both grow with
+  # the crate (2285 at 9.9 s on 2026-10-05), and eight would leave about 30%
+  # headroom. Not more: each shard pays its own toolchain, cargo-mutants and
+  # baseline build, and holds a runner from the org's shared pool.
   # No step timeout: the gate does not yet refuse a partial outcomes.json
   # (bd DAS-Backup-Manager-2kb1.9), so a run cut short must stay a
   # cancelled, red job.
@@ -268,7 +272,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     env:
       SHARD: ${{ strategy.job-index }}
       SHARDS: ${{ strategy.job-total }}
