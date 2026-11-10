@@ -755,14 +755,7 @@ pub fn report_message(
     } else {
         format!("DAS {kind} ({short_hostname}) <{from_addr}>")
     };
-    // The script's three states (`subject_status` in backup-run.sh).
-    let status_word = if report.contains("FAILURE") {
-        "FAILURE"
-    } else if report.contains("Status: COMPLETED WITH WARNINGS") {
-        "SUCCESS WITH WARNINGS"
-    } else {
-        "SUCCESS"
-    };
+    let status_word = subject_status(report);
     Ok(MailMessage {
         subject: format!("[DAS {kind}] {hostname} — {status_word} — {}", context.now),
         from,
@@ -773,6 +766,18 @@ pub fn report_message(
         ),
         body: report.to_string(),
     })
+}
+
+/// The subject's status word for `report`: the script's three states
+/// (`subject_status` in backup-run.sh, bd DAS-Backup-Manager-qras).
+fn subject_status(report: &str) -> &'static str {
+    if report.contains("FAILURE") {
+        "FAILURE"
+    } else if report.contains("Status: COMPLETED WITH WARNINGS") {
+        "SUCCESS WITH WARNINGS"
+    } else {
+        "SUCCESS"
+    }
 }
 
 /// Send a backup report: [`send_email_report_with_kind`] with the `Backup`
