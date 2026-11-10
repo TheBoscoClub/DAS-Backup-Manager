@@ -248,6 +248,14 @@ jobs:
   # timeout-minutes 300, so three: 1118 each, about 3.1 hours.
   # Re-measured for its review round 2: 3367 in all, coverage.rs 140; shards
   # of 1123, 1122 and 1122, still about 3.1 hours each.
+  # Measured from the 2026-11-09 run (bd DAS-Backup-Manager-thi): 3495 mutants,
+  # 1165 a shard, at about 31 s each on the runner (26 s build + 5 s test, up
+  # from 9.9 s as the crate grew): about 10 hours a shard. The runs of
+  # 2026-10-26, 11-02 and 11-09 were all cancelled at timeout-minutes 300 with
+  # nothing archived. Hence eight shards: about 437 each, about 3.8 hours.
+  # No step timeout: the gate does not yet refuse a partial outcomes.json
+  # (bd DAS-Backup-Manager-2kb1.9), so a run cut short must stay a
+  # cancelled, red job.
   # Re-measure before widening:
   #   cargo mutants --list --file '<glob>' | wc -l   (and with --shard k/N)
   # As above, the matrix list alone sets the shard count.
@@ -260,7 +268,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
       SHARD: ${{ strategy.job-index }}
       SHARDS: ${{ strategy.job-total }}
