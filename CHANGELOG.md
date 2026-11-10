@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A snapshot step with a target not mounted no longer fails after creating every snapshot** (bd `DAS-Backup-Manager-2ab3`): `btrbk snapshot` reads every target of the subvolumes it snapshots, and one it cannot read is aborted, so btrbk exits 10 once the snapshots exist (reproduced in a VM, btrbk 0.32.7); `btrdasd backup snapshot` mounts no target, and read that as `No snapshots can be assumed created`
+  - Both `backup snapshot` and `backup run`'s snapshot step now pass `--preserve-snapshots`: btrbk reads no target and deletes no snapshot — retention is the `btrbk resume` or `btrbk run` that sends — `backup::create_snapshots_with`
+
 - **A CLI/GUI backup that worked with warnings says so in the email subject** (bd `DAS-Backup-Manager-qras`): a recovery-OS, boot-step or coverage WARN made the report read `COMPLETED WITH WARNINGS` but the subject only `SUCCESS`; it is now `SUCCESS WITH WARNINGS`, as `backup-run.sh`'s has been
 
 - **A CLI/GUI backup mounts only the targets it was given** (bd `DAS-Backup-Manager-u8kk`): `btrdasd backup run --targets` and the GUI's ticked targets were written to alone, but every configured target was mounted and unmounted — a spin-up, USB traffic and a mount on a drive left out of the run; `run_backup_job` now hands the target mount the selected targets only (none named: all, as before)

@@ -795,6 +795,15 @@ Like
 it first syncs
 .I btrbk.conf
 with the subvolumes on the mounted sources, and stops if the sync fails.
+btrbk is run with
+.BR \-\-preserve\-snapshots :
+it reads no target, so one that is not mounted does not fail the step, and it
+deletes no snapshot; retention is applied by the next run that sends.
+The snapshot step of
+.B backup run
+is run the same way, and the
+.B "btrbk resume"
+after it applies the retention policy.
 .PP
 .B btrdasd backup snapshot
 .RB [ \-\-config

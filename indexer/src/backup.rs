@@ -1012,7 +1012,14 @@ fn create_snapshots_with(
     // btrbk syntax: `btrbk -c <conf> snapshot [<filter>...]`
     // The "snapshot" subcommand must appear exactly once, followed by the
     // filters (see `btrbk_filters`) that limit it to the selection.
-    cmd.arg("snapshot").args(&filters);
+    // `--preserve-snapshots`: with it (and the `--preserve-backups` that
+    // `snapshot` implies) btrbk reads no target and deletes no snapshot.
+    // Without it, a target that is not mounted made btrbk exit 10 after
+    // creating every snapshot (bd DAS-Backup-Manager-2ab3). Retention is the
+    // `resume` or `run` that sends.
+    cmd.arg("--preserve-snapshots")
+        .arg("snapshot")
+        .args(&filters);
 
     let (stdout, status) = run_command(&mut cmd, runner, progress)?;
 
@@ -4977,7 +4984,7 @@ mod tests {
         use BtrbkSteps::{SendOnly, SnapshotAndSend, SnapshotOnly};
         let f = primary_filters();
         let run = btrbk(&format!("run {f}"));
-        let snap = btrbk(&format!("snapshot {f}"));
+        let snap = btrbk(&format!("--preserve-snapshots snapshot {f}"));
         let resume = btrbk(&format!("resume {f}"));
         let cases = [
             (Full, SnapshotAndSend, vec![run.clone()], (1, 1)),
@@ -5181,7 +5188,11 @@ mod tests {
         let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
         let script = || {
             vec![
-                (at(&format!("snapshot {f}")), 0, String::new()),
+                (
+                    at(&format!("--preserve-snapshots snapshot {f}")),
+                    0,
+                    String::new(),
+                ),
                 (at(&format!("resume {f}")), 0, String::new()),
                 (
                     at(&format!("--format=raw list latest {f}")),
@@ -5257,7 +5268,7 @@ mod tests {
         let config = steps_config();
         let runner = Scripted::from_owned(vec![
             (
-                btrbk(&format!("snapshot {PRIMARY}/hdd/data")),
+                btrbk(&format!("--preserve-snapshots snapshot {PRIMARY}/hdd/data")),
                 0,
                 String::new(),
             ),
@@ -5388,10 +5399,27 @@ mod tests {
 
     // -- create_snapshots ------------------------------------------------------
 
+    /// bd DAS-Backup-Manager-2ab3: without `--preserve-snapshots`, `btrbk
+    /// snapshot` reads every target of the subvolumes it snapshots, and one
+    /// that is absent (not mounted: `backup snapshot` mounts none) makes it
+    /// exit 10 after creating the snapshots, which this step reported as "no
+    /// snapshots can be assumed created" (reproduced in a VM, btrbk 0.32.7).
+    /// With it, btrbk reads no target and deletes no snapshot; retention is
+    /// the `resume` or `run` that sends.
+    #[test]
+    fn the_snapshot_step_reads_no_target_and_deletes_nothing() {
+        let runner = Scripted::from_owned(vec![
+            (btrbk("--preserve-snapshots snapshot"), 0, String::new()),
+            (btrbk("--format=raw list latest"), 0, String::new()),
+        ]);
+        create_snapshots_with(&steps_config(), None, None, &TestProgress::new(), &runner).unwrap();
+        assert_eq!(runner.calls()[0], btrbk("--preserve-snapshots snapshot"));
+    }
+
     #[test]
     fn snapshots_of_everything_are_run_with_no_filter() {
         let runner = Scripted::from_owned(vec![
-            (btrbk("snapshot"), 0, String::new()),
+            (btrbk("--preserve-snapshots snapshot"), 0, String::new()),
             (
                 btrbk("--format=raw list latest"),
                 0,
@@ -5411,7 +5439,10 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(
             runner.calls(),
-            [btrbk("snapshot"), btrbk("--format=raw list latest")]
+            [
+                btrbk("--preserve-snapshots snapshot"),
+                btrbk("--format=raw list latest")
+            ]
         );
         assert_eq!(
             *progress.stages.lock().unwrap(),
@@ -5437,7 +5468,11 @@ mod tests {
     fn snapshots_of_one_source_name_its_subvolumes_and_not_the_other_on_its_volume() {
         let filters = "/.btrfs-nvme/@ /.btrfs-nvme/@home";
         let runner = Scripted::from_owned(vec![
-            (btrbk(&format!("snapshot {filters}")), 0, String::new()),
+            (
+                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
+                0,
+                String::new(),
+            ),
             (
                 btrbk(&format!("--format=raw list latest {filters}")),
                 0,
@@ -5456,7 +5491,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             [
-                btrbk(&format!("snapshot {filters}")),
+                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
                 btrbk(&format!("--format=raw list latest {filters}"))
             ],
             "the listing that counts is limited to the same subvolumes"
@@ -5467,7 +5502,11 @@ mod tests {
     fn snapshots_in_a_run_are_confined_to_the_subvolumes_that_go_to_its_targets() {
         let filters = primary_filters();
         let runner = Scripted::from_owned(vec![
-            (btrbk(&format!("snapshot {filters}")), 0, String::new()),
+            (
+                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
+                0,
+                String::new(),
+            ),
             (
                 btrbk(&format!("--format=raw list latest {filters}")),
                 0,
@@ -5484,7 +5523,10 @@ mod tests {
         )
         .unwrap();
         let calls = runner.calls();
-        assert_eq!(calls[0], btrbk(&format!("snapshot {filters}")));
+        assert_eq!(
+            calls[0],
+            btrbk(&format!("--preserve-snapshots snapshot {filters}"))
+        );
         assert!(
             !calls.iter().any(|c| c.contains(RECOVERY)),
             "an unticked target is not named to btrbk: {calls:?}"
@@ -5513,8 +5555,15 @@ mod tests {
 
     #[test]
     fn a_failed_snapshot_run_is_an_error_and_is_not_counted() {
-        let runner = Scripted::from_owned(vec![(btrbk("snapshot"), 10, String::new())])
-            .with_stderr(&btrbk("snapshot"), "ERROR: x\n\n  \nWARNING: y\n");
+        let runner = Scripted::from_owned(vec![(
+            btrbk("--preserve-snapshots snapshot"),
+            10,
+            String::new(),
+        )])
+        .with_stderr(
+            &btrbk("--preserve-snapshots snapshot"),
+            "ERROR: x\n\n  \nWARNING: y\n",
+        );
         let progress = TestProgress::new();
         let err = create_snapshots_with(&steps_config(), None, None, &progress, &runner)
             .unwrap_err()
@@ -5525,7 +5574,7 @@ mod tests {
         );
         assert_eq!(
             runner.calls(),
-            [btrbk("snapshot")],
+            [btrbk("--preserve-snapshots snapshot")],
             "a failed run is not followed by a listing"
         );
         assert!(logged(&progress, LogLevel::Error, &err));
@@ -5554,7 +5603,7 @@ mod tests {
     fn snapshot_counts_fall_back_to_the_markers_when_the_listing_cannot_be_read() {
         // The listing is not scripted, so it exits 1.
         let runner = Scripted::from_owned(vec![(
-            btrbk("snapshot"),
+            btrbk("--preserve-snapshots snapshot"),
             0,
             "+++ /s/a.1\n  +++ /s/b.1\n>>> /t/a.1\n".into(),
         )]);
@@ -6020,7 +6069,11 @@ mod tests {
             BackupOptions::default(),
             BackupMode::Incremental,
             vec![
-                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (
+                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    0,
+                    String::new(),
+                ),
                 (
                     btrbk(&format!("resume {f}")),
                     0,
@@ -6032,7 +6085,7 @@ mod tests {
         assert_eq!(
             calls,
             [
-                btrbk(&format!("snapshot {f}")),
+                btrbk(&format!("--preserve-snapshots snapshot {f}")),
                 btrbk(&format!("--format=raw list latest {f}")),
                 btrbk(&format!("resume {f}")),
                 btrbk(&format!("--format=raw list latest {f}")),
@@ -6057,7 +6110,11 @@ mod tests {
         let f = primary_filters();
         let script = || {
             vec![
-                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (
+                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    0,
+                    String::new(),
+                ),
                 (btrbk(&format!("resume {f}")), 0, String::new()),
                 listing_of(raw_row("/s/a.1", "/t1/a.1")),
             ]
@@ -6082,7 +6139,10 @@ mod tests {
             BackupMode::Incremental,
             script(),
         );
-        assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
+        assert_eq!(
+            calls[0],
+            btrbk(&format!("--preserve-snapshots snapshot {f}"))
+        );
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!((done.created, done.sent), (Some(1), Some(0)));
     }
@@ -6093,7 +6153,11 @@ mod tests {
         let script = || {
             vec![
                 (btrbk(&format!("run {f}")), 0, "--- /t/old\n".into()),
-                (btrbk(&format!("snapshot {f}")), 0, String::new()),
+                (
+                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    0,
+                    String::new(),
+                ),
                 (btrbk(&format!("resume {f}")), 0, String::new()),
                 listing_of(raw_row("/s/a.1", "/t1/a.1")),
             ]
@@ -6119,7 +6183,10 @@ mod tests {
             BackupMode::Full,
             script(),
         );
-        assert_eq!(calls[0], btrbk(&format!("snapshot {f}")));
+        assert_eq!(
+            calls[0],
+            btrbk(&format!("--preserve-snapshots snapshot {f}"))
+        );
         assert_eq!(
             (done.created, done.sent, done.cleaned),
             (Some(1), Some(0), 0)
@@ -6146,7 +6213,11 @@ mod tests {
             BackupOptions::default(),
             BackupMode::Incremental,
             vec![
-                (btrbk(&format!("snapshot {f}")), 10, String::new()),
+                (
+                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    10,
+                    String::new(),
+                ),
                 (btrbk(&format!("resume {f}")), 0, String::new()),
                 listing_of(raw_row("/s/a.1", "/t1/a.1")),
             ],
@@ -6173,7 +6244,11 @@ mod tests {
         let (done, _, _) = pipeline(
             BackupOptions::default(),
             BackupMode::Incremental,
-            vec![(btrbk(&format!("snapshot {f}")), 0, String::new())],
+            vec![(
+                btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                0,
+                String::new(),
+            )],
         );
         assert_eq!(
             (done.created, done.sent),
@@ -7646,7 +7721,10 @@ mod tests {
         let f = "/proc/self/root /proc/self/home";
         let runner = Scripted::from_owned(vec![
             (
-                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--preserve-snapshots snapshot {f}"),
+                ),
                 0,
                 String::new(),
             ),
@@ -7812,7 +7890,11 @@ mod tests {
         let f = "/proc/self/root /proc/self/home";
         let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
         vec![
-            (at(&format!("snapshot {f}")), 0, String::new()),
+            (
+                at(&format!("--preserve-snapshots snapshot {f}")),
+                0,
+                String::new(),
+            ),
             (at(&format!("resume {f}")), resume_status, resume_out.into()),
             (
                 at(&format!("--format=raw list latest {f}")),
@@ -7934,7 +8016,11 @@ mod tests {
         let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
         let row = raw_row("/s/a.1", "/t/a.1");
         let script = vec![
-            (at(&format!("snapshot {f}")), 10, String::new()),
+            (
+                at(&format!("--preserve-snapshots snapshot {f}")),
+                10,
+                String::new(),
+            ),
             (at(&format!("resume {f}")), 10, String::new()),
             (at(&format!("--format=raw list latest {f}")), 0, row),
         ];
@@ -8005,7 +8091,10 @@ mod tests {
         let f = "/proc/self/root /proc/self/home";
         let runner = Scripted::from_owned(vec![
             (
-                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--preserve-snapshots snapshot {f}"),
+                ),
                 10,
                 String::new(),
             ),
@@ -8050,7 +8139,10 @@ mod tests {
         let f = "/proc/self/root /proc/self/home";
         let runner = Scripted::from_owned(vec![
             (
-                btrbk_at("/nonexistent/btrbk.conf", &format!("snapshot {f}")),
+                btrbk_at(
+                    "/nonexistent/btrbk.conf",
+                    &format!("--preserve-snapshots snapshot {f}"),
+                ),
                 0,
                 String::new(),
             ),
@@ -9767,7 +9859,7 @@ mod tests {
     #[test]
     fn a_cancel_during_the_snapshot_step_lets_it_finish_and_sends_nothing() {
         let f = primary_filters();
-        let snap = btrbk(&format!("snapshot {f}"));
+        let snap = btrbk(&format!("--preserve-snapshots snapshot {f}"));
         let resume = btrbk(&format!("resume {f}"));
         let scripted = Scripted::from_owned(vec![
             (snap.clone(), 0, String::new()),
@@ -11160,7 +11252,11 @@ mod tests {
             .join(" ");
         let conf = &config.general.btrbk_conf;
         vec![
-            (btrbk_at(conf, &format!("snapshot {f}")), 0, String::new()),
+            (
+                btrbk_at(conf, &format!("--preserve-snapshots snapshot {f}")),
+                0,
+                String::new(),
+            ),
             (
                 btrbk_at(conf, &format!("resume {f}")),
                 0,
@@ -11420,8 +11516,11 @@ mod tests {
             .unwrap()
             .join(" ");
         // The snapshot step answers or fails, whichever: the cancel is the point.
-        let scripted =
-            Scripted::from_owned(vec![(btrbk(&format!("snapshot {f}")), 0, String::new())]);
+        let scripted = Scripted::from_owned(vec![(
+            btrbk(&format!("--preserve-snapshots snapshot {f}")),
+            0,
+            String::new(),
+        )]);
         let progress = TestProgress::cancellable();
         let runner = CancelDuringSnapshot {
             inner: &scripted,
