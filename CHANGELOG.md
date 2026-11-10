@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The nightly report no longer says "no new data" for a target whose used space did not grow** (bd `DAS-Backup-Manager-17x`): the THROUGHPUT line is a capacity delta taken around btrbk, and retention prunes in the same window, so a night that sent plenty read as no data (2026-09-06: 128 snapshots received, all three targets "no new data"); it now reads `used space fell <N> (retention freed more than was written; what btrbk sent is not measured)` or `used space unchanged (...)`, in the report and the log — `backup-run.sh` 4.17.4
+  - What btrbk actually sent is not yet measured on either path; both read the targets' used space
+
 - **A CLI/GUI mount that reports a failure yet mounted is taken down** (bd `DAS-Backup-Manager-1fpw`): a `mount` (or bind mount) whose helper exits non-zero after the kernel mounted left the target or source volume mounted and untracked, since `MountGuard` recorded only a mount that exited 0 — `backup-run.sh` records ownership before mounting; the failure is now probed and the mount unmounted, and one that will not come down stays the guard's, so the job's own unmount fails the job — `MountGuard::take_back_failed_mount`
 
 - **A recovery drive's ESP that will not come down after its reading keeps what was read, warns, and is released by the CLI/GUI job** (bd `DAS-Backup-Manager-s5jv.2`): the reading's findings were replaced by `still mounted` and the drive showed only `ESP  not checked`, and only `backup-run.sh` (4.17.2, bd `s5jv.1`) released a leftover ESP before unmounting the targets

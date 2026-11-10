@@ -1,6 +1,6 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.3
+# Version: 4.17.4
 # Date: 2026-11-09
 #
 # Features:
@@ -3113,8 +3113,13 @@ log_throughput() {
         local delta=$(( after - before ))
         total_written=$(( total_written + delta ))
 
-        if (( delta <= 0 )); then
-            log_info "  $name: no new data written"
+        # A capacity delta, not what btrbk sent: retention prunes in the same
+        # window, so a night that sent plenty can read as space freed (bd
+        # DAS-Backup-Manager-17x: 128 received, "no new data" on all three).
+        if (( delta < 0 )); then
+            log_info "  $name: used space fell $(format_bytes $(( -delta ))) (retention freed more than was written; what btrbk sent is not measured)"
+        elif (( delta == 0 )); then
+            log_info "  $name: used space unchanged (what btrbk sent is not measured)"
         elif (( elapsed > 0 )); then
             local rate_bytes=$(( delta / elapsed ))
             log_info "  $name: $(format_bytes $delta) @ $(format_bytes $rate_bytes)/s"
@@ -3588,7 +3593,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.3
+  backup-run.sh v4.17.4
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -3608,8 +3613,12 @@ generate_throughput_section() {
         local delta=$(( after - before ))
         total_written=$(( total_written + delta ))
 
-        if (( delta <= 0 )); then
-            printf "  %-24s no new data\n" "$name"
+        # A capacity delta, not what btrbk sent (bd 17x; log_throughput).
+        if (( delta < 0 )); then
+            printf "  %-24s used space fell %s (retention freed more than was written; what btrbk sent is not measured)\n" \
+                "$name" "$(format_bytes $(( -delta )))"
+        elif (( delta == 0 )); then
+            printf "  %-24s used space unchanged (what btrbk sent is not measured)\n" "$name"
         elif (( elapsed > 0 )); then
             local rate=$(( delta / elapsed ))
             printf "  %-24s %s @ %s/s\n" "$name" "$(format_bytes $delta)" "$(format_bytes $rate)"

@@ -328,6 +328,28 @@ check "growth: a target read once is unknown, not its whole used space" \
     "$(grep -A1 '^  recovery:' <<<"$growth" | tail -1)" \
     "    Today:              unknown (not measured before and after btrbk)"
 
+# --- the throughput section: a capacity delta is not what was sent (bd 17x) --------
+# A night btrbk sends plenty and prunes more reads the same as one that sends
+# nothing: used space fell. It used to say "no new data" (2026-09-06: 128
+# snapshots received, all three targets "no new data").
+body="$(extract generate_throughput_section)"
+[[ -n "$body" ]] || { echo "FAIL: generate_throughput_section not found in backup-run.sh"; exit 1; }
+eval "$body"
+BTRBK_START_TIME=1000
+BTRBK_END_TIME=1300
+ALL_TARGET_MOUNTS=(/t1 /t2)
+USAGE_BEFORE=([/t1]=5000 [/t2]=700)
+USAGE_AFTER=([/t1]=3976 [/t2]=700)
+tp="$(generate_throughput_section)"
+check "throughput: a target whose used space fell does not claim no data was sent" \
+    "$(grep -c 'no new data' <<<"$tp")" 0
+check "throughput: it says what was measured" \
+    "$(grep '^  primary ' <<<"$tp" | sed 's/  */ /g')" \
+    " primary used space fell 1.00 KiB (retention freed more than was written; what btrbk sent is not measured)"
+check "throughput: unchanged used space is said as such" \
+    "$(grep '^  recovery ' <<<"$tp" | sed 's/  */ /g')" \
+    " recovery used space unchanged (what btrbk sent is not measured)"
+
 echo
 if (( fails > 0 )); then
     echo "$fails check(s) FAILED"
