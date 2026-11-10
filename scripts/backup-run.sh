@@ -1,7 +1,7 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.4
-# Date: 2026-11-09
+# Version: 4.17.5
+# Date: 2026-11-10
 #
 # Features:
 #   - A recovery drive's ESP a killed recovery-OS reading left mounted is
@@ -3099,6 +3099,65 @@ log_throughput() {
     log_info "=== Throughput Report ==="
     log_info "  Elapsed: ${elapsed_min}m ${elapsed_sec}s"
 
+    # ---- The negotiated USB link speed ------------------------------------
+    #
+    # That field — NOT the throughput — is the one that detects a degraded
+    # bus. Measured over the nine days the DAS ran at 480 Mbit/s instead of
+    # 10 Gbit/s:
+    #
+    #     2026-08-28 degraded  40.52 GiB / 75m27s =  9.17 MiB/s
+    #     2026-08-29 restored   8.59 GiB / 13m22s = 10.97 MiB/s
+    #     2026-08-31 restored  13.00 GiB / 11m12s = 19.80 MiB/s
+    #
+    # 9.17 against 10.97 is inside ordinary run-to-run variation, so a
+    # throughput trend alone would never have flagged it. An enclosure
+    # bound to usb-storage (BOT) rather than UAS by a modprobe quirk — a
+    # common stability trade for USB JBODs — issues one command at a time
+    # with no queuing, so above roughly Gen 1 the spindles and BOT are the
+    # limit, not the bus; that is exactly why link rate and transfer rate
+    # are only loosely coupled.
+    #
+    # Checked on every live run, whether or not it wrote anything: link
+    # health is not traffic (bd DAS-Backup-Manager-7qe).
+    #
+    # The enclosure is every USB device whose product string contains
+    # [das].model_pattern (DAS_MODEL_PATTERN from dump-env); each is read and
+    # the slowest is the link's speed, so one degraded device among several
+    # is not hidden behind the first. Empty, no device is singled out: the
+    # first USB device on the bus would be a guess (a keyboard's 12 Mbit/s
+    # read as the enclosure's), so the link is left unknown and the log says
+    # why — never a borrowed reading. Below [das].expected_link_mbit_s
+    # (DAS_EXPECTED_LINK_MBIT_S, default 10000: USB 3.2 Gen2) is a FAIL, so a
+    # Gen1 link at 5000 is a downgrade, not a pass. A pattern no device
+    # matches is a WARN: the enclosure's link went unread.
+    local expected="${DAS_EXPECTED_LINK_MBIT_S:-10000}"
+    local link_speed="unknown"
+    local d speed
+    if [[ -z "${DAS_MODEL_PATTERN:-}" ]]; then
+        log_info "  DAS USB link speed not checked: no [das].model_pattern is configured (your enclosure's USB product string)"
+    else
+        for d in /sys/bus/usb/devices/*/; do
+            [[ -f "$d/speed" && -f "$d/product" ]] || continue
+            [[ "$(cat "$d/product" 2>/dev/null)" == *"$DAS_MODEL_PATTERN"* ]] || continue
+            speed="$(cat "$d/speed" 2>/dev/null)" || speed=""
+            case "$speed" in '' | *[!0123456789]*) continue ;; esac
+            if [[ "$link_speed" == "unknown" ]] || (( speed < link_speed )); then
+                link_speed="$speed"
+            fi
+        done
+        if [[ "$link_speed" == "unknown" ]]; then
+            log_warn "  DAS USB link speed not read: no USB device's product contains '${DAS_MODEL_PATTERN}'"
+            record_op "usb_link" "WARN" "no USB device's product contains '${DAS_MODEL_PATTERN}'"
+        elif (( link_speed < expected )); then
+            log_warn "  DAS USB link negotiated at ${link_speed} Mbit/s — expected ${expected}."
+            log_warn "  Backups will still succeed, just slower. Reseat the cable (power the"
+            log_warn "  enclosure down first — see docs/DAS-BAY-MAPPING.md)."
+            record_op "usb_link" "FAIL" "negotiated ${link_speed} Mbit/s, expected ${expected}"
+        else
+            record_op "usb_link" "OK" "negotiated ${link_speed} Mbit/s"
+        fi
+    fi
+
     local total_written=0
 
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
@@ -3136,50 +3195,8 @@ log_throughput() {
         # ---- Machine-readable history (bd DAS-Backup-Manager-6lr) -----------
         #
         # The human report above was a producer with no consumer: emitted every
-        # run, read by nothing, compared across runs by nothing.
-        #
-        # It also records the negotiated USB link speed, and that field — NOT
-        # the throughput — is the one that detects a degraded bus. Measured
-        # over the nine days the DAS ran at 480 Mbit/s instead of 10 Gbit/s:
-        #
-        #     2026-08-28 degraded  40.52 GiB / 75m27s =  9.17 MiB/s
-        #     2026-08-29 restored   8.59 GiB / 13m22s = 10.97 MiB/s
-        #     2026-08-31 restored  13.00 GiB / 11m12s = 19.80 MiB/s
-        #
-        # 9.17 against 10.97 is inside ordinary run-to-run variation, so a
-        # throughput trend alone would never have flagged it. An enclosure
-        # bound to usb-storage (BOT) rather than UAS by a modprobe quirk — a
-        # common stability trade for USB JBODs — issues one command at a time
-        # with no queuing, so above roughly Gen 1 the spindles and BOT are the
-        # limit, not the bus; that is exactly why link rate and transfer rate
-        # are only loosely coupled.
-        #
-        # The enclosure is the USB device whose product string contains
-        # [das].model_pattern (DAS_MODEL_PATTERN from dump-env). Empty, no
-        # device is singled out: the first USB device on the bus would be a
-        # guess (a keyboard's 12 Mbit/s read as the enclosure's), so the link
-        # is left unknown and the log says why — never a borrowed reading.
-        local link_speed="unknown"
-        local d
-        if [[ -z "${DAS_MODEL_PATTERN:-}" ]]; then
-            log_info "  DAS USB link speed not checked: no [das].model_pattern is configured (your enclosure's USB product string)"
-        else
-            for d in /sys/bus/usb/devices/*/; do
-                [[ -f "$d/speed" && -f "$d/product" ]] || continue
-                if [[ "$(cat "$d/product" 2>/dev/null)" == *"$DAS_MODEL_PATTERN"* ]]; then
-                    link_speed="$(cat "$d/speed" 2>/dev/null || echo unknown)"
-                    break
-                fi
-            done
-        fi
-
-        if [[ "$link_speed" != "unknown" && "$link_speed" -lt 5000 ]]; then
-            log_warn "  DAS USB link negotiated at ${link_speed} Mbit/s — expected 10000."
-            log_warn "  Backups will still succeed, just slower. Reseat the cable (power the"
-            log_warn "  enclosure down first — see docs/DAS-BAY-MAPPING.md)."
-            record_op "usb_link" "FAIL" "negotiated ${link_speed} Mbit/s, expected 10000"
-        fi
-
+        # run, read by nothing, compared across runs by nothing. It carries the
+        # link speed the probe at the top of this function read.
         if [[ -n "${DAS_THROUGHPUT_LOG:-}" ]]; then
             printf '{"ts":"%s","elapsed_s":%d,"bytes":%d,"bytes_per_s":%d,"usb_link_mbit_s":"%s"}\n' \
                 "$(date -Is)" "$elapsed" "$total_written" "$total_rate" "$link_speed" \
@@ -3560,6 +3577,7 @@ generate_report() {
 BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
+  USB link              ${OP_STATUS[usb_link]:-N/A}  (${OP_STATUS[usb_link_detail]:-not checked})
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Snapshot counts       ${OP_STATUS[btrbk_counters]:-N/A}  (${OP_STATUS[btrbk_counters_detail]:-n/a})
   Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
@@ -3593,7 +3611,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.4
+  backup-run.sh v4.17.5
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

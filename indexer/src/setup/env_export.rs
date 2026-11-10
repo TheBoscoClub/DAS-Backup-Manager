@@ -39,6 +39,10 @@ pub fn dump_env(config: &Config) -> String {
 
     // DAS enclosure
     out.push_str(&kv("DAS_MODEL_PATTERN", &config.das.model_pattern));
+    out.push_str(&format!(
+        "DAS_EXPECTED_LINK_MBIT_S={}\n",
+        config.das.expected_link_mbit_s
+    ));
     out.push_str(&kv("DAS_IO_SCHEDULER", &config.das.io_scheduler));
     out.push_str(&kv("DAS_MOUNT_OPTS", &config.das.mount_opts));
 
@@ -387,6 +391,20 @@ mod tests {
     #[test]
     fn dump_env_exports_an_empty_model_pattern_by_default() {
         assert!(dump_env(&Config::default()).contains("DAS_MODEL_PATTERN=''\n"));
+    }
+
+    /// The link rate `backup-run.sh` holds the enclosure to: USB 3.2 Gen2 by
+    /// default, configuration otherwise (bd DAS-Backup-Manager-7qe).
+    #[test]
+    fn dump_env_exports_the_expected_link_rate() {
+        assert!(dump_env(&Config::default()).contains("DAS_EXPECTED_LINK_MBIT_S=10000\n"));
+        let mut config = Config::default();
+        config.das.expected_link_mbit_s = 5000;
+        assert!(dump_env(&config).contains("DAS_EXPECTED_LINK_MBIT_S=5000\n"));
+        let parsed: Das = toml::from_str("expected_link_mbit_s = 20000\n").expect("parse");
+        assert_eq!(parsed.expected_link_mbit_s, 20000);
+        let unset: Das = toml::from_str("").expect("parse");
+        assert_eq!(unset.expected_link_mbit_s, 10000);
     }
 
     /// The recovery OS's account: exported only when configured, so provision

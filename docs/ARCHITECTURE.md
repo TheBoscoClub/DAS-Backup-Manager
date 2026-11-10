@@ -460,7 +460,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `general` | version, install_prefix, db_path, log_file, growth_log, last_report, btrbk_conf | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
-| `das` | model_pattern, io_scheduler, mount_opts | DAS enclosure match, I/O scheduler, target mount options |
+| `das` | model_pattern, expected_link_mbit_s, io_scheduler, mount_opts | DAS enclosure match, I/O scheduler, target mount options |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
 | `doctor` | exclude[] | Older exclusion list, still read and merged with `[subvolumes].exclude` |

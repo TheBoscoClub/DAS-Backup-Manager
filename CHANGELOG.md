@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The USB link check no longer passes a Gen1 link, reads every enclosure device, runs on a quiet night and says why in the report** (bd `DAS-Backup-Manager-7qe`): the check failed only below 5000 Mbit/s, so a USB 3.2 Gen2 enclosure that fell back to Gen1 (5000, half its rated link) passed; it read only the first device whose product matched; it sat inside the branch for a run that wrote something, so a night with nothing new never checked the bus; and its FAIL reached the journal but no row of the email
+  - New `[das].expected_link_mbit_s` (default `10000`, USB 3.2 Gen2; a Gen1 enclosure sets `5000`): below it is a FAIL, exported to the script as `DAS_EXPECTED_LINK_MBIT_S`
+  - Every USB device whose product contains `[das].model_pattern` is read and the slowest is the link's speed, in the log and `throughput.jsonl`; a pattern no device matches is a WARN naming it
+  - New `USB link` row in BACKUP OPERATIONS: `OK (negotiated N Mbit/s)`, `FAIL (negotiated N Mbit/s, expected M)`, `WARN (...)`, or `N/A (not checked)` with no pattern configured — `backup-run.sh` 4.17.5
+
 - **The nightly report no longer says "no new data" for a target whose used space did not grow** (bd `DAS-Backup-Manager-17x`): the THROUGHPUT line is a capacity delta taken around btrbk, and retention prunes in the same window, so a night that sent plenty read as no data (2026-09-06: 128 snapshots received, all three targets "no new data"); it now reads `used space fell <N> (retention freed more than was written; what btrbk sent is not measured)` or `used space unchanged (...)`, in the report and the log — `backup-run.sh` 4.17.4
   - What btrbk actually sent is not yet measured on either path; both read the targets' used space
 

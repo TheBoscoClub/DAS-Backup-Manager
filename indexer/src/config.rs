@@ -231,6 +231,11 @@ pub struct Das {
     /// built-in product name — the default never names one vendor's enclosure.
     #[serde(default)]
     pub model_pattern: String,
+    /// The USB link rate, in Mbit/s, the enclosure should negotiate:
+    /// `backup-run.sh` fails its USB-link check below it. 10000 (USB 3.2
+    /// Gen2) by default; a Gen1 enclosure sets 5000 (bd DAS-Backup-Manager-7qe).
+    #[serde(default = "default_expected_link_mbit_s")]
+    pub expected_link_mbit_s: u32,
     #[serde(default = "default_io_scheduler")]
     pub io_scheduler: String,
     #[serde(default)]
@@ -241,10 +246,15 @@ impl Default for Das {
     fn default() -> Self {
         Self {
             model_pattern: String::new(),
+            expected_link_mbit_s: default_expected_link_mbit_s(),
             io_scheduler: default_io_scheduler(),
             mount_opts: String::new(),
         }
     }
+}
+
+fn default_expected_link_mbit_s() -> u32 {
+    10000
 }
 
 fn default_io_scheduler() -> String {

@@ -402,7 +402,8 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `model_pattern` | string | `""` (none) | Optional drive-model substring (spaces removed) that `backup-verify.sh` matches to identify DAS drives; empty means no enclosure-model filter |
+| `model_pattern` | string | `""` (none) | Optional drive-model substring (spaces removed) that `backup-verify.sh` matches to identify DAS drives; `backup-run.sh` also reads the link speed of every USB device whose product string contains it; empty means no enclosure-model filter, and the link is not checked |
+| `expected_link_mbit_s` | integer | `10000` | The USB link rate (Mbit/s) the enclosure should negotiate; `backup-run.sh` reports the USB link as FAIL below it (10000 = USB 3.2 Gen2; set 5000 for a Gen1 enclosure) |
 | `io_scheduler` | string | `"mq-deadline"` | I/O scheduler `backup-run.sh` sets on the DAS drives during a run |
 | `mount_opts` | string | `""` (none) | Mount options for every backup-target mount, by `backup-run.sh` and by `btrdasd` (`MountGuard`) alike |
 
