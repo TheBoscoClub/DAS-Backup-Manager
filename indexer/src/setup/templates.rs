@@ -298,13 +298,15 @@ pub fn render_systemd_doctor_service(config: &Config) -> String {
          # Exit semantics (bd DAS-Backup-Manager-01u, refined by -f6p):\n\
          #   0 = ran clean, or deferred because a backup/scrub/another doctor run\n\
          #       holds a lock (never a failure).\n\
-         #   1 = DRIFT FOUND — missing or stale subvolumes. A successful check\n\
+         #   1 = DRIFT FOUND — missing or stale subvolumes, or a declared pair a\n\
+         #       target holds no recent snapshot of (bd -sp78.7). A successful check\n\
          #       WITH A RESULT, not a malfunction, which is why SuccessExitStatus\n\
          #       below tells systemd not to fail the unit for it. The finding\n\
          #       travels by email (--email) and by the journal report.\n\
          #   3 = at least one configured volume failed to mount/list while others\n\
          #       were checked — those subvolumes went unexamined — or a volume\n\
-         #       the check mounted could not be unmounted again. An operational\n\
+         #       the check mounted could not be unmounted again, or a target the\n\
+         #       delivery check could not read. An operational\n\
          #       fault, so the unit DOES fail. Outranks 1 when both occur: an\n\
          #       incomplete check cannot claim its drift list is complete.\n\
          #   2 = could not run at all — every configured source volume failed to\n\

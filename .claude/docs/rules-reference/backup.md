@@ -223,7 +223,17 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   hand edits used to leave it stale, and the entry was silently not backed up).
 - **Drift check.** `doctor --check-drift` uses the same listing and exclusions; one section, "NOT
   BACKED UP — the backup run should have adopted these". Mutation scope: the five new modules are
-  in the weekly full scope; the one exclusion is the `perform_drift_check` host shell in `doctor.rs`.
+  in the weekly full scope; the exclusions are the `perform_drift_check` and `perform_delivery_check` host
+  shells and the `local_today` clock call in `doctor.rs` (`.cargo/mutants.toml`).
+- **Delivery check (bd `DAS-Backup-Manager-sp78.7`).** Coverage compares intent; btrbk can skip a declared pair
+  and exit 0. Operator decision 2026-11-09: the check lives in `doctor`, not the nightly run. After the sources,
+  `perform_delivery_check` mounts the targets under the maintenance lock the doctor holds, proves each with
+  `mount::verify_write_targets` (a bare mount point would otherwise read as an empty drive), and
+  `delivery_check` lists `<mount>/<subdir>` per declared pair: the newest `<snapshot name>.<YYYYMMDD…>` entry is
+  the delivery, stale when more than `[doctor].max_snapshot_age_days` local days old (default 3, validated >= 1).
+  A directory that does not exist on a verified target is every pair undelivered; any other listing error, or an
+  unverifiable or unmountable target (an unplugged recovery drive too), is a target failure: exit 3, none of its
+  pairs reported fresh or stale. Retired and `after_index` entries are not declared pairs.
 
 **`btrfs send` does not descend into nested subvolumes.** A snapshot of a parent
 subvolume contains an *empty directory* wherever a child subvolume is mounted, so
@@ -391,7 +401,15 @@ a WARN `not checked`, and no backup exit code changes; only a missing or unrecog
 script is a FAIL (fail-silent "always a defect" #6). No WARN-to-FAIL escalation. GUI accept is `sp78.4`.
 
 **The pair and the record.** A pair is `(Source.volume, SubvolConfig.name, Target.label)`; the source label
-and the snapshot name are not part of it, so renaming either says nothing. Schema 5 adds `coverage_state`
+and the snapshot name are not part of it, so renaming either says nothing. Since schema 7 a row also holds its
+subvolume's own btrfs UUID (`btrfs subvolume list -u`, the field before ` path `), and a recorded row whose
+UUID a read listing shows at another path moves there first (`coverage::follow_renames`): a rename is one
+pair, and `mv @a @b` with `@b` excluded is a DROP `renamed from '@a'; …`. The volume is followed first the
+same way: a row's filesystem UUID (`volume_uuid`, schema 8; the `findmnt` UUID `list_volume` verified against
+the device) held by exactly one read volume, not at the row's own path, moves the row to that volume path
+(`coverage::volume_now`); a drop there reads `volume moved from '<old>'; …`. A row with no UUID (older record,
+top level, a listing that gave none or gave one to two paths, a filesystem two read volumes hold) is paired by path, never as covered; rows the
+listing confirms claim a name before path-only ones, so two rows never end on one pair. Schema 5 adds `coverage_state`
 (one row: first and last recorded date, number of recorded checks; no row = no record yet),
 `coverage_baseline` (every pair intended at the last recorded check, plus every dropped pair not yet
 restored, gone or accepted; `CHECK`s keep a row either wholly covered or wholly dropped) and
@@ -405,7 +423,7 @@ advances); a schema-4 binary returns at its own `version >= 4` and never sees th
 | Situation | Outcome |
 |:--|:--|
 | No `[[source]]` names the volume | DROP: `no [[source]] names volume V any more (last in source 'L')` |
-| Volume read, subvolume not on it (never `.`) | GONE: row removed, counted, no warning |
+| Volume read, subvolume not on it by path or UUID (never `.`) | GONE: row removed, counted, no warning |
 | No live entry; `plan.unplaceable` has it | DROP: `could not be placed — see COULD NOT BE PLACED: …` |
 | No live entry; a retired one exists | DROP: `its entry in source 'S' is retired although it is still on disk` |
 | No live entry; skipped by a pattern | DROP: `excluded by pattern 'P' (built-in, [subvolumes].exclude, [doctor].exclude — every list holding it)` |

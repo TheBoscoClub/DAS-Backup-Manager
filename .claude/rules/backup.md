@@ -134,8 +134,8 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
   - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
     step, the unmount after it, or the mount once its locks were held failed, **1** only when it could not
     start (config, locks).
-  - `btrdasd doctor`: **0** clean or deferred, **1** drift found, **2** could not run, **3** some volume
-    failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
+  - `btrdasd doctor`: **0** clean or deferred, **1** drift found (an undelivered pair included, bd `sp78.7`),
+    **2** could not run, **3** some volume or target failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`; that line is load-bearing.
   - `das-recovery-os-update-*.service` carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing.
     A refused, warned or failed session is not a failed unit (outcome: `recovery-os-vm-history.jsonl`),

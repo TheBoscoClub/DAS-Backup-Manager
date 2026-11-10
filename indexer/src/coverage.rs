@@ -412,6 +412,90 @@ fn carry_over_renames(
     (out, renamed)
 }
 
+/// A baseline row, placed where its subvolume is now.
+struct Followed {
+    row: CoverageRow,
+    /// The volume path the row was recorded under, when the volume has been
+    /// mounted somewhere else since (bd DAS-Backup-Manager-sp78.6).
+    volume_was: Option<String>,
+    /// The path the row was recorded under, when the subvolume has been
+    /// renamed since.
+    was: Option<String>,
+    /// The row's UUID is the one the listing shows at the row's (new) path.
+    confirmed: bool,
+}
+
+/// The listing of `volume`, when it was read.
+fn read_listing<'a>(listings: &'a [VolumeListing], volume: &str) -> Option<&'a VolumeListing> {
+    listings
+        .iter()
+        .find(|l| l.volume == volume)
+        .filter(|l| l.subvolumes.is_ok())
+}
+
+/// The read volume holding the filesystem `fs_uuid`, when exactly one does
+/// and the row's own volume path is not one of them: a path two read volumes
+/// hold the filesystem at names no single place, and a path that still holds
+/// it has not moved.
+fn volume_now<'a>(listings: &'a [VolumeListing], volume: &str, fs_uuid: &str) -> Option<&'a str> {
+    let holders: Vec<&str> = listings
+        .iter()
+        .filter(|l| l.subvolumes.is_ok() && l.fs_uuid.as_deref() == Some(fs_uuid))
+        .map(|l| l.volume.as_str())
+        .collect();
+    match holders[..] {
+        [one] if one != volume => Some(one),
+        _ => None,
+    }
+}
+
+/// Where each baseline row's volume and subvolume are now (bd
+/// DAS-Backup-Manager-sp78.5, sp78.6). A row holding a filesystem UUID that
+/// exactly one read volume reports, and not at the row's own path, moves to
+/// that volume path: the same filesystem mounted elsewhere. Then a row
+/// holding a subvolume UUID that a read listing of its volume shows at
+/// another path moves to that path: the subvolume was renamed, and it is the
+/// same pair. Anything less certain stays where it was recorded and is
+/// paired by path, as a row with no UUID always was: a volume not read, a
+/// listing that gave no UUID for the row's, a UUID no longer there. Rows
+/// whose UUID the listing confirms sort first, so when a name is claimed by
+/// one subvolume's row and by another's older path-only row, the first keeps
+/// it.
+fn follow_renames(rows: Vec<CoverageRow>, listings: &[VolumeListing]) -> Vec<Followed> {
+    let mut out: Vec<Followed> = rows
+        .into_iter()
+        .map(|mut row| {
+            let volume_was = row
+                .volume_uuid
+                .as_deref()
+                .and_then(|fs| volume_now(listings, &row.volume, fs))
+                .map(str::to_string)
+                .map(|now| std::mem::replace(&mut row.volume, now));
+            let listing = read_listing(listings, &row.volume);
+            let moved_to = row.subvol_uuid.as_deref().and_then(|u| {
+                listing?
+                    .uuids
+                    .iter()
+                    .find(|(_, listed)| listed.as_str() == u)
+                    .map(|(path, _)| path.clone())
+            });
+            let was = moved_to
+                .filter(|path| *path != row.subvolume)
+                .map(|path| std::mem::replace(&mut row.subvolume, path));
+            let confirmed = row.subvol_uuid.is_some()
+                && row.subvol_uuid.as_ref() == listing.and_then(|l| l.uuids.get(&row.subvolume));
+            Followed {
+                row,
+                volume_was,
+                was,
+                confirmed,
+            }
+        })
+        .collect();
+    out.sort_by_key(|f| !f.confirmed);
+    out
+}
+
 /// Why `row`, no longer scheduled, is not backed up — or `None` when its
 /// subvolume is gone from a volume that was read (retirement, not a drop).
 fn why_dropped(
@@ -542,22 +626,37 @@ pub fn evaluate(
     recording: Recording,
 ) -> (CoverageOutcome, Vec<CoverageRow>, CoverageState) {
     let intent = intended(now);
-    let covered = |pair: &Pair, source_label: &str, first_covered: &str| CoverageRow {
-        volume: pair.volume.clone(),
-        subvolume: pair.subvolume.clone(),
-        target: pair.target.clone(),
-        target_identity: now
-            .targets
-            .iter()
-            .find(|t| t.label == pair.target)
-            .and_then(|t| t.coverage_identity()),
-        source_label: source_label.to_string(),
-        first_covered: first_covered.to_string(),
-        last_covered: today.to_string(),
-        dropped_since: None,
-        dropped_checks: 0,
-        drop_rule: None,
+    // The UUID the listing of the pair's volume gives its subvolume now.
+    let uuid_now = |volume: &str, subvolume: &str| {
+        read_listing(listings, volume).and_then(|l| l.uuids.get(subvolume).cloned())
     };
+    // The filesystem UUID the listing of a volume gives it now.
+    let fs_now = |volume: &str| read_listing(listings, volume).and_then(|l| l.fs_uuid.clone());
+    // `known` is the baseline row the pair continues, for what a listing
+    // that gave no UUID cannot say.
+    let covered =
+        |pair: &Pair, source_label: &str, first_covered: &str, known: Option<&CoverageRow>| {
+            CoverageRow {
+                volume: pair.volume.clone(),
+                subvolume: pair.subvolume.clone(),
+                target: pair.target.clone(),
+                target_identity: now
+                    .targets
+                    .iter()
+                    .find(|t| t.label == pair.target)
+                    .and_then(|t| t.coverage_identity()),
+                source_label: source_label.to_string(),
+                first_covered: first_covered.to_string(),
+                last_covered: today.to_string(),
+                dropped_since: None,
+                dropped_checks: 0,
+                drop_rule: None,
+                subvol_uuid: uuid_now(&pair.volume, &pair.subvolume)
+                    .or_else(|| known.and_then(|k| k.subvol_uuid.clone())),
+                volume_uuid: fs_now(&pair.volume)
+                    .or_else(|| known.and_then(|k| k.volume_uuid.clone())),
+            }
+        };
     let mut outcome = CoverageOutcome {
         kind: CoverageKind::NoBaseline,
         pairs: intent.len(),
@@ -571,7 +670,10 @@ pub fn evaluate(
         accept_db: None,
     };
     let Some(baseline) = baseline else {
-        let rows = intent.iter().map(|(p, l)| covered(p, l, today)).collect();
+        let rows = intent
+            .iter()
+            .map(|(p, l)| covered(p, l, today, None))
+            .collect();
         let state = CoverageState {
             first_recorded: today.to_string(),
             last_recorded: today.to_string(),
@@ -583,18 +685,33 @@ pub fn evaluate(
     outcome.compared_with = Some(baseline.state.clone());
     let (rows, renamed) = carry_over_renames(&baseline.rows, now);
     outcome.renamed_targets = renamed;
+    let followed = follow_renames(rows, listings);
     let recorded = outcome.recording == Recording::Recorded;
 
     let mut next: Vec<CoverageRow> = Vec::new();
     let mut seen: BTreeSet<Pair> = BTreeSet::new();
     let mut drops: BTreeMap<(String, String, String, String, u32), Vec<String>> = BTreeMap::new();
     let mut restored: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
-    for r in &rows {
+    // Pairs a row holds already: two rows never end on one.
+    let mut claimed: BTreeSet<Pair> = BTreeSet::new();
+    for Followed {
+        row: r,
+        volume_was,
+        was,
+        ..
+    } in &followed
+    {
         let pair = Pair {
             volume: r.volume.clone(),
             subvolume: r.subvolume.clone(),
             target: r.target.clone(),
         };
+        if !claimed.insert(pair.clone()) {
+            // Another subvolume's row holds this name now; this one's
+            // subvolume is no longer anywhere it can be found.
+            outcome.gone += 1;
+            continue;
+        }
         if let Some(source_label) = intent.get(&pair) {
             if let Some(since) = &r.dropped_since {
                 restored
@@ -602,13 +719,21 @@ pub fn evaluate(
                     .or_default()
                     .push(r.target.clone());
             }
-            next.push(covered(&pair, source_label, &r.first_covered));
+            next.push(covered(&pair, source_label, &r.first_covered, Some(r)));
             seen.insert(pair);
             continue;
         }
         let Some(why) = why_dropped(r, now, plan, listings) else {
             outcome.gone += 1;
             continue;
+        };
+        let why = match (volume_was, was) {
+            (None, None) => why,
+            (Some(old), None) => format!("volume moved from '{old}'; {why}"),
+            (None, Some(old)) => format!("renamed from '{old}'; {why}"),
+            (Some(v), Some(old)) => {
+                format!("volume moved from '{v}', renamed from '{old}'; {why}")
+            }
         };
         let since = r.dropped_since.clone().unwrap_or_else(|| today.to_string());
         let checks = r.dropped_checks + 1;
@@ -637,12 +762,14 @@ pub fn evaluate(
             dropped_since: Some(since),
             dropped_checks: checks,
             drop_rule: Some(why),
+            subvol_uuid: uuid_now(&r.volume, &r.subvolume).or_else(|| r.subvol_uuid.clone()),
+            volume_uuid: fs_now(&r.volume).or_else(|| r.volume_uuid.clone()),
             ..r.clone()
         });
     }
     for (pair, source_label) in &intent {
         if !seen.contains(pair) {
-            next.push(covered(pair, source_label, today));
+            next.push(covered(pair, source_label, today, None));
             outcome.new_pairs += 1;
         }
     }
@@ -974,6 +1101,8 @@ mod tests {
         VolumeListing {
             volume: volume.into(),
             subvolumes: Ok(names.iter().map(|s| s.to_string()).collect()),
+            uuids: BTreeMap::new(),
+            fs_uuid: None,
         }
     }
 
@@ -1015,6 +1144,344 @@ mod tests {
 
     fn whys(o: &CoverageOutcome) -> Vec<String> {
         o.drops.iter().map(|b| b.why.clone()).collect()
+    }
+
+    // --- pairing by the subvolume's own UUID (bd DAS-Backup-Manager-sp78.5) ---
+
+    /// A fixture subvolume UUID, by number.
+    fn uuid(n: u32) -> String {
+        format!("5eed{n:04}-0000-4000-8000-{n:012}")
+    }
+
+    /// A listing whose subvolumes carry the UUIDs `(path, n)` names.
+    fn listing_u(volume: &str, subs: &[(&str, u32)]) -> VolumeListing {
+        VolumeListing {
+            volume: volume.into(),
+            subvolumes: Ok(subs.iter().map(|(p, _)| p.to_string()).collect()),
+            uuids: subs
+                .iter()
+                .map(|(p, n)| (p.to_string(), uuid(*n)))
+                .collect(),
+            fs_uuid: None,
+        }
+    }
+
+    /// `on_disk()` with a UUID on every subvolume: @srv 1, @data 2, @opt 3,
+    /// media 4.
+    fn on_disk_u() -> Vec<VolumeListing> {
+        vec![
+            listing_u("/ssd", &[("@srv", 1), ("@data", 2), ("@opt", 3)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ]
+    }
+
+    fn first_u() -> Baseline {
+        step(None, &cfg(), &on_disk_u(), DAY1, Recording::Recorded).1
+    }
+
+    fn uuid_of_row(b: &Baseline, subvolume: &str, target: &str) -> Option<String> {
+        b.rows
+            .iter()
+            .find(|r| r.subvolume == subvolume && r.target == target)
+            .unwrap_or_else(|| panic!("no row {subvolume} -> {target}"))
+            .subvol_uuid
+            .clone()
+    }
+
+    #[test]
+    fn a_recorded_check_keeps_each_subvolumes_uuid_and_none_where_the_listing_had_none() {
+        let b1 = first_u();
+        assert_eq!(uuid_of_row(&b1, "@data", "big"), Some(uuid(2)));
+        assert_eq!(uuid_of_row(&b1, "@data", "small"), Some(uuid(2)));
+        assert_eq!(uuid_of_row(&b1, "media", "big"), Some(uuid(4)));
+        let bare = first(&cfg());
+        assert!(bare.rows.iter().all(|r| r.subvol_uuid.is_none()));
+    }
+
+    /// The case sp78.5 was filed for: `mv @data @renamed`, the new name
+    /// excluded by a pattern. By path the old pair is simply gone.
+    #[test]
+    fn a_rename_into_an_excluded_name_warns_and_names_the_old_name() {
+        let b1 = first_u();
+        let mut now = cfg();
+        now.subvolumes.exclude = vec!["@renamed".into()];
+        let disk = vec![
+            listing_u("/ssd", &[("@srv", 1), ("@renamed", 2), ("@opt", 3)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ];
+        let (o, b2) = step(Some(&b1), &now, &disk, DAY2, Recording::Recorded);
+        assert_eq!(o.gone, 0, "{o:?}");
+        assert_eq!(
+            o.drops,
+            vec![DropBlock {
+                volume: "/ssd".into(),
+                subvolume: "@renamed".into(),
+                targets: vec!["big".into(), "small".into()],
+                why: "renamed from '@data'; excluded by pattern '@renamed' \
+                      ([subvolumes].exclude); no config entry names it"
+                    .into(),
+                since: DAY2.into(),
+                runs: 1,
+            }]
+        );
+        assert!(o.has_warnings());
+        // The record follows the subvolume to its new name, UUID kept.
+        assert_eq!(uuid_of_row(&b2, "@renamed", "big"), Some(uuid(2)));
+        assert!(b2.rows.iter().all(|r| r.subvolume != "@data"));
+    }
+
+    /// A rename sync adopts is followed, not read as one gone and one new:
+    /// what the old name had on a target the adopted entry does not reach is
+    /// the finding.
+    #[test]
+    fn a_rename_that_sync_adopts_is_followed_and_only_the_narrowing_warns() {
+        let b1 = first_u();
+        let disk = vec![
+            listing_u("/ssd", &[("@srv", 1), ("@renamed", 2), ("@opt", 3)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ];
+        let (o, b2) = step(Some(&b1), &cfg(), &disk, DAY2, Recording::Recorded);
+        assert_eq!((o.gone, o.new_pairs), (0, 0), "{o:?}");
+        assert_eq!(o.drops.len(), 1, "{o:?}");
+        let block = &o.drops[0];
+        assert_eq!(
+            (block.subvolume.as_str(), block.targets.as_slice()),
+            ("@renamed", ["small".to_string()].as_slice())
+        );
+        assert!(
+            block.why.starts_with(
+                "renamed from '@data'; its entry left source 'ssd' and was re-adopted"
+            ),
+            "{}",
+            block.why
+        );
+        let kept = b2
+            .rows
+            .iter()
+            .find(|r| r.subvolume == "@renamed" && r.target == "big")
+            .unwrap();
+        assert_eq!(
+            (kept.first_covered.as_str(), kept.dropped_since.as_deref()),
+            (DAY1, None)
+        );
+    }
+
+    #[test]
+    fn two_subvolumes_swapping_names_stay_covered() {
+        let b1 = first_u();
+        let disk = vec![
+            listing_u("/ssd", &[("@srv", 1), ("@data", 3), ("@opt", 2)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ];
+        let (o, b2) = step(Some(&b1), &cfg(), &disk, DAY2, Recording::Recorded);
+        assert_eq!((o.gone, o.new_pairs, o.dropped_pairs()), (0, 0, 0), "{o:?}");
+        assert_eq!(uuid_of_row(&b2, "@data", "big"), Some(uuid(3)));
+        assert_eq!(uuid_of_row(&b2, "@opt", "big"), Some(uuid(2)));
+        assert_eq!(b2.rows.len(), 7);
+    }
+
+    /// A row no earlier binary gave a UUID is paired by path, as before — a
+    /// missing UUID never reads as covered — and the first recorded check
+    /// that can read the UUID stamps it.
+    #[test]
+    fn a_row_with_no_uuid_is_paired_by_path_and_gets_one_at_the_next_record() {
+        let mut b1 = first_u();
+        for r in &mut b1.rows {
+            r.subvol_uuid = None;
+        }
+        // The same rename, into an excluded name: no UUID, so nothing links
+        // @data to @renamed, and the old pair is gone (the old behaviour).
+        let mut now = cfg();
+        now.subvolumes.exclude = vec!["@renamed".into()];
+        let renamed = vec![
+            listing_u("/ssd", &[("@srv", 1), ("@renamed", 2), ("@opt", 3)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ];
+        let (o, _) = step(Some(&b1), &now, &renamed, DAY2, Recording::Recorded);
+        assert_eq!((o.gone, o.dropped_pairs()), (2, 0), "{o:?}");
+        // Unchanged disk: nothing drops, and every row now holds its UUID.
+        let (o, b2) = step(Some(&b1), &cfg(), &on_disk_u(), DAY2, Recording::Recorded);
+        assert_eq!(o.dropped_pairs(), 0, "{o:?}");
+        assert_eq!(uuid_of_row(&b2, "@srv", "small"), Some(uuid(1)));
+        assert_eq!(uuid_of_row(&b2, "media", "big"), Some(uuid(4)));
+    }
+
+    /// A volume read without UUIDs (or not read at all) cannot move a row,
+    /// and cannot erase the UUID it holds.
+    #[test]
+    fn a_listing_without_uuids_keeps_the_uuid_a_row_holds_and_moves_nothing() {
+        let b1 = first_u();
+        let (o, b2) = step(Some(&b1), &cfg(), &on_disk(), DAY2, Recording::Recorded);
+        assert_eq!((o.gone, o.new_pairs, o.dropped_pairs()), (0, 0, 0), "{o:?}");
+        assert_eq!(uuid_of_row(&b2, "@data", "big"), Some(uuid(2)));
+    }
+
+    /// The row's UUID is on disk at another path, and an old row still holds
+    /// that path: the two never collapse onto one pair.
+    #[test]
+    fn a_name_taken_over_by_another_subvolume_never_yields_two_rows_for_one_pair() {
+        let b1 = first_u();
+        // @opt (3) deleted; @data (2) renamed to @opt. By UUID @data's row
+        // moves to @opt, and the old @opt row (UUID 3, gone) is not a second
+        // claim on the pair.
+        let disk = vec![
+            listing_u("/ssd", &[("@srv", 1), ("@opt", 2)]),
+            listing_u("/hdd", &[("media", 4)]),
+        ];
+        let (o, b2) = step(Some(&b1), &cfg(), &disk, DAY2, Recording::Recorded);
+        let opt_rows = b2.rows.iter().filter(|r| r.subvolume == "@opt").count();
+        assert_eq!(o.gone, 2, "{o:?}");
+        assert_eq!(opt_rows, 2, "one per target: {:?}", b2.rows);
+        assert_eq!(uuid_of_row(&b2, "@opt", "big"), Some(uuid(2)));
+        assert_eq!(o.dropped_pairs(), 0, "{o:?}");
+    }
+
+    // --- pairing the volume by its filesystem UUID (bd DAS-Backup-Manager-sp78.6)
+
+    /// `listing` as the volume of filesystem number `n`.
+    fn on_fs(mut listing: VolumeListing, n: u32) -> VolumeListing {
+        listing.fs_uuid = Some(uuid(1000 + n));
+        listing
+    }
+
+    /// `on_disk_u()` with `/ssd` on filesystem 1 and `/hdd` on filesystem 2.
+    fn on_disk_fs() -> Vec<VolumeListing> {
+        let mut disk = on_disk_u().into_iter();
+        let (ssd, hdd) = (disk.next().unwrap(), disk.next().unwrap());
+        vec![on_fs(ssd, 1), on_fs(hdd, 2)]
+    }
+
+    /// `cfg()` with the `/ssd` source now mounted at `/ssd2`.
+    fn cfg_moved() -> Config {
+        let mut c = cfg();
+        c.sources[0].volume = "/ssd2".into();
+        c
+    }
+
+    fn disk_moved() -> Vec<VolumeListing> {
+        let mut disk = on_disk_fs();
+        disk[0].volume = "/ssd2".into();
+        disk
+    }
+
+    fn first_fs() -> Baseline {
+        step(None, &cfg(), &on_disk_fs(), DAY1, Recording::Recorded).1
+    }
+
+    #[test]
+    fn a_recorded_check_keeps_each_volumes_filesystem_uuid() {
+        let b1 = first_fs();
+        let of = |volume: &str| {
+            b1.rows
+                .iter()
+                .find(|r| r.volume == volume)
+                .and_then(|r| r.volume_uuid.clone())
+        };
+        assert_eq!(of("/ssd"), Some(uuid(1001)));
+        assert_eq!(of("/hdd"), Some(uuid(1002)));
+        assert!(first(&cfg()).rows.iter().all(|r| r.volume_uuid.is_none()));
+    }
+
+    /// The case sp78.6 was filed for: the same filesystem, mounted at
+    /// another path the configuration was updated to.
+    #[test]
+    fn a_volume_moved_on_the_same_filesystem_is_the_same_pairs() {
+        let b1 = first_fs();
+        let (o, b2) = step(
+            Some(&b1),
+            &cfg_moved(),
+            &disk_moved(),
+            DAY2,
+            Recording::Recorded,
+        );
+        assert_eq!(
+            (o.gone, o.new_pairs, o.dropped_pairs()),
+            (0, 0, 0),
+            "{}",
+            o.section()
+        );
+        assert!(!o.has_warnings(), "{}", o.section());
+        assert!(b2.rows.iter().all(|r| r.volume != "/ssd"), "{:?}", b2.rows);
+        let moved: Vec<&CoverageRow> = b2.rows.iter().filter(|r| r.volume == "/ssd2").collect();
+        assert_eq!(moved.len(), 6);
+        assert!(moved.iter().all(|r| r.first_covered == DAY1));
+        assert_eq!(b2.rows.len(), 7);
+    }
+
+    /// A moved volume whose subvolume a pattern now skips is a drop that
+    /// says the volume moved.
+    #[test]
+    fn a_drop_on_a_moved_volume_says_where_it_was() {
+        let b1 = first_fs();
+        let mut now = without(cfg_moved(), "@data");
+        now.subvolumes.exclude = vec!["@data".into()];
+        let (o, _) = step(Some(&b1), &now, &disk_moved(), DAY2, Recording::Recorded);
+        assert_eq!(
+            whys(&o),
+            [
+                "volume moved from '/ssd'; excluded by pattern '@data' ([subvolumes].exclude); no \
+              config entry names it"
+            ]
+        );
+        assert_eq!(o.drops[0].volume, "/ssd2");
+    }
+
+    /// A row recorded with no filesystem UUID is paired by path alone —
+    /// the old behaviour, never silently "covered" — and the record that
+    /// follows stamps it.
+    #[test]
+    fn a_row_with_no_volume_uuid_is_paired_by_path_and_gets_one_at_the_next_record() {
+        let mut b1 = first_fs();
+        for r in &mut b1.rows {
+            r.volume_uuid = None;
+        }
+        let (o, _) = step(
+            Some(&b1),
+            &cfg_moved(),
+            &disk_moved(),
+            DAY2,
+            Recording::Recorded,
+        );
+        assert_eq!((o.dropped_pairs(), o.new_pairs), (6, 6), "{}", o.section());
+        let (o, b2) = step(Some(&b1), &cfg(), &on_disk_fs(), DAY2, Recording::Recorded);
+        assert_eq!(o.dropped_pairs(), 0, "{}", o.section());
+        assert!(b2.rows.iter().all(|r| r.volume_uuid.is_some()));
+    }
+
+    fn row_on(volume: &str, volume_uuid: Option<String>) -> CoverageRow {
+        CoverageRow {
+            volume: volume.into(),
+            volume_uuid,
+            ..dropped_row("@a", "big", "ssd")
+        }
+    }
+
+    #[test]
+    fn a_volume_moves_only_to_the_one_read_volume_holding_its_filesystem() {
+        let at = |rows: Vec<CoverageRow>, disk: &[VolumeListing]| -> Vec<String> {
+            follow_renames(rows, disk)
+                .into_iter()
+                .map(|f| f.row.volume)
+                .collect()
+        };
+        let row = || vec![row_on("/a", Some(uuid(1001)))];
+        let b = on_fs(listing("/b", &["@a"]), 1);
+        let c = on_fs(listing("/c", &["@a"]), 1);
+        let a_same = on_fs(listing("/a", &["@a"]), 1);
+        // Exactly one read volume holds it: the row moves there.
+        assert_eq!(at(row(), std::slice::from_ref(&b)), ["/b"]);
+        // Two do (the filesystem mounted twice): nothing says which.
+        assert_eq!(at(row(), &[b.clone(), c.clone()]), ["/a"]);
+        // Its own path still holds it: it stays, whatever else does too.
+        assert_eq!(at(row(), &[b.clone(), a_same]), ["/a"]);
+        // The holder was not read (no filesystem UUID is known for it).
+        let unread = VolumeListing {
+            subvolumes: Err("not mounted".into()),
+            ..b.clone()
+        };
+        assert_eq!(at(row(), &[unread]), ["/a"]);
+        // A row with no filesystem UUID never moves.
+        assert_eq!(at(vec![row_on("/a", None)], &[b]), ["/a"]);
     }
 
     // --- the comparison -------------------------------------------------------
@@ -1149,6 +1616,8 @@ mod tests {
             VolumeListing {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
+                uuids: BTreeMap::new(),
+                fs_uuid: None,
             },
             listing("/hdd", &["media"]),
         ];
@@ -1188,6 +1657,8 @@ mod tests {
             VolumeListing {
                 volume: "/ssd".into(),
                 subvolumes: Err("not mounted".into()),
+                uuids: BTreeMap::new(),
+                fs_uuid: None,
             },
             listing("/hdd", &["media"]),
         ];
@@ -1682,6 +2153,8 @@ mod tests {
             dropped_since: None,
             dropped_checks: 0,
             drop_rule: None,
+            subvol_uuid: None,
+            volume_uuid: None,
         }
     }
 
