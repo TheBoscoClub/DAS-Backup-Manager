@@ -177,6 +177,13 @@ pub struct MountGuard {
     runner: Arc<dyn CommandRunner>,
     /// What this guard holds, for the progress stage it reports on release.
     held_kind: &'static str,
+    /// Each mirror target's ESP directory under [`ESP_MOUNT_ROOT`] and the
+    /// `PARTUUID=` spec of its `esp_partuuid`: a recovery-OS reading that
+    /// could not take its ESP down leaves it there, and it holds the drive
+    /// as the target does. Released before the targets, and only when
+    /// `findmnt` shows that partition mounted at that directory (bd
+    /// DAS-Backup-Manager-s5jv.2; `backup-run.sh`'s `unmount_all`, s5jv.1).
+    esps: Vec<(String, String)>,
 }
 
 /// How many times an unmount is tried before the mount point is reported as
@@ -320,7 +327,24 @@ impl MountGuard {
             newly_mounted: Vec::new(),
             runner,
             held_kind: "targets",
+            esps: Vec::new(),
         }
+    }
+
+    /// Note `target`'s ESP for release, when it is a mirror with an
+    /// `esp_partuuid` (the only ESP a reading mounts).
+    fn note_esp(&mut self, target: &crate::config::Target, root: &Path) {
+        if target.role != crate::config::TargetRole::Mirror {
+            return;
+        }
+        let Some(pu) = target.esp_partuuid.as_deref() else {
+            return;
+        };
+        let dir = root.join(esp_dir_name(&target.label));
+        self.esps.push((
+            dir.to_string_lossy().into_owned(),
+            format!("PARTUUID={}", pu.to_ascii_lowercase()),
+        ));
     }
 
     /// A guard over the source volumes rather than the targets.
@@ -345,7 +369,7 @@ impl MountGuard {
     /// `Drop`, which can only print.
     #[must_use = "a mount point left mounted must fail the job (see still_mounted_error)"]
     pub fn unmount(&mut self, progress: &dyn ProgressCallback) -> Vec<String> {
-        let mut still_mounted = Vec::new();
+        let mut still_mounted = self.release_esps(progress);
         if self.newly_mounted.is_empty() {
             return still_mounted;
         }
@@ -372,6 +396,60 @@ impl MountGuard {
             }
         }
         still_mounted
+    }
+
+    /// Take down each noted ESP that `findmnt` shows mounted at its own
+    /// directory; anything else mounted from it, or nothing, is left as it
+    /// is. Returns the directories still mounted, or that could not be told
+    /// about: either fails the job, as a target left mounted does.
+    fn release_esps(&mut self, progress: &dyn ProgressCallback) -> Vec<String> {
+        use crate::progress::LogLevel;
+        let mut still = Vec::new();
+        for (dir, spec) in std::mem::take(&mut self.esps) {
+            let out = self
+                .runner
+                .output(Command::new("findmnt").args(["-n", "-o", "TARGET", "-S", &spec]));
+            let here = match out {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).lines().any(|l| l == dir)
+                }
+                // 1: mounted nowhere.
+                Ok(o) if o.status.code() == Some(1) => false,
+                Ok(o) => {
+                    progress.on_log(
+                        LogLevel::Error,
+                        &format!(
+                            "Could not tell whether {dir} holds {spec}: {}",
+                            exit_why("findmnt", o.status)
+                        ),
+                    );
+                    still.push(dir);
+                    continue;
+                }
+                Err(e) => {
+                    progress.on_log(
+                        LogLevel::Error,
+                        &format!(
+                            "Could not tell whether {dir} holds {spec}: findmnt failed to run: {e}"
+                        ),
+                    );
+                    still.push(dir);
+                    continue;
+                }
+            };
+            if !here {
+                continue;
+            }
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("{dir}: a recovery drive's ESP left mounted by a recovery-OS reading — unmounting it"),
+            );
+            if let Err(why) = take_down_leftover_with(&*self.runner, &dir, progress) {
+                progress.on_log(LogLevel::Error, &format!("{dir} is still mounted: {why}"));
+                still.push(dir);
+            }
+        }
+        still
     }
 
     /// How many mount points this guard is responsible for.
@@ -488,6 +566,10 @@ fn ensure_targets_mounted_with(
 
     for (i, target) in config.targets.iter().enumerate() {
         let mount_path = Path::new(&target.mount);
+        // Under a handed-down lock the parent releases its own (`unmount_all`).
+        if !held.is_delegated() {
+            guard.note_esp(target, Path::new(ESP_MOUNT_ROOT));
+        }
 
         // Already mounted at the configured path.
         if mount_path.exists() && (probes.is_mountpoint)(mount_path) {
@@ -1230,8 +1312,9 @@ pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
 /// a mirror target's own ESP, the partition its `esp_partuuid` names, mounted
 /// read-only at [`ESP_MOUNT_ROOT`]`/<label>` for `read`, then unmounted.
 /// `drive_ids` are the names `lsblk` gives this drive's partitions
-/// (`PARTUUID=…` among them). `Ok` is what `read` found; `Err` says why the
-/// ESP was not read, or that it was read and could not be unmounted.
+/// (`PARTUUID=…` among them). [`EspReading::read`] is what `read` found, or
+/// why the ESP was not read; [`EspReading::left_mounted`] says why it is still
+/// mounted, when it could not be taken down afterwards (bd s5jv.2).
 ///
 /// The configured PARTUUID is a claim, not an identity: it is mounted only
 /// when the drive itself lists it, so a mistyped or copied key — the host's
@@ -1243,7 +1326,7 @@ pub fn read_recovery_esp<T>(
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
     read: &dyn Fn(&Path) -> Result<T, String>,
-) -> Result<T, String> {
+) -> EspReading<T> {
     read_recovery_esp_with(
         &SystemRunner,
         Path::new(ESP_MOUNT_ROOT),
@@ -1253,12 +1336,37 @@ pub fn read_recovery_esp<T>(
     )
 }
 
+/// A reading of a recovery drive's ESP ([`read_recovery_esp`]): what `read`
+/// said, or why it was not asked, and — when the ESP could not be taken down
+/// after it — why it is still mounted. A failed unmount never takes the
+/// reading's place (bd DAS-Backup-Manager-s5jv.2).
+#[derive(Debug, PartialEq)]
+pub struct EspReading<T> {
+    pub read: Result<T, String>,
+    pub left_mounted: Option<String>,
+}
+
 fn read_recovery_esp_with<T>(
     runner: &dyn CommandRunner,
     root: &Path,
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
     read: &dyn Fn(&Path) -> Result<T, String>,
+) -> EspReading<T> {
+    let mut left_mounted = None;
+    let read = mount_read_unmount(runner, root, target, drive_ids, read, &mut left_mounted);
+    EspReading { read, left_mounted }
+}
+
+/// [`read_recovery_esp_with`]'s steps: `Err` when the ESP was not read;
+/// `left_mounted` is set when, read or not, it is still mounted at the end.
+fn mount_read_unmount<T>(
+    runner: &dyn CommandRunner,
+    root: &Path,
+    target: &crate::config::Target,
+    drive_ids: &std::collections::BTreeSet<String>,
+    read: &dyn Fn(&Path) -> Result<T, String>,
+    left_mounted: &mut Option<String>,
 ) -> Result<T, String> {
     let pu = target
         .esp_partuuid
@@ -1351,10 +1459,13 @@ fn read_recovery_esp_with<T>(
     };
     match umount_retrying(runner, dir_s, |_| {}) {
         Ok(()) => gone(read),
-        Err(why) => Err(format!(
-            "{spec} is still mounted at {dir_s} after {UMOUNT_ATTEMPTS} attempts ({why}); \
-             the next reading takes it down"
-        )),
+        Err(why) => {
+            *left_mounted = Some(format!(
+                "{spec} is still mounted at {dir_s} after {UMOUNT_ATTEMPTS} attempts ({why}); \
+                 the next reading takes it down"
+            ));
+            read
+        }
     }
 }
 
@@ -4610,7 +4721,11 @@ mod tests {
             answer.clone()
         };
         let r = read_recovery_esp_with(runner, root, target, &esp_drive_ids(), &read);
-        (r, seen.into_inner().unwrap())
+        assert_eq!(
+            r.left_mounted, None,
+            "left mounted: use read_esp_reading for that case"
+        );
+        (r.read, seen.into_inner().unwrap())
     }
 
     fn argvs(runner: &ScriptedRunner, program: &str) -> Vec<Vec<String>> {
@@ -4899,20 +5014,29 @@ mod tests {
         assert!(!scratch.path().join("recovery-a").exists());
     }
 
+    /// bd DAS-Backup-Manager-s5jv.2: what the reading found is kept when the
+    /// ESP cannot be taken down after it; that it stays mounted is said beside
+    /// it, never in its place.
     #[test]
-    fn an_esp_left_mounted_after_its_reading_says_so() {
+    fn an_esp_left_mounted_after_its_reading_keeps_the_findings_and_says_so() {
         let scratch = tempfile::tempdir().unwrap();
         let [s, q] = unmounted_host();
         let runner = ScriptedRunner::with_rules(&[s, q, verified(), ("umount", Reply::exit(32))]);
-        let (r, _) = read_esp(
-            &runner,
+        let r = read_recovery_esp_with(
+            &*runner,
             scratch.path(),
             &esp_target(Some(ESP_PU)),
-            Ok(vec![]),
+            &esp_drive_ids(),
+            &|_: &Path| Ok(vec!["a problem".to_string()]),
         );
-        let why = r.unwrap_err();
+        assert_eq!(r.read, Ok(vec!["a problem".to_string()]));
+        let why = r.left_mounted.unwrap();
         assert!(why.contains("still mounted"), "{why}");
         assert_eq!(argvs(&runner, "umount").len(), UMOUNT_ATTEMPTS as usize);
+        assert!(
+            scratch.path().join("recovery-a").exists(),
+            "a mounted directory is kept"
+        );
     }
 
     #[test]
@@ -4925,6 +5049,59 @@ mod tests {
         let (_, seen) = read_esp(&runner, scratch.path(), &t, Ok(vec![]));
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].parent(), Some(scratch.path()), "{seen:?}");
+    }
+
+    /// bd DAS-Backup-Manager-s5jv.2: an ESP a reading left mounted is
+    /// released by the job's own unmount, before the targets, and one that
+    /// will not come down is still mounted, so the job fails as for a target.
+    #[test]
+    fn the_job_s_unmount_releases_an_esp_a_reading_left_mounted_before_the_targets() {
+        let root = Path::new("/run/das-backup/esp");
+        let dir = "/run/das-backup/esp/recovery-a";
+        let spec = format!("PARTUUID={ESP_PU}");
+        let shown = |stdout: &'static str| {
+            (
+                leak(spec.clone()),
+                Reply::Exit {
+                    code: 0,
+                    stdout,
+                    stderr: "",
+                },
+            )
+        };
+        // Shown there: unmounted, then the target.
+        let runner = ScriptedRunner::with_rules(&[shown(leak(format!("{dir}\n")))]);
+        let mut guard = MountGuard::new(runner.clone());
+        guard.newly_mounted.push("/mnt/recovery-a".into());
+        guard.note_esp(&esp_target(Some(ESP_PU)), root);
+        assert!(guard.unmount(&Recorder::default()).is_empty());
+        assert_eq!(
+            argvs(&runner, "umount"),
+            [
+                vec!["umount".to_string(), dir.into()],
+                vec!["umount".to_string(), "/mnt/recovery-a".into()]
+            ]
+        );
+        // Shown elsewhere, or nowhere: not this project's, never unmounted.
+        let runner = ScriptedRunner::with_rules(&[shown("/somewhere/else\n")]);
+        let mut guard = MountGuard::new(runner.clone());
+        guard.note_esp(&esp_target(Some(ESP_PU)), root);
+        assert!(guard.unmount(&Recorder::default()).is_empty());
+        assert!(argvs(&runner, "umount").is_empty(), "{:?}", runner.calls());
+        // Will not come down: still mounted, the plain tries then -f.
+        let runner =
+            ScriptedRunner::with_rules(&[shown(leak(format!("{dir}\n"))), (dir, Reply::exit(32))]);
+        let mut guard = MountGuard::new(runner.clone());
+        guard.note_esp(&esp_target(Some(ESP_PU)), root);
+        assert_eq!(guard.unmount(&Recorder::default()), [dir.to_string()]);
+        assert_eq!(argvs(&runner, "umount").len(), UMOUNT_ATTEMPTS as usize + 1);
+        // A primary, or a mirror with no key, has no ESP to release.
+        let mut primary = esp_target(Some(ESP_PU));
+        primary.role = TargetRole::Primary;
+        let mut guard = MountGuard::new(ScriptedRunner::succeeding());
+        guard.note_esp(&primary, root);
+        guard.note_esp(&esp_target(None), root);
+        assert!(guard.esps.is_empty());
     }
 
     // --- bd DAS-Backup-Manager-s5jv.3 ------------------------------------

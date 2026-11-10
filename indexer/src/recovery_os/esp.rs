@@ -25,6 +25,10 @@ pub struct Findings {
     /// One line per file an entry names that the ESP does not hold, or the
     /// one line saying there is nothing to boot.
     pub problems: Vec<String>,
+    /// Why the ESP is still mounted after it was read, when it could not be
+    /// taken down (bd DAS-Backup-Manager-s5jv.2): a WARN, never a boot
+    /// problem.
+    pub left_mounted: Option<String>,
 }
 
 impl Findings {
@@ -90,6 +94,7 @@ pub fn read_loader(esp: &Path) -> Result<Findings, String> {
             entries: 0,
             unified,
             problems,
+            left_mounted: None,
         });
     }
     let mut problems = Vec::new();
@@ -121,6 +126,7 @@ pub fn read_loader(esp: &Path) -> Result<Findings, String> {
         entries: count,
         unified: 0,
         problems,
+        left_mounted: None,
     })
 }
 

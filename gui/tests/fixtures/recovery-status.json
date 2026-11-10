@@ -6,6 +6,7 @@
         "age_days": 19,
         "boot_problems": [],
         "esp": null,
+        "esp_left_mounted": null,
         "fstab_unchecked": null,
         "reasons": [],
         "stale": false,

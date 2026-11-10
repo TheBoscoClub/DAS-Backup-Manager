@@ -1007,13 +1007,21 @@ pub struct Assessment {
     /// reading had no way to look.
     #[serde(default)]
     pub esp: Option<String>,
+    /// Why the drive's ESP is still mounted after it was read, when it could
+    /// not be taken down (bd DAS-Backup-Manager-s5jv.2): a WARN — it holds
+    /// the drive — never a boot problem.
+    #[serde(default)]
+    pub esp_left_mounted: Option<String>,
 }
 
 impl Assessment {
     /// Stale, or carrying a warning: what `recovery-os` exits 1 for, and
     /// what the backup run marks WARN.
     pub fn needs_attention(&self) -> bool {
-        self.stale || !self.warnings.is_empty() || !self.boot_problems.is_empty()
+        self.stale
+            || !self.warnings.is_empty()
+            || !self.boot_problems.is_empty()
+            || self.esp_left_mounted.is_some()
     }
 }
 
@@ -1150,6 +1158,7 @@ pub fn assess(os: &RecoveryOs, host: &HostVersions, today: &str, max_age_days: u
         boot_problems: Vec::new(),
         fstab_unchecked: None,
         esp: None,
+        esp_left_mounted: None,
     }
 }
 
@@ -1253,7 +1262,19 @@ pub fn check_esp(
             Err(format!("the drive's partitions could not be listed: {why}"))
         }
         Err(_) => Err("no `esp_partuuid` is configured for this target".into()),
-        Ok(ids) => crate::mount::read_recovery_esp(target, ids, &esp::read_loader),
+        Ok(ids) => {
+            let reading = crate::mount::read_recovery_esp(target, ids, &esp::read_loader);
+            match (reading.read, reading.left_mounted) {
+                (Ok(found), left_mounted) => Ok(esp::Findings {
+                    left_mounted,
+                    ..found
+                }),
+                // Not read and not taken down: said in one line, and the
+                // job's own unmount releases it (bd s5jv.2).
+                (Err(why), Some(left)) => Err(format!("{why}; {left}")),
+                (Err(why), None) => Err(why),
+            }
+        }
     })
 }
 
@@ -1506,6 +1527,7 @@ pub fn status_noting_until(
                         Some(Ok(found)) => {
                             assessment.esp = Some(found.summary());
                             assessment.boot_problems.extend(found.problems);
+                            assessment.esp_left_mounted = found.left_mounted;
                         }
                         Some(Err(why)) => assessment.esp = Some(format!("not checked: {why}")),
                         None => {}
@@ -1754,6 +1776,9 @@ pub fn format_section(entries: &[DriveEntry], host: &HostVersions) -> String {
                 }
                 if let Some(esp) = &assessment.esp {
                     out.push_str(&row("ESP", esp));
+                }
+                if let Some(left) = &assessment.esp_left_mounted {
+                    out.push_str(&row("ESP mounted", left));
                 }
                 out.push_str(&row("Result", &verdict(assessment)));
             }
@@ -2177,6 +2202,9 @@ pub fn classify(entries: &[DriveEntry], state_error: Option<&str>) -> (RecordSta
         }
         if assessments().any(|a| !a.boot_problems.is_empty()) {
             why.push("its boot may stop: see BOOT PROBLEM");
+        }
+        if assessments().any(|a| a.esp_left_mounted.is_some()) {
+            why.push("its ESP is still mounted: see ESP mounted");
         }
         return (
             RecordStatus::Warn,
@@ -4321,6 +4349,7 @@ mod tests {
         let entries = read(&listed, &|t, ids| {
             Some(Ok(esp::Findings {
                 entries: 1,
+                left_mounted: None,
                 unified: 0,
                 problems: vec![format!(
                     "loader entry x.conf names initrd /amd-ucode.img, which this drive's ESP \
@@ -4370,6 +4399,7 @@ mod tests {
         let entries = read(&listed, &|_, _| {
             Some(Ok(esp::Findings {
                 entries: 2,
+                left_mounted: None,
                 unified: 0,
                 problems: Vec::new(),
             }))
@@ -4378,6 +4408,34 @@ mod tests {
         assert!(format_section(&entries, &current_host()).contains(
             "ESP                 checked: 2 loader entries, every file they name is there"
         ));
+        // Read, then not taken down (bd DAS-Backup-Manager-s5jv.2): what it
+        // found is shown, and that it is still mounted is a WARN of its own.
+        let entries = read(&listed, &|_, _| {
+            Some(Ok(esp::Findings {
+                entries: 2,
+                left_mounted: Some("PARTUUID=x is still mounted at /run/das-backup/esp/A".into()),
+                unified: 0,
+                problems: Vec::new(),
+            }))
+        });
+        let section = format_section(&entries, &current_host());
+        assert!(
+            section.contains(
+                "ESP                 checked: 2 loader entries, every file they name is there"
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "ESP mounted         PARTUUID=x is still mounted at /run/das-backup/esp/A"
+            ),
+            "{section}"
+        );
+        assert!(assessment(&entries).boot_problems.is_empty());
+        let (status, why) = classify(&entries, None);
+        assert_eq!(status, RecordStatus::Warn, "{why}");
+        assert!(why.contains("its ESP is still mounted"), "{why}");
+        assert!(!why.contains("btrbk may run at boot"), "{why}");
         // The partitions could not be listed: the check is still asked, and
         // told why.
         let entries = read(&|_| Some(Err("lsblk exited with 1".into())), &|_, ids| {
@@ -4413,6 +4471,7 @@ mod tests {
                 &|_, _| {
                     Some(Ok(esp::Findings {
                         entries: 1,
+                        left_mounted: None,
                         unified: 0,
                         problems: vec!["asked".into()],
                     }))
