@@ -142,6 +142,39 @@ exclude_re = [
     # `^` give the same value: an equivalent mutant no test can tell apart.
     # The `| -> &` mutant (flags 0) is not excluded and is caught.
     "replace \\| with \\^ in copy_no_follow",
+    # The other raw opens in restore.rs (`link_at`, `DirFd::openat`,
+    # `DirFd::create_file`) combine `O_*` flags the same way: each flag is one
+    # bit no other shares (`O_RDONLY` is 0), so `^` gives the same value.
+    # Equivalent. A `| -> &` mutant changes the flags and is not excluded
+    # (create_file's is caught by its `fcntl` check). bd s5jv.3.
+    "replace \\| with \\^ in (link_at|DirFd::openat|DirFd::create_file)",
+    # Their `fd < 0` / `n < 0` checks: `<= 0` differs only on a returned 0.
+    # `openat` returns the lowest free fd, and 0 (stdin) is always open in a
+    # test process; `readlinkat` returns 0 for no link (Linux refuses an
+    # empty link target). No test can reach either without closing its own
+    # stdin. bd s5jv.3.
+    "replace < with <= in (link_at|DirFd::openat|DirFd::create_file)",
+    # `link_at` calls `readlinkat` on an fd `fstat` has just shown to be a
+    # link: it fails, or returns 0, in no state a test can reach, so
+    # `n < 0 -> n == 0` cannot be told apart. Anchored by its column: the
+    # `fd < 0 -> fd == 0` mutant in the same function is caught and stays.
+    # bd s5jv.3.
+    ":10: replace < with == in link_at",
+    # `follow_link` joins a relative target to the link's directory and uses
+    # an absolute one as it is. `Path::join` with an absolute path returns
+    # that path, so dropping the `is_relative()` guard changes nothing.
+    # Equivalent. bd s5jv.3.
+    "replace match guard target.is_relative\\(\\) with true in DirFd::follow_link",
+    # `take_down_leftover` is `take_down_leftover_with` bound to the real
+    # `umount` (`SystemRunner`): called from a test it would unmount on this
+    # host. The core is mutated and tested with a scripted runner. Only the
+    # whole-body replacement is excluded. bd s5jv.3.
+    "replace take_down_leftover -> Result<\\(\\), String> with Ok\\(\\(\\)\\)",
+    # `drive_partition_ids` binds `drive_partition_ids_with` to the real
+    # `findmnt` and `lsblk`: only a real drive mounted at a known path could
+    # tell it from a constant. The core is mutated and tested with scripted
+    # answers. All four whole-body replacements are excluded. bd s5jv.3.
+    "replace drive_partition_ids -> Option<Result<BTreeSet<String>, String>> with ",
 ]
 
 # The D-Bus helper (`src/bin/btrdasd-helper.rs`) is built only with

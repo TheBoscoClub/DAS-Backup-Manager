@@ -358,4 +358,50 @@ mod tests {
         let r = loader_problems(d.path());
         assert!(r.as_ref().is_err_and(|e| e.contains("dir.conf")), "{r:?}");
     }
+
+    // --- bd DAS-Backup-Manager-s5jv.3 ------------------------------------
+
+    #[test]
+    fn every_image_one_initrd_line_lists_is_looked_up() {
+        let d = esp();
+        write(
+            d.path(),
+            "loader/entries/zz.conf",
+            "linux /vmlinuz-linux-cachyos\ninitrd /amd-ucode.img /not-built.img\n",
+        );
+        let problems = loader_problems(d.path()).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("initrd /not-built.img"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_entries_directory_that_cannot_be_listed_is_an_error_not_an_empty_esp() {
+        let d = esp();
+        std::fs::remove_dir_all(d.path().join("loader/entries")).unwrap();
+        write(d.path(), "loader/entries", "not a directory");
+        let r = loader_problems(d.path());
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("loader/entries")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_path_that_cannot_be_looked_up_is_an_error_not_a_missing_file() {
+        // Through a file: ENOTDIR, not "the ESP does not have it".
+        let d = esp();
+        write(
+            d.path(),
+            "loader/entries/zz.conf",
+            "linux /vmlinuz-linux-cachyos/inside-a-file\n",
+        );
+        let r = loader_problems(d.path());
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("inside-a-file")),
+            "{r:?}"
+        );
+    }
 }

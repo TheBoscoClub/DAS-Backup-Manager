@@ -324,6 +324,20 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_is_protected_while_live_and_a_live_entry_only_by_live() {
+        // bd DAS-Backup-Manager-s5jv.3: a top level is never expired, retired
+        // or not; a live entry is protected by `live` alone.
+        let sources = [source(&[
+            ("live", Some("ssd-live"), None),
+            (".", Some("ssd-toplevel"), None),
+        ])];
+        assert_eq!(
+            protected_series(&[], &sources),
+            vec!["ssd-toplevel".to_string()]
+        );
+    }
+
+    #[test]
     fn forget_refuses_a_pattern_that_reaches_a_retired_series() {
         // bd DAS-Backup-Manager-ow2a: a retired entry is not in btrbk.conf, so
         // `live` lacks it, but its backups are kept until expiry says so.

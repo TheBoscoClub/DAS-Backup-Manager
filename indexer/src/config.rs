@@ -2544,6 +2544,24 @@ mod tests {
     }
 
     #[test]
+    fn a_second_spelling_is_caught_behind_another_volume() {
+        // bd DAS-Backup-Manager-s5jv.3: each volume's first spelling is
+        // remembered, not only the first volume's.
+        let three = format!(
+            "{}{}{}{ONE_TARGET}",
+            source_with("o", "/other", &[("@o", None)]),
+            source_with("a", "/vol", &[("@a", None)]),
+            source_with("b", "/vol/", &[("@b", None)])
+        );
+        let errors = Config::from_toml(&minimal_toml(&three)).unwrap().validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'/vol'") && errors[0].contains("'/vol/'"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn validate_refuses_a_target_label_no_target_has() {
         // bd DAS-Backup-Manager-sp78.8: a typo renders the source with no
         // target line, so nothing of it is backed up, and validate passed.

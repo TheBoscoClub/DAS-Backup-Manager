@@ -2354,6 +2354,13 @@ mod tests {
                      maintenance lock; left mounted for it"
                 )
             )]
+        ); // Counted as the first of one target, not the zeroth.
+        assert!(
+            progress
+                .steps()
+                .contains(&(1, 1, "alpha already mounted".to_string())),
+            "{:?}",
+            progress.steps()
         );
     }
 
@@ -4918,5 +4925,37 @@ mod tests {
         let (_, seen) = read_esp(&runner, scratch.path(), &t, Ok(vec![]));
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].parent(), Some(scratch.path()), "{seen:?}");
+    }
+
+    // --- bd DAS-Backup-Manager-s5jv.3 ------------------------------------
+
+    #[test]
+    fn a_label_of_dots_never_names_the_esp_root_or_its_parent() {
+        assert_eq!(esp_dir_name("."), "_.");
+        assert_eq!(esp_dir_name(".."), "_..");
+        assert_eq!(esp_dir_name(""), "_");
+        assert_eq!(esp_dir_name("recovery-a"), "recovery-a");
+        assert_eq!(esp_dir_name("a/../b"), "a_.._b");
+    }
+
+    #[test]
+    fn a_mountpoint_check_that_gives_no_answer_mounts_nothing_and_leaves_no_directory() {
+        // Exit 1 is neither "not a mount point" (32) nor "is one" (0).
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = ScriptedRunner::with_rules(&[("-S", Reply::exit(1)), ("-q", Reply::exit(1))]);
+        let (r, seen) = read_esp(
+            &runner,
+            scratch.path(),
+            &esp_target(Some(ESP_PU)),
+            Ok(vec![]),
+        );
+        let why = r.unwrap_err();
+        assert!(
+            why.contains("mountpoint exited with code 1") && !why.contains("already a mount point"),
+            "{why}"
+        );
+        assert!(argvs(&runner, "mount").is_empty());
+        assert!(seen.is_empty());
+        assert!(!scratch.path().join("recovery-a").exists());
     }
 }

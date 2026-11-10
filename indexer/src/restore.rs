@@ -167,15 +167,31 @@ enum DestPolicy {
 
 /// [`check_dest_allowed`]'s rule on a path already resolved.
 fn judge_dest(resolved: std::path::PathBuf, allowed_roots: &[String]) -> DestPolicy {
+    judge_dest_with(
+        resolved,
+        allowed_roots,
+        crate::config::RESTORE_DENIED_ROOTS,
+        &owner_of_link,
+    )
+}
+
+/// [`judge_dest`] with the denied roots and the owner of a link met on the
+/// way to an allowed root supplied by the caller.
+fn judge_dest_with(
+    resolved: std::path::PathBuf,
+    allowed_roots: &[String],
+    denied_roots: &[&'static str],
+    owner: &dyn Fn(&Path) -> Option<u32>,
+) -> DestPolicy {
     // Each root is compared as written and resolved: the destination is
     // resolved, and a root reached through a link (`/home -> var/home`)
     // otherwise never matched it (bd DAS-Backup-Manager-sp78.18). For the
     // denylist that only refuses more.
     let under = |root: &Path| resolved.starts_with(root);
     let under_resolved = |root: &Path| {
-        under(root) || resolve_root(root, owner_of_link).is_some_and(|r| resolved.starts_with(r))
+        under(root) || resolve_root(root, owner).is_some_and(|r| resolved.starts_with(r))
     };
-    for denied in crate::config::RESTORE_DENIED_ROOTS {
+    for denied in denied_roots {
         if under(Path::new(denied))
             || resolve_for_policy(Path::new(denied)).is_ok_and(|r| resolved.starts_with(r))
         {
@@ -2932,5 +2948,217 @@ mod tests {
         let empty = TempDir::new().unwrap();
         assert_eq!(count_dir_bytes(empty.path()), 0);
         assert_eq!(count_dir_bytes(&empty.path().join("absent")), 0);
+    }
+
+    // --- bd DAS-Backup-Manager-s5jv.3: the link-following's untested edges --
+
+    /// A scratch directory by its real path, so resolved paths compare equal.
+    fn real_scratch() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        (tmp, base)
+    }
+
+    #[test]
+    fn an_allowed_root_reached_only_through_a_root_owned_link_admits_what_is_under_its_target() {
+        let (_tmp, base) = real_scratch();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.join("home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let allowed = [link.to_string_lossy().into_owned()];
+        // `real/x` is not under the root as written: only its resolution admits it.
+        let root_owned = |_: &Path| Some(0);
+        assert!(matches!(
+            judge_dest_with(real.join("x"), &allowed, &[], &root_owned),
+            DestPolicy::Allowed(_)
+        ));
+        let users = |_: &Path| Some(OWN);
+        assert!(matches!(
+            judge_dest_with(real.join("x"), &allowed, &[], &users),
+            DestPolicy::NotAllowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_denied_root_that_is_a_link_refuses_what_lies_under_its_target() {
+        let (_tmp, base) = real_scratch();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.join("denied");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let denied: &'static str = Box::leak(link.to_string_lossy().into_owned().into_boxed_str());
+        // Granted by the scratch root, denied only once the denied root is resolved.
+        let allowed = [base.to_string_lossy().into_owned()];
+        match judge_dest_with(real.join("x"), &allowed, &[denied], &|_: &Path| None) {
+            DestPolicy::Denied { root, .. } => assert_eq!(root, denied),
+            DestPolicy::Allowed(p) | DestPolicy::NotAllowed(p) => {
+                panic!("{} was not refused as under {denied}", p.display())
+            }
+        }
+    }
+
+    #[test]
+    fn owner_of_link_reads_the_link_itself_and_none_when_nothing_is_there() {
+        let (_tmp, base) = real_scratch();
+        let link = base.join("l");
+        std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
+        // SAFETY: geteuid() is always safe.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(owner_of_link(&link), Some(uid));
+        assert_eq!(owner_of_link(&base.join("absent")), None);
+    }
+
+    /// `n` links in a fresh directory, `l0 -> l1 -> ... -> real`.
+    fn link_chain(n: usize) -> (TempDir, std::path::PathBuf) {
+        let (tmp, base) = real_scratch();
+        fs::create_dir(base.join("real")).unwrap();
+        for i in 0..n {
+            let to = if i + 1 == n {
+                "real".to_string()
+            } else {
+                format!("l{}", i + 1)
+            };
+            std::os::unix::fs::symlink(to, base.join(format!("l{i}"))).unwrap();
+        }
+        (tmp, base)
+    }
+
+    #[test]
+    fn resolve_trusting_follows_forty_links_and_refuses_the_forty_first() {
+        // The kernel's own limit (MAXSYMLINKS). A straight chain, not a
+        // loop: a broken count then answers wrongly instead of spinning.
+        let (_tmp, base) = link_chain(40);
+        assert_eq!(
+            resolve_trusting(&base.join("l0"), |_| true),
+            Some(base.join("real"))
+        );
+        let (_tmp, base) = link_chain(41);
+        assert_eq!(resolve_trusting(&base.join("l0"), |_| true), None);
+    }
+
+    #[test]
+    fn a_link_target_climbing_with_dotdot_resolves_from_where_the_link_sits() {
+        let (_tmp, base) = real_scratch();
+        fs::create_dir(base.join("a")).unwrap();
+        fs::create_dir(base.join("real")).unwrap();
+        std::os::unix::fs::symlink("../real", base.join("a/l")).unwrap();
+        assert_eq!(
+            resolve_trusting(&base.join("a/l/x"), |_| true),
+            Some(base.join("real/x"))
+        );
+    }
+
+    #[test]
+    fn resolve_trusting_takes_a_missing_tail_as_written_and_refuses_a_path_through_a_file() {
+        let (_tmp, base) = real_scratch();
+        fs::write(base.join("f"), "").unwrap();
+        assert_eq!(
+            resolve_trusting(&base.join("absent/x"), |_| true),
+            Some(base.join("absent/x"))
+        );
+        // ENOTDIR is not "does not exist yet": nothing is taken as written.
+        assert_eq!(resolve_trusting(&base.join("f/x"), |_| true), None);
+    }
+
+    #[test]
+    fn c_name_takes_one_literal_component_only() {
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(
+                c_name(std::ffi::OsStr::new(bad)).is_err(),
+                "{bad:?} was taken as one component"
+            );
+        }
+        for good in ["a", "...", ".hidden"] {
+            assert_eq!(
+                c_name(std::ffi::OsStr::new(good)).unwrap().as_bytes(),
+                good.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn open_child_reports_why_a_directory_could_not_be_made() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid() is always safe.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes into a 0555 directory
+        }
+        let (_tmp, base) = real_scratch();
+        let ro = base.join("ro");
+        fs::create_dir(&ro).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+        let fd = DirFd::open_abs(&ro, false).unwrap();
+        let r = fd.open_child(c"new", true);
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        // The mkdir's own error, not the ENOENT of a reopen after it.
+        assert_eq!(r.err().and_then(|e| e.raw_os_error()), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn is_link_is_true_for_a_link_only() {
+        let (_tmp, base) = real_scratch();
+        fs::write(base.join("f"), "").unwrap();
+        fs::create_dir(base.join("d")).unwrap();
+        std::os::unix::fs::symlink("f", base.join("l")).unwrap();
+        let fd = DirFd::open_abs(&base, false).unwrap();
+        assert!(fd.is_link(c"l"));
+        assert!(!fd.is_link(c"f"));
+        assert!(!fd.is_link(c"d"));
+        assert!(!fd.is_link(c"absent"));
+    }
+
+    #[test]
+    fn descend_refuses_a_file_on_the_way_and_never_judges_it_as_a_link() {
+        let (_tmp, base) = real_scratch();
+        fs::write(base.join("f"), "").unwrap();
+        let fd = DirFd::open_abs(&base, false).unwrap();
+        let judged = std::cell::Cell::new(false);
+        let link = |d: &DirFd, c: &std::ffi::CStr| {
+            judged.set(true);
+            link_at(d, c)
+        };
+        let path_owner = |_: &Path| Some(OWN);
+        let dir_owner = |_: &DirFd| Ok(OWN);
+        let roots = test_roots();
+        let follow = Follow {
+            allowed_roots: &roots,
+            dest_owner: OWN,
+            link: &link,
+            path_owner: &path_owner,
+            dir_owner: &dir_owner,
+        };
+        let Err(err) = fd.descend(Path::new("f/x"), &base, &follow) else {
+            panic!("a file on the way was descended through");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err}");
+        assert!(err.to_string().contains("writes through no link"), "{err}");
+        assert!(!judged.get(), "a file met on the way was judged as a link");
+    }
+
+    #[test]
+    fn create_file_opens_non_blocking_and_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        let (_tmp, base) = real_scratch();
+        let fd = DirFd::open_abs(&base, false).unwrap();
+        let f = fd.create_file(std::ffi::OsStr::new("new")).unwrap();
+        // SAFETY: a valid open fd; F_GETFL / F_GETFD only read its flags.
+        let (status, fd_flags) = unsafe {
+            (
+                libc::fcntl(f.as_raw_fd(), libc::F_GETFL),
+                libc::fcntl(f.as_raw_fd(), libc::F_GETFD),
+            )
+        };
+        assert_ne!(status & libc::O_NONBLOCK, 0, "O_NONBLOCK is not set");
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0, "FD_CLOEXEC is not set");
+        // What O_NONBLOCK is for: a FIFO planted there refuses, never waits.
+        let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStringExt::into_vec(
+            base.join("fifo").into_os_string(),
+        ))
+        .unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let err = fd.create_file(std::ffi::OsStr::new("fifo")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENXIO), "{err}");
     }
 }
