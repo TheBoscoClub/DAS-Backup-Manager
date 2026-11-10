@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A count read from btrbk's output no longer includes its summary legend** (bd `DAS-Backup-Manager-s5jv.5`): the legend lists `+++`, `***` and `>>>` indented, and the marker parsers trimmed whitespace, so a count taken from the markers was one snapshot and two sends too many (seen live: 7 snapshots created, `Created 8 snapshots`); an entry is the marker at column 0, as btrbk prints it — `parse_btrbk_snapshot_count`, `parse_btrbk_send_count`
+
 - **A nightly run whose clock is stepped back during btrbk is still recorded** (bd `DAS-Backup-Manager-taa`): `backup-run.sh` timed btrbk with `date +%s`, so an NTP or RTC correction mid-run made the duration negative, and `btrdasd backup record-run` refuses `--duration-secs -N` as it once refused `-1` (bd `6wt`) — the run left no `backup_runs` row
   - btrbk and the maintenance-lock wait are now timed by `monotonic_secs` (`/proc/uptime`, never stepped back); `backup-run.sh` 4.17.3
 

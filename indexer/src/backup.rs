@@ -592,25 +592,22 @@ fn raw_field_values<'a>(raw: &'a str, key: &'a str) -> impl Iterator<Item = &'a 
     })
 }
 
+/// Count btrbk's created-snapshot lines, `+++` at column 0: the summary's
+/// legend lists the marker indented, and is not a snapshot.
 fn parse_btrbk_snapshot_count(output: &str) -> usize {
     output
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("+++")
-        })
+        .filter(|line| line.starts_with("+++ "))
         .count()
 }
 
 /// Count btrbk send lines.  btrbk marks sends with `>>>` (incremental) or
-/// `***` (non-incremental/full).
+/// `***` (non-incremental/full), at column 0: the summary's legend lists the
+/// same markers indented, and is not a send.
 fn parse_btrbk_send_count(output: &str) -> usize {
     output
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with(">>>") || trimmed.starts_with("***")
-        })
+        .filter(|line| line.starts_with(">>> ") || line.starts_with("*** "))
         .count()
 }
 
@@ -1119,10 +1116,10 @@ fn send_snapshots_with(
 
     let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
-        let trimmed = line.trim_start();
-        // btrbk marks sends with >>> (incremental) or *** (full). The count
-        // comes from the listing below; only a size btrbk prints is read here.
-        if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
+        // btrbk marks sends with >>> (incremental) or *** (full), at column 0
+        // (its legend lists them indented). The count comes from the listing
+        // below; only a size btrbk prints is read here.
+        if line.starts_with(">>> ") || line.starts_with("*** ") {
             bytes_sent += parse_btrbk_size_field(line);
         }
         // Parse throughput hints from btrbk progress lines.
@@ -1224,9 +1221,8 @@ fn run_full_pipeline_with(
     let status = stream_command(&mut cmd, env.runner, progress, |line| {
         stdout_lines.push(line.to_string());
         // The counts come from the listing below; only a size btrbk prints on
-        // a send line is read here.
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(">>>") || trimmed.starts_with("***") {
+        // a send line is read here, at column 0 (its legend is indented).
+        if line.starts_with(">>> ") || line.starts_with("*** ") {
             bytes_sent += parse_btrbk_size_field(line);
         }
         let lower = line.to_lowercase();
@@ -4153,6 +4149,34 @@ mod tests {
         assert_eq!(count, 2, "should count 2 +++ lines, got {count}");
     }
 
+    /// btrbk's summary opens with a legend whose lines are its markers,
+    /// indented: `    +++  created subvolume (source snapshot)`. Counted, it
+    /// made every count from the markers one snapshot and two sends too
+    /// many (seen 2026-11-10: 7 created, "Created 8 snapshots"). An entry
+    /// starts at column 0.
+    #[test]
+    fn the_summary_legend_is_not_counted_as_snapshots_or_sends() {
+        let output = "\
+Options:
+    preserve-snapshots: Preserved all snapshots
+
+Legend:
+    ===  up-to-date subvolume (source snapshot)
+    +++  created subvolume (source snapshot)
+    ---  deleted subvolume
+    ***  received subvolume (non-incremental)
+    >>>  received subvolume (incremental)
+--------------------------------------------------------------------------------
+/vol/@
++++ /vol/.btrbk-snapshots/root.20261110T0924
+>>> /mnt/t/vol/root.20261110T0924
+/vol/@home
++++ /vol/.btrbk-snapshots/home.20261110T0924
+";
+        assert_eq!(parse_btrbk_snapshot_count(output), 2);
+        assert_eq!(parse_btrbk_send_count(output), 1);
+    }
+
     #[test]
     fn test_parse_btrbk_snapshot_count_empty() {
         assert_eq!(parse_btrbk_snapshot_count(""), 0);
@@ -5594,7 +5618,7 @@ mod tests {
         let runner = Scripted::from_owned(vec![(
             btrbk("--preserve-snapshots snapshot"),
             0,
-            "+++ /s/a.1\n  +++ /s/b.1\n>>> /t/a.1\n".into(),
+            "+++ /s/a.1\n+++ /s/b.1\n>>> /t/a.1\n".into(),
         )]);
         let progress = TestProgress::new();
         let count = create_snapshots_with(&steps_config(), None, None, &progress, &runner).unwrap();
@@ -5890,7 +5914,7 @@ mod tests {
         let runner = Scripted::from_owned(vec![(
             btrbk("resume"),
             0,
-            ">>> /t/a.1\n  *** /t/b.1\n+++ /s/c.1\n".into(),
+            ">>> /t/a.1\n*** /t/b.1\n+++ /s/c.1\n".into(),
         )]);
         let progress = TestProgress::new();
         let (sent, _) = send_snapshots_with(
