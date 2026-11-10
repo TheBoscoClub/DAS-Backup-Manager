@@ -91,7 +91,7 @@ pub fn format_report_with_sync(
     config: &Config,
     sync: Option<&SyncSection>,
 ) -> String {
-    format_report_from(result, sync, &capture_report_data(config))
+    format_report_from(result, sync, &capture_report_data(config, &[]))
 }
 
 /// The report sections that read the mounted targets — disk capacity, SMART,
@@ -111,17 +111,32 @@ pub struct ReportData {
 /// Capture [`ReportData`] from the live system. Call while mounted. Only
 /// the two queries live here; what they become is decided by
 /// [`render_capacity_and_smart`] and [`render_latest_snapshots`].
-pub fn capture_report_data(config: &Config) -> ReportData {
+pub fn capture_report_data(config: &Config, filters: &[String]) -> ReportData {
     let health = crate::health::get_health(config).ok();
     let latest = latest_listing(
         Command::new("btrbk")
-            .args(["-c", &config.general.btrbk_conf, "list", "latest"])
+            .args(latest_listing_args(config, filters))
             .output(),
     );
     ReportData {
         capacity_and_smart: render_capacity_and_smart(health.as_ref()),
         latest_snapshots: render_latest_snapshots(latest.as_deref().map_err(String::as_str)),
     }
+}
+
+/// The arguments of the `btrbk list latest` the report reads. `filters` are the
+/// run's own (`backup::btrbk_filters`): btrbk reads only the targets they name,
+/// so an unselected, unmounted target does not make the listing fail
+/// (bd DAS-Backup-Manager-s5jv.6); none: every target, as before.
+fn latest_listing_args(config: &Config, filters: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "-c".to_string(),
+        config.general.btrbk_conf.clone(),
+        "list".to_string(),
+        "latest".to_string(),
+    ];
+    args.extend(filters.iter().cloned());
+    args
 }
 
 /// What `btrbk list latest` answered: its output, or why there is none.
@@ -1581,6 +1596,29 @@ mod tests {
         assert!(!text.contains("unavailable"), "{text}");
         // btrbk answered, nothing listed: an empty section, no note.
         assert!(render_latest_snapshots(Ok("HEADER\n")).ends_with("─\n"));
+    }
+
+    #[test]
+    fn the_latest_listing_is_confined_to_the_filters_it_is_given() {
+        let mut config = Config::default();
+        config.general.btrbk_conf = "/c/btrbk.conf".into();
+        let none: &[String] = &[];
+        assert_eq!(
+            latest_listing_args(&config, none),
+            ["-c", "/c/btrbk.conf", "list", "latest"]
+        );
+        let filters = ["/t1/root".to_string(), "/t1/home".to_string()];
+        assert_eq!(
+            latest_listing_args(&config, &filters),
+            [
+                "-c",
+                "/c/btrbk.conf",
+                "list",
+                "latest",
+                "/t1/root",
+                "/t1/home"
+            ]
+        );
     }
 
     #[test]

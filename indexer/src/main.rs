@@ -1452,7 +1452,10 @@ fn run_manual_step_cli(
         &progress,
     );
     let say = |done: backup::ManualStepDone| match done {
-        backup::ManualStepDone::Snapshots(count) => println!("Created {count} snapshots"),
+        backup::ManualStepDone::Snapshots(Some(count)) => println!("Created {count} snapshots"),
+        backup::ManualStepDone::Snapshots(None) => {
+            println!("Created an unknown number of snapshots (btrbk's log did not say)");
+        }
         backup::ManualStepDone::Sent { snapshots, bytes } => {
             println!(
                 "Sent {snapshots} snapshots ({})",

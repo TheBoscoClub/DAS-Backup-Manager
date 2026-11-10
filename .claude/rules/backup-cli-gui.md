@@ -31,6 +31,8 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
 ## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
 
 - A count a failed step could not take is `None` (NULL / `unknown` / `null`), never `0`.
+- The snapshot step counts from btrbk's raw transaction log (`btrbk --format=raw --preserve-snapshots snapshot`: `type='snapshot' status='success'` rows, valid only with the `startup` and `finished` rows), never `list latest` (it reads every target); no `finished` row after exit 0 is `None` (`create_snapshots_with` → `Result<Option<usize>>`, bd `s5jv.6`).
+- The report's LATEST SNAPSHOTS lists with the run's own btrbk filters, so an unselected target is not read.
 - `btrdasd backup run` exits 0 / 3 / 1 by the script's rule (`BackupJobOutcome::exit_code`); an aborted
   run records a failed row; a report neither saved nor mailed fails the run before the row is written.
 - A failed `host.record` fails the job, never only warns.

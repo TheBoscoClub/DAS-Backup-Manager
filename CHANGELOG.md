@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A standalone `backup snapshot` no longer warns on every run, and a run to some targets no longer reports LATEST SNAPSHOTS as unavailable** (bd `DAS-Backup-Manager-s5jv.6`): `btrbk list latest` reads every target, so with a target unmounted (the normal case for `backup snapshot`, which mounts none) it exited 10, the count fell back to the human markers with a WARN, and a partial-target run's report listed the unselected, unmounted targets too
+  - The snapshot step runs `btrbk --format=raw --preserve-snapshots snapshot …` and counts the `type='snapshot' status='success'` rows of its own transaction log, which reads no target; the count is what this step created, and the log is valid only with its `startup` and `finished` rows — `backup::parse_snapshot_transaction_log`
+  - btrbk exiting 0 with no `finished` row is an unknown count (`None`, logged as a WARN), never 0: `create_snapshots_with` returns `Result<Option<usize>>`, `ManualStepDone::Snapshots` carries it, and `backup snapshot` prints `Created an unknown number of snapshots` — `run_pipeline` records it as unknown
+  - The report's LATEST SNAPSHOTS is listed with the run's own btrbk filters (`BackupJobHost::capture_report` takes them), so an unselected target is not read; a selection of everything passes none, as before — `report::latest_listing_args`
+
 - **`btrdasd backup send` mounts only the targets `--targets` names** (bd `DAS-Backup-Manager-s5jv.10`): `backup::run_manual_step` mounted every configured target for a send, so a drive the operator left out was spun up and mounted for nothing; it now applies the job's rule (bd `u8kk`) — an unnamed target is never mounted, and no `--targets` mounts all, as before — `backup::targets_named_only`
 
 - **A backup the timer starts while `btrdasd setup` or a configuration edit holds the singleton lock waits for it instead of losing the day** (bd `DAS-Backup-Manager-al9`): `backup-run.sh` took `/run/das-backup.lock` without waiting and skipped, exit 0, when it was held, so a few seconds of `setup --upgrade` cost a night's backup and nothing flagged the missing day

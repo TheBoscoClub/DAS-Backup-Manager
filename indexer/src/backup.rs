@@ -691,6 +691,33 @@ fn raw_field_values<'a>(raw: &'a str, key: &'a str) -> impl Iterator<Item = &'a 
     })
 }
 
+/// How many snapshots a `btrbk --format=raw ... snapshot` run created, from
+/// the TRANSACTION LOG it prints (btrbk 0.32.7 `print_formatted("transaction")`:
+/// one `format="transaction"` row per action, values single-quoted, a `'` in a
+/// value written `'\''`, so a value cannot carry a field of its own).
+///
+/// `Some(n)`: the log has its `startup` and `finished` rows, and `n` is the
+/// rows `type='snapshot' status='success'`. Anything else is `None` - a log
+/// cut or empty after exit 0 says nothing about what was created, and `0`
+/// would be a measurement (fail-silent.md, always a defect 1). The human
+/// markers are presentation and no second source (bd `oi0`).
+fn parse_snapshot_transaction_log(raw: &str) -> Option<usize> {
+    let (mut started, mut finished, mut created) = (false, false, 0usize);
+    for line in raw
+        .lines()
+        .filter(|l| l.starts_with("format=\"transaction\" "))
+    {
+        let field = |key: &'static str| raw_field_values(line, key).next();
+        match (field("type"), field("status")) {
+            (Some("startup"), _) => started = true,
+            (Some("finished"), _) => finished = true,
+            (Some("snapshot"), Some("success")) => created += 1,
+            _ => {}
+        }
+    }
+    (started && finished).then_some(created)
+}
+
 /// Count btrbk's created-snapshot lines, `+++` at column 0: the summary's
 /// legend lists the marker indented, and is not a snapshot.
 fn parse_btrbk_snapshot_count(output: &str) -> usize {
@@ -1124,7 +1151,7 @@ pub fn create_snapshots(
     config: &Config,
     sources: Option<&[String]>,
     progress: &dyn ProgressCallback,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
     create_snapshots_with(config, sources, None, progress, &SystemRunner)
 }
 
@@ -1137,7 +1164,7 @@ fn create_snapshots_with(
     targets: Option<&[String]>,
     progress: &dyn ProgressCallback,
     runner: &dyn CommandRunner,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
     let named = named_sources(config, sources);
     progress.on_stage("Creating snapshots", named.len() as u64);
 
@@ -1160,7 +1187,9 @@ fn create_snapshots_with(
     // Without it, a target that is not mounted made btrbk exit 10 after
     // creating every snapshot (bd DAS-Backup-Manager-2ab3). Retention is the
     // `resume` or `run` that sends.
-    cmd.arg("--preserve-snapshots")
+    // `--format=raw`: the transaction log on stdout is machine-readable.
+    cmd.arg("--format=raw")
+        .arg("--preserve-snapshots")
         .arg("snapshot")
         .args(&filters);
 
@@ -1182,24 +1211,30 @@ fn create_snapshots_with(
         return Err(msg.into());
     }
 
-    // Prefer the machine-readable listing; fall back to the marker parse only
-    // if btrbk cannot be queried (bd DAS-Backup-Manager-06p).
-    let count = match btrbk_raw_listing(config, &filters, runner) {
-        Some(raw) => parse_raw_snapshot_count(&raw),
-        None => {
-            progress.on_log(
-                LogLevel::Warning,
-                "btrbk --format=raw list latest failed — counts fall back to output markers",
-            );
-            parse_btrbk_snapshot_count(&stdout)
-        }
-    };
+    // What THIS step created, from btrbk's own transaction log (bd
+    // DAS-Backup-Manager-s5jv.6). `list latest` reads every target, so a target
+    // that is not mounted made it fail on every standalone run; the log reads
+    // none. No finished row is an unknown count, never 0.
+    let count = parse_snapshot_transaction_log(&stdout);
+    if count.is_none() {
+        progress.on_log(
+            LogLevel::Warning,
+            "btrbk's transaction log has no finished row (btrbk exited 0): \
+             the number of snapshots created is unknown",
+        );
+    }
 
     for (i, src) in named.iter().enumerate() {
         progress.on_progress(i as u64 + 1, named.len() as u64, &src.label);
     }
 
-    progress.on_log(LogLevel::Info, &format!("Snapshots created: {count}"));
+    progress.on_log(
+        LogLevel::Info,
+        &match count {
+            Some(n) => format!("Snapshots created: {n}"),
+            None => "Snapshots created: unknown".to_string(),
+        },
+    );
     Ok(count)
 }
 
@@ -2664,7 +2699,7 @@ fn run_pipeline(
         progress,
         env.runner,
     ) {
-        Ok(n) => done.created = Some(n),
+        Ok(n) => done.created = n,
         Err(e) => {
             done.created = None;
             done.failed(progress, format!("{}: {e}", BTRBK_STEP_FAILURES[0]));
@@ -3529,7 +3564,7 @@ pub trait BackupJobHost {
     ) -> Result<BackupResult, String>;
     /// The report sections that read the mounted targets. Called while they
     /// are still mounted.
-    fn capture_report(&self, config: &Config) -> crate::report::ReportData;
+    fn capture_report(&self, config: &Config, filters: &[String]) -> crate::report::ReportData;
     /// Write and email the report; what became of it.
     fn report(
         &self,
@@ -3557,7 +3592,7 @@ pub trait BackupJobHost {
         config: &Config,
         sources: Option<&[String]>,
         progress: &dyn ProgressCallback,
-    ) -> Result<usize, String>;
+    ) -> Result<Option<usize>, String>;
     /// `btrdasd backup send`'s step: the snapshots sent to `targets` (none:
     /// all), as [`send_snapshots`] — snapshots sent and bytes.
     fn send(
@@ -3580,8 +3615,12 @@ pub enum ManualStep {
 /// What a manual step got done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualStepDone {
-    Snapshots(usize),
-    Sent { snapshots: usize, bytes: u64 },
+    /// `None`: btrbk did not say how many (never read as 0).
+    Snapshots(Option<usize>),
+    Sent {
+        snapshots: usize,
+        bytes: u64,
+    },
 }
 
 /// How a manual step ended.
@@ -3942,7 +3981,20 @@ pub fn run_backup_job(
     // targets are mounted; the report itself is built after the unmount so
     // it can say what was left mounted (backup-run.sh: capture_report_data,
     // then unmount_all).
-    let captured = (!options.dry_run && ran.is_ok()).then(|| host.capture_report(&config));
+    let captured = (!options.dry_run && ran.is_ok()).then(|| {
+        // The listing reads the run's own selection, so an unselected (and
+        // unmounted) target is not read (bd DAS-Backup-Manager-s5jv.6). A
+        // selection btrbk cannot be given as filters has failed the run
+        // already; the listing then reads every target, as it always did.
+        let filters = btrbk_filters(
+            &config,
+            options.sources.as_deref(),
+            options.targets.as_deref(),
+            progress,
+        )
+        .unwrap_or_default();
+        host.capture_report(&config, &filters)
+    });
     let mut still_mounted = targets.release(progress);
     still_mounted.extend(sources.release(progress));
     let mut result = match ran {
@@ -4130,8 +4182,8 @@ impl BackupJobHost for SystemBackupHost {
         run_backup_with(config, options, progress, &env).map_err(|e| e.to_string())
     }
 
-    fn capture_report(&self, config: &Config) -> crate::report::ReportData {
-        crate::report::capture_report_data(config)
+    fn capture_report(&self, config: &Config, filters: &[String]) -> crate::report::ReportData {
+        crate::report::capture_report_data(config, filters)
     }
 
     fn report(
@@ -4166,7 +4218,7 @@ impl BackupJobHost for SystemBackupHost {
         config: &Config,
         sources: Option<&[String]>,
         progress: &dyn ProgressCallback,
-    ) -> Result<usize, String> {
+    ) -> Result<Option<usize>, String> {
         create_snapshots(config, sources, progress).map_err(|e| e.to_string())
     }
 
@@ -5125,6 +5177,32 @@ Legend:
         )
     }
 
+    /// What `btrbk --format=raw ... snapshot` prints on stdout: its TRANSACTION
+    /// LOG, one row per action in btrbk 0.32.7's own raw format
+    /// (`format="transaction"`, then single-quoted key=value pairs).
+    /// `snapshots` are the targets of the created ones, `errors` those that
+    /// failed; `finished` adds the closing row.
+    fn tx_log(snapshots: &[&str], errors: &[&str], finished: bool) -> String {
+        let row = |ty: &str, status: &str, target: &str, source: &str, message: &str| {
+            format!(
+                "format=\"transaction\" time='1' localtime='2026-11-10T03:00:00+0000' \
+                 type='{ty}' status='{status}' duration='' target_url='{target}' \
+                 source_url='{source}' parent_url='' message='{message}'\n"
+            )
+        };
+        let mut out = row("startup", "v0.32.7", "", "", "0.32.7");
+        for t in snapshots {
+            out += &row("snapshot", "success", t, "/.btrfs-nvme/@", "");
+        }
+        for t in errors {
+            out += &row("snapshot", "ERROR", t, "/.btrfs-nvme/@home", "");
+        }
+        if finished {
+            out += &row("finished", "success", "", "", "");
+        }
+        out
+    }
+
     /// A step environment for the tests: `runner` runs every command, and every
     /// target verifies clean — unless a test hands in its own `verify`.
     fn env(runner: &dyn CommandRunner) -> StepEnv<'_> {
@@ -5649,7 +5727,7 @@ Legend:
         use BtrbkSteps::{SendOnly, SnapshotAndSend, SnapshotOnly};
         let f = primary_filters();
         let run = btrbk(&format!("run {f}"));
-        let snap = btrbk(&format!("--preserve-snapshots snapshot {f}"));
+        let snap = btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}"));
         let resume = btrbk(&format!("resume {f}"));
         let cases = [
             (Full, SnapshotAndSend, vec![run.clone()], (1, 1)),
@@ -5673,7 +5751,7 @@ Legend:
                 mode,
                 vec![
                     (run.clone(), 0, String::new()),
-                    (snap.clone(), 0, String::new()),
+                    (snap.clone(), 0, tx_log(&["/s/a.1"], &[], true)),
                     (resume.clone(), 0, String::new()),
                     listing_of(raw_row("/s/a.1", "/t1/a.1")),
                 ],
@@ -5854,7 +5932,7 @@ Legend:
         let script = || {
             vec![
                 (
-                    at(&format!("--preserve-snapshots snapshot {f}")),
+                    at(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                     0,
                     String::new(),
                 ),
@@ -5933,7 +6011,9 @@ Legend:
         let config = steps_config();
         let runner = Scripted::from_owned(vec![
             (
-                btrbk(&format!("--preserve-snapshots snapshot {PRIMARY}/hdd/data")),
+                btrbk(&format!(
+                    "--format=raw --preserve-snapshots snapshot {PRIMARY}/hdd/data"
+                )),
                 0,
                 String::new(),
             ),
@@ -6073,25 +6153,22 @@ Legend:
     /// the `resume` or `run` that sends.
     #[test]
     fn the_snapshot_step_reads_no_target_and_deletes_nothing() {
-        let runner = Scripted::from_owned(vec![
-            (btrbk("--preserve-snapshots snapshot"), 0, String::new()),
-            (btrbk("--format=raw list latest"), 0, String::new()),
-        ]);
+        // `--format=raw`: the count is read from btrbk's own transaction log,
+        // so no `list` (which reads every target) follows (bd s5jv.6).
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
+        let runner = Scripted::from_owned(vec![(cmd.clone(), 0, tx_log(&[], &[], true))]);
         create_snapshots_with(&steps_config(), None, None, &TestProgress::new(), &runner).unwrap();
-        assert_eq!(runner.calls()[0], btrbk("--preserve-snapshots snapshot"));
+        assert_eq!(runner.calls(), [cmd]);
     }
 
     #[test]
-    fn snapshots_of_everything_are_run_with_no_filter() {
-        let runner = Scripted::from_owned(vec![
-            (btrbk("--preserve-snapshots snapshot"), 0, String::new()),
-            (
-                btrbk("--format=raw list latest"),
-                0,
-                // Two series, one listed twice: the count is of snapshots.
-                raw_row("/s/a.1", "") + &raw_row("/s/b.1", "") + &raw_row("/s/a.1", ""),
-            ),
-        ]);
+    fn snapshots_of_everything_are_run_with_no_filter_and_counted_from_the_log() {
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
+        let runner = Scripted::from_owned(vec![(
+            cmd.clone(),
+            0,
+            tx_log(&["/s/a.1", "/s/b.1"], &[], true),
+        )]);
         let progress = TestProgress::new();
         let count = create_snapshots_with(
             &steps_config(),
@@ -6101,14 +6178,8 @@ Legend:
             &runner,
         )
         .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(
-            runner.calls(),
-            [
-                btrbk("--preserve-snapshots snapshot"),
-                btrbk("--format=raw list latest")
-            ]
-        );
+        assert_eq!(count, Some(2));
+        assert_eq!(runner.calls(), [cmd], "no listing: no target is read");
         assert_eq!(
             *progress.stages.lock().unwrap(),
             [("Creating snapshots".to_string(), 3)]
@@ -6132,18 +6203,10 @@ Legend:
     #[test]
     fn snapshots_of_one_source_name_its_subvolumes_and_not_the_other_on_its_volume() {
         let filters = "/.btrfs-nvme/@ /.btrfs-nvme/@home";
-        let runner = Scripted::from_owned(vec![
-            (
-                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
-                0,
-                String::new(),
-            ),
-            (
-                btrbk(&format!("--format=raw list latest {filters}")),
-                0,
-                raw_row("/s/a.1", ""),
-            ),
-        ]);
+        let cmd = btrbk(&format!(
+            "--format=raw --preserve-snapshots snapshot {filters}"
+        ));
+        let runner = Scripted::from_owned(vec![(cmd.clone(), 0, tx_log(&["/s/a.1"], &[], true))]);
         let count = create_snapshots_with(
             &steps_config(),
             Some(labels(&["nvme-root"]).as_slice()),
@@ -6152,32 +6215,17 @@ Legend:
             &runner,
         )
         .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(
-            runner.calls(),
-            [
-                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
-                btrbk(&format!("--format=raw list latest {filters}"))
-            ],
-            "the listing that counts is limited to the same subvolumes"
-        );
+        assert_eq!(count, Some(1));
+        assert_eq!(runner.calls(), [cmd]);
     }
 
     #[test]
     fn snapshots_in_a_run_are_confined_to_the_subvolumes_that_go_to_its_targets() {
         let filters = primary_filters();
-        let runner = Scripted::from_owned(vec![
-            (
-                btrbk(&format!("--preserve-snapshots snapshot {filters}")),
-                0,
-                String::new(),
-            ),
-            (
-                btrbk(&format!("--format=raw list latest {filters}")),
-                0,
-                raw_row("/s/a.1", ""),
-            ),
-        ]);
+        let cmd = btrbk(&format!(
+            "--format=raw --preserve-snapshots snapshot {filters}"
+        ));
+        let runner = Scripted::from_owned(vec![(cmd.clone(), 0, tx_log(&["/s/a.1"], &[], true))]);
         let primary = labels(&["primary-22tb"]);
         create_snapshots_with(
             &steps_config(),
@@ -6188,10 +6236,7 @@ Legend:
         )
         .unwrap();
         let calls = runner.calls();
-        assert_eq!(
-            calls[0],
-            btrbk(&format!("--preserve-snapshots snapshot {filters}"))
-        );
+        assert_eq!(calls, [cmd]);
         assert!(
             !calls.iter().any(|c| c.contains(RECOVERY)),
             "an unticked target is not named to btrbk: {calls:?}"
@@ -6220,15 +6265,9 @@ Legend:
 
     #[test]
     fn a_failed_snapshot_run_is_an_error_and_is_not_counted() {
-        let runner = Scripted::from_owned(vec![(
-            btrbk("--preserve-snapshots snapshot"),
-            10,
-            String::new(),
-        )])
-        .with_stderr(
-            &btrbk("--preserve-snapshots snapshot"),
-            "ERROR: x\n\n  \nWARNING: y\n",
-        );
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
+        let runner = Scripted::from_owned(vec![(cmd.clone(), 10, String::new())])
+            .with_stderr(&cmd, "ERROR: x\n\n  \nWARNING: y\n");
         let progress = TestProgress::new();
         let err = create_snapshots_with(&steps_config(), None, None, &progress, &runner)
             .unwrap_err()
@@ -6239,7 +6278,7 @@ Legend:
         );
         assert_eq!(
             runner.calls(),
-            [btrbk("--preserve-snapshots snapshot")],
+            [btrbk("--format=raw --preserve-snapshots snapshot")],
             "a failed run is not followed by a listing"
         );
         assert!(logged(&progress, LogLevel::Error, &err));
@@ -6265,21 +6304,58 @@ Legend:
     }
 
     #[test]
-    fn snapshot_counts_fall_back_to_the_markers_when_the_listing_cannot_be_read() {
-        // The listing is not scripted, so it exits 1.
+    fn a_snapshot_run_whose_log_has_no_finished_row_counts_unknown_and_never_zero() {
+        // btrbk exited 0 but its log is cut or empty: what it created is not
+        // known (fail-silent.md, always a defect 1). The human markers are not
+        // a second source.
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
+        for out in [
+            String::new(),
+            tx_log(&["/s/a.1"], &[], false),
+            "+++ /s/a.1\n+++ /s/b.1\n".to_string(),
+        ] {
+            let runner = Scripted::from_owned(vec![(cmd.clone(), 0, out.clone())]);
+            let progress = TestProgress::new();
+            let count =
+                create_snapshots_with(&steps_config(), None, None, &progress, &runner).unwrap();
+            assert_eq!(count, None, "{out:?}");
+            assert!(
+                progress.logs.lock().unwrap().iter().any(|(l, m)| {
+                    *l == LogLevel::Warning && m.starts_with("btrbk's transaction log")
+                }),
+                "{:?}",
+                progress.logs.lock().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn only_successful_snapshot_rows_are_counted() {
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
         let runner = Scripted::from_owned(vec![(
-            btrbk("--preserve-snapshots snapshot"),
+            cmd,
             0,
-            "+++ /s/a.1\n+++ /s/b.1\n>>> /t/a.1\n".into(),
+            tx_log(&["/s/a.1", "/s/b.1"], &["/s/c.1"], true),
         )]);
-        let progress = TestProgress::new();
-        let count = create_snapshots_with(&steps_config(), None, None, &progress, &runner).unwrap();
-        assert_eq!(count, 2, "the two +++ lines");
-        assert!(logged(
-            &progress,
-            LogLevel::Warning,
-            "btrbk --format=raw list latest failed — counts fall back to output markers"
-        ));
+        let count =
+            create_snapshots_with(&steps_config(), None, None, &TestProgress::new(), &runner)
+                .unwrap();
+        assert_eq!(count, Some(2));
+    }
+
+    #[test]
+    fn a_snapshot_row_in_a_message_is_not_a_snapshot() {
+        // A field value cannot forge a row: quoting turns its `'` into `'\''`.
+        let cmd = btrbk("--format=raw --preserve-snapshots snapshot");
+        let forged = "format=\"transaction\" time='1' localtime='x' type='startup' status='v' \
+                      duration='' target_url='' source_url='' parent_url='' \
+                      message='a '\\''type='\\''snapshot'\\'' status='\\''success'\\'''\n";
+        let out = forged.to_string() + &tx_log(&[], &[], true);
+        let runner = Scripted::from_owned(vec![(cmd, 0, out)]);
+        let count =
+            create_snapshots_with(&steps_config(), None, None, &TestProgress::new(), &runner)
+                .unwrap();
+        assert_eq!(count, Some(0));
     }
 
     #[test]
@@ -6735,9 +6811,9 @@ Legend:
             BackupMode::Incremental,
             vec![
                 (
-                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                     0,
-                    String::new(),
+                    tx_log(&["/s/a.1", "/s/b.1"], &[], true),
                 ),
                 (
                     btrbk(&format!("resume {f}")),
@@ -6750,8 +6826,7 @@ Legend:
         assert_eq!(
             calls,
             [
-                btrbk(&format!("--preserve-snapshots snapshot {f}")),
-                btrbk(&format!("--format=raw list latest {f}")),
+                btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                 btrbk(&format!("resume {f}")),
                 btrbk(&format!("--format=raw list latest {f}")),
             ]
@@ -6776,9 +6851,9 @@ Legend:
         let script = || {
             vec![
                 (
-                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                     0,
-                    String::new(),
+                    tx_log(&["/s/a.1"], &[], true),
                 ),
                 (btrbk(&format!("resume {f}")), 0, String::new()),
                 listing_of(raw_row("/s/a.1", "/t1/a.1")),
@@ -6806,9 +6881,9 @@ Legend:
         );
         assert_eq!(
             calls[0],
-            btrbk(&format!("--preserve-snapshots snapshot {f}"))
+            btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}"))
         );
-        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls.len(), 1, "no listing follows a snapshot: {calls:?}");
         assert_eq!((done.created, done.sent), (Some(1), Some(0)));
     }
 
@@ -6819,9 +6894,9 @@ Legend:
             vec![
                 (btrbk(&format!("run {f}")), 0, "--- /t/old\n".into()),
                 (
-                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                     0,
-                    String::new(),
+                    tx_log(&["/s/a.1"], &[], true),
                 ),
                 (btrbk(&format!("resume {f}")), 0, String::new()),
                 listing_of(raw_row("/s/a.1", "/t1/a.1")),
@@ -6850,7 +6925,7 @@ Legend:
         );
         assert_eq!(
             calls[0],
-            btrbk(&format!("--preserve-snapshots snapshot {f}"))
+            btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}"))
         );
         assert_eq!(
             (done.created, done.sent, done.cleaned),
@@ -6879,7 +6954,7 @@ Legend:
             BackupMode::Incremental,
             vec![
                 (
-                    btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                    btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                     10,
                     String::new(),
                 ),
@@ -6910,9 +6985,9 @@ Legend:
             BackupOptions::default(),
             BackupMode::Incremental,
             vec![(
-                btrbk(&format!("--preserve-snapshots snapshot {f}")),
+                btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                 0,
-                String::new(),
+                tx_log(&[], &[], true),
             )],
         );
         assert_eq!(
@@ -8394,10 +8469,10 @@ Legend:
             (
                 btrbk_at(
                     "/nonexistent/btrbk.conf",
-                    &format!("--preserve-snapshots snapshot {f}"),
+                    &format!("--format=raw --preserve-snapshots snapshot {f}"),
                 ),
                 0,
-                String::new(),
+                tx_log(&["/s/a.1", "/s/b.1"], &[], true),
             ),
             (
                 btrbk_at("/nonexistent/btrbk.conf", &format!("resume {f}")),
@@ -8426,7 +8501,7 @@ Legend:
             (Some(2), Some(2))
         );
         let calls = runner.calls();
-        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls.len(), 3, "{calls:?}");
         assert!(
             !calls
                 .iter()
@@ -8563,9 +8638,9 @@ Legend:
         let at = |args: &str| btrbk_at("/nonexistent/btrbk.conf", args);
         vec![
             (
-                at(&format!("--preserve-snapshots snapshot {f}")),
+                at(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                 0,
-                String::new(),
+                tx_log(&["/s/a.1"], &[], true),
             ),
             (at(&format!("resume {f}")), resume_status, resume_out.into()),
             (
@@ -8689,7 +8764,7 @@ Legend:
         let row = raw_row("/s/a.1", "/t/a.1");
         let script = vec![
             (
-                at(&format!("--preserve-snapshots snapshot {f}")),
+                at(&format!("--format=raw --preserve-snapshots snapshot {f}")),
                 10,
                 String::new(),
             ),
@@ -8765,7 +8840,7 @@ Legend:
             (
                 btrbk_at(
                     "/nonexistent/btrbk.conf",
-                    &format!("--preserve-snapshots snapshot {f}"),
+                    &format!("--format=raw --preserve-snapshots snapshot {f}"),
                 ),
                 10,
                 String::new(),
@@ -8813,10 +8888,10 @@ Legend:
             (
                 btrbk_at(
                     "/nonexistent/btrbk.conf",
-                    &format!("--preserve-snapshots snapshot {f}"),
+                    &format!("--format=raw --preserve-snapshots snapshot {f}"),
                 ),
                 0,
-                String::new(),
+                tx_log(&[], &[], true),
             ),
             (
                 btrbk_at("/nonexistent/btrbk.conf", &format!("resume {f}")),
@@ -10097,9 +10172,11 @@ Legend:
         second_target: bool,
         /// The target labels each `mount_targets` call was asked to mount.
         mounted: std::sync::Mutex<Vec<Vec<String>>>,
+        /// The btrbk filters each `capture_report` call was given.
+        captured_filters: std::sync::Mutex<Vec<Vec<String>>>,
         /// What the manual steps do (bd r1tr).
         manual_sync: Result<(), String>,
-        snapshot_step: Result<usize, String>,
+        snapshot_step: Result<Option<usize>, String>,
         send_step: Result<(usize, u64), String>,
     }
 
@@ -10159,8 +10236,9 @@ Legend:
                 sync_coverage: Some(clean_coverage()),
                 second_target: false,
                 mounted: std::sync::Mutex::new(Vec::new()),
+                captured_filters: std::sync::Mutex::new(Vec::new()),
                 manual_sync: Ok(()),
-                snapshot_step: Ok(3),
+                snapshot_step: Ok(Some(3)),
                 send_step: Ok((2, 10)),
             }
         }
@@ -10255,6 +10333,7 @@ Legend:
             if self.second_target {
                 let mut recovery = config.targets[0].clone();
                 recovery.label = "recovery-a".into();
+                recovery.mount = "/proc/recovery".into();
                 recovery.role = TargetRole::Mirror;
                 config.targets.push(recovery);
             }
@@ -10322,7 +10401,8 @@ Legend:
                 coverage_message: String::new(),
             })
         }
-        fn capture_report(&self, _: &Config) -> crate::report::ReportData {
+        fn capture_report(&self, _: &Config, filters: &[String]) -> crate::report::ReportData {
+            self.captured_filters.lock().unwrap().push(filters.to_vec());
             self.step("capture report");
             crate::report::ReportData {
                 capacity_and_smart: "\nDISK CAPACITY\n  primary-loop  1 GiB\n".into(),
@@ -10369,6 +10449,7 @@ Legend:
             if self.second_target {
                 let mut recovery = config.targets[0].clone();
                 recovery.label = "recovery-a".into();
+                recovery.mount = "/proc/recovery".into();
                 recovery.role = TargetRole::Mirror;
                 config.targets.push(recovery);
             }
@@ -10379,7 +10460,7 @@ Legend:
             config: &Config,
             sources: Option<&[String]>,
             _: &dyn ProgressCallback,
-        ) -> Result<usize, String> {
+        ) -> Result<Option<usize>, String> {
             self.step(&format!(
                 "snapshot ({}, {sources:?})",
                 config.general.version
@@ -10428,6 +10509,47 @@ Legend:
             assert!(outcome.success(), "{targets:?}: {outcome:?}");
             assert_eq!(*host.mounted.lock().unwrap(), vec![mounted], "{targets:?}");
         }
+    }
+
+    #[test]
+    fn the_report_listing_reads_only_the_selected_targets() {
+        // A run to a subset of targets must not have its LATEST SNAPSHOTS read
+        // the unselected, unmounted ones (bd s5jv.6): the listing is given the
+        // run's own btrbk filters. Selection is everything: no filter.
+        let primary_dir = |f: &String| !f.contains("/proc/recovery");
+        let host = FakeHost {
+            second_target: true,
+            ..Default::default()
+        };
+        let options = BackupOptions {
+            targets: Some(vec!["primary-22tb".to_string()]),
+            ..Default::default()
+        };
+        let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+        assert!(outcome.success(), "{outcome:?}");
+        let seen = host.captured_filters.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(!seen[0].is_empty(), "a subset is named: {seen:?}");
+        assert!(
+            seen[0].iter().all(primary_dir),
+            "the recovery target is not read: {seen:?}"
+        );
+
+        let host = FakeHost {
+            second_target: true,
+            ..Default::default()
+        };
+        let outcome = run_backup_job(
+            &host,
+            make_test_config(),
+            BackupOptions::default(),
+            &TestProgress::new(),
+        );
+        assert!(outcome.success(), "{outcome:?}");
+        assert_eq!(
+            *host.captured_filters.lock().unwrap(),
+            [Vec::<String>::new()]
+        );
     }
 
     // --- Cancel stops the work at the next safe boundary (bd yq2) -----------
@@ -10566,10 +10688,10 @@ Legend:
     #[test]
     fn a_cancel_during_the_snapshot_step_lets_it_finish_and_sends_nothing() {
         let f = primary_filters();
-        let snap = btrbk(&format!("--preserve-snapshots snapshot {f}"));
+        let snap = btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}"));
         let resume = btrbk(&format!("resume {f}"));
         let scripted = Scripted::from_owned(vec![
-            (snap.clone(), 0, String::new()),
+            (snap.clone(), 0, tx_log(&["/s/a.1"], &[], true)),
             (resume.clone(), 0, String::new()),
             listing_of(raw_row("/s/a.1", "/t1/a.1")),
         ]);
@@ -11340,7 +11462,7 @@ Legend:
         let outcome = manual(&host, snapshot_step());
         assert_eq!(
             outcome,
-            ManualStepOutcome::Done(ManualStepDone::Snapshots(3))
+            ManualStepOutcome::Done(ManualStepDone::Snapshots(Some(3)))
         );
         assert_eq!(
             host.steps(),
@@ -11479,7 +11601,7 @@ Legend:
         assert_eq!(
             manual(&host, snapshot_step()),
             ManualStepOutcome::Failed {
-                done: Some(ManualStepDone::Snapshots(3)),
+                done: Some(ManualStepDone::Snapshots(Some(3))),
                 why: "still mounted: /mnt/src".into()
             }
         );
@@ -12212,7 +12334,7 @@ Legend:
             (
                 btrbk_at(
                     conf,
-                    format!("--preserve-snapshots snapshot {f}").trim_end(),
+                    format!("--format=raw --preserve-snapshots snapshot {f}").trim_end(),
                 ),
                 0,
                 String::new(),
@@ -12864,7 +12986,7 @@ Legend:
             .join(" ");
         // The snapshot step answers or fails, whichever: the cancel is the point.
         let scripted = Scripted::from_owned(vec![(
-            btrbk(&format!("--preserve-snapshots snapshot {f}")),
+            btrbk(&format!("--format=raw --preserve-snapshots snapshot {f}")),
             0,
             String::new(),
         )]);
