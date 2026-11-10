@@ -513,16 +513,19 @@ A wrong date mostly costs a late deletion. Nothing of a retired entry is deleted
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `exclude` | string[] | `[]` | Still read, and merged with `[subvolumes].exclude`, so existing configs keep working. Prefer `[subvolumes].exclude` — it governs adoption as well as `btrdasd doctor --check-drift` |
+| `max_snapshot_age_days` | integer | `3` | The delivery check: every target must hold a snapshot of every pair `btrbk.conf` declares for it, named `<snapshot name>.<timestamp>`, at most this many days old. At least `1` (`0` is refused). Three nights tolerates a missed run or two |
 
 Because the backup run adopts new subvolumes itself, a **missing** or **stale** finding from the drift check now means the sync step failed or has not run since the subvolume appeared; the report advises `sudo btrdasd subvol sync --dry-run`.
+
+**The delivery check.** After the source volumes, the drift check mounts the targets (under the maintenance lock it holds, never writing to one), proves each is the drive `config.toml` names, and lists the directory of each pair `btrbk.conf` declares for it. A pair whose directory holds no snapshot (`<snapshot name>.<timestamp>`, in any of btrbk's timestamp formats) newer than `max_snapshot_age_days` is an **undelivered** finding (`UNDELIVERED` in the report, exit `1`) — a pair btrbk skipped while exiting 0, which the nightly run's own coverage check (intent, not delivery) cannot see. A target that cannot be verified, mounted or listed — an unplugged recovery drive included — is `TARGETS NOT CHECKED` (exit `3`): an unread target is never taken as fresh. The nightly run does not do this check; only the weekly doctor does. `btrdasd doctor --json` adds `undelivered` and `targets_failed` counts.
 
 **Exit codes**, because systemd cannot tell a finding from a malfunction:
 
 | Code | Meaning | `das-backup-doctor.service` |
 | --- | --- | --- |
 | `0` | Ran clean, or deferred because a backup/scrub holds the maintenance lock | success |
-| `1` | **Drift found** — missing or stale subvolumes. A successful check *with a result* | **success**, via `SuccessExitStatus=1` |
-| `3` | At least one volume failed to mount/list while others were checked — those subvolumes went unexamined | **failed** |
+| `1` | **Drift found** — missing or stale subvolumes, or an undelivered pair. A successful check *with a result* | **success**, via `SuccessExitStatus=1` |
+| `3` | At least one volume failed to mount/list while others were checked, or a target could not be read by the delivery check — those went unexamined | **failed** |
 | `2` | Could not run at all — config load failure, lock I/O error, or every volume failed | **failed** |
 
 `3` outranks `1` when both occur: an incomplete check cannot assert that its drift list is complete. Without

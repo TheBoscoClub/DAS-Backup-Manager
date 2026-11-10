@@ -465,7 +465,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `das` | model_pattern, io_scheduler, mount_opts | DAS enclosure match, I/O scheduler, target mount options |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
-| `doctor` | exclude[] | Older exclusion list, still read and merged with `[subvolumes].exclude` |
+| `doctor` | exclude[], max_snapshot_age_days | Older exclusion list, still read and merged with `[subvolumes].exclude`; the delivery check's age limit (default 3) |
 | `subvolumes` | exclude[] | Glob patterns the backup run must not adopt (`btrdasd subvol sync`); a pattern also covers everything nested under it; only the exact pattern `/` excludes a volume's top level (entry `.`, adopted primary-only) |
 | `restore` | allowed_roots[] | Where a restore may write (an unoverridable denylist is checked first) |
 | `recovery_os` | max_age_days | Age past which a mirror target's own OS is reported STALE (`btrdasd recovery-os`) |
@@ -676,7 +676,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `config` | `src/config.rs` | ~4780 | TOML config types, DAS/source/target models |
 | `coverage` | `src/coverage.rs` | ~2280 | Subvolume coverage run over run: the pairs a config schedules, compared with the record of the last backup run inside every sync; why each dropped pair is no longer backed up, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept/list` |
 | `db` | `src/db.rs` | ~4150 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
-| `doctor` | `src/doctor.rs` | ~1180 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk |
+| `doctor` | `src/doctor.rs` | ~1550 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk, and checks that every target holds a recent snapshot of every declared pair (`delivery_check`) |
 | `expire` | `src/expire.rs` | ~2430 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | ~1260 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~460 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |

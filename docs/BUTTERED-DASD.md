@@ -51,7 +51,7 @@ backup-run.sh                   btrdasd CLI
 | `config` | `src/config.rs` | TOML config types and validation, DAS/source/target models |
 | `coverage` | `src/coverage.rs` | Subvolume coverage run over run: the pairs a config schedules compared with the last backup run's record inside every sync, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept`/`list` |
 | `db` | `src/db.rs` | SQLite connection, schema, CRUD, FTS5 search |
-| `doctor` | `src/doctor.rs` | Subvolume drift detector (`btrdasd doctor --check-drift`) |
+| `doctor` | `src/doctor.rs` | Subvolume drift detector (`btrdasd doctor --check-drift`), with the delivery check: each target holds a recent snapshot of every declared pair |
 | `expire` | `src/expire.rs` | Expiry of retired subvolumes' backups per target and location (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `health` | `src/health.rs` | Drive health (SMART), mountpoint checks, serial to device resolution, scrub health |

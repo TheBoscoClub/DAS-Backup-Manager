@@ -1290,6 +1290,8 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             volumes_failed: usize,
             missing: usize,
             stale: usize,
+            undelivered: usize,
+            targets_failed: usize,
         },
     }
     serde_json::to_string(&match outcome {
@@ -1299,6 +1301,8 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             volumes_failed: dr.volumes_failed.len(),
             missing: dr.missing.len(),
             stale: dr.stale.len(),
+            undelivered: dr.undelivered.len(),
+            targets_failed: dr.targets_failed.len(),
         },
     })
 }
@@ -1357,7 +1361,10 @@ fn email_doctor_report(
 ///   so the generated unit lets it fail. It outranks drift when both occur:
 ///   an incomplete check cannot assert that its drift list is complete. A
 ///   volume the check mounted and could not unmount again is the same kind
-///   of operational fault (bd DAS-Backup-Manager-5oc) and is 3 as well.
+///   of operational fault (bd DAS-Backup-Manager-5oc) and is 3 as well, and
+///   so is a target the delivery check could not read (bd
+///   DAS-Backup-Manager-sp78.7). A pair a readable target holds no recent
+///   snapshot of is drift (1).
 /// - `Ran` cleanly with drift is **1** — a successful check with a result.
 ///   `render_systemd_doctor_service` pairs this with `SuccessExitStatus=1`.
 /// - Otherwise 0.
@@ -1379,7 +1386,7 @@ pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
         doctor::DoctorOutcome::Ran(report) => {
             if !report.ran() {
                 2
-            } else if !report.volumes_failed.is_empty() || !report.left_mounted.is_empty() {
+            } else if report.could_not_examine() {
                 3
             } else if report.has_drift() {
                 1
@@ -4272,7 +4279,67 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         }
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0}"#
+            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0}"#
+        );
+    }
+
+    #[test]
+    fn doctor_json_counts_undelivered_pairs_and_unread_targets() {
+        let report = doctor::DriftReport {
+            volumes_checked: 1,
+            targets_checked: 1,
+            targets_failed: vec![("small".into(), "not mounted".into())],
+            undelivered: vec![doctor::UndeliveredPair {
+                target: "big".into(),
+                source_label: "ssd".into(),
+                subvolume: "@data".into(),
+                snapshot_name: "data".into(),
+                newest: None,
+                age_days: None,
+                limit_days: 3,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
+            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1}"#
+        );
+    }
+
+    /// The delivery check (bd DAS-Backup-Manager-sp78.7): a pair a target
+    /// holds no recent snapshot of is drift, exit 1 like the others; a target
+    /// that could not be read is the malfunction, exit 3, and outranks it.
+    #[test]
+    fn exit_code_for_doctor_undelivered_is_one_and_an_unread_target_is_three() {
+        let undelivered = doctor::UndeliveredPair {
+            target: "big".into(),
+            source_label: "ssd".into(),
+            subvolume: "@data".into(),
+            snapshot_name: "data".into(),
+            newest: None,
+            age_days: None,
+            limit_days: 3,
+        };
+        let mut report = doctor::DriftReport {
+            volumes_checked: 1,
+            targets_checked: 1,
+            undelivered: vec![undelivered],
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report.clone())),
+            1
+        );
+        report.targets_failed = vec![("small".into(), "not mounted".into())];
+        assert_eq!(exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report)), 3);
+        let unread_only = doctor::DriftReport {
+            volumes_checked: 1,
+            targets_failed: vec![("small".into(), "not mounted".into())],
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(unread_only)),
+            3
         );
     }
 

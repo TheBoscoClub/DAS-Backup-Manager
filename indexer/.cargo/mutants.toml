@@ -88,6 +88,13 @@ exclude_re = [
     # that decides what is missing, stale or unreadable lives in
     # `drift_from_listings`, which is mutated and tested.
     "replace perform_drift_check -> DriftReport with Default::default\\(\\)",
+    # `perform_delivery_check` and `local_today` are its target-side shell: the
+    # same root-and-real-BTRFS need (mount the targets, verify them, list their
+    # directories, unmount) and the one libc clock call. Everything that
+    # decides is in `delivery_check`, `snapshot_day`, `days_from_tm` and
+    # `civil_days`, which are mutated and tested.
+    "replace perform_delivery_check with \\(\\)",
+    "replace local_today -> i64 with (0|1|-1)",
     # `btrfs_uuid_for_serial` binds its core to the host: the real
     # `/dev/disk/by-id` lookup and the real `blkid`. A test can only tell it
     # from `None` with a real drive attached. Only the whole-body replacement

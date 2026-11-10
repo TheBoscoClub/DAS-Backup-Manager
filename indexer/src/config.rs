@@ -355,13 +355,36 @@ impl Default for Scrub {
 /// effect to an explicit `exclude = []`. The built-in exclusions (`.snapshots/`,
 /// `.btrbk-snapshots/`, `@tmp`, `@var-tmp`) are never configurable — this list only
 /// adds patterns on top of them.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Doctor {
     /// Additional glob patterns (`*`/`?` wildcards, matched case-sensitively
     /// against the full on-disk subvolume path) excluded from drift reporting,
     /// on top of the built-in exclusions. See `doctor::glob_match`.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// The delivery check (bd DAS-Backup-Manager-sp78.7): every target must
+    /// hold a snapshot of every pair `btrbk.conf` declares for it that is at
+    /// most this many days old, or `btrdasd doctor` reports the pair as
+    /// undelivered. At least 1; a target that cannot be read is never counted
+    /// as fresh.
+    #[serde(default = "default_doctor_max_snapshot_age_days")]
+    pub max_snapshot_age_days: u32,
+}
+
+/// Three nights: a missed run or two does not raise it, a week-long silence does.
+pub const DEFAULT_DOCTOR_MAX_SNAPSHOT_AGE_DAYS: u32 = 3;
+
+fn default_doctor_max_snapshot_age_days() -> u32 {
+    DEFAULT_DOCTOR_MAX_SNAPSHOT_AGE_DAYS
+}
+
+impl Default for Doctor {
+    fn default() -> Self {
+        Self {
+            exclude: Vec::new(),
+            max_snapshot_age_days: default_doctor_max_snapshot_age_days(),
+        }
+    }
 }
 
 /// A subvolume within a source, with an optional snapshot name override.
@@ -2110,6 +2133,13 @@ impl Config {
             &self.schedule.full,
         ));
 
+        if self.doctor.max_snapshot_age_days == 0 {
+            errors.push(
+                "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
+                 undelivered)"
+                    .into(),
+            );
+        }
         if self.recovery_os.max_age_days == 0 {
             errors.push(
                 "recovery_os.max_age_days must be at least 1 (0 would mark every recovery OS stale)"
@@ -3017,6 +3047,51 @@ mod tests {
             30
         );
         assert!(Config::from_toml(&minimal_toml("[recovery_os]\nmax_age_days = -1\n")).is_err());
+    }
+
+    #[test]
+    fn doctor_snapshot_age_defaults_to_three_days_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.doctor.max_snapshot_age_days, 3, "absent section");
+        assert_eq!(Doctor::default().max_snapshot_age_days, 3);
+        let cfg = Config::from_toml(&minimal_toml("[doctor]\nexclude = [\"@x\"]\n")).unwrap();
+        assert_eq!(cfg.doctor.max_snapshot_age_days, 3, "section without it");
+        let cfg =
+            Config::from_toml(&minimal_toml("[doctor]\nmax_snapshot_age_days = 10\n")).unwrap();
+        assert_eq!(cfg.doctor.max_snapshot_age_days, 10);
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("max_snapshot_age_days = 10\n"), "{text}");
+        assert_eq!(
+            Config::from_toml(&text)
+                .unwrap()
+                .doctor
+                .max_snapshot_age_days,
+            10
+        );
+        assert!(
+            Config::from_toml(&minimal_toml("[doctor]\nmax_snapshot_age_days = -1\n")).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_requires_a_doctor_snapshot_age_of_at_least_one_day() {
+        let msg = "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
+                   undelivered)";
+        let mut cfg =
+            Config::from_toml(&minimal_toml("[doctor]\nmax_snapshot_age_days = 0\n")).unwrap();
+        assert!(
+            cfg.validate().iter().any(|e| e == msg),
+            "{:?}",
+            cfg.validate()
+        );
+        cfg.doctor.max_snapshot_age_days = 1;
+        assert!(
+            !cfg.validate()
+                .iter()
+                .any(|e| e.contains("max_snapshot_age_days")),
+            "{:?}",
+            cfg.validate()
+        );
     }
 
     #[test]

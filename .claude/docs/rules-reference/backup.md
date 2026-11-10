@@ -223,7 +223,17 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   hand edits used to leave it stale, and the entry was silently not backed up).
 - **Drift check.** `doctor --check-drift` uses the same listing and exclusions; one section, "NOT
   BACKED UP — the backup run should have adopted these". Mutation scope: the five new modules are
-  in the weekly full scope; the one exclusion is the `perform_drift_check` host shell in `doctor.rs`.
+  in the weekly full scope; the exclusions are the `perform_drift_check` and `perform_delivery_check` host
+  shells and the `local_today` clock call in `doctor.rs` (`.cargo/mutants.toml`).
+- **Delivery check (bd `DAS-Backup-Manager-sp78.7`).** Coverage compares intent; btrbk can skip a declared pair
+  and exit 0. Operator decision 2026-11-09: the check lives in `doctor`, not the nightly run. After the sources,
+  `perform_delivery_check` mounts the targets under the maintenance lock the doctor holds, proves each with
+  `mount::verify_write_targets` (a bare mount point would otherwise read as an empty drive), and
+  `delivery_check` lists `<mount>/<subdir>` per declared pair: the newest `<snapshot name>.<YYYYMMDD…>` entry is
+  the delivery, stale when more than `[doctor].max_snapshot_age_days` local days old (default 3, validated >= 1).
+  A directory that does not exist on a verified target is every pair undelivered; any other listing error, or an
+  unverifiable or unmountable target (an unplugged recovery drive too), is a target failure: exit 3, none of its
+  pairs reported fresh or stale. Retired and `after_index` entries are not declared pairs.
 
 **`btrfs send` does not descend into nested subvolumes.** A snapshot of a parent
 subvolume contains an *empty directory* wherever a child subvolume is mounted, so

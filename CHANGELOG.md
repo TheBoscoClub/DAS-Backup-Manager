@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A recorded pair holds its volume's filesystem UUID — the one `list_volume` already verifies with `findmnt` (schema 8: nullable `coverage_baseline.volume_uuid`, added on the first open) — and moves to the one read volume that reports it, never when two read volumes hold the same filesystem or the row's own path still does — `VolumeListing::fs_uuid`, `coverage::volume_now`
   - A drop on a moved volume says so (`volume moved from '<old path>'; …`); a row with no filesystem UUID is paired by path as before and stamped by the next recorded run
 
+- **`btrdasd doctor` checks that every target holds a recent snapshot of every declared pair** (bd `DAS-Backup-Manager-sp78.7`, operator decision 2026-11-09: in the doctor, not the nightly run): coverage compares what `config.toml` schedules, never what reached a target, so a pair btrbk skipped while exiting 0 raised nothing
+  - After the source volumes the check mounts the targets under the maintenance lock it holds, proves each is the configured drive (`mount::verify_write_targets`) and lists the directory of every pair `btrbk.conf` declares for it; a pair with no `<snapshot name>.<timestamp>` entry newer than the limit is an `UNDELIVERED` finding (exit 1) naming its newest snapshot or that it has none — `doctor::delivery_check`
+  - New key `[doctor].max_snapshot_age_days`, default 3, at least 1 (`0` is refused by validation)
+  - A target that cannot be verified, mounted or listed (an unplugged recovery drive too) is `TARGETS NOT CHECKED`, exit 3 — never read as fresh; `doctor --json` gains `undelivered` and `targets_failed`; the generated `das-backup-doctor.service` comment names both
+
 ### Removed
 
 - **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
