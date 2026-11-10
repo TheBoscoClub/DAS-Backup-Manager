@@ -137,7 +137,6 @@ fn config_for(fs: &Loopback, snapshot_name: &str) -> (Config, tempfile::NamedTem
         volume: "/.btrfs-nvme".into(),
         subvolumes: vec![buttered_dasd::config::SubvolConfig {
             name: "@".into(),
-            manual_only: false,
             snapshot_name: None,
             ..Default::default()
         }],

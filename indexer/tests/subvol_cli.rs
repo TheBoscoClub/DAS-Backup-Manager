@@ -217,24 +217,17 @@ fn config_validate_warns_about_an_unknown_key_with_a_hint() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("Config is valid."));
 }
 
+/// bd DAS-Backup-Manager-9ry: `manual_only` is gone, and with it the two
+/// commands that set it.
 #[test]
-fn subvol_set_manual_and_set_auto_keep_btrbk_conf_in_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = write_config(dir.path());
-    let config_s = config.to_str().unwrap();
-
+fn subvol_set_manual_and_set_auto_are_no_longer_commands() {
     for action in ["set-manual", "set-auto"] {
-        let out = btrdasd(&["subvol", action, "s", "@", "--config", config_s]);
+        let out = btrdasd(&["subvol", action, "s", "@"]);
+        assert_eq!(out.status.code(), Some(2), "{action}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            out.status.success(),
-            "{action}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let conf = std::fs::read_to_string(dir.path().join("btrbk.conf"))
-            .unwrap_or_else(|e| panic!("{action} left no btrbk.conf: {e}"));
-        assert!(
-            conf.contains("subvolume             @\n"),
-            "{action}: {conf}"
+            stderr.contains("unrecognized subcommand"),
+            "{action}: {stderr}"
         );
     }
 }
@@ -688,16 +681,6 @@ fn subvol_add_refuses_a_scratch_config_naming_the_live_btrbk_files() {
 #[test]
 fn subvol_remove_refuses_a_scratch_config_naming_the_live_btrbk_files() {
     assert_refused_for_live_outputs(&["subvol", "remove", "s", "@extra"]);
-}
-
-#[test]
-fn subvol_set_manual_refuses_a_scratch_config_naming_the_live_btrbk_files() {
-    assert_refused_for_live_outputs(&["subvol", "set-manual", "s", "@"]);
-}
-
-#[test]
-fn subvol_set_auto_refuses_a_scratch_config_naming_the_live_btrbk_files() {
-    assert_refused_for_live_outputs(&["subvol", "set-auto", "s", "@"]);
 }
 
 #[test]

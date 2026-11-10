@@ -159,7 +159,6 @@ pub struct Adoption {
     pub name: String,
     pub source_label: String,
     pub nested_under: Option<String>,
-    pub manual_only: bool,
     /// Where the entry will be sent, as the report says it: `as its parent
     /// <name>`, `primary target only`, or the targets of an existing source
     /// someone re-scoped (`targets 'a', 'b'`).
@@ -355,7 +354,6 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                     name: name.clone(),
                     source_label: source.label.clone(),
                     nested_under: Some(entry.name.clone()),
-                    manual_only: entry.manual_only,
                     scope: format!("as its parent {}", entry.name),
                 }),
                 None if has_primary => {
@@ -381,7 +379,6 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                             name: name.clone(),
                             source_label,
                             nested_under: None,
-                            manual_only: false,
                             // A source sync creates sends to the primary only;
                             // an existing one says what it really does.
                             scope: home.map_or_else(
@@ -530,7 +527,6 @@ pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Result<Confi
         taken.insert(snapshot_name.clone());
         out.sources[index].subvolumes.push(SubvolConfig {
             name: adoption.name.clone(),
-            manual_only: adoption.manual_only,
             snapshot_name: Some(snapshot_name),
             adopted: Some(today.to_string()),
             retired: None,
@@ -1337,7 +1333,6 @@ mod tests {
                     // Two ancestors are configured; the nearer one wins.
                     source_label: "ssd-vm".into(),
                     nested_under: Some("@srv/VirtualMachines".into()),
-                    manual_only: false,
                     scope: "as its parent @srv/VirtualMachines".into(),
                 },
                 Adoption {
@@ -1345,7 +1340,6 @@ mod tests {
                     name: "@srv/stremio-web".into(),
                     source_label: "ssd".into(),
                     nested_under: Some("@srv".into()),
-                    manual_only: false,
                     scope: "as its parent @srv".into(),
                 },
                 Adoption {
@@ -1353,7 +1347,6 @@ mod tests {
                     name: "media/video".into(),
                     source_label: "media".into(),
                     nested_under: Some("media".into()),
-                    manual_only: false,
                     scope: "as its parent media".into(),
                 },
             ]
@@ -1376,15 +1369,6 @@ mod tests {
             .collect();
         assert_eq!(names, [("@optional", None), ("@srv2", None)]);
         assert!(plan.adopt.iter().all(|a| a.source_label == "ssd-adopted"));
-    }
-
-    #[test]
-    fn nested_subvolume_inherits_manual_only() {
-        let mut c = config();
-        c.sources[0].subvolumes[0].manual_only = true; // @srv
-        let mut l = all_present();
-        l[0] = listing("/ssd", &["@srv", "@opt", "@srv/VirtualMachines", "@srv/x"]);
-        assert!(plan_sync(&c, &l).adopt[0].manual_only);
     }
 
     #[test]
@@ -1733,7 +1717,6 @@ mod tests {
                 name: "@lost".into(),
                 source_label: "nowhere-adopted".into(),
                 nested_under: None,
-                manual_only: false,
                 scope: "primary target only".into(),
             }],
             ..Default::default()
@@ -2596,7 +2579,6 @@ mod tests {
                     name: "@srv/web".into(),
                     source_label: "ssd".into(),
                     nested_under: Some("@srv".into()),
-                    manual_only: false,
                     scope: "as its parent @srv".into(),
                 },
                 Adoption {
@@ -2604,7 +2586,6 @@ mod tests {
                     name: "@new".into(),
                     source_label: "ssd-adopted".into(),
                     nested_under: None,
-                    manual_only: false,
                     scope: "primary target only".into(),
                 },
             ],
@@ -2670,7 +2651,6 @@ mod tests {
                 name: "a".into(),
                 source_label: "s".into(),
                 nested_under: None,
-                manual_only: false,
                 scope: "primary target only".into(),
             }],
             ..Default::default()
@@ -3137,7 +3117,6 @@ mod tests {
                     name: TOP_LEVEL.into(),
                     source_label: "ssd-adopted".into(),
                     nested_under: None,
-                    manual_only: false,
                     scope: "primary target only".into(),
                 },
                 Adoption {
@@ -3145,7 +3124,6 @@ mod tests {
                     name: TOP_LEVEL.into(),
                     source_label: "media-adopted".into(),
                     nested_under: None,
-                    manual_only: false,
                     scope: "primary target only".into(),
                 },
             ]
@@ -3274,7 +3252,6 @@ mod tests {
         let ssd = entry("ssd-adopted");
         assert_eq!(ssd.snapshot_name.as_deref(), Some("ssd-toplevel"));
         assert_eq!(ssd.adopted.as_deref(), Some("2026-10-18"));
-        assert!(!ssd.manual_only);
         assert_eq!(
             entry("media-adopted").snapshot_name.as_deref(),
             Some("hdd-toplevel-2")

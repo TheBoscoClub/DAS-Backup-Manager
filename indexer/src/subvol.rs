@@ -5,10 +5,9 @@ use crate::config::{Config, SubvolConfig};
 pub struct SubvolInfo {
     pub source_label: String,
     pub name: String,
-    pub manual_only: bool,
 }
 
-/// List all subvolumes across all sources with their schedule status.
+/// List all subvolumes across all sources.
 pub fn list_subvolumes(config: &Config) -> Vec<SubvolInfo> {
     config
         .sources
@@ -17,19 +16,13 @@ pub fn list_subvolumes(config: &Config) -> Vec<SubvolInfo> {
             src.subvolumes.iter().map(|sv| SubvolInfo {
                 source_label: src.label.clone(),
                 name: sv.name.clone(),
-                manual_only: sv.manual_only,
             })
         })
         .collect()
 }
 
 /// Add a subvolume to a source.
-pub fn add_subvolume(
-    config: &mut Config,
-    source_label: &str,
-    name: &str,
-    manual_only: bool,
-) -> Result<(), String> {
+pub fn add_subvolume(config: &mut Config, source_label: &str, name: &str) -> Result<(), String> {
     let src = config
         .sources
         .iter_mut()
@@ -43,8 +36,6 @@ pub fn add_subvolume(
     }
     src.subvolumes.push(SubvolConfig {
         name: name.to_string(),
-        manual_only,
-        snapshot_name: None,
         ..Default::default()
     });
     Ok(())
@@ -68,27 +59,6 @@ pub fn remove_subvolume(config: &mut Config, source_label: &str, name: &str) -> 
     Ok(())
 }
 
-/// Set a subvolume's manual_only flag.
-pub fn set_manual(
-    config: &mut Config,
-    source_label: &str,
-    name: &str,
-    manual: bool,
-) -> Result<(), String> {
-    let src = config
-        .sources
-        .iter_mut()
-        .find(|s| s.label == source_label)
-        .ok_or_else(|| format!("Source '{}' not found", source_label))?;
-    let sv = src
-        .subvolumes
-        .iter_mut()
-        .find(|sv| sv.name == name)
-        .ok_or_else(|| format!("Subvolume '{}' not found", name))?;
-    sv.manual_only = manual;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,13 +72,11 @@ mod tests {
             subvolumes: vec![
                 SubvolConfig {
                     name: "@".into(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".into(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
@@ -123,7 +91,6 @@ mod tests {
             volume: "/.btrfs-ssd".into(),
             subvolumes: vec![SubvolConfig {
                 name: "@opt".into(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -150,24 +117,15 @@ mod tests {
     #[test]
     fn add_subvolume_success() {
         let mut cfg = test_config();
-        add_subvolume(&mut cfg, "nvme", "@log", false).unwrap();
+        add_subvolume(&mut cfg, "nvme", "@log").unwrap();
         assert_eq!(cfg.sources[0].subvolumes.len(), 3);
         assert_eq!(cfg.sources[0].subvolumes[2].name, "@log");
-        assert!(!cfg.sources[0].subvolumes[2].manual_only);
-    }
-
-    #[test]
-    fn add_subvolume_manual_only() {
-        let mut cfg = test_config();
-        add_subvolume(&mut cfg, "ssd", "@cache", true).unwrap();
-        assert_eq!(cfg.sources[1].subvolumes.len(), 2);
-        assert!(cfg.sources[1].subvolumes[1].manual_only);
     }
 
     #[test]
     fn add_subvolume_duplicate_fails() {
         let mut cfg = test_config();
-        let result = add_subvolume(&mut cfg, "nvme", "@", false);
+        let result = add_subvolume(&mut cfg, "nvme", "@");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -175,7 +133,7 @@ mod tests {
     #[test]
     fn add_subvolume_bad_source_fails() {
         let mut cfg = test_config();
-        let result = add_subvolume(&mut cfg, "nonexistent", "@foo", false);
+        let result = add_subvolume(&mut cfg, "nonexistent", "@foo");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -194,22 +152,5 @@ mod tests {
         let result = remove_subvolume(&mut cfg, "nvme", "@nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
-    }
-
-    #[test]
-    fn set_manual_flag() {
-        let mut cfg = test_config();
-        assert!(!cfg.sources[0].subvolumes[0].manual_only);
-        set_manual(&mut cfg, "nvme", "@", true).unwrap();
-        assert!(cfg.sources[0].subvolumes[0].manual_only);
-        set_manual(&mut cfg, "nvme", "@", false).unwrap();
-        assert!(!cfg.sources[0].subvolumes[0].manual_only);
-    }
-
-    #[test]
-    fn set_manual_bad_subvol_fails() {
-        let mut cfg = test_config();
-        let result = set_manual(&mut cfg, "nvme", "@nope", true);
-        assert!(result.is_err());
     }
 }

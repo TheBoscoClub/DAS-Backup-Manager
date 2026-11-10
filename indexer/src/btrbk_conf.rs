@@ -724,13 +724,11 @@ mod tests {
             subvolumes: vec![
                 SubvolConfig {
                     name: "@".to_string(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".to_string(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
@@ -816,7 +814,6 @@ mod tests {
             volume: "/.btrfs-hdd".to_string(),
             subvolumes: vec![SubvolConfig {
                 name: "ClaudeCodeProjects".to_string(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -836,7 +833,6 @@ mod tests {
     fn subvol(name: &str, snapshot_name: Option<&str>) -> SubvolConfig {
         SubvolConfig {
             name: name.to_string(),
-            manual_only: false,
             snapshot_name: snapshot_name.map(str::to_string),
             ..Default::default()
         }

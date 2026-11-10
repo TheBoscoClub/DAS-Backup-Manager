@@ -249,20 +249,6 @@ bool DBusClient::subvolRemove(const QString &source,
     return true;
 }
 
-bool DBusClient::subvolSetManual(const QString &source,
-                                 const QString &name, bool manual)
-{
-    if (!m_available) return false;
-    QDBusReply<void> reply = m_interface->call(QStringLiteral("SubvolSetManual"),
-                                               source, name, manual);
-    if (!reply.isValid()) {
-        Q_EMIT errorOccurred(QStringLiteral("SubvolSetManual"),
-                             mapDBusError(reply.error().name(), reply.error().message()));
-        return false;
-    }
-    return true;
-}
-
 bool DBusClient::jobCancel(const QString &jobId)
 {
     if (!m_available) return false;

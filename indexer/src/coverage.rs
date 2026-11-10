@@ -12,7 +12,7 @@
 //! accepted (`btrdasd subvol coverage accept`).
 //!
 //! Coverage compares INTENT — what `config.toml` schedules — never delivery:
-//! an absent target, a one-source run, a dry run or a manual-only default
+//! an absent target, a one-source run or a dry run
 //! leaves intent unchanged and cannot raise a false drop. Delivery failures
 //! are FAIL rows elsewhere. The check never fails a sync, a backup or an
 //! exit code.
@@ -46,8 +46,8 @@ pub struct Pair {
 }
 
 /// Every pair `cfg` schedules, each with the label of the source that holds
-/// it: per source, per live (not retired) entry — `after_index` and
-/// `manual_only` ones included, since both are rendered and sent — per
+/// it: per source, per live (not retired) entry — `after_index` ones
+/// included, since they are rendered and sent — per
 /// target the source's volume block sends to. A top level in a source that
 /// reaches a mirror is left out: the renderer refuses it.
 pub fn intended(cfg: &Config) -> BTreeMap<Pair, String> {
@@ -1581,12 +1581,11 @@ mod tests {
     }
 
     #[test]
-    fn source_label_snapshot_name_and_manual_only_changes_say_nothing() {
+    fn source_label_and_snapshot_name_changes_say_nothing() {
         let b1 = first(&cfg());
         let mut now = cfg();
         now.sources[0].label = "nvme".into();
         now.sources[0].subvolumes[0].snapshot_name = Some("renamed".into());
-        now.sources[0].subvolumes[1].manual_only = true;
         let (o, _) = step(Some(&b1), &now, &on_disk(), DAY2, Recording::Recorded);
         assert_eq!(o.row(), "OK  (7 subvolume/target pairs, none dropped)");
     }

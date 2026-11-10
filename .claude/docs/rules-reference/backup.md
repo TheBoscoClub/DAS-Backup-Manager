@@ -193,7 +193,7 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   or revived, because an absent listing must never read as "everything was deleted". An empty
   listing counts as not read. Only listing lines starting `ID ` are parsed; paths may hold spaces.
 - **Placement.** Nested under a live entry: joins the nearest such ancestor's source and inherits
-  its targets and `manual_only`. Otherwise it joins the volume's `<first-source>-adopted` source,
+  its targets. Otherwise it joins the volume's `<first-source>-adopted` source,
   which sends to the primary target only (no primary target: not adopted, run failed, named in the
   report). Snapshot names are made unique across the whole config and never change afterwards.
 - **Exclusion.** Patterns (`*`, `?`; `*` also matches `/`) name the subvolume without a trailing
@@ -452,7 +452,7 @@ the binding summary; this is the full text it condenses (heading then: "Subvolum
 Run Over Run, Repeated Until Restored Or Accepted"):
 
 - **Every sync checks coverage** (bd `sp78.1`): the `(volume, subvolume, target)` pairs `config.toml`
-  schedules — every live entry, `after_index` and `manual_only` included, times each target its source
+  schedules — every live entry, `after_index` included, times each target its source
   sends to — against the record of the last backup run (`coverage_*` tables, schema 5). **One rule, both
   paths**: `adopt::sync_subvolumes` → `coverage::check`, reached by `backup-run.sh` through `btrdasd subvol
   sync --record-coverage` and by the CLI/GUI run through `backup::sync_before_backup`. Never a second copy.

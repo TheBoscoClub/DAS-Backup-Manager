@@ -1480,7 +1480,6 @@ mod tests {
             assert_eq!(names(&parsed), expected, "input {input:?}");
             // A typed subvolume is an ordinary scheduled one under btrbk's
             // default snapshot name.
-            assert!(parsed.iter().all(|sv| !sv.manual_only));
             assert!(parsed.iter().all(|sv| sv.snapshot_name.is_none()));
         }
     }
@@ -1619,7 +1618,6 @@ mod tests {
         assert_eq!(src.volume, "/.btrfs-root");
         assert_eq!(src.device, "/dev/nvme0n1p2");
         assert_eq!(names(&src.subvolumes), ["@", "@home"]);
-        assert!(src.subvolumes.iter().all(|sv| !sv.manual_only));
         assert!(src.subvolumes.iter().all(|sv| sv.snapshot_name.is_none()));
         assert_eq!(src.snapshot_dir, ".btrbk-snapshots");
         assert!(src.target_subdirs.is_empty());

@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The key is refused unless the drive itself lists that PARTUUID, so a key naming another partition (a host ESP copied in by mistake) never reaches `mount`; one mounted elsewhere is left as it is; one an earlier reading left at its directory is taken down first (bd `jgm`'s rule)
   - A missing file is a `BOOT PROBLEM` row and marks the drive WARN; a clean reading says what it read (`ESP  checked: 2 loader entries, every file they name is there`); without the key, or when the ESP could not be read, the reading shows `ESP  not checked: <why>`, never a warning by itself. The WARN's detail on both paths is now `its boot may stop: see BOOT PROBLEM` (`backup-run.sh` 4.17.1), since the row may come from the fstab or the ESP
 
+### Removed
+
+- **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
+  - A run naming no source now backs up every source, as the nightly run always did; a configuration with no source at all is refused, never handed to btrbk as "no filter"
+  - The D-Bus helper's `SubvolSetManual` and the GUI client's unused `subvolSetManual` are gone; adoption no longer copies the flag; `subvol list` drops its `Schedule` column and its JSON the `manual_only` field
+  - An old `config.toml` carrying the key still loads: each occurrence is warned about by name (`... is no longer read: manual_only was removed ...`, `config::REMOVED_KEYS`), and the next save takes it out of every subvolume entry, changed or not (`surgical::drop_removed_keys`)
+
 ### Fixed
 
 - **A snapshot step with a target not mounted no longer fails after creating every snapshot** (bd `DAS-Backup-Manager-2ab3`): `btrbk snapshot` reads every target of the subvolumes it snapshots, and one it cannot read is aborted, so btrbk exits 10 once the snapshots exist (reproduced in a VM, btrbk 0.32.7); `btrdasd backup snapshot` mounts no target, and read that as `No snapshots can be assumed created`

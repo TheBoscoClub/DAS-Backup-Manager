@@ -699,7 +699,6 @@ mod tests {
                 .iter()
                 .map(|n| SubvolConfig {
                     name: (*n).into(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 })

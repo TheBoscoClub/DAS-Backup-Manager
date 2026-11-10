@@ -49,8 +49,6 @@ public:
                    const QString &name);
     bool subvolRemove(const QString &source,
                       const QString &name);
-    bool subvolSetManual(const QString &source,
-                         const QString &name, bool manual);
     bool jobCancel(const QString &jobId);
 
     // Async versions of slow methods (non-blocking, result via signal)

@@ -770,7 +770,7 @@ A label that is not in the configuration refuses the run before anything is
 locked or mounted (exit 1), even beside valid ones.
 A value that names nothing real (an empty one) is such a label: the run is
 refused, never widened to every source.
-Default (flag not given): every source with at least one subvolume that is not manual-only.
+Default (flag not given): every source.
 .TP
 .BI \-\-targets " LABELS"
 Comma-separated target labels to send to.
@@ -1291,16 +1291,13 @@ beside it would be the live
 files: set
 .B btrbk_conf
 to a scratch path first. The same holds for
-.BR "subvol remove" ,
-.BR "subvol set\-manual" ,
-.B "subvol set\-auto"
+.B "subvol remove"
 and a real (not
 .BR \-\-dry\-run )
 .BR "subvol sync" .
 .PP
 .B btrdasd subvol add
 .I SOURCE NAME
-.RB [ \-\-manual\-only ]
 .RB [ \-\-config
 .IR PATH ]
 .TP
@@ -1309,9 +1306,6 @@ Source label to add the subvolume to.
 .TP
 .I NAME
 Subvolume name (e.g., "@home").
-.TP
-.B \-\-manual\-only
-Mark the subvolume as manual-only, excluding it from automatic backups.
 .TP
 .BI \-\-config " PATH"
 Path to config.toml.
@@ -1334,44 +1328,6 @@ instead. The snapshots the removed entry already made are not expired by
 which only handles retired entries.
 .PP
 .B btrdasd subvol remove
-.I SOURCE NAME
-.RB [ \-\-config
-.IR PATH ]
-.TP
-.I SOURCE
-Source label.
-.TP
-.I NAME
-Subvolume name.
-.TP
-.BI \-\-config " PATH"
-Path to config.toml.
-Default:
-.IR /etc/das\-backup/config.toml .
-.\"
-.SS subvol set\-manual
-Mark a subvolume as manual-only, excluding it from automatic backups.
-.PP
-.B btrdasd subvol set\-manual
-.I SOURCE NAME
-.RB [ \-\-config
-.IR PATH ]
-.TP
-.I SOURCE
-Source label.
-.TP
-.I NAME
-Subvolume name.
-.TP
-.BI \-\-config " PATH"
-Path to config.toml.
-Default:
-.IR /etc/das\-backup/config.toml .
-.\"
-.SS subvol set\-auto
-Mark a subvolume for automatic backups, removing the manual-only flag.
-.PP
-.B btrdasd subvol set\-auto
 .I SOURCE NAME
 .RB [ \-\-config
 .IR PATH ]
@@ -1475,19 +1431,17 @@ if some volume could not be read. A sync with nothing to change rewrites it
 whenever it differs from what config.toml renders to, and says so in its
 report, except on a dry run or when the sync failed (a volume was not read):
 then the file is left alone and the report says it is out of date. So do every configuration change made from the GUI,
-.BR "subvol add" ,
-.BR remove ,
-.B set\-manual
+.B "subvol add"
 and
-.BR set\-auto ,
+.BR remove ,
 and
 .BR "btrdasd setup \-\-upgrade" .
 A hand edit is lost the next time any of them rewrites it; change config.toml
 instead.
 .PP
 An adopted entry that is nested under a configured subvolume uses that
-subvolume's source: its targets, snapshot directory and target subdirectory,
-and its manual\-only flag. One with no configured ancestor goes to the volume's
+subvolume's source: its targets, snapshot directory and target subdirectory.
+One with no configured ancestor goes to the volume's
 .I <first\-source\-label>\-adopted
 source, created on first need, which takes its device and snapshot directory
 from the first source on that volume, uses its own label as the target
@@ -1527,7 +1481,7 @@ or
 .BR ) ,
 .B backup\-run.sh
 reads. The check takes the (volume, subvolume, target) pairs config.toml
-schedules after the sync \(em every live entry, manual\-only and after\-index
+schedules after the sync \(em every live entry, after\-index
 ones included, sent to each target its source reaches \(em and compares them
 with the record of the last backup run in the index database. A pair recorded
 then, not scheduled now, and still on disk is reported as

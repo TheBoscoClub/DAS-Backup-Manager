@@ -364,12 +364,11 @@ pub struct Doctor {
     pub exclude: Vec<String>,
 }
 
-/// A subvolume within a source, with optional scheduling flags and snapshot name override.
-/// Accepts bare strings ("@"), structs with name+manual_only, or full structs with snapshot_name.
+/// A subvolume within a source, with an optional snapshot name override.
+/// Accepts bare strings ("@") or tables naming the subvolume and its options.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SubvolConfig {
     pub name: String,
-    pub manual_only: bool,
     /// Override the btrbk snapshot_name (default: algorithmic from subvol name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_name: Option<String>,
@@ -402,8 +401,6 @@ impl<'de> Deserialize<'de> for SubvolConfig {
             Full {
                 name: String,
                 #[serde(default)]
-                manual_only: bool,
-                #[serde(default)]
                 snapshot_name: Option<String>,
                 #[serde(default)]
                 adopted: Option<String>,
@@ -421,14 +418,12 @@ impl<'de> Deserialize<'de> for SubvolConfig {
             }),
             SubvolEntry::Full {
                 name,
-                manual_only,
                 snapshot_name,
                 adopted,
                 retired,
                 after_index,
             } => Ok(SubvolConfig {
                 name,
-                manual_only,
                 snapshot_name,
                 adopted,
                 retired,
@@ -763,7 +758,6 @@ fn key_schema() -> toml::Table {
         volume: String::new(),
         subvolumes: vec![SubvolConfig {
             name: String::new(),
-            manual_only: true,
             snapshot_name: Some(String::new()),
             adopted: Some(String::new()),
             retired: Some(String::new()),
@@ -820,7 +814,19 @@ fn unknown_keys_in(path: &str, v: &toml::Value, known: &toml::Value, out: &mut V
     }
 }
 
+/// Keys an earlier version read and this one has removed: `(key, why)`.
+/// Warned about by name, so an old file is not told it holds a typo.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    // bd DAS-Backup-Manager-9ry (operator 2026-11-09): the renderer and
+    // backup-run.sh never read it, so it kept nothing out of a backup.
+    "manual_only",
+    "manual_only was removed, and every backup run backs this subvolume up \u{2014} delete the key",
+)];
+
 fn unknown_key_line(path: &str, key: &str, known: &toml::Table) -> String {
+    if let Some((_, why)) = REMOVED_KEYS.iter().find(|(k, _)| *k == key) {
+        return format!("{path} is no longer read: {why}");
+    }
     let nearest = known
         .keys()
         .map(|k| (edit_distance(key, k), k))
@@ -975,6 +981,35 @@ mod surgical {
         doc.remove(key);
         if let Some(v) = last_value_mut(doc) {
             append_suffix(v, &tail);
+        }
+    }
+
+    /// Each subvolume entry's removed keys ([`super::REMOVED_KEYS`]) taken
+    /// out, whether the entry changed or not: nothing reads them, and every
+    /// load warns about them until a save drops them (bd 9ry).
+    pub(super) fn drop_removed_keys(doc: &mut toml_edit::Table) {
+        let Some(sources) = doc.get_mut("source").and_then(Item::as_array_of_tables_mut) else {
+            return;
+        };
+        for source in sources.iter_mut() {
+            let mut entries: Vec<&mut dyn TableLike> = match source.get_mut("subvolumes") {
+                Some(Item::ArrayOfTables(subs)) => {
+                    subs.iter_mut().map(|t| t as &mut dyn TableLike).collect()
+                }
+                Some(Item::Value(Value::Array(a))) => a
+                    .iter_mut()
+                    .filter_map(Value::as_inline_table_mut)
+                    .map(|t| t as &mut dyn TableLike)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for entry in &mut entries {
+                for (key, _) in super::REMOVED_KEYS {
+                    if entry.contains_key(key) {
+                        remove_key(*entry, key);
+                    }
+                }
+            }
         }
     }
 
@@ -1278,7 +1313,7 @@ mod surgical {
     ///   period is 0, which changes btrbk's `target_preserve`)
     ///
     /// Not here: defaults whose absence is itself the value (`Option`s, and
-    /// `manual_only` / `after_index` = false), advisory ones (`serials`,
+    /// `after_index` = false), advisory ones (`serials`,
     /// `display_name`), and ones that decide neither scope nor retention
     /// (logs, `[das]`, `[scrub]`, `[recovery_os]`, email, GUI).
     ///
@@ -1717,6 +1752,7 @@ impl Config {
         surgical::attach_trailing_comments(&mut doc);
         surgical::merge_table(doc.as_table_mut(), &old, &new, &mut reordered);
         surgical::pin(doc.as_table_mut(), &new);
+        surgical::drop_removed_keys(doc.as_table_mut());
         fault(&mut doc);
         if reordered {
             surgical::forget_positions(doc.as_table_mut());
@@ -3228,13 +3264,11 @@ mod tests {
             subvolumes: vec![
                 SubvolConfig {
                     name: "@".into(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
                 SubvolConfig {
                     name: "@home".into(),
-                    manual_only: false,
                     snapshot_name: None,
                     ..Default::default()
                 },
@@ -3274,7 +3308,6 @@ mod tests {
         assert_eq!(parsed.sources[0].subvolumes.len(), 2);
         assert_eq!(parsed.sources[0].subvolumes[0].name, "@");
         assert_eq!(parsed.sources[0].subvolumes[1].name, "@home");
-        assert!(!parsed.sources[0].subvolumes[0].manual_only);
         assert_eq!(parsed.sources[0].snapshot_dir, ".snapshots");
         assert_eq!(parsed.sources[0].target_subdirs, vec!["nvme"]);
         assert_eq!(parsed.targets.len(), 1);
@@ -3477,7 +3510,6 @@ daily = 7
             volume: "/mnt/src".into(),
             subvolumes: vec![SubvolConfig {
                 name: "@".into(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -3514,7 +3546,6 @@ daily = 7
             volume: "/mnt/src".into(),
             subvolumes: vec![SubvolConfig {
                 name: "@".into(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -3562,7 +3593,6 @@ daily = 7
             volume: "/vol".into(),
             subvolumes: vec![SubvolConfig {
                 name: "@".into(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -3611,8 +3641,6 @@ enabled = false
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.sources[0].subvolumes[0].name, "@");
         assert_eq!(cfg.sources[0].subvolumes[1].name, "@home");
-        assert!(!cfg.sources[0].subvolumes[0].manual_only);
-        assert!(!cfg.sources[0].subvolumes[1].manual_only);
     }
 
     #[test]
@@ -3636,7 +3664,7 @@ device = "/dev/sda"
 name = "@"
 [[source.subvolumes]]
 name = "@root"
-manual_only = true
+snapshot_name = "root"
 [[target]]
 label = "t"
 serial = "X"
@@ -3652,9 +3680,12 @@ enabled = false
         let cfg = Config::from_toml(toml).unwrap();
         assert_eq!(cfg.sources[0].subvolumes.len(), 2);
         assert_eq!(cfg.sources[0].subvolumes[0].name, "@");
-        assert!(!cfg.sources[0].subvolumes[0].manual_only);
+        assert_eq!(cfg.sources[0].subvolumes[0].snapshot_name, None);
         assert_eq!(cfg.sources[0].subvolumes[1].name, "@root");
-        assert!(cfg.sources[0].subvolumes[1].manual_only);
+        assert_eq!(
+            cfg.sources[0].subvolumes[1].snapshot_name.as_deref(),
+            Some("root")
+        );
     }
 
     /// Minimal config carrying only the mandatory sections, plus whatever
@@ -3992,7 +4023,7 @@ device = "/dev/nvme0n1p2"
 subvolumes = [
   "@",
   { name = "@srv", snapshot_name = "srv-a", adopted = "2026-10-01" },
-  { name = "@gone", snapshot_name = "gone", retired = "2026-10-02", manual_only = true },
+  { name = "@gone", snapshot_name = "gone", retired = "2026-10-02" },
 ]
 [[target]]
 label = "t"
@@ -4010,7 +4041,7 @@ enabled = false
         let before = Config::from_toml(toml).unwrap();
         let shown = before.to_toml().unwrap();
         let after = Config::from_toml(&shown).unwrap();
-        type Entry = (String, bool, Option<String>, Option<String>, Option<String>);
+        type Entry = (String, Option<String>, Option<String>, Option<String>);
         let entries = |c: &Config| -> Vec<Entry> {
             c.sources[0]
                 .subvolumes
@@ -4018,7 +4049,6 @@ enabled = false
                 .map(|e| {
                     (
                         e.name.clone(),
-                        e.manual_only,
                         e.snapshot_name.clone(),
                         e.adopted.clone(),
                         e.retired.clone(),
@@ -4031,7 +4061,6 @@ enabled = false
             entries(&after)[2],
             (
                 "@gone".to_string(),
-                true,
                 Some("gone".to_string()),
                 None,
                 Some("2026-10-02".to_string())
@@ -4234,7 +4263,7 @@ enabled = false
         );
         let text = saved_after(&file, |c| {
             let subs = &mut c.sources[0].subvolumes;
-            subs[0].manual_only = true;
+            subs[0].after_index = true;
             subs[1].retired = Some("2026-10-30".into());
             subs.push(SubvolConfig {
                 name: "@new".into(),
@@ -4244,7 +4273,10 @@ enabled = false
         let line = text.lines().find(|l| l.starts_with("subvolumes")).unwrap();
         // The changed bare string became a table; its unchanged neighbour did
         // not; the inline table kept its unknown key.
-        assert!(line.contains("name = \"@\", manual_only = true"), "{line}");
+        assert!(
+            line.contains("{ name = \"@\", snapshot_name = \"root\", after_index = true }"),
+            "{line}"
+        );
         assert!(line.contains("future_inline = 1"), "{line}");
         assert!(line.contains("retired = \"2026-10-30\""), "{line}");
         assert!(
@@ -4416,7 +4448,7 @@ enabled = false
         // The kept one edited as well: still its own unknown key.
         let text = saved_after(&file, |c| {
             c.sources[0].subvolumes.remove(0);
-            c.sources[0].subvolumes[0].manual_only = true;
+            c.sources[0].subvolumes[0].after_index = true;
         });
         assert!(!text.contains("of first"), "{text}");
         assert!(text.contains("future = \"of second\""), "{text}");
@@ -4425,7 +4457,7 @@ enabled = false
         let text = saved_after(&file, |c| {
             let first = &mut c.sources[0].subvolumes[0];
             first.snapshot_name = Some("second".into());
-            first.manual_only = true;
+            first.after_index = true;
         });
         assert_eq!(text.matches("of first").count(), 1, "{text}");
         assert_eq!(text.matches("of second").count(), 1, "{text}");
@@ -4439,7 +4471,7 @@ enabled = false
         let file = minimal_toml(
             "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
              [[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"x\"\nfuture = \"of a\"\n\
-             [[source.subvolumes]]\nname = \"@b\"\nmanual_only = true\nsnapshot_name = \"y\"\n\
+             [[source.subvolumes]]\nname = \"@b\"\nafter_index = true\nsnapshot_name = \"y\"\n\
              future = \"of b\"\n",
         );
         // @a now looks like the old @b in everything but its name; @b changed
@@ -4447,7 +4479,7 @@ enabled = false
         let text = saved_after(&file, |c| {
             let a = &mut c.sources[0].subvolumes[0];
             a.snapshot_name = Some("y".into());
-            a.manual_only = true;
+            a.after_index = true;
             c.sources[0].subvolumes[1].snapshot_name = Some("z".into());
         });
         let (a, of_a) = (
@@ -4841,6 +4873,54 @@ enabled = false
         let fresh = Config::from_toml(&clean).unwrap().to_toml().unwrap();
         assert_eq!(unknown_key_warnings(&fresh).unwrap(), Vec::<String>::new());
         assert!(unknown_key_warnings("not [ toml").is_err());
+    }
+
+    /// bd DAS-Backup-Manager-9ry (operator 2026-11-09): `manual_only` is
+    /// removed. A file still carrying it loads — the subvolume is backed up
+    /// like any other — and the warning says the key is gone, not a typo.
+    #[test]
+    fn an_old_config_naming_manual_only_still_loads_and_is_told_the_key_is_gone() {
+        let text = minimal_toml(&format!(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             [[source.subvolumes]]\nname = \"@a\"\nmanual_only = true\n\
+             [[source.subvolumes]]\nname = \"@b\"\nmanual_only = false\n{ONE_TARGET}"
+        ));
+        let cfg = Config::from_toml(&text).unwrap();
+        let names: Vec<&str> = cfg.sources[0]
+            .subvolumes
+            .iter()
+            .map(|sv| sv.name.as_str())
+            .collect();
+        assert_eq!(names, ["@a", "@b"]);
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let gone = "is no longer read: manual_only was removed, and every backup run \
+                    backs this subvolume up \u{2014} delete the key";
+        assert_eq!(
+            unknown_key_warnings(&text).unwrap(),
+            [
+                format!("source[0].subvolumes[0].manual_only {gone}"),
+                format!("source[0].subvolumes[1].manual_only {gone}"),
+            ]
+        );
+    }
+
+    /// bd DAS-Backup-Manager-9ry: a save takes the removed key out of every
+    /// subvolume entry, changed or not — table and inline — so the warning
+    /// stops; the entry's other unknown keys stay.
+    #[test]
+    fn a_save_drops_manual_only_from_every_subvolume_entry() {
+        let file = minimal_toml(
+            "[[source]]\nlabel = \"s\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             subvolumes = [{ name = \"@\", manual_only = false, future_inline = 1 }]\n\
+             [[source]]\nlabel = \"t\"\nvolume = \"/vol2\"\ndevice = \"/dev/sdb\"\n\
+             [[source.subvolumes]]\nname = \"@a\"\nmanual_only = true\nfuture = 2\n",
+        );
+        // An unrelated edit: neither entry changes.
+        let text = saved_after(&file, |c| c.schedule.randomized_delay_min = 31);
+        assert!(!text.contains("manual_only"), "{text}");
+        assert!(text.contains("future_inline = 1"), "{text}");
+        assert!(text.contains("future = 2"), "{text}");
+        assert_eq!(unknown_key_warnings(&text).unwrap().len(), 2, "{text}");
     }
 
     /// The Backup panel's contract: gui/tests/fixtures/panel-config.json IS

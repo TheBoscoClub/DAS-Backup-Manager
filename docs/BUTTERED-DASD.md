@@ -62,7 +62,7 @@ backup-run.sh                   btrdasd CLI
 | `restore` | `src/restore.rs` | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and a denylist |
 | `schedule` | `src/schedule.rs` | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | Scheduled BTRFS scrub engine for the DAS filesystems |
-| `subvol` | `src/subvol.rs` | Subvolume CRUD operations (`btrdasd subvol add/remove/set-manual/set-auto`) |
+| `subvol` | `src/subvol.rs` | Subvolume CRUD operations (`btrdasd subvol add/remove`) |
 | `scanner` | `src/scanner.rs` | Filesystem traversal with walkdir |
 | `indexer` | `src/indexer.rs` | Snapshot discovery, span logic, walk orchestration |
 | `reconcile` | `src/reconcile.rs` | Prune index rows for snapshots gone from disk; mountpoint-gated |

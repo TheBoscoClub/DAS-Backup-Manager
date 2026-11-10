@@ -485,7 +485,7 @@ enum BackupAction {
         /// Run a full backup instead of incremental
         #[arg(long)]
         full: bool,
-        /// Source labels to back up (comma-separated). Default: all non-manual sources
+        /// Source labels to back up (comma-separated). Default: every source
         #[arg(long, value_delimiter = ',')]
         sources: Vec<String>,
         /// Target labels to send to (comma-separated). Default: all mounted targets
@@ -677,35 +677,12 @@ enum SubvolAction {
         source: String,
         /// Subvolume name (e.g., "@home")
         name: String,
-        /// Mark as manual-only (excluded from automatic backups)
-        #[arg(long)]
-        manual_only: bool,
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
     /// Remove a subvolume from a source
     Remove {
-        /// Source label
-        source: String,
-        /// Subvolume name
-        name: String,
-        /// Path to config.toml
-        #[arg(long, default_value = DEFAULT_CONFIG)]
-        config: PathBuf,
-    },
-    /// Mark a subvolume as manual-only
-    SetManual {
-        /// Source label
-        source: String,
-        /// Subvolume name
-        name: String,
-        /// Path to config.toml
-        #[arg(long, default_value = DEFAULT_CONFIG)]
-        config: PathBuf,
-    },
-    /// Mark a subvolume for automatic backups (remove manual-only flag)
-    SetAuto {
         /// Source label
         source: String,
         /// Subvolume name
@@ -2868,32 +2845,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             print!(",");
                         }
                         print!(
-                            "{{\"source\":\"{}\",\"name\":\"{}\",\"manual_only\":{}}}",
-                            sv.source_label, sv.name, sv.manual_only
+                            "{{\"source\":\"{}\",\"name\":\"{}\"}}",
+                            sv.source_label, sv.name
                         );
                     }
                     println!("]");
                 } else {
-                    println!("{:<16} {:<16} Schedule", "Source", "Subvolume");
-                    println!("{}", "-".repeat(48));
+                    println!("{:<16} Subvolume", "Source");
+                    println!("{}", "-".repeat(32));
                     for sv in &subs {
-                        println!(
-                            "{:<16} {:<16} {}",
-                            sv.source_label,
-                            sv.name,
-                            if sv.manual_only { "manual" } else { "auto" }
-                        );
+                        println!("{:<16} {}", sv.source_label, sv.name);
                     }
                 }
             }
             SubvolAction::Add {
                 source,
                 name,
-                manual_only,
                 config,
             } => {
                 let mut cfg = Config::load(&config)?;
-                subvol::add_subvolume(&mut cfg, &source, &name, manual_only)?;
+                subvol::add_subvolume(&mut cfg, &source, &name)?;
                 buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Added subvolume '{name}' to source '{source}'.");
             }
@@ -2906,26 +2877,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subvol::remove_subvolume(&mut cfg, &source, &name)?;
                 buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
                 println!("Removed subvolume '{name}' from source '{source}'.");
-            }
-            SubvolAction::SetManual {
-                source,
-                name,
-                config,
-            } => {
-                let mut cfg = Config::load(&config)?;
-                subvol::set_manual(&mut cfg, &source, &name, true)?;
-                buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
-                println!("Subvolume '{name}' in source '{source}' set to manual-only.");
-            }
-            SubvolAction::SetAuto {
-                source,
-                name,
-                config,
-            } => {
-                let mut cfg = Config::load(&config)?;
-                subvol::set_manual(&mut cfg, &source, &name, false)?;
-                buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
-                println!("Subvolume '{name}' in source '{source}' set to automatic.");
             }
             SubvolAction::Coverage { action } => {
                 let (code, out, err) = match action {

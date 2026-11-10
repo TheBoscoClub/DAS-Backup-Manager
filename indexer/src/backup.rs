@@ -2405,31 +2405,23 @@ fn nothing_selected(what: &str, other: &str) -> String {
 }
 
 /// The source labels a run backs up: the ones named or — when none were
-/// specified — every source with at least one subvolume that is not
-/// manual-only. A selection made and empty is refused, never widened.
+/// specified — every source. A selection made and empty is refused, never
+/// widened.
 fn effective_sources(config: &Config, options: &BackupOptions) -> Result<Vec<String>, String> {
     if let Some(why) = empty_selection(options).or_else(|| unknown_label(config, options)) {
         return Err(why);
     }
     match &options.sources {
         None => {
-            let automatic: Vec<String> = config
-                .sources
-                .iter()
-                .filter(|src| {
-                    // Include source if at least one non-manual_only subvolume exists.
-                    src.subvolumes.iter().any(|sv| !sv.manual_only)
-                })
-                .map(|src| src.label.clone())
-                .collect();
-            if automatic.is_empty() {
+            let all: Vec<String> = config.sources.iter().map(|s| s.label.clone()).collect();
+            if all.is_empty() {
                 // "Not specified" resolving to nothing is not "everything":
-                // btrbk would be handed the manual-only subvolumes too.
-                return Err("No source to back up: every source has only manual-only \
-                            subvolumes, and none was named — nothing was started"
-                    .into());
+                // an empty list would reach btrbk as no filter at all.
+                return Err(
+                    "No source to back up: the configuration has none — nothing was started".into(),
+                );
             }
-            Ok(automatic)
+            Ok(all)
         }
         Some(named) => Ok(named.clone()),
     }
@@ -4081,13 +4073,11 @@ mod tests {
                     subvolumes: vec![
                         SubvolConfig {
                             name: "@".into(),
-                            manual_only: false,
                             snapshot_name: None,
                             ..Default::default()
                         },
                         SubvolConfig {
                             name: "@home".into(),
-                            manual_only: false,
                             snapshot_name: None,
                             ..Default::default()
                         },
@@ -4101,11 +4091,10 @@ mod tests {
                     target_labels: vec![],
                 },
                 Source {
-                    label: "manual-src".into(),
-                    volume: "/.btrfs-manual".into(),
+                    label: "other-src".into(),
+                    volume: "/.btrfs-other".into(),
                     subvolumes: vec![SubvolConfig {
                         name: "@special".into(),
-                        manual_only: true,
                         snapshot_name: None,
                         ..Default::default()
                     }],
@@ -7694,8 +7683,8 @@ mod tests {
     // run only checks.
 
     /// The run's config: `/proc` stands in for the one target that is
-    /// mounted, a second one is absent, and one of the two sources is
-    /// manual-only.
+    /// mounted, a second one is absent, and of the two sources only
+    /// `nvme-root`'s volume is mounted.
     fn live_config() -> Config {
         let mut config = make_test_config();
         config.targets.push(Target {
@@ -7709,6 +7698,7 @@ mod tests {
     fn live_options() -> BackupOptions {
         BackupOptions {
             mode: Some(BackupMode::Incremental),
+            sources: Some(labels(&["nvme-root"])),
             targets: Some(labels(&["primary-22tb"])),
             ..Default::default()
         }
@@ -7716,7 +7706,7 @@ mod tests {
 
     #[test]
     fn a_live_run_goes_to_the_selected_target_only_and_mounts_nothing_itself() {
-        // `manual-src` is left out (manual-only), the absent `recovery` target
+        // `other-src` is not selected, the absent `recovery` target
         // is not ticked: the run names `/proc/self/root` and `home` to btrbk.
         let f = "/proc/self/root /proc/self/home";
         let runner = Scripted::from_owned(vec![
@@ -7872,6 +7862,7 @@ mod tests {
             ..env(&runner)
         };
         let options = BackupOptions {
+            sources: Some(labels(&["nvme-root"])),
             targets: Some(labels(&["primary-22tb"])),
             ..options
         };
@@ -8209,9 +8200,9 @@ mod tests {
     #[test]
     fn only_the_volumes_of_the_sources_selected_have_to_be_mounted() {
         let runner = Scripted::from_owned(vec![]);
-        // `manual-src` is selected, its volume is not mounted.
+        // `other-src` is selected, its volume is not mounted.
         let options = BackupOptions {
-            sources: Some(labels(&["manual-src"])),
+            sources: Some(labels(&["other-src"])),
             ..live_options()
         };
         let nvme_mounted = |p: &Path| p == Path::new("/.btrfs-nvme");
@@ -8222,10 +8213,7 @@ mod tests {
         let err = run_backup_with(&live_config(), &options, &TestProgress::new(), &host)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("/.btrfs-manual (source 'manual-src')"),
-            "{err}"
-        );
+        assert!(err.contains("/.btrfs-other (source 'other-src')"), "{err}");
         assert!(!err.contains("/.btrfs-nvme"), "{err}");
     }
 
@@ -8243,16 +8231,16 @@ mod tests {
         );
         // Only the sources named are looked at.
         assert_eq!(
-            unmounted_source_volumes(&config, &labels(&["manual-src"]), &mounted),
-            ["/.btrfs-manual (source 'manual-src')"]
+            unmounted_source_volumes(&config, &labels(&["other-src"]), &mounted),
+            ["/.btrfs-other (source 'other-src')"]
         );
         assert!(unmounted_source_volumes(&config, &[], &mounted).is_empty());
         // One that is mounted is not listed.
         assert_eq!(
-            unmounted_source_volumes(&config, &labels(&["nvme-root", "manual-src"]), &|p| {
+            unmounted_source_volumes(&config, &labels(&["nvme-root", "other-src"]), &|p| {
                 p == Path::new("/.btrfs-nvme")
             }),
-            ["/.btrfs-manual (source 'manual-src')"]
+            ["/.btrfs-other (source 'other-src')"]
         );
     }
 
@@ -8266,24 +8254,28 @@ mod tests {
 
     // -- the selection a run starts from ----------------------------------------
 
+    /// bd DAS-Backup-Manager-9ry: `manual_only` is gone; a run naming no
+    /// source backs up every one, as the nightly run always did.
     #[test]
-    fn a_run_with_no_sources_named_backs_up_those_with_a_subvolume_that_is_not_manual_only() {
+    fn a_run_with_no_sources_named_backs_up_every_source() {
         let config = make_test_config();
         let options = BackupOptions::default();
-        // `manual-src` has only a manual-only subvolume.
-        assert_eq!(effective_sources(&config, &options).unwrap(), ["nvme-root"]);
+        assert_eq!(
+            effective_sources(&config, &options).unwrap(),
+            ["nvme-root", "other-src"]
+        );
     }
 
     #[test]
-    fn a_source_named_explicitly_is_backed_up_even_if_manual_only() {
+    fn the_sources_named_are_the_sources_backed_up() {
         let config = make_test_config();
         let options = BackupOptions {
-            sources: Some(labels(&["manual-src", "nvme-root"])),
+            sources: Some(labels(&["other-src", "nvme-root"])),
             ..Default::default()
         };
         assert_eq!(
             effective_sources(&config, &options).unwrap(),
-            ["manual-src", "nvme-root"]
+            ["other-src", "nvme-root"]
         );
     }
 
@@ -8405,7 +8397,7 @@ mod tests {
         assert!(why.contains("No source selected"), "{why}");
         assert_eq!(
             effective_sources(&config, &BackupOptions::default()).unwrap(),
-            ["nvme-root"]
+            ["nvme-root", "other-src"]
         );
     }
 
@@ -8486,38 +8478,29 @@ mod tests {
         );
     }
 
-    /// bd DAS-Backup-Manager-7tx (review I1): "no source named" that resolves to
-    /// nothing — every source has only manual-only subvolumes — used to be an
-    /// empty list, which `btrbk_filters` read as "every declared pair": btrbk
-    /// was handed the manual-only subvolumes.
+    /// bd DAS-Backup-Manager-7tx (review I1): a run naming no source that
+    /// resolved to nothing used to be an empty list,
+    /// which `btrbk_filters` read as "every declared pair". With no source
+    /// configured, it is refused and btrbk never runs.
     #[test]
-    fn a_run_naming_no_source_where_every_source_is_manual_only_is_refused_and_btrbk_never_runs() {
+    fn a_run_naming_no_source_with_none_configured_is_refused_and_btrbk_never_runs() {
         let mut config = live_config();
-        for source in &mut config.sources {
-            for sv in &mut source.subvolumes {
-                sv.manual_only = true;
-            }
-        }
-        // The control: with one automatic subvolume the same run selects it.
-        assert!(effective_sources(&live_config(), &live_options()).is_ok());
-        let why = effective_sources(&config, &live_options()).unwrap_err();
-        assert!(why.contains("manual-only"), "{why}");
+        config.sources.clear();
+        let none_named = BackupOptions {
+            sources: None,
+            ..live_options()
+        };
+        // The control: with the sources there, the same run selects them.
+        assert!(effective_sources(&live_config(), &none_named).is_ok());
+        let why = effective_sources(&config, &none_named).unwrap_err();
+        assert!(why.contains("No source to back up"), "{why}");
 
         let runner = Scripted::from_owned(vec![]);
-        let err = run_backup_with(
-            &config,
-            &live_options(),
-            &TestProgress::new(),
-            &env(&runner),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("manual-only"), "{err}");
-        assert!(
-            runner.calls().is_empty(),
-            "btrbk must not be handed the manual-only subvolumes: {:?}",
-            runner.calls()
-        );
+        let err = run_backup_with(&config, &none_named, &TestProgress::new(), &env(&runner))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No source to back up"), "{err}");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
     /// The same defect one level down: whoever hands a step a list that was
@@ -8851,7 +8834,6 @@ mod tests {
         config.boot.subvolumes = vec!["@".to_string()];
         config.sources[0].subvolumes = vec![SubvolConfig {
             name: "@".into(),
-            manual_only: false,
             snapshot_name: None,
             ..Default::default()
         }];
@@ -8920,7 +8902,6 @@ mod tests {
         config.boot.subvolumes = vec!["@".to_string()];
         config.sources[0].subvolumes = vec![SubvolConfig {
             name: "@".into(),
-            manual_only: false,
             snapshot_name: None,
             ..Default::default()
         }];

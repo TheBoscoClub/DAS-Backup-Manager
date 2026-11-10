@@ -2422,7 +2422,6 @@ auth = "starttls""#,
             volume: "/test".to_string(),
             subvolumes: vec![SubvolConfig {
                 name: "@".to_string(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],
@@ -2616,7 +2615,6 @@ auth = "starttls""#,
             volume: "/test".to_string(),
             subvolumes: vec![SubvolConfig {
                 name: "@".to_string(),
-                manual_only: false,
                 snapshot_name: None,
                 ..Default::default()
             }],

@@ -1715,7 +1715,7 @@ impl HelperInterface {
 
         edit_config(|| {
             let mut config = load_config()?;
-            subvol::add_subvolume(&mut config, source, name, false).map_err(fdo::Error::Failed)?;
+            subvol::add_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
             save_config(&config)
         })
     }
@@ -1733,24 +1733,6 @@ impl HelperInterface {
         edit_config(|| {
             let mut config = load_config()?;
             subvol::remove_subvolume(&mut config, source, name).map_err(fdo::Error::Failed)?;
-            save_config(&config)
-        })
-    }
-
-    /// Set the manual_only flag on a subvolume.
-    async fn subvol_set_manual(
-        &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        source: &str,
-        name: &str,
-        manual: bool,
-    ) -> fdo::Result<()> {
-        let sender = sender_from_header(&header)?;
-        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
-
-        edit_config(|| {
-            let mut config = load_config()?;
-            subvol::set_manual(&mut config, source, name, manual).map_err(fdo::Error::Failed)?;
             save_config(&config)
         })
     }
@@ -3510,9 +3492,9 @@ mod tests {
         let save = format!("{}(&config)", "save_config");
         let save_text = format!("{}(toml_content)", "save_config_text");
         let guarded = format!("{}(|| {{", "edit_config");
-        assert_eq!(body.matches(&save).count(), 4, "four writing methods");
+        assert_eq!(body.matches(&save).count(), 3, "three writing methods");
         assert_eq!(body.matches(&save_text).count(), 1, "and ConfigSet");
-        assert_eq!(body.matches(&guarded).count(), 5);
+        assert_eq!(body.matches(&guarded).count(), 4);
         // Each save sits inside the edit_config closure that precedes it.
         let saves = body
             .match_indices(&save)
