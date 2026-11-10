@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CLI/GUI backup mounts only the targets it was given** (bd `DAS-Backup-Manager-u8kk`): `btrdasd backup run --targets` and the GUI's ticked targets were written to alone, but every configured target was mounted and unmounted — a spin-up, USB traffic and a mount on a drive left out of the run; `run_backup_job` now hands the target mount the selected targets only (none named: all, as before)
+
 - **`btrdasd walk` refuses a path under a refused target root, and finds a target's top level by what is mounted, not by its options** (bd `DAS-Backup-Manager-71q1`)
   - `reconcile::VerifiedRoots::refusal_for` matched only the refused mount point itself, so `walk <refused root>/nvme` walked under a refused bind; anything under it is now refused, matched by component (`/mnt/ab` is not under `/mnt/a`)
   - `health::find_mount_for_device` reads `/proc/self/mountinfo` and takes a mount only when its root (field 4) is `/`: `/proc/mounts` shows a bind of a subdirectory of the top level as `subvolid=5`, the same as the top level, so it could be picked and then refused by the FSROOT check

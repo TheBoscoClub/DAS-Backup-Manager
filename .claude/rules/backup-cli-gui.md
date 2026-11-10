@@ -23,6 +23,7 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
   `run` goes on after a failed sync only while `btrbk.conf` is still what `config.toml` renders (bd `03j3`).
 - The run mounts **nothing** itself: each `MountGuard` gives back exactly what it mounted;
   `run_backup` only refuses an unmounted selected source.
+- The job mounts only the selected targets (none named → all; `selected_targets_only`, bd `u8kk`).
 - Never re-render `btrbk.conf` per run to narrow the targets (it shifts other targets' retention).
 
 ## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)

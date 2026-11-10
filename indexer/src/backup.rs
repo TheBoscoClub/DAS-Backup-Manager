@@ -3476,7 +3476,11 @@ pub fn run_backup_job(
             progress,
         );
     }
-    let mut targets = match host.mount_targets(&config, progress, locks.maintenance()) {
+    let mut targets = match host.mount_targets(
+        &selected_targets_only(&config, &options),
+        progress,
+        locks.maintenance(),
+    ) {
         Ok(targets) => targets,
         Err(e) => {
             let still = sources.release(progress);
@@ -3554,6 +3558,18 @@ pub fn run_backup_job(
         result.coverage_message = crate::coverage::message_line(sync.coverage.as_ref());
     }
     BackupJobOutcome::Ran(result)
+}
+
+/// `config` with only the targets `options` selects, for mounting: an
+/// unticked target gets no btrbk write, so it is not mounted either (bd
+/// DAS-Backup-Manager-u8kk). Not specified: every target. Every selected
+/// label is in the configuration (`unknown_label`, checked before the locks).
+fn selected_targets_only(config: &Config, options: &BackupOptions) -> Config {
+    let mut selected = config.clone();
+    if let Some(named) = &options.targets {
+        selected.targets.retain(|t| named.contains(&t.label));
+    }
+    selected
 }
 
 /// [`BackupJobHost`] on this machine.
@@ -9323,6 +9339,10 @@ mod tests {
         cancel_during: Option<&'static str>,
         /// The coverage check the fake sync reports (clean by default).
         sync_coverage: Option<crate::coverage::CoverageOutcome>,
+        /// The synced config also has a second target, `recovery-a`.
+        second_target: bool,
+        /// The target labels each `mount_targets` call was asked to mount.
+        mounted: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     /// A clean coverage check, as a recorded backup run with nothing dropped
@@ -9379,6 +9399,8 @@ mod tests {
                 report_emailed: true,
                 cancel_during: None,
                 sync_coverage: Some(clean_coverage()),
+                second_target: false,
+                mounted: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -9467,6 +9489,12 @@ mod tests {
             ));
             let mut config = make_test_config();
             config.general.version = "after-sync".into();
+            if self.second_target {
+                let mut recovery = config.targets[0].clone();
+                recovery.label = "recovery-a".into();
+                recovery.role = TargetRole::Mirror;
+                config.targets.push(recovery);
+            }
             (
                 config,
                 SyncSection {
@@ -9484,6 +9512,10 @@ mod tests {
         ) -> Result<Box<dyn Release>, String> {
             self.maybe_cancel("mount targets", progress);
             self.step(&format!("mount targets ({})", config.general.version));
+            self.mounted
+                .lock()
+                .unwrap()
+                .push(config.targets.iter().map(|t| t.label.clone()).collect());
             self.targets.clone().map(|left| {
                 Box::new(FakeMounts {
                     name: "targets",
@@ -9574,6 +9606,29 @@ mod tests {
         };
         let outcome = run_backup_job(host, make_test_config(), options, &progress);
         (outcome, progress)
+    }
+
+    #[test]
+    fn only_the_ticked_targets_are_mounted() {
+        // An unticked target gets no btrbk write, so it gets no mount either:
+        // no spin-up, no USB traffic, no mount on a drive the operator left
+        // out (bd DAS-Backup-Manager-u8kk). Targets not specified: all of them.
+        for (targets, mounted) in [
+            (Some(vec!["primary-22tb".to_string()]), vec!["primary-22tb"]),
+            (None, vec!["primary-22tb", "recovery-a"]),
+        ] {
+            let host = FakeHost {
+                second_target: true,
+                ..Default::default()
+            };
+            let options = BackupOptions {
+                targets: targets.clone(),
+                ..Default::default()
+            };
+            let outcome = run_backup_job(&host, make_test_config(), options, &TestProgress::new());
+            assert!(outcome.success(), "{targets:?}: {outcome:?}");
+            assert_eq!(*host.mounted.lock().unwrap(), vec![mounted], "{targets:?}");
+        }
     }
 
     // --- Cancel stops the work at the next safe boundary (bd yq2) -----------
