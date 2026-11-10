@@ -288,6 +288,27 @@ check "no binary: FAIL" "${OP_STATUS[run_history]:-unset}" "FAIL"
 check "no binary: the reason" "$(x="${OP_STATUS[run_history_detail]:-unset}"; echo "${x%%:*}")" "recording it failed"
 BTRDASD_BIN="$WORK/btrdasd"
 
+# --- a clock stepped back during btrbk (bd taa) ----------------------------------
+# The stamps around btrbk, read by the real capture_usage, with the wall clock
+# stepped back between them (an NTP correction). record-run refuses a negative
+# duration as it refused -1 (6wt): that run would leave no history row.
+for fn in capture_usage monotonic_secs; do
+    body="$(extract "$fn")"
+    [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
+    eval "$body"
+done
+ALL_TARGET_MOUNTS=()
+printf '%s\n' 5000 1400 >"$WORK/clock"
+date() { sed -n 1p "$WORK/clock"; sed -i 1d "$WORK/clock"; }
+reset
+capture_usage before
+capture_usage after
+unset -f date
+record_run_args SUCCESS false
+dur="$(vector | grep -A1 '^--duration-secs$' | sed -n 2p)"
+check "a clock stepped back: the duration is a count of seconds, never negative" \
+    "$([[ "$dur" =~ ^[[:digit:]]+$ ]] && echo seconds || echo "$dur")" seconds
+
 # --- the growth section: a missing reading is unknown, never 0 (bd 3lpr) ----------------------
 # The real generate_growth_section (the stub above stands in for it elsewhere).
 for fn in generate_growth_section usage_delta format_bytes; do

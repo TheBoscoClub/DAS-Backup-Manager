@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A nightly run whose clock is stepped back during btrbk is still recorded** (bd `DAS-Backup-Manager-taa`): `backup-run.sh` timed btrbk with `date +%s`, so an NTP or RTC correction mid-run made the duration negative, and `btrdasd backup record-run` refuses `--duration-secs -N` as it once refused `-1` (bd `6wt`) — the run left no `backup_runs` row
+  - btrbk and the maintenance-lock wait are now timed by `monotonic_secs` (`/proc/uptime`, never stepped back); `backup-run.sh` 4.17.3
+
 - **A snapshot step with a target not mounted no longer fails after creating every snapshot** (bd `DAS-Backup-Manager-2ab3`): `btrbk snapshot` reads every target of the subvolumes it snapshots, and one it cannot read is aborted, so btrbk exits 10 once the snapshots exist (reproduced in a VM, btrbk 0.32.7); `btrdasd backup snapshot` mounts no target, and read that as `No snapshots can be assumed created`
   - Both `backup snapshot` and `backup run`'s snapshot step now pass `--preserve-snapshots`: btrbk reads no target and deletes no snapshot — retention is the `btrbk resume` or `btrbk run` that sends — `backup::create_snapshots_with`
 

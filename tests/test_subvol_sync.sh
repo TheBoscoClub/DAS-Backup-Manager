@@ -13,7 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup create_target_dirs make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk cleanup monotonic_secs create_target_dirs make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"

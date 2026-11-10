@@ -1,6 +1,6 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.17.2
+# Version: 4.17.3
 # Date: 2026-11-09
 #
 # Features:
@@ -927,13 +927,13 @@ acquire_maintenance_lock() {
 
     log_info "DAS maintenance lock held by $(maintenance_holder) — waiting..."
     local wait_start
-    wait_start=$(date +%s)
+    wait_start=$(monotonic_secs)
 
     flock 8
     record_maintenance_holder
 
     local wait_secs
-    wait_secs=$(( $(date +%s) - wait_start ))
+    wait_secs=$(( $(monotonic_secs) - wait_start ))
     log_info "DAS maintenance lock acquired after waiting ${wait_secs}s"
     record_op "lock_wait" "OK" "waited ${wait_secs}s for $MAINTENANCE_LOCKFILE"
 }
@@ -2958,6 +2958,16 @@ format_bytes() {
 }
 
 # Capture disk usage on all mounted backup targets
+# Seconds since boot, never stepped back: the wall clock is, by an NTP or RTC
+# correction, and a duration taken from it could be negative — refused by
+# record-run, so that run left no history row (bd DAS-Backup-Manager-taa).
+# Never 0, which BTRBK_START_TIME reserves for "btrbk has not started".
+monotonic_secs() {
+    local up
+    read -r up _ </proc/uptime
+    echo $((${up%.*} + 1))
+}
+
 capture_usage() {
     local phase="$1"  # "before" or "after"
 
@@ -2974,9 +2984,9 @@ capture_usage() {
     done
 
     if [[ "$phase" == "before" ]]; then
-        BTRBK_START_TIME=$(date +%s)
+        BTRBK_START_TIME=$(monotonic_secs)
     else
-        BTRBK_END_TIME=$(date +%s)
+        BTRBK_END_TIME=$(monotonic_secs)
     fi
 }
 
@@ -3578,7 +3588,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.17.2
+  backup-run.sh v4.17.3
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -4333,7 +4343,7 @@ cleanup() {
     if [[ "$BACKUP_MODE_REAL" == "true" && "$BACKUP_RUN_RECORDED" == "false" ]]; then
         # btrbk's duration so far, if it started; 0 if it never did.
         if (( BTRBK_START_TIME != 0 && BTRBK_END_TIME == 0 )); then
-            BTRBK_END_TIME=$(date +%s)
+            BTRBK_END_TIME=$(monotonic_secs)
         fi
         record_backup_run_in_db "FAILURE" "$BACKUP_FORCE_FULL"
     fi
