@@ -647,11 +647,7 @@ followed by the paths. Once the targets are mounted and verified, the run
 creates the directory each one receives into (the first
 .I target_subdirs
 entry of each source, or its label), logging each one it creates, on a dry
-run too; a directory that cannot be created fails the run. This command does not
-expire retired backups
-.RB ( backup\-run.sh
-does, with
-.BR "subvol expire" ).
+run too; a directory that cannot be created fails the run.
 When
 .B [boot].enabled
 is set, the boot subvolumes on each non-mirror target are handled by one rule
@@ -696,6 +692,33 @@ next drive; the drives are unmounted, and the locks given back, only once it
 has, so a drive it was reading is read to its end first. The summary the CLI prints and the GUI shows ends with a
 .B "recovery OS"
 line saying which.
+.PP
+A live run also does what
+.B backup\-run.sh
+does around btrbk. It reads every USB device whose product contains
+.BR [das].model_pattern ,
+takes the slowest negotiated speed as the enclosure's link and fails the run
+below
+.BR [das].expected_link_mbit_s ;
+a pattern no device matches is a warning, an empty pattern is not checked; the
+report's
+.B "USB link"
+row says which, whether or not the run wrote anything. It appends a line to
+.I throughput.jsonl
+beside
+.B [general].growth_log
+when the targets grew and btrbk ran for at least a second, and one line per
+read target to
+.B growth.log
+(a line that cannot be appended is a warning). Directly after btrbk, and only
+when the selection is everything the configuration declares (every source and
+every target: a run of fewer expires nothing and the report's
+.B "Retired expiry"
+row says so), it expires retired subvolumes as
+.B "subvol expire"
+does: a dry run on a dry run, and a dry run only when the run's subvolume sync
+failed; a failure of it fails the run. The boot-archive pruner runs only in
+.BR backup\-run.sh .
 .PP
 If another backup already holds the singleton lock, the command prints that it
 declines and exits 0; it waits for a running scrub. A run that could not start
@@ -3296,6 +3319,8 @@ targets' drive serials and
 .I /var/lib/das\-backup/growth.log
 Disk usage growth log for trend monitoring, appended by
 .B backup\-run.sh
+and by
+.BR "backup run" ,
 and read by
 .BR "btrdasd health" .
 .TP

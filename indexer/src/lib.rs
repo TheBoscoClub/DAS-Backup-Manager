@@ -18,6 +18,7 @@ pub mod reconcile;
 pub mod recovery_os;
 pub mod report;
 pub mod restore;
+pub mod run_steps;
 pub mod scanner;
 pub mod schedule;
 pub mod scrub;

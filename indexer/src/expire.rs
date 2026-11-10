@@ -586,6 +586,23 @@ pub fn expire_retired(
     })
 }
 
+/// Drop the index rows of snapshots an expiry just deleted. Returns how many
+/// rows were pruned.
+pub fn prune_deleted_from_index(
+    db: &Path,
+    deleted: &[PathBuf],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let database = crate::db::Database::open(db)?;
+    let ids: Vec<i64> = database
+        .list_snapshots()?
+        .into_iter()
+        .filter(|s| deleted.iter().any(|p| p.to_string_lossy() == s.path))
+        .map(|s| s.id)
+        .collect();
+    database.prune_snapshots(&ids)?;
+    Ok(ids.len())
+}
+
 /// The "RETIRED SUBVOLUMES" section of the run report. Empty when no entry
 /// is retired, so the section appears only while there is something to say.
 pub fn format_expire_report(outcome: &ExpireOutcome, dry_run: bool) -> String {

@@ -8,6 +8,7 @@ use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback, cut_short, stop_requested};
 use crate::recovery_os::{self, RecordStatus};
+use crate::run_steps::{self, ExpireRun, ExpiryStep, UsbLinkStep};
 use crate::scrub;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -489,6 +490,11 @@ pub struct BackupResult {
     pub bytes_sent: Option<u64>,
     pub boot: BootStep,
     pub recovery_os: RecoveryOsStep,
+    /// The enclosure's negotiated USB link, read after btrbk as
+    /// `backup-run.sh`'s `log_throughput` reads it (bd DAS-Backup-Manager-7qe).
+    pub usb_link: UsbLinkStep,
+    /// The expiry of retired subvolumes, after btrbk, on a run of everything.
+    pub expiry: ExpiryStep,
     pub indexed: bool,
     pub report_sent: bool,
     pub errors: Vec<String>,
@@ -704,6 +710,47 @@ struct StepEnv<'a> {
     /// handed and record them in the state file
     /// ([`record_recovery_os`]).
     recovery_os: &'a RecordRecoveryOs<'a>,
+    /// Read the enclosure's USB link ([`usb_link_on_host`]).
+    usb_link: &'a dyn Fn(&Config) -> UsbLinkStep,
+    /// Expire the retired subvolumes of the config it is handed, as a dry run
+    /// when the bool is set ([`StepEnv::HOST`]: unavailable, the job's host
+    /// supplies the config file's path).
+    expire: &'a dyn Fn(&Config, bool) -> ExpireRun,
+    /// Append one line to a file, making its directory
+    /// ([`append_line_to`]): `growth.log`, `throughput.jsonl`.
+    append_line: &'a dyn Fn(&Path, &str) -> std::io::Result<()>,
+    /// Seconds since the epoch.
+    now: &'a dyn Fn() -> i64,
+}
+
+/// [`StepEnv::usb_link`] on this machine: the kernel's USB device list, the
+/// config's `[das]` pattern and expected speed.
+fn usb_link_on_host(config: &Config) -> UsbLinkStep {
+    run_steps::check_usb_link(
+        Path::new(run_steps::USB_DEVICES_DIR),
+        &config.das.model_pattern,
+        config.das.expected_link_mbit_s,
+    )
+}
+
+/// [`StepEnv::append_line`] on this machine.
+fn append_line_to(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// [`StepEnv::now`] on this machine.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// The step behind [`StepEnv::recovery_os`].
@@ -770,6 +817,12 @@ impl StepEnv<'static> {
         usage: &synced_target_usage,
         index: &index_mounted_targets,
         recovery_os: &record_recovery_os,
+        usb_link: &usb_link_on_host,
+        expire: &|_, _| {
+            ExpireRun::Unavailable("the run was not given its configuration file".into())
+        },
+        append_line: &append_line_to,
+        now: &unix_now,
     };
 }
 
@@ -2782,6 +2835,13 @@ fn run_backup_with(
             ),
         );
 
+        let expiry = expiry_step(config, options, progress, env);
+        if let ExpiryStep::Ran { detail, .. } = &expiry
+            && expiry.failed()
+        {
+            errors.push(format!("{}{detail}", run_steps::EXPIRY_ERROR_PREFIX));
+        }
+
         let success = errors.is_empty();
         let result = BackupResult {
             success,
@@ -2792,6 +2852,8 @@ fn run_backup_with(
             bytes_sent: Some(0),
             boot: BootStep::NotSelected,
             recovery_os: RecoveryOsStep::NotSelected,
+            usb_link: UsbLinkStep::NotChecked,
+            expiry,
             indexed: false,
             report_sent: false,
             errors,
@@ -2867,6 +2929,7 @@ fn run_backup_with(
         &format!("Target usage before: {}", usage_text(&usage_before)),
     );
 
+    let btrbk_start = (env.now)();
     let done = run_pipeline(
         config,
         options,
@@ -2876,6 +2939,7 @@ fn run_backup_with(
         progress,
         env,
     );
+    let btrbk_secs = ((env.now)() - btrbk_start).max(0) as u64;
     // The pipeline stopped at its own boundary: nothing after it runs.
     let done_cancelled = cut_short(progress);
     errors.extend(done.errors);
@@ -2892,12 +2956,15 @@ fn run_backup_with(
     // step failed or was stopped) is read again, never assumed to have sent
     // nothing (bd DAS-Backup-Manager-3lpr).
     let nothing_done = snapshots_created == Some(0) && snapshots_sent == Some(0);
+    //
+    // The reading is taken on every live run: `growth.log` takes a line from
+    // it whether or not anything was sent.
+    // `usage` forces BTRFS to commit pending transactions first, so statvfs
+    // reflects the data that was just received. Without that, BTRFS defers
+    // metadata updates and statvfs returns stale values, making the delta
+    // zero.
+    let usage_after = (env.usage)(config, progress);
     if done.bytes == 0 && !nothing_done {
-        // `usage` forces BTRFS to commit pending transactions first, so statvfs
-        // reflects the data that was just received. Without that, BTRFS defers
-        // metadata updates and statvfs returns stale values, making the delta
-        // zero.
-        let usage_after = (env.usage)(config, progress);
         bytes_sent = bytes_grown(&usage_before, &usage_after);
         progress.on_log(
             if bytes_sent.is_some() {
@@ -2912,6 +2979,47 @@ fn run_backup_with(
             ),
         );
     }
+
+    // The enclosure's USB link, the throughput and growth history and the
+    // expiry of retired subvolumes: what backup-run.sh does after btrbk and
+    // before the recovery-OS check (bd DAS-Backup-Manager-7qe). The link is
+    // read whether or not anything was written: its health is not traffic.
+    let usb_link = if done_cancelled {
+        UsbLinkStep::NotChecked
+    } else {
+        let step = (env.usb_link)(config);
+        if let UsbLinkStep::Checked(c) = &step {
+            let level = match c.status {
+                RecordStatus::Ok => LogLevel::Info,
+                RecordStatus::Warn => LogLevel::Warning,
+                RecordStatus::Fail => LogLevel::Error,
+            };
+            progress.on_log(level, &format!("DAS USB link: {}", c.detail));
+            if step.failed() {
+                errors.push(format!("{}{}", run_steps::USB_LINK_ERROR_PREFIX, c.detail));
+            }
+        }
+        step
+    };
+    append_history_lines(
+        config,
+        (bytes_sent, btrbk_secs),
+        &usb_link,
+        &usage_after,
+        progress,
+        env,
+    );
+    let expiry = if done_cancelled {
+        ExpiryStep::NotRun
+    } else {
+        let step = expiry_step(config, options, progress, env);
+        if let ExpiryStep::Ran { detail, .. } = &step
+            && step.failed()
+        {
+            errors.push(format!("{}{detail}", run_steps::EXPIRY_ERROR_PREFIX));
+        }
+        step
+    };
 
     // Recovery OSes — after btrbk, while the targets are mounted, as
     // backup-run.sh's check_recovery_os runs after btrbk and expiry: read
@@ -2989,6 +3097,8 @@ fn run_backup_with(
         bytes_sent,
         boot,
         recovery_os,
+        usb_link,
+        expiry,
         indexed,
         report_sent: false,
         errors,
@@ -2997,6 +3107,118 @@ fn run_backup_with(
     };
 
     Ok(result)
+}
+
+/// Whether what `options` selects is everything the configuration declares —
+/// the case in which btrbk is given no filter (`btrbk_filters`). Expiry
+/// deletes across the whole configuration, so only such a run may do it.
+fn selection_is_everything(config: &Config, options: &BackupOptions) -> bool {
+    btrbk_filters(
+        config,
+        options.sources.as_deref(),
+        options.targets.as_deref(),
+        &crate::progress::NullProgress,
+    )
+    .is_ok_and(|filters| filters.is_empty())
+}
+
+/// The retired-subvolume expiry of a run, as `backup-run.sh`'s
+/// `expire_retired_subvolumes` does it: a dry run in a dry run and when this
+/// run's subvolume sync failed (a retired subvolume may be waiting for sync
+/// to revive it), never on a run of a selection.
+fn expiry_step(
+    config: &Config,
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+    env: &StepEnv,
+) -> ExpiryStep {
+    if !selection_is_everything(config, options) {
+        let step = ExpiryStep::skipped_for_selection();
+        progress.on_log(LogLevel::Info, &format!("Retired expiry {}", step.row()));
+        return step;
+    }
+    let held_back = !options.dry_run && options.subvolume_sync.as_ref().is_some_and(|s| s.failed);
+    if held_back {
+        progress.on_log(
+            LogLevel::Warning,
+            "Subvolume sync failed this run — retired subvolumes are not expired (dry run only)",
+        );
+    }
+    let step = ExpiryStep::from_run(
+        (env.expire)(config, options.dry_run || held_back),
+        held_back,
+    );
+    if let ExpiryStep::Ran {
+        status,
+        detail,
+        section,
+    } = &step
+    {
+        let (level, line) = match status {
+            run_steps::ExpiryStatus::Fail => (
+                LogLevel::Error,
+                format!("Expiry of retired subvolumes failed: {detail}"),
+            ),
+            _ => (LogLevel::Info, format!("Retired expiry {}", step.row())),
+        };
+        progress.on_log(level, &line);
+        for l in section.lines() {
+            progress.on_log(LogLevel::Info, &format!("  {l}"));
+        }
+    }
+    step
+}
+
+/// The run's lines in `throughput.jsonl` (a run that wrote something) and
+/// `growth.log` (each target read), beside `[general].growth_log`. A line that
+/// cannot be appended is a warning, never a failure of the run.
+fn append_history_lines(
+    config: &Config,
+    (bytes_sent, btrbk_secs): (Option<u64>, u64),
+    usb_link: &UsbLinkStep,
+    usage_after: &TargetUsage,
+    progress: &dyn ProgressCallback,
+    env: &StepEnv,
+) {
+    let now = (env.now)();
+    let growth_log = Path::new(&config.general.growth_log);
+    if let Some(line) = bytes_sent.and_then(|bytes| {
+        run_steps::throughput_line(
+            &run_steps::iso_local(now),
+            btrbk_secs,
+            bytes,
+            &usb_link.speed_text(),
+        )
+    }) {
+        let path = run_steps::throughput_log_path(&config.general.growth_log);
+        if let Err(e) = (env.append_line)(&path, &line) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!("Could not append to throughput log {}: {e}", path.display()),
+            );
+        }
+    }
+    let readings: Vec<(String, Option<u64>)> = config
+        .targets
+        .iter()
+        .filter_map(|t| {
+            usage_after
+                .get(&t.label)
+                .map(|used| (t.mount.clone(), *used))
+        })
+        .collect();
+    for line in run_steps::growth_lines(&run_steps::growth_stamp(now), &readings) {
+        if let Err(e) = (env.append_line)(growth_log, &line) {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "Could not append to growth log {}: {e}",
+                    growth_log.display()
+                ),
+            );
+            break;
+        }
+    }
 }
 
 /// The recovery-OS step of a live run over `targets`: not selected when none
@@ -3229,6 +3451,9 @@ pub trait BackupJobHost {
 }
 
 /// How a backup job ended.
+// One outcome per job, moved once: boxing `Ran` would change every consumer
+// of the result for no gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum BackupJobOutcome {
     /// Another backup holds the singleton lock — declined, not queued.
@@ -3390,6 +3615,8 @@ fn abort_job(
         bytes_sent: Some(0),
         boot: BootStep::NotSelected,
         recovery_os: RecoveryOsStep::NotSelected,
+        usb_link: UsbLinkStep::NotChecked,
+        expiry: ExpiryStep::NotRun,
         indexed: false,
         report_sent: false,
         errors: vec![why.clone()],
@@ -3657,7 +3884,23 @@ impl BackupJobHost for SystemBackupHost {
         options: &BackupOptions,
         progress: &dyn ProgressCallback,
     ) -> Result<BackupResult, String> {
-        run_backup(config, options, progress).map_err(|e| e.to_string())
+        // The expiry rewrites the config file, so it needs the file's path:
+        // the one this job loaded (`run_backup` alone has no path to give).
+        let expire = |config: &Config, dry_run: bool| {
+            run_steps::expire_at(
+                &self.config_path,
+                Path::new(&config.general.db_path),
+                dry_run,
+                &crate::caldate::today(),
+                &SystemRunner,
+                &health::is_mountpoint,
+            )
+        };
+        let env = StepEnv {
+            expire: &expire,
+            ..StepEnv::HOST
+        };
+        run_backup_with(config, options, progress, &env).map_err(|e| e.to_string())
     }
 
     fn capture_report(&self, config: &Config) -> crate::report::ReportData {
@@ -6776,6 +7019,11 @@ Legend:
             usage: &|_, _| TargetUsage::new(),
             index: &|_, _| false,
             recovery_os: &|_, _| quiet_recording(),
+            usb_link: &|_| UsbLinkStep::NotChecked,
+            expire: &|_, _| ExpireRun::Unavailable("test".into()),
+            // Never the real files: the test config names `/tmp/growth.log`.
+            append_line: &|_, _| Ok(()),
+            now: &|| 1_700_000_000,
         }
     }
 
@@ -7986,7 +8234,7 @@ Legend:
     }
 
     #[test]
-    fn nothing_created_or_sent_reads_the_targets_once_and_sends_zero_bytes() {
+    fn nothing_created_or_sent_sends_zero_bytes_whatever_the_second_reading_says() {
         let (result, taken) = live_run_measuring(
             BackupOptions {
                 steps: BtrbkSteps::SendOnly,
@@ -8000,15 +8248,13 @@ Legend:
             (result.snapshots_created, result.snapshots_sent),
             (Some(0), Some(0))
         );
-        assert_eq!(
-            (result.bytes_sent, taken),
-            (Some(0), 1),
-            "no second reading"
-        );
+        // The second reading is `growth.log`'s; the measurement is not
+        // derived from it (5000 - 1000 would be 4000, not 0).
+        assert_eq!((result.bytes_sent, taken), (Some(0), 2));
     }
 
     #[test]
-    fn a_size_btrbk_reported_is_kept_and_the_targets_are_not_read_again() {
+    fn a_size_btrbk_reported_is_kept_and_not_replaced_by_the_second_reading() {
         let row = raw_row("/s/a.1", "/t/a.1");
         let (result, taken) = live_run_measuring(
             BackupOptions {
@@ -8019,7 +8265,9 @@ Legend:
             &[1000, 5000],
         );
         assert_eq!(result.bytes_sent, Some(2 * 1_048_576));
-        assert_eq!(taken, 1, "the step's own figure is the answer");
+        // The step's own figure is the answer; the second reading is
+        // `growth.log`'s.
+        assert_eq!(taken, 2);
     }
 
     #[test]
@@ -9546,6 +9794,8 @@ Legend:
             bytes_sent: r.bytes_sent,
             boot: r.boot.clone(),
             recovery_os: r.recovery_os.clone(),
+            usb_link: r.usb_link.clone(),
+            expiry: r.expiry.clone(),
             indexed: r.indexed,
             report_sent: r.report_sent,
             errors: r.errors.clone(),
@@ -9647,6 +9897,8 @@ Legend:
                 bytes_sent: Some(10),
                 boot: BootStep::NotSelected,
                 recovery_os: RecoveryOsStep::NotSelected,
+                usb_link: UsbLinkStep::NotChecked,
+                expiry: ExpiryStep::NotRun,
                 indexed: true,
                 report_sent: false,
                 errors,
@@ -10640,6 +10892,8 @@ Legend:
                 ..Default::default()
             }),
             recovery_os: RecoveryOsStep::NotSelected,
+            usb_link: UsbLinkStep::NotChecked,
+            expiry: ExpiryStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: if success {
@@ -11173,8 +11427,12 @@ Legend:
         };
         // With no target there is nothing to verify (a legacy target would be
         // checked by its drive's serial, which no test host can supply).
+        // The run also shows what it would expire, from the host's own config
+        // file: a valid one, with nothing retired in it.
+        sync_fixture(dir.path());
         let result = host.run(&config, &options, &progress).unwrap();
-        assert!(result.success);
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(result.expiry.row(), "OK  (n/a)");
         let mut nothing = make_test_config();
         nothing.targets[0].mount = "/nonexistent/das/mount".into();
         assert!(
@@ -11258,17 +11516,20 @@ Legend:
         let conf = &config.general.btrbk_conf;
         vec![
             (
-                btrbk_at(conf, &format!("--preserve-snapshots snapshot {f}")),
+                btrbk_at(
+                    conf,
+                    format!("--preserve-snapshots snapshot {f}").trim_end(),
+                ),
                 0,
                 String::new(),
             ),
             (
-                btrbk_at(conf, &format!("resume {f}")),
+                btrbk_at(conf, format!("resume {f}").trim_end()),
                 0,
                 ">>> /t/a.1\n".into(),
             ),
             (
-                btrbk_at(conf, &format!("--format=raw list latest {f}")),
+                btrbk_at(conf, format!("--format=raw list latest {f}").trim_end()),
                 0,
                 raw_row("/s/a.1", "/t/a.1"),
             ),
@@ -11280,6 +11541,393 @@ Legend:
             targets: Some(labels(&["primary-22tb", "recovery"])),
             ..live_options()
         }
+    }
+
+    // -- the steps backup-run.sh does around btrbk (bd 7qe) ------------------
+
+    /// Everything selected: every source, every target.
+    fn whole_selection() -> BackupOptions {
+        BackupOptions {
+            sources: Some(labels(&["nvme-root", "other-src"])),
+            ..both_targets()
+        }
+    }
+
+    /// What a live run of `options` over `mirror_live_config` (its growth log
+    /// at `/gl/growth.log`, a file no test touches) did through the seams that
+    /// reach the host: the result, every line appended and where, every
+    /// expiry asked for (`dry_run`), and the order of expiry and the
+    /// recovery-OS step.
+    struct StepsRun {
+        result: BackupResult,
+        appended: Vec<(std::path::PathBuf, String)>,
+        expiries: Vec<bool>,
+        order: Vec<&'static str>,
+        progress: TestProgress,
+    }
+
+    fn run_steps_with(
+        config: &Config,
+        options: &BackupOptions,
+        usb: UsbLinkStep,
+        usage: (TargetUsage, TargetUsage),
+        expire: ExpireRun,
+        append_fails: bool,
+    ) -> StepsRun {
+        let mut config = config.clone();
+        config.general.growth_log = "/gl/growth.log".into();
+        let runner = Scripted::from_owned(clean_run_script(&config, options));
+        let appended = std::sync::Mutex::new(Vec::new());
+        let expiries = std::sync::Mutex::new(Vec::new());
+        let order = std::sync::Mutex::new(Vec::new());
+        let reads = std::cell::Cell::new(0);
+        let usage_of = |_: &Config, _: &dyn ProgressCallback| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                usage.0.clone()
+            } else {
+                usage.1.clone()
+            }
+        };
+        let append = |p: &Path, l: &str| {
+            appended
+                .lock()
+                .unwrap()
+                .push((p.to_path_buf(), l.to_string()));
+            if append_fails {
+                Err(std::io::Error::other("disk full"))
+            } else {
+                Ok(())
+            }
+        };
+        let expire_step = |_: &Config, dry: bool| {
+            expiries.lock().unwrap().push(dry);
+            order.lock().unwrap().push("expiry");
+            expire.clone()
+        };
+        let ros = |_: &Config, _: &dyn ProgressCallback| {
+            order.lock().unwrap().push("recovery-os");
+            quiet_recording()
+        };
+        // The first reading starts btrbk, every later one is 100 s on.
+        let clock = std::cell::Cell::new(0);
+        let now = || {
+            clock.set(clock.get() + 1);
+            1_700_000_000 + if clock.get() == 1 { 0 } else { 100 }
+        };
+        let usb_step = |_: &Config| usb.clone();
+        let env = StepEnv {
+            is_mountpoint: &|_| true,
+            usage: &usage_of,
+            usb_link: &usb_step,
+            expire: &expire_step,
+            append_line: &append,
+            recovery_os: &ros,
+            now: &now,
+            ..env(&runner)
+        };
+        let progress = TestProgress::new();
+        let result = run_backup_with(&config, options, &progress, &env).unwrap();
+        StepsRun {
+            result,
+            appended: appended.into_inner().unwrap(),
+            expiries: expiries.into_inner().unwrap(),
+            order: order.into_inner().unwrap(),
+            progress,
+        }
+    }
+
+    fn usage_of_labels(readings: &[(&str, Option<u64>)]) -> TargetUsage {
+        readings.iter().map(|(l, u)| (l.to_string(), *u)).collect()
+    }
+
+    fn link(status: RecordStatus, speed: Option<u64>, detail: &str) -> UsbLinkStep {
+        UsbLinkStep::Checked(run_steps::UsbLinkCheck {
+            status,
+            detail: detail.into(),
+            speed,
+        })
+    }
+
+    fn quiet_expiry() -> ExpireRun {
+        ExpireRun::Performed {
+            section: String::new(),
+            failure: None,
+        }
+    }
+
+    fn unchanged() -> (TargetUsage, TargetUsage) {
+        let u = usage_of_labels(&[("primary-22tb", Some(100)), ("recovery", Some(100))]);
+        (u.clone(), u)
+    }
+
+    #[test]
+    fn a_usb_link_below_expected_fails_the_run_naming_the_speed() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            link(
+                RecordStatus::Fail,
+                Some(5000),
+                "negotiated 5000 Mbit/s, expected 10000",
+            ),
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert!(!run.result.success);
+        assert!(run.result.usb_link.failed());
+        assert!(
+            run.result
+                .errors
+                .contains(&"USB link: negotiated 5000 Mbit/s, expected 10000".to_string()),
+            "{:?}",
+            run.result.errors
+        );
+        // Nothing was written, and the link was read all the same.
+        assert_eq!(run.result.bytes_sent, Some(0));
+    }
+
+    #[test]
+    fn a_usb_link_that_went_unread_only_warns_and_a_dry_run_reads_nothing() {
+        let warn = link(
+            RecordStatus::Warn,
+            None,
+            "no USB device's product contains 'X'",
+        );
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            warn.clone(),
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert!(run.result.success, "{:?}", run.result.errors);
+        assert_eq!(run.result.usb_link, warn);
+        let dry = BackupOptions {
+            dry_run: true,
+            ..both_targets()
+        };
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &dry,
+            warn,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert_eq!(run.result.usb_link, UsbLinkStep::NotChecked);
+    }
+
+    #[test]
+    fn a_run_that_wrote_something_appends_its_throughput_line_beside_the_growth_log() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            link(RecordStatus::Ok, Some(10000), "negotiated 10000 Mbit/s"),
+            (
+                usage_of_labels(&[("primary-22tb", Some(100)), ("recovery", Some(100))]),
+                usage_of_labels(&[("primary-22tb", Some(1100)), ("recovery", Some(100))]),
+            ),
+            quiet_expiry(),
+            false,
+        );
+        let throughput: Vec<&str> = run
+            .appended
+            .iter()
+            .filter(|(p, _)| p == Path::new("/gl/throughput.jsonl"))
+            .map(|(_, l)| l.as_str())
+            .collect();
+        let ts = run_steps::iso_local(1_700_000_100);
+        assert_eq!(
+            throughput,
+            vec![format!(
+                r#"{{"ts":"{ts}","elapsed_s":100,"bytes":1000,"bytes_per_s":10,"usb_link_mbit_s":"10000"}}"#
+            )],
+            "{:?}",
+            run.appended
+        );
+    }
+
+    #[test]
+    fn a_run_that_wrote_nothing_appends_no_throughput_line() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert!(
+            !run.appended
+                .iter()
+                .any(|(p, _)| p == Path::new("/gl/throughput.jsonl")),
+            "{:?}",
+            run.appended
+        );
+    }
+
+    #[test]
+    fn the_growth_log_gets_a_line_per_read_target_and_none_for_an_unread_one() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            UsbLinkStep::NotChecked,
+            (
+                unchanged().0,
+                usage_of_labels(&[("primary-22tb", Some(1100)), ("recovery", None)]),
+            ),
+            quiet_expiry(),
+            false,
+        );
+        let stamp = run_steps::growth_stamp(1_700_000_100);
+        let growth: Vec<String> = run
+            .appended
+            .iter()
+            .filter(|(p, _)| p == Path::new("/gl/growth.log"))
+            .map(|(_, l)| l.clone())
+            .collect();
+        // Both targets are mounted at `/proc` in this config; only the read
+        // one has a line, and its value is the reading.
+        assert_eq!(growth, vec![format!("{stamp} /proc 1100")]);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_appended_to_warns_and_never_fails_the_run() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            UsbLinkStep::NotChecked,
+            (
+                unchanged().0,
+                usage_of_labels(&[("primary-22tb", Some(1100)), ("recovery", Some(100))]),
+            ),
+            quiet_expiry(),
+            true,
+        );
+        assert!(run.result.success, "{:?}", run.result.errors);
+        let logs = run.progress.logs.lock().unwrap();
+        for what in ["growth log", "throughput log"] {
+            assert!(
+                logs.iter().any(|(l, m)| *l == LogLevel::Warning
+                    && m.contains(what)
+                    && m.contains("disk full")),
+                "{what}: {logs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_everything_expires_retired_subvolumes_after_btrbk_and_before_the_recovery_os() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &whole_selection(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            ExpireRun::Performed {
+                section: "RETIRED SUBVOLUMES\n  x\n".into(),
+                failure: None,
+            },
+            false,
+        );
+        assert_eq!(run.expiries, vec![false]);
+        assert_eq!(run.order, vec!["expiry", "recovery-os"]);
+        assert_eq!(run.result.expiry.row(), "OK  (n/a)");
+        assert!(run.result.success, "{:?}", run.result.errors);
+    }
+
+    #[test]
+    fn a_run_of_a_selection_never_expires_and_says_why() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert!(run.expiries.is_empty());
+        assert_eq!(run.result.expiry, ExpiryStep::skipped_for_selection());
+        assert!(run.result.success);
+    }
+
+    #[test]
+    fn a_failed_expiry_fails_the_run() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &whole_selection(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            ExpireRun::Performed {
+                section: String::new(),
+                failure: Some("a delete failed".into()),
+            },
+            false,
+        );
+        assert!(!run.result.success);
+        assert!(run.result.expiry.failed());
+        assert!(
+            run.result
+                .errors
+                .iter()
+                .any(|e| e
+                    == "Retired expiry: a delete failed — see RETIRED SUBVOLUMES in the report"),
+            "{:?}",
+            run.result.errors
+        );
+    }
+
+    #[test]
+    fn a_dry_run_of_everything_asks_for_a_dry_run_expiry() {
+        let options = BackupOptions {
+            dry_run: true,
+            ..whole_selection()
+        };
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &options,
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert_eq!(run.expiries, vec![true]);
+        assert_eq!(run.result.expiry.row(), "OK  (n/a)");
+    }
+
+    #[test]
+    fn an_expiry_whose_sync_failed_is_only_a_dry_run_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("btrbk.conf");
+        let mut config = mirror_live_config();
+        config.general.btrbk_conf = conf.to_string_lossy().into_owned();
+        std::fs::write(
+            &conf,
+            crate::btrbk_conf::render_btrbk_conf(&config).unwrap(),
+        )
+        .unwrap();
+        let options = BackupOptions {
+            subvolume_sync: Some(failed_sync()),
+            ..whole_selection()
+        };
+        let run = run_steps_with(
+            &config,
+            &options,
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            ExpireRun::Performed {
+                section: "RETIRED SUBVOLUMES\n  would delete a\n".into(),
+                failure: None,
+            },
+            false,
+        );
+        assert_eq!(run.expiries, vec![true], "never a deleting expiry");
+        assert_eq!(
+            run.result.expiry.row(),
+            format!("SKIP  ({})", run_steps::SYNC_FAILED)
+        );
     }
 
     /// A live run of `options` over `mirror_live_config` whose recovery-OS

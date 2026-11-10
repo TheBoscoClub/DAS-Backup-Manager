@@ -1394,23 +1394,6 @@ pub fn exit_code_for_doctor(outcome: &doctor::DoctorOutcome) -> i32 {
 // Main
 // ---------------------------------------------------------------------------
 
-/// Drop the index rows of snapshots `subvol expire` just deleted.
-/// Returns how many rows were pruned.
-fn prune_deleted_from_index(
-    db: &Path,
-    deleted: &[PathBuf],
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let database = Database::open(db)?;
-    let ids: Vec<i64> = database
-        .list_snapshots()?
-        .into_iter()
-        .filter(|s| deleted.iter().any(|p| p.to_string_lossy() == s.path))
-        .map(|s| s.id)
-        .collect();
-    database.prune_snapshots(&ids)?;
-    Ok(ids.len())
-}
-
 /// What `backup run` asks of the job: incremental unless `--full`, the
 /// selection its flags name (none given: not specified), everything after the
 /// btrbk steps on, and a report.
@@ -1501,7 +1484,7 @@ fn backup_run_line(result: &backup::BackupResult) -> String {
 fn expire_failed(outcome_failed: bool, deleted: &[PathBuf], db: &Path) -> bool {
     let mut failed = outcome_failed;
     if !deleted.is_empty()
-        && let Err(e) = prune_deleted_from_index(db, deleted)
+        && let Err(e) = buttered_dasd::expire::prune_deleted_from_index(db, deleted)
     {
         eprintln!("Warning: deleted snapshots could not be removed from the index: {e}");
         failed = true;
@@ -3333,6 +3316,8 @@ mod tests {
             bytes_sent: Some(0),
             boot: backup::BootStep::NotSelected,
             recovery_os: backup::RecoveryOsStep::NotSelected,
+            usb_link: buttered_dasd::run_steps::UsbLinkStep::NotChecked,
+            expiry: buttered_dasd::run_steps::ExpiryStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: Vec::new(),

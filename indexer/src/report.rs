@@ -283,6 +283,7 @@ pub fn format_report_from(
         "FAILURES DETECTED"
     } else if result.boot.has_warnings()
         || result.recovery_os.has_warnings()
+        || result.usb_link.has_warnings()
         || sync.is_some_and(|s| crate::coverage::has_warnings_or_missing(s.coverage.as_ref()))
     {
         "COMPLETED WITH WARNINGS"
@@ -309,6 +310,8 @@ pub fn format_report_from(
         .filter(|e| {
             !e.starts_with(crate::backup::BOOT_ERROR_PREFIX)
                 && !e.starts_with(crate::backup::RECOVERY_OS_ERROR_PREFIX)
+                && !e.starts_with(crate::run_steps::USB_LINK_ERROR_PREFIX)
+                && !e.starts_with(crate::run_steps::EXPIRY_ERROR_PREFIX)
         })
         .any(|e| e.contains("btrbk") || crate::backup::is_btrbk_step_failure(e))
     {
@@ -319,10 +322,20 @@ pub fn format_report_from(
     let index_status = if result.indexed { "OK" } else { "N/A" };
 
     r.push_str(&format!("BACKUP OPERATIONS\n{thin}\n"));
+    // First, where backup-run.sh's `Maintenance lock` row (which this path has
+    // no counterpart for) is followed by it.
+    r.push_str(&format!(
+        "  USB link              {}\n",
+        result.usb_link.row()
+    ));
     r.push_str(&format!(
         "  btrbk send/receive    {btrbk_status}  ({elapsed_min}m {elapsed_sec}s)\n"
     ));
     r.push_str(&format!("  Boot subvolumes       {}\n", result.boot.row()));
+    r.push_str(&format!(
+        "  Retired expiry        {}\n",
+        result.expiry.row()
+    ));
     r.push_str(&format!(
         "  Recovery OS           {}\n",
         result.recovery_os.row()
@@ -337,6 +350,13 @@ pub fn format_report_from(
         ));
         r.push('\n');
         r.push_str(&sync.report);
+    }
+    // What the expiry of retired subvolumes did, after the sync's section.
+    if let crate::run_steps::ExpiryStep::Ran { section, .. } = &result.expiry
+        && !section.is_empty()
+    {
+        r.push('\n');
+        r.push_str(section);
     }
     if let crate::backup::BootStep::Ran(o) = &result.boot
         && (!o.warnings.is_empty() || !o.failures.is_empty())
@@ -930,6 +950,8 @@ mod tests {
                 bytes_sent: Some(bytes),
                 boot: crate::backup::BootStep::NotSelected,
                 recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+                usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+                expiry: crate::run_steps::ExpiryStep::NotRun,
                 indexed: false,
                 report_sent: false,
                 errors: vec![],
@@ -963,6 +985,8 @@ mod tests {
             bytes_sent: Some(1_073_741_824),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+            usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+            expiry: crate::run_steps::ExpiryStep::NotRun,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -1039,6 +1063,121 @@ mod tests {
         assert!(clean.contains("Boot subvolumes       OK  (2 updated, 0 skipped)"));
     }
 
+    /// The report's rows, in the order the script prints them.
+    fn rows(report: &str) -> Vec<&str> {
+        report
+            .lines()
+            .skip_while(|l| !l.starts_with("BACKUP OPERATIONS"))
+            .skip(2)
+            .take_while(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_usb_link_row_leads_the_operations_and_a_failed_link_says_why() {
+        let mut result = result_with(
+            Some(0),
+            Some(0),
+            0,
+            &["USB link: negotiated 5000 Mbit/s, expected 10000"],
+        );
+        result.usb_link = crate::run_steps::UsbLinkStep::checked_for_test(
+            crate::recovery_os::RecordStatus::Fail,
+            "negotiated 5000 Mbit/s, expected 10000",
+        );
+        let report = format_report(&result, &Config::default());
+        assert!(report.contains("Status: FAILURES DETECTED"), "{report}");
+        let ops = rows(&report);
+        assert_eq!(
+            ops[0], "  USB link              FAIL  (negotiated 5000 Mbit/s, expected 10000)",
+            "{report}"
+        );
+        assert!(ops[1].starts_with("  btrbk send/receive    OK"), "{report}");
+
+        // Never checked: the row says so, and flags nothing.
+        let quiet = format_report(&result_with(Some(0), Some(0), 0, &[]), &Config::default());
+        assert_eq!(
+            rows(&quiet)[0],
+            "  USB link              N/A  (not checked)"
+        );
+        assert!(
+            quiet.contains("Status: ALL OPERATIONS SUCCESSFUL"),
+            "{quiet}"
+        );
+
+        // An unread link only warns.
+        let mut warned = result_with(Some(0), Some(0), 0, &[]);
+        warned.usb_link = crate::run_steps::UsbLinkStep::checked_for_test(
+            crate::recovery_os::RecordStatus::Warn,
+            "no USB device's product contains 'X'",
+        );
+        let warned = format_report(&warned, &Config::default());
+        assert!(
+            warned.contains("Status: COMPLETED WITH WARNINGS"),
+            "{warned}"
+        );
+    }
+
+    #[test]
+    fn the_retired_expiry_row_and_section_are_in_the_report() {
+        let mut result = result_with(Some(0), Some(0), 0, &[]);
+        result.expiry = crate::run_steps::ExpiryStep::from_run(
+            crate::run_steps::ExpireRun::Performed {
+                section: "RETIRED SUBVOLUMES\n  nvme-root @gone: 3 snapshots deleted\n".into(),
+                failure: None,
+            },
+            false,
+        );
+        let report = format_report(&result, &Config::default());
+        let ops = rows(&report);
+        let at = |prefix: &str| ops.iter().position(|r| r.starts_with(prefix)).unwrap();
+        assert_eq!(
+            ops[at("  Retired expiry")],
+            "  Retired expiry        OK  (n/a)"
+        );
+        assert!(at("  Retired expiry") < at("  Recovery OS"), "{report}");
+        assert!(
+            report.contains("RETIRED SUBVOLUMES\n  nvme-root @gone: 3 snapshots deleted"),
+            "{report}"
+        );
+
+        // A selection run says it did not expire; never reached has no row text.
+        let mut narrow = result_with(Some(0), Some(0), 0, &[]);
+        narrow.expiry = crate::run_steps::ExpiryStep::skipped_for_selection();
+        let narrow = format_report(&narrow, &Config::default());
+        assert!(
+            narrow.contains("Retired expiry        SKIP  (not performed: a run of a selection"),
+            "{narrow}"
+        );
+        assert!(
+            narrow.contains("Status: ALL OPERATIONS SUCCESSFUL"),
+            "{narrow}"
+        );
+
+        // A failed expiry is not a btrbk send/receive failure.
+        let mut failed = result_with(
+            Some(0),
+            Some(0),
+            0,
+            &["Retired expiry: exit code 1 — see RETIRED SUBVOLUMES in the report"],
+        );
+        failed.expiry = crate::run_steps::ExpiryStep::from_run(
+            crate::run_steps::ExpireRun::Performed {
+                section: String::new(),
+                failure: Some("exit code 1".into()),
+            },
+            false,
+        );
+        let failed = format_report(&failed, &Config::default());
+        assert!(failed.contains("Status: FAILURES DETECTED"), "{failed}");
+        assert!(
+            failed.contains(
+                "Retired expiry        FAIL  (exit code 1 — see RETIRED SUBVOLUMES in the report)"
+            ),
+            "{failed}"
+        );
+    }
+
     #[test]
     fn a_boot_failure_that_names_btrbk_is_not_a_btrbk_send_receive_failure() {
         let mut result = result_with(Some(0), Some(0), 0, &[]);
@@ -1070,6 +1209,8 @@ mod tests {
             bytes_sent: Some(bytes),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+            usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+            expiry: crate::run_steps::ExpiryStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: errors.iter().map(|e| e.to_string()).collect(),
@@ -1149,6 +1290,8 @@ mod tests {
             bytes_sent: Some(0),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+            usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+            expiry: crate::run_steps::ExpiryStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
@@ -1204,6 +1347,8 @@ mod tests {
             bytes_sent: Some(500_000),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+            usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+            expiry: crate::run_steps::ExpiryStep::NotRun,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -1294,6 +1439,8 @@ mod tests {
             bytes_sent: Some(0),
             boot: crate::backup::BootStep::NotSelected,
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
+            usb_link: crate::run_steps::UsbLinkStep::NotChecked,
+            expiry: crate::run_steps::ExpiryStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: vec!["btrbk failed".into(), "target not mounted".into()],

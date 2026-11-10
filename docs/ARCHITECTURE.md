@@ -155,10 +155,12 @@ backup holds the singleton, wait for the maintenance lock), mount sources, subvo
 sync, mount targets (`mount::verify_write_targets()` before btrbk), `run_backup`, capture
 the report data while mounted, unmount (same 5 × 2 s retry; a mount point left mounted
 fails the run with `still mounted: …`), then report and record. A failed sync never
-stops the run, but marks it failed in the result, the report and `backup_runs`. These
-steps run only in `backup-run.sh`, which the timers start: `btrdasd subvol expire`,
-the boot-archive pruner, the growth log, and the throughput log with its USB link
-check. In the helper, a job's
+stops the run, but marks it failed in the result, the report and `backup_runs`. After btrbk
+the run reads the USB link (`run_steps::check_usb_link`, FAIL below
+`[das].expected_link_mbit_s`), appends `growth.log` and `throughput.jsonl`, and — only
+when the selection is everything the configuration declares — expires retired
+subvolumes (`run_steps::expire_at`, a dry run when the sync failed); the boot-archive
+pruner runs only in `backup-run.sh`, which the timers start. In the helper, a job's
 progress goes through one ordered queue (`progress::OrderedProgress`) and ends with
 exactly one `JobFinished`. `JobCancel` stops the work at its next safe boundary
 (`progress::CancelToken`, checked between stages): a lock wait stops at once, holding
@@ -693,6 +695,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `recovery_os::session` | `src/recovery_os/session.rs` | ~1290 | `recovery-os-vm.sh session` as a helper job: built environment, lines to the job's signals, one SIGINT to the script's process group on cancel |
 | `report` | `src/report.rs` | ~1640 | Backup report formatting, and the `Mailer` seam every report send (backup, scrub, doctor) goes through; `MAILX` runs `mailx`, and refuses in a test build |
 | `restore` | `src/restore.rs` | ~1980 | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and an unoverridable denylist |
+| `run_steps` | `src/run_steps.rs` | ~600 | The steps `backup-run.sh` does around btrbk, as pure functions the CLI/GUI run calls through `StepEnv`: USB link check over a sysfs root, `throughput.jsonl` and `growth.log` lines, the retired-subvolume expiry step |
 | `scanner` | `src/scanner.rs` | ~135 | walkdir-based filesystem traversal |
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | ~3570 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
