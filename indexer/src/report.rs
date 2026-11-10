@@ -464,7 +464,7 @@ pub fn record_backup_run(
 /// One report as the relay is to receive it: everything `mailx` is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailMessage {
-    /// `[DAS <kind>] <host> — <SUCCESS|FAILURE> — <YYYY-MM-DD HH:MM>`.
+    /// `[DAS <kind>] <host> — <SUCCESS|SUCCESS WITH WARNINGS|FAILURE> — <YYYY-MM-DD HH:MM>`.
     pub subject: String,
     /// `DAS <kind> (<short host>) <address>`, or a `DAS_REPORT_FROM` that
     /// carries its own display name. s-nail takes the bracketed address as
@@ -755,8 +755,11 @@ pub fn report_message(
     } else {
         format!("DAS {kind} ({short_hostname}) <{from_addr}>")
     };
+    // The script's three states (`subject_status` in backup-run.sh).
     let status_word = if report.contains("FAILURE") {
         "FAILURE"
+    } else if report.contains("Status: COMPLETED WITH WARNINGS") {
+        "SUCCESS WITH WARNINGS"
     } else {
         "SUCCESS"
     };
@@ -1519,6 +1522,18 @@ mod tests {
                 "smtp://127.0.0.1:1",
                 "Status: FAILURE\n",
             ))
+        );
+        // A run that worked with warnings says so in the subject, as
+        // backup-run.sh's does (bd DAS-Backup-Manager-qras).
+        let warned = report_message(
+            "  Status: COMPLETED WITH WARNINGS\n",
+            &config,
+            "Backup",
+            &context("nas"),
+        );
+        assert_eq!(
+            warned.unwrap().subject,
+            "[DAS Backup] nas — SUCCESS WITH WARNINGS — 2026-11-01 01:02"
         );
         let mut elsewhere = mail_config();
         elsewhere.email.smtp_host = "relay.example.org".into();

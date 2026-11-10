@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CLI/GUI backup that worked with warnings says so in the email subject** (bd `DAS-Backup-Manager-qras`): a recovery-OS, boot-step or coverage WARN made the report read `COMPLETED WITH WARNINGS` but the subject only `SUCCESS`; it is now `SUCCESS WITH WARNINGS`, as `backup-run.sh`'s has been
+
 - **A CLI/GUI backup mounts only the targets it was given** (bd `DAS-Backup-Manager-u8kk`): `btrdasd backup run --targets` and the GUI's ticked targets were written to alone, but every configured target was mounted and unmounted — a spin-up, USB traffic and a mount on a drive left out of the run; `run_backup_job` now hands the target mount the selected targets only (none named: all, as before)
 
 - **`btrdasd walk` refuses a path under a refused target root, and finds a target's top level by what is mounted, not by its options** (bd `DAS-Backup-Manager-71q1`)
