@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CLI/GUI mount that reports a failure yet mounted is taken down** (bd `DAS-Backup-Manager-1fpw`): a `mount` (or bind mount) whose helper exits non-zero after the kernel mounted left the target or source volume mounted and untracked, since `MountGuard` recorded only a mount that exited 0 — `backup-run.sh` records ownership before mounting; the failure is now probed and the mount unmounted, and one that will not come down stays the guard's, so the job's own unmount fails the job — `MountGuard::take_back_failed_mount`
+
 - **A recovery drive's ESP that will not come down after its reading keeps what was read, warns, and is released by the CLI/GUI job** (bd `DAS-Backup-Manager-s5jv.2`): the reading's findings were replaced by `still mounted` and the drive showed only `ESP  not checked`, and only `backup-run.sh` (4.17.2, bd `s5jv.1`) released a leftover ESP before unmounting the targets
   - The findings stand, an `ESP mounted` row says why it is still mounted, and the drive is `WARN` (`its ESP is still mounted`) — `mount::EspReading`, `Assessment::esp_left_mounted`
   - Every job that mounts targets (`btrdasd backup run`, the GUI, `recovery-os record`) notes each selected mirror's ESP and releases it before the targets, only when `findmnt -S PARTUUID=<esp_partuuid>` shows it at its own directory under `/run/das-backup/esp`; one that will not come down, or that cannot be told about, fails the job like a target left mounted — `MountGuard::release_esps`

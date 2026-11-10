@@ -361,6 +361,40 @@ impl MountGuard {
         umount_retrying(&*self.runner, mount_point, retrying)
     }
 
+    /// After a `mount` at `mount_point` that did not succeed: a mount helper
+    /// can fail after the kernel mounted, and that mount is this job's — the
+    /// path was not a mount point before it (bd DAS-Backup-Manager-1fpw;
+    /// `backup-run.sh` records ownership before mounting). It is taken down
+    /// now; one that will not come down stays this guard's, so the job's own
+    /// unmount tries again and fails the job if it stays.
+    fn take_back_failed_mount(
+        &mut self,
+        is_mountpoint: &dyn Fn(&Path) -> bool,
+        mount_point: &str,
+        what: &str,
+        progress: &dyn ProgressCallback,
+    ) {
+        use crate::progress::LogLevel;
+        if !is_mountpoint(Path::new(mount_point)) {
+            return;
+        }
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "{what}: mount reported a failure, yet {mount_point} is mounted — unmounting it"
+            ),
+        );
+        if let Err(why) = self.release(mount_point, |msg| progress.on_log(LogLevel::Warning, msg)) {
+            progress.on_log(
+                LogLevel::Error,
+                &format!(
+                    "{what}: {mount_point} is still mounted: {why} after {UMOUNT_ATTEMPTS} attempts"
+                ),
+            );
+            self.newly_mounted.push(mount_point.to_string());
+        }
+    }
+
     /// Unmount everything this guard mounted, last-mounted first, retrying
     /// each, with progress reporting. Returns the mount points that are STILL
     /// MOUNTED after every attempt — the caller must fail its job on a
@@ -666,6 +700,12 @@ fn ensure_targets_mounted_with(
                             target.label, actual, target.mount
                         ),
                     );
+                    guard.take_back_failed_mount(
+                        probes.is_mountpoint,
+                        &target.mount,
+                        &format!("Target '{}'", target.label),
+                        progress,
+                    );
                     if created {
                         remove_created_mount_point(
                             &format!("Target '{}'", target.label),
@@ -785,6 +825,12 @@ fn ensure_targets_mounted_with(
                             stderr.trim()
                         ),
                     );
+                    guard.take_back_failed_mount(
+                        probes.is_mountpoint,
+                        &target.mount,
+                        &format!("Target '{}'", target.label),
+                        progress,
+                    );
                 }
                 Err(e) => {
                     progress.on_log(
@@ -898,6 +944,12 @@ fn ensure_sources_mounted_with(
                         source.volume,
                         stderr.trim()
                     ),
+                );
+                guard.take_back_failed_mount(
+                    probes.is_mountpoint,
+                    &source.volume,
+                    &format!("Source '{}'", source.label),
+                    progress,
                 );
                 false
             }
@@ -1523,6 +1575,9 @@ mod tests {
         /// Exits with these codes on successive calls, then the last one for
         /// every call after.
         Seq(&'static [i32]),
+        /// Exits 32, yet the mount took effect: a mount helper that failed
+        /// after the kernel had mounted (bd DAS-Backup-Manager-1fpw).
+        FailMounting,
     }
 
     impl Reply {
@@ -1620,7 +1675,8 @@ mod tests {
                 Some((_, reply)) => reply.clone(),
                 None => Reply::ok(),
             };
-            if matches!(reply, Reply::Exit { code: 0, .. })
+            if (matches!(reply, Reply::Exit { code: 0, .. })
+                || (matches!(reply, Reply::FailMounting) && argv[0] == "mount"))
                 && let Some(mount_point) = argv.last()
             {
                 let mut mounted = self.mounted.lock().unwrap();
@@ -1650,6 +1706,11 @@ mod tests {
                     io::ErrorKind::NotFound,
                     "scripted: no such program",
                 )),
+                Reply::FailMounting => Ok(Output {
+                    status: ExitStatus::from_raw(32 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"mount: helper failed after mounting".to_vec(),
+                }),
                 Reply::FailLeavingFile(path) => {
                     std::fs::write(&path, b"left behind").unwrap();
                     Ok(Output {
@@ -5102,6 +5163,46 @@ mod tests {
         guard.note_esp(&primary, root);
         guard.note_esp(&esp_target(None), root);
         assert!(guard.esps.is_empty());
+    }
+
+    /// bd DAS-Backup-Manager-1fpw: a `mount` that exits non-zero yet mounted
+    /// is this job's mount, taken down — never left behind untracked, as the
+    /// guard recorded only a mount that exited 0 (`backup-run.sh` records
+    /// ownership before mounting).
+    #[test]
+    fn a_target_mount_that_failed_but_mounted_is_taken_down() {
+        let scratch = Scratch::new();
+        let (config, host, _part, mnt) = attached_primary(&scratch);
+        let runner = ScriptedRunner::with_rules(&[("mount", Reply::FailMounting)]);
+        let progress = Recorder::default();
+        let r = host.mount_targets(&config, &progress, &runner);
+        drop(r);
+        assert!(
+            runner.mounted.lock().unwrap().is_empty(),
+            "left mounted: {:?}",
+            runner.calls()
+        );
+        assert!(
+            argvs(&runner, "umount")
+                .iter()
+                .any(|a| a.last() == Some(&mnt))
+        );
+    }
+
+    #[test]
+    fn a_source_mount_that_failed_but_mounted_is_taken_down() {
+        let scratch = Scratch::new();
+        let vol = scratch.mkdir("vol");
+        let config = config_with(Vec::new(), vec![source("s", "/dev/fake-hdd", &vol)]);
+        let runner = ScriptedRunner::with_rules(&[("mount", Reply::FailMounting)]);
+        let progress = Recorder::default();
+        let guard = Host::default().mount_sources(&config, &progress, &runner);
+        drop(guard);
+        assert!(
+            runner.mounted.lock().unwrap().is_empty(),
+            "left mounted: {:?}",
+            runner.calls()
+        );
     }
 
     // --- bd DAS-Backup-Manager-s5jv.3 ------------------------------------
