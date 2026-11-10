@@ -60,7 +60,10 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         // A prompt that cannot be shown is a refusal, which the line above
         // and the exit status already say.
         dialoguer::Confirm::new()
-            .with_prompt("Your answers are kept. Wait until it has finished and try again?")
+            .with_prompt(
+                "Your answers are kept, so there is no need to run setup again: try again now \
+                 (it is refused again while the lock is still held)?",
+            )
             .default(true)
             .interact()
             .unwrap_or(false)
