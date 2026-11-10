@@ -825,6 +825,11 @@ btrbk is run with
 .BR \-\-preserve\-snapshots :
 it reads no target, so one that is not mounted does not fail the step, and it
 deletes no snapshot; retention is applied by the next run that sends.
+It counts the snapshots it created from btrbk's own transaction log
+.RB ( \-\-format=raw ),
+which reads no target; a log that does not end in its
+.B finished
+row after exit 0 is reported as an unknown number, never as 0.
 The snapshot step of
 .B backup run
 is run the same way, and the
@@ -859,8 +864,10 @@ a send of every source and target passes btrbk no filter, so it would
 otherwise trust a
 .I btrbk.conf
 that may be out of date.
-The targets are mounted after the sync, and a step that fails and leaves a
-mount behind says both.
+The targets are mounted after the sync, and only those
+.B \-\-targets
+names (none named: all); an unnamed target is never mounted.
+A step that fails and leaves a mount behind says both.
 .PP
 .B btrdasd backup send
 .RB [ \-\-config
