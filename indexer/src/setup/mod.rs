@@ -55,6 +55,16 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
             .default(false)
             .interact()?)
     };
+    let ask_retry = |why: &str| -> bool {
+        eprintln!("{why}");
+        // A prompt that cannot be shown is a refusal, which the line above
+        // and the exit status already say.
+        dialoguer::Confirm::new()
+            .with_prompt("Your answers are kept. Wait until it has finished and try again?")
+            .default(true)
+            .interact()
+            .unwrap_or(false)
+    };
     let host = SetupHost {
         site: installer::SetupLockSite::production(),
         check: &installer::check,
@@ -64,6 +74,7 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
         upgrade: &installer::upgrade,
         wizard: &wizard,
         ask_remove_db: &ask_remove_db,
+        ask_retry: &ask_retry,
     };
     let outcome = dispatch(
         &args,
@@ -111,6 +122,9 @@ struct SetupHost<'a> {
         &'a dyn Fn(Option<config::Config>) -> Result<config::Config, Box<dyn std::error::Error>>,
     /// "Also remove the backup database?"
     ask_remove_db: &'a dyn Fn() -> Result<bool, Box<dyn std::error::Error>>,
+    /// The wizard's answers are in hand and a job holds one of setup's locks,
+    /// as the argument says: wait and try again? `false` gives the refusal up.
+    ask_retry: &'a dyn Fn(&str) -> bool,
 }
 
 /// What one `btrdasd setup` invocation does.
@@ -156,7 +170,8 @@ fn select_action(args: &SetupArgs) -> Action {
 /// `host` binds it; progress to `say`, a refusal to `warn`. Every mode that
 /// writes or removes installed files does so under setup's two locks, taken
 /// only once its questions are answered: held across a prompt, the backup
-/// singleton would make a backup the timer starts meanwhile skip its run.
+/// singleton would make a backup the timer starts meanwhile skip its run. A
+/// wizard refused then keeps its answers and offers to wait and retry.
 /// `--check` takes none.
 fn dispatch(
     args: &SetupArgs,
@@ -210,21 +225,31 @@ fn dispatch(
             } else {
                 "btrdasd setup"
             };
-            installer::under_setup_locks(&host.site, job, |held| {
-                // The wizard pre-filled what --modify read; anything written
-                // to the file since — the GUI, a subvol sync — would be lost
-                // under the answers. Compared under the locks, which keep out
-                // a backup run and another setup from here to the write; a
-                // writer that takes neither lock — the helper's ConfigSet and
-                // SubvolAdd, the `subvol` commands, an editor — can still land
-                // in between, and is then lost (bd DAS-Backup-Manager-lxw).
-                if let Some(read) = &read
-                    && config_bytes(config_path)? != read.bytes
-                {
-                    return Ok(Err(config_changed_line(config_path)));
+            // The locks are not held through the questions, so a job may hold
+            // one by the time they are answered. The answers are kept: the
+            // operator is asked whether to wait, never made to answer again
+            // (bd DAS-Backup-Manager-896).
+            loop {
+                let attempt = installer::under_setup_locks(&host.site, job, |held| {
+                    // The wizard pre-filled what --modify read; anything written
+                    // to the file since — the GUI, a subvol sync — would be lost
+                    // under the answers. Compared under the locks, which keep out
+                    // a backup run and another setup from here to the write; a
+                    // writer that takes neither lock — the helper's ConfigSet and
+                    // SubvolAdd, the `subvol` commands, an editor — can still land
+                    // in between, and is then lost (bd DAS-Backup-Manager-lxw).
+                    if let Some(read) = &read
+                        && config_bytes(config_path)? != read.bytes
+                    {
+                        return Ok(Err(config_changed_line(config_path)));
+                    }
+                    (host.install)(&config, held).map(Ok)
+                })?;
+                match attempt {
+                    installer::Locked::Refused(why) if (host.ask_retry)(&why) => {}
+                    done => break done,
                 }
-                (host.install)(&config, held).map(Ok)
-            })?
+            }
         }
     };
     let why = match ran {
@@ -576,9 +601,12 @@ mod tests {
     fn never_ask() -> Result<bool, BoxError> {
         panic!("nothing may be asked")
     }
+    fn never_retry(_: &str) -> bool {
+        panic!("no retry may be offered")
+    }
 
     /// A host on which no step may run, its lock files in `dir`.
-    fn host_that_runs_nothing(dir: &Path) -> SetupHost<'static> {
+    fn host_that_runs_nothing<'a>(dir: &Path) -> SetupHost<'a> {
         SetupHost {
             site: installer::SetupLockSite {
                 backup: dir.join("das-backup.lock"),
@@ -591,6 +619,7 @@ mod tests {
             upgrade: &never_upgrade,
             wizard: &never_wizard,
             ask_remove_db: &never_ask,
+            ask_retry: &never_retry,
         }
     }
 
@@ -628,5 +657,92 @@ mod tests {
         let err =
             dispatch(&args(&["modify"]), &broken, &host, &mut |_| {}, &mut quiet).unwrap_err();
         assert!(err.to_string().contains("--modify: refusing to continue"));
+    }
+
+    /// bd DAS-Backup-Manager-896: a backup that starts while the wizard is
+    /// open must not cost the operator their answers. The locks are taken
+    /// after the questions (held across them, the singleton would make the
+    /// timer's backup skip its run), so a refusal then offers to wait and
+    /// retry with the answers in hand.
+    #[test]
+    fn a_wizard_refused_by_a_held_lock_keeps_its_answers_and_retries_when_asked() {
+        use std::cell::{Cell, RefCell};
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = host_that_runs_nothing(dir.path());
+        let holder = RefCell::new(Some(
+            buttered_dasd::backup::SingletonHeld::try_acquire_at(
+                &host.site.backup,
+                "backup-run.sh",
+            )
+            .unwrap()
+            .unwrap(),
+        ));
+        let (asked, answered, installed) = (RefCell::new(Vec::new()), Cell::new(0), Cell::new(0));
+        let wizard = |_: Option<config::Config>| -> Result<config::Config, BoxError> {
+            answered.set(answered.get() + 1);
+            Ok(config::Config::default())
+        };
+        let install = |_: &config::Config, _: &installer::SetupLocks| -> Result<(), BoxError> {
+            installed.set(installed.get() + 1);
+            Ok(())
+        };
+        // The backup finishes while the operator decides.
+        let retry = |why: &str| {
+            asked.borrow_mut().push(why.to_string());
+            holder.borrow_mut().take();
+            true
+        };
+        host.wizard = &wizard;
+        host.install = &install;
+        host.ask_retry = &retry;
+        let outcome = dispatch(
+            &args(&[]),
+            &dir.path().join("config.toml"),
+            &host,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome, installer::SetupOutcome::Done);
+        assert_eq!(answered.get(), 1, "the wizard must not be asked twice");
+        assert_eq!(installed.get(), 1);
+        let asked = asked.borrow();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("backup-run.sh"), "{asked:?}");
+    }
+
+    #[test]
+    fn a_wizard_refused_and_not_retried_installs_nothing_and_says_why() {
+        use std::cell::{Cell, RefCell};
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = host_that_runs_nothing(dir.path());
+        let _held = buttered_dasd::backup::SingletonHeld::try_acquire_at(
+            &host.site.backup,
+            "backup-run.sh",
+        )
+        .unwrap()
+        .unwrap();
+        let asked = Cell::new(0);
+        let wizard = |_: Option<config::Config>| -> Result<config::Config, BoxError> {
+            Ok(config::Config::default())
+        };
+        let retry = |_: &str| {
+            asked.set(asked.get() + 1);
+            false
+        };
+        host.wizard = &wizard;
+        host.ask_retry = &retry;
+        let said = RefCell::new(Vec::new());
+        let outcome = dispatch(
+            &args(&[]),
+            &dir.path().join("config.toml"),
+            &host,
+            &mut |_| {},
+            &mut |line| said.borrow_mut().push(line),
+        )
+        .unwrap();
+        assert_eq!(outcome, installer::SetupOutcome::Refused);
+        assert_eq!(asked.get(), 1);
+        assert!(said.borrow()[0].starts_with("Refused, nothing written or removed"));
     }
 }

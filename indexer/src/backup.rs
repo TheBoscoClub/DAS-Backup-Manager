@@ -4575,7 +4575,10 @@ mod tests {
         let (ok, line) = outcome.finish_line(false);
         assert!(!ok);
         assert!(line.contains("btrdasd setup --upgrade pid"), "{line}");
-        assert!(line.contains(&host.singleton_lock.display().to_string()), "{line}");
+        assert!(
+            line.contains(&host.singleton_lock.display().to_string()),
+            "{line}"
+        );
     }
 
     #[test]

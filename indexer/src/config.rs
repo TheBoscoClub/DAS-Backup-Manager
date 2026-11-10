@@ -5036,7 +5036,9 @@ enabled = false
         );
         // Positive control: the entry's own key is still the removed one.
         assert!(
-            warnings.iter().any(|w| w.starts_with("source[0].subvolumes[0].manual_only is no longer read")),
+            warnings
+                .iter()
+                .any(|w| w.starts_with("source[0].subvolumes[0].manual_only is no longer read")),
             "{warnings:?}"
         );
     }

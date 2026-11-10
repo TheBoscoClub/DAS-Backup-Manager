@@ -5626,6 +5626,8 @@ auth = "starttls""#,
             upgrade: &upgrade,
             wizard: &wizard,
             ask_remove_db: &ask_remove_db,
+            // These cases are about what a refusal leaves behind: none waits.
+            ask_retry: &|_| false,
         };
 
         let mut said = Vec::new();
