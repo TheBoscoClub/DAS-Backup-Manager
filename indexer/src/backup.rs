@@ -4237,6 +4237,14 @@ impl BackupJobHost for SystemBackupHost {
         targets: &[String],
         progress: &dyn ProgressCallback,
     ) -> Result<(usize, u64), String> {
+        // The directories the targets receive into, as `run_backup` makes
+        // them (bd DAS-Backup-Manager-arx): a target never backed up, or a
+        // source sync just adopted, has none, and btrbk then skips that
+        // target — "Failed to fetch subvolume detail", exit 10. Only the
+        // targets this send writes to; the step verifies them again before
+        // btrbk runs.
+        let named = step_targets(config, targets).map_err(|e| e.to_string())?;
+        mount::create_target_dirs(config, &named, progress)?;
         send_snapshots(config, None, targets, false, progress).map_err(|e| e.to_string())
     }
 }
