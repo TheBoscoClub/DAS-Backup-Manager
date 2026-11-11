@@ -353,20 +353,27 @@ fn successful_stdout(cmd: &mut Command) -> Option<String> {
 
 /// Check if a binary is available on PATH.
 pub fn which(binary: &str) -> bool {
-    Command::new("which")
-        .arg(binary)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    which_path(binary).is_some()
 }
 
-/// Run `which` and return the trimmed path if found.
+/// The path `binary` resolves to on PATH, if any.
 pub fn which_path(binary: &str) -> Option<String> {
-    Command::new("which")
-        .arg(binary)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    which_in(binary, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// [`which_path`] on the search path `path`: the first entry holding `binary`
+/// as a regular file with an execute bit, as the shell finds it. Searched
+/// here, not by running `which`, so a host without one does not report every
+/// dependency missing (bd DAS-Backup-Manager-pz6).
+fn which_in(binary: &str, path: &std::ffi::OsStr) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+        .map(|found| found.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -761,5 +768,26 @@ ID 263 gen 993 top level 256 path @home/user/My Documents\n";
         for dep in &with_email {
             assert_eq!(dep.path, which_path(&dep.name), "{}", dep.name);
         }
+    }
+
+    /// A dependency is found by searching PATH itself: on a host with no
+    /// `which` binary, every dependency read as missing (bd
+    /// DAS-Backup-Manager-pz6 item 6). Only an executable regular file counts.
+    #[test]
+    fn which_searches_path_itself_and_needs_no_which_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("btrbk");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("notes");
+        std::fs::write(&plain, "x").unwrap();
+        std::fs::create_dir(dir.path().join("adir")).unwrap();
+        let path =
+            std::env::join_paths([std::path::Path::new("/nonexistent"), dir.path()]).unwrap();
+        assert_eq!(which_in("btrbk", &path), Some(tool.display().to_string()));
+        assert_eq!(which_in("notes", &path), None, "not executable");
+        assert_eq!(which_in("adir", &path), None, "a directory");
+        assert_eq!(which_in("absent", &path), None);
     }
 }

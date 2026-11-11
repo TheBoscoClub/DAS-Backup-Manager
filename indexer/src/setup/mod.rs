@@ -13,19 +13,22 @@ use clap::Args;
 #[derive(Args)]
 pub struct SetupArgs {
     /// Re-open wizard with current config pre-filled
-    #[arg(long)]
+    // One mode per run, and --force (never prompt) cannot open the wizard: a
+    // flag accepted and dropped is a defect (bd DAS-Backup-Manager-pz6).
+    // Conflicts are symmetric, so each pair is named once.
+    #[arg(long, conflicts_with_all = ["upgrade", "uninstall", "uninstall_all", "check", "force"])]
     pub modify: bool,
 
     /// Regenerate files from existing config (after binary update)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["uninstall", "uninstall_all", "check"])]
     pub upgrade: bool,
 
     /// Remove all generated files, disable timers, optionally remove DB
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["uninstall_all", "check"])]
     pub uninstall: bool,
 
     /// Remove ALL files: generated configs, binaries, D-Bus, polkit, icons, man page, completions
-    #[arg(long)]
+    #[arg(long, conflicts_with = "check")]
     pub uninstall_all: bool,
 
     /// Validate config + deps, report issues, change nothing
@@ -206,11 +209,11 @@ fn dispatch(
         Action::ForceInstall => {
             installer::under_setup_locks(&host.site, "btrdasd setup --force", |held| {
                 // Read under the locks, which keep out a backup run (its
-                // subvol sync and expiry write this file) and another setup.
-                // A writer that takes neither lock — the helper's ConfigSet
-                // and SubvolAdd, the `subvol` commands, an editor — can still
-                // change it before the write, and the last writer wins
-                // (bd DAS-Backup-Manager-lxw).
+                // subvol sync and expiry write this file), another setup, and
+                // the writers that take the backup singleton: the helper's
+                // config edits (bd lxw) and `subvol add`/`remove` and
+                // `schedule set` (bd olyo). An editor takes no lock and can
+                // still change it before the write; the last writer wins.
                 let config = load_existing_for_force(config_path)?;
                 (host.install)(&config, held).map(Ok)
             })?
@@ -485,6 +488,50 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(effective_uid(), from_proc);
+    }
+
+    /// Two modes at once, or `--force` (never prompt) with `--modify` (open
+    /// the wizard), are refused before anything runs: one would otherwise be
+    /// accepted and dropped (bd DAS-Backup-Manager-pz6 item 1). `--force` beside
+    /// another mode stays: it is that mode without prompts, as INSTALL.md shows.
+    #[test]
+    fn contradictory_flags_are_refused_and_force_beside_a_mode_is_not() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            setup: SetupArgs,
+        }
+        let parse = |flags: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(
+                std::iter::once("setup").chain(flags.iter().copied()),
+            )
+        };
+        for flags in [
+            &["--uninstall", "--uninstall-all"][..],
+            &["--check", "--upgrade"],
+            &["--modify", "--upgrade"],
+            &["--uninstall-all", "--upgrade"],
+            &["--force", "--modify"],
+        ] {
+            let err = parse(flags)
+                .err()
+                .unwrap_or_else(|| panic!("{flags:?} accepted"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}"
+            );
+        }
+        for flags in [
+            &["--upgrade", "--force"][..],
+            &["--uninstall-all", "--force"],
+            &["--uninstall", "--force"],
+            &["--check", "--force"],
+            &["--force"],
+            &["--modify"],
+        ] {
+            assert!(parse(flags).is_ok(), "{flags:?} refused");
+        }
     }
 
     #[test]

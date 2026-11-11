@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd setup` refuses contradictory flags instead of dropping one** (bd `DAS-Backup-Manager-pz6`): two modes at once (`--uninstall --uninstall-all`, `--check --upgrade`, `--modify --upgrade`, …) ran one and silently ignored the other, and `--force --modify` ran a forced install, skipping the wizard `--modify` asked for; clap now refuses each (exit 2) before anything runs. `--force` beside `--upgrade`, `--uninstall`, `--uninstall-all` or `--check` stays, meaning that mode without prompts, as `docs/INSTALL.md` shows
+  - `setup`'s dependency check searches `PATH` itself for each tool, where it ran `which`: a host without a `which` binary reported every dependency missing
+
 - **The nightly run makes only the target directories btrbk receives into** (bd `DAS-Backup-Manager-c0x`): `create_target_dirs` made every `target_subdirs` entry of every source on every mounted target, so a source scoped to the primary (`target_labels`) left empty directories on the recovery drives, and the state pass's directories were never named; it now makes, on each mounted target, exactly the `target` lines of this run's `btrbk.conf` and of the state pass's `btrbk-state.conf` (and of the dry run's planned file, as before) — the rule the Rust path's `btrbk_conf::target_dirs` already follows — and says when one of those files cannot be read (`backup-run.sh` 4.19.1)
   - `btrdasd config dump-env` no longer exports `DAS_SOURCE_<n>_TARGET_SUBDIRS`, which only that loop read
   - The expiry row a failed sync leaves reads `SKIP  (not performed: subvolume sync failed this run; dry run shown)`, no parentheses inside the parentheses, on both paths (`run_steps::SYNC_FAILED`)
