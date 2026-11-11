@@ -1264,9 +1264,9 @@ mod splice {
                     None => {
                         let write = match ov {
                             Some(ov) if ov == nv => pinned_part(&schema, nv),
-                            Some(toml::Value::Table(ot)) => match nv {
+                            Some(toml::Value::Table(old_t)) => match nv {
                                 toml::Value::Table(nt) => {
-                                    Some(toml::Value::Table(changed_part(&schema, ot, nt)))
+                                    Some(toml::Value::Table(changed_part(&schema, old_t, nt)))
                                 }
                                 _ => Some(nv.clone()),
                             },
@@ -2257,12 +2257,12 @@ mod splice {
     }
 
     /// What of table `nt` a save writes into a file that left the table out
-    /// while `ot` held its defaults: the keys that changed, and the pinned.
-    fn changed_part(schema: &[&str], ot: &toml::Table, nt: &toml::Table) -> toml::Table {
+    /// while `old_t` held its defaults: the keys that changed, and the pinned.
+    fn changed_part(schema: &[&str], old_t: &toml::Table, nt: &toml::Table) -> toml::Table {
         nt.iter()
             .filter_map(|(k, v)| {
                 let s: Vec<&str> = schema.iter().copied().chain([k.as_str()]).collect();
-                match ot.get(k) {
+                match old_t.get(k) {
                     Some(o) if o == v => Some((k.clone(), pinned_part(&s, v)?)),
                     Some(toml::Value::Table(ost)) => match v {
                         toml::Value::Table(nst) => {
