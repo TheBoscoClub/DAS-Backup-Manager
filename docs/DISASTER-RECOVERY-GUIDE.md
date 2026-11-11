@@ -1309,7 +1309,8 @@ The first time is by hand at the console — it needs your login on the recovery
    A pacman hook that names btrbk (a snapshot before every upgrade, say) runs during the very pacman commands below, after the guard is lifted, when the real btrbk can run: move it out of the hook directory, inside the recovery OS, before step 1. If das-backup-manager is installed here, its timers must not fire in the recovery OS — it is not the host, and its jobs would act on whatever disks it sees. Disable every one that is enabled, inside the recovery OS (an install of another version may have a different set):
 
    ```bash
-   systemctl list-unit-files --no-legend --state=enabled 'das-*.timer' | awk '{print $1}' | xargs -r sudo systemctl disable --now
+   timers=$(systemctl list-unit-files --no-legend --state=enabled 'das-*.timer' | awk '{print $1}')
+   [ -z "$timers" ] || { sudo systemctl stop $timers && sudo systemctl disable $timers; }   # stop first: a linked timer disabled while armed is left failed
    ```
 
    Then a **rollback point**:

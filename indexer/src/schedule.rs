@@ -250,20 +250,63 @@ pub fn set_schedule(
     Ok(())
 }
 
+/// The backup timers the schedule switch turns on and off.
+const BACKUP_TIMERS: [&str; 2] = ["das-backup.timer", "das-backup-full.timer"];
+
+/// The real `systemctl`, its stderr kept for the error.
+fn systemctl(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run systemctl {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Turn both backup timers on (`enable --now`, by name) or off. Off is
+/// never `disable --now`: the units are linked from a directory of their
+/// own, and that leaves an armed one failed (bd DAS-Backup-Manager-5237.7);
+/// each is stopped, disabled and linked again
+/// ([`crate::unit_links::keep_disabled`]). Both timers are attempted; the
+/// first failure is returned.
+fn set_timers_enabled(
+    dirs: &crate::unit_links::UnitDirs<'_>,
+    enabled: bool,
+    systemctl: crate::unit_links::Systemctl,
+) -> Result<(), String> {
+    if enabled {
+        let mut args = vec!["enable", "--now"];
+        args.extend_from_slice(&BACKUP_TIMERS);
+        return systemctl(&args);
+    }
+    let results: Vec<Result<(), String>> = BACKUP_TIMERS
+        .iter()
+        .map(|timer| crate::unit_links::keep_disabled(dirs, timer, systemctl))
+        .collect();
+    results.into_iter().collect()
+}
+
 /// Enable or disable scheduled backups via the appropriate init system.
 pub fn set_enabled(config: &Config, enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
     match config.init.system {
         InitSystem::Systemd => {
-            let verb = if enabled { "enable" } else { "disable" };
-            let output = Command::new("systemctl")
-                .args([verb, "--now", "das-backup.timer", "das-backup-full.timer"])
-                .output()
-                .map_err(|e| format!("Failed to run systemctl {verb}: {e}"))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("systemctl {verb} failed: {stderr}").into());
-            }
+            let units =
+                crate::unit_links::units_dir(std::path::Path::new(crate::btrbk_conf::LIVE_CONFIG))?;
+            set_timers_enabled(
+                &crate::unit_links::UnitDirs {
+                    systemd: std::path::Path::new(crate::unit_links::SYSTEMD_DIR),
+                    units: &units,
+                },
+                enabled,
+                &systemctl,
+            )?;
         }
         InitSystem::Sysvinit => {
             manage_cron_entry(config, enabled)?;
@@ -296,6 +339,75 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pre-existing test (kept unchanged)
     // -----------------------------------------------------------------------
+
+    /// bd 5237.7: off is stop, disable with no reload, link again, reload —
+    /// for each timer, the second attempted though the first failed — and
+    /// never `disable --now`.
+    #[test]
+    fn the_schedule_switch_never_disables_a_linked_timer_while_it_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd = dir.path().join("etc/systemd/system");
+        let units = dir.path().join("etc/das-backup-units");
+        let dirs = crate::unit_links::UnitDirs {
+            systemd: &systemd,
+            units: &units,
+        };
+        for timer in BACKUP_TIMERS {
+            crate::unit_links::place(&dirs, timer, "[Timer]\n", None).unwrap();
+        }
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |args: &[&str]| {
+            calls.borrow_mut().push(args.join(" "));
+            if args.contains(&"disable") {
+                std::fs::remove_file(systemd.join(args[2])).unwrap();
+            }
+            if args == ["stop", "das-backup.timer"] && calls.borrow().len() > 6 {
+                return Err("stop refused".to_string());
+            }
+            Ok(())
+        };
+
+        set_timers_enabled(&dirs, false, &run).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "stop das-backup.timer",
+                "--no-reload disable das-backup.timer",
+                "daemon-reload",
+                "stop das-backup-full.timer",
+                "--no-reload disable das-backup-full.timer",
+                "daemon-reload",
+            ]
+        );
+        for timer in BACKUP_TIMERS {
+            assert_eq!(
+                std::fs::read_link(systemd.join(timer)).unwrap(),
+                units.join(timer)
+            );
+        }
+
+        set_timers_enabled(&dirs, true, &run).unwrap();
+        assert_eq!(
+            calls.borrow().last().unwrap(),
+            "enable --now das-backup.timer das-backup-full.timer"
+        );
+
+        // The first timer refusing its stop does not keep the second armed.
+        let before = calls.borrow().len();
+        assert_eq!(
+            set_timers_enabled(&dirs, false, &run),
+            Err("stop refused".to_string())
+        );
+        assert_eq!(
+            calls.borrow()[before..],
+            [
+                "stop das-backup.timer",
+                "stop das-backup-full.timer",
+                "--no-reload disable das-backup-full.timer",
+                "daemon-reload",
+            ]
+        );
+    }
 
     #[test]
     fn schedule_info_fields() {

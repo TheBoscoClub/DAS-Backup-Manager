@@ -501,7 +501,25 @@ No email config file is generated because this project stores no mail
 credential: reports are submitted unauthenticated to the local relay named by
 `[email].smtp_host`/`smtp_port`. No ESP sync hook is generated.
 
-The generated units land in `/etc/systemd/system/`, and they are the only copies: CMake installs
+The generated units are files in a directory of their own beside the config's, `<config dir>-units`
+(`/etc/das-backup-units`; `unit_links::units_dir`, derived, never a config key), and systemd reads each
+through a link of the same name in `/etc/systemd/system/` (bd `DAS-Backup-Manager-5237.7`): the
+directory holds nothing but this project's units, so it can be versioned whole. Every write, enable,
+disable and removal of them goes through `indexer/src/unit_links.rs`, because systemd treats a linked
+unit differently from a file in its own directory (systemd 262, observed):
+
+- `systemctl disable` removes the unit's link as well as its `timers.target.wants` link, so a unit that
+  is to stay (`schedule disable`, a scrub timer switched off in the config) is linked again afterwards.
+- A unit whose link goes at a reload while it is active is left `failed` — the state a supervisor
+  restarts. `disable --now` does exactly that (unlink, reload, then stop), so it is never used on these
+  units: the timer is stopped first and the disable is `--no-reload`.
+- A unit written before as a regular file in `/etc/systemd/system/` is replaced by its link in one
+  rename; a timer armed from it keeps its next elapse across that and the reload.
+- A masked unit (a link to `/dev/null` at its name) or any foreign link refuses the install before
+  anything is written. Drop-ins stay in `/etc/systemd/system/<unit>.d` and `/run/systemd/system/<unit>.d`;
+  one inside the units directory is not read.
+
+The manifest lists each unit's file and its link. They are the only copies: CMake installs
 just `btrdasd-helper.service`. Until bd `DAS-Backup-Manager-7rf` it also installed its own
 `das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system` — a second writer of the
 same units, which systemd ran whenever setup's were gone, with a USB-glob condition and a

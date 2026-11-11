@@ -421,8 +421,28 @@ pub fn install(config: &Config, _held: &SetupLocks) -> Result<(), Box<dyn std::e
     )?;
     apply_udev_rules();
     // Only in real installs — `install_to_prefix` never touches the host's units.
-    install_schedule(config, &|args| command_status(SYSTEMCTL, args))
+    let units_dir = buttered_dasd::unit_links::units_dir(Path::new(CONFIG_FILE))?;
+    install_schedule(
+        config,
+        &buttered_dasd::unit_links::UnitDirs {
+            systemd: Path::new(buttered_dasd::unit_links::SYSTEMD_DIR),
+            units: &units_dir,
+        },
+        &|args| command_status(SYSTEMCTL, args),
+    )
 }
+
+/// The units setup writes, each service before its timer.
+const SETUP_UNITS: [&str; 8] = [
+    "das-backup.service",
+    "das-backup.timer",
+    "das-backup-full.service",
+    "das-backup-full.timer",
+    "das-scrub.service",
+    "das-scrub.timer",
+    "das-backup-doctor.service",
+    "das-backup-doctor.timer",
+];
 
 /// The `systemctl` invocations that put the schedule in place for `config`, in
 /// the order they must run. Empty on any init system but systemd: there the
@@ -436,14 +456,10 @@ fn schedule_unit_operations(config: &Config) -> Vec<Vec<&'static str>> {
         // — the timer is the sole enforcement point for the schedule
         // (bd DAS-Backup-Manager-atq). Explicitly disable on the false path
         // too (not just "skip enabling") so a later `enabled = true -> false`
-        // edit followed by `setup --upgrade` actually turns the timer off —
-        // `enable --now`/`disable --now` are both idempotent no-ops if the
-        // unit is already in the target state.
-        let scrub_verb = if config.scrub.enabled {
-            "enable"
-        } else {
-            "disable"
-        };
+        // edit followed by `setup --upgrade` actually turns the timer off:
+        // that is `install_schedule`'s last step, not an entry here, because
+        // a linked unit is never given `disable --now`
+        // (bd DAS-Backup-Manager-5237.7, `unit_links::keep_disabled`).
 
         // das-backup-doctor.timer is always generated and always enabled —
         // unlike das-scrub, there is no `[doctor].enabled` config toggle
@@ -457,13 +473,16 @@ fn schedule_unit_operations(config: &Config) -> Vec<Vec<&'static str>> {
         // have caught none of them any sooner than a human remembering to
         // look). If a future need for disabling it emerges, add
         // `[doctor].enabled` and gate this the same way scrub is gated above.
-        vec![
+        let mut ops = vec![
             vec!["daemon-reload"],
             vec!["enable", "--now", "das-backup.timer"],
             vec!["enable", "--now", "das-backup-full.timer"],
-            vec![scrub_verb, "--now", "das-scrub.timer"],
-            vec!["enable", "--now", "das-backup-doctor.timer"],
-        ]
+        ];
+        if config.scrub.enabled {
+            ops.push(vec!["enable", "--now", "das-scrub.timer"]);
+        }
+        ops.push(vec!["enable", "--now", "das-backup-doctor.timer"]);
+        ops
     } else {
         Vec::new()
     }
@@ -475,12 +494,23 @@ fn schedule_unit_operations(config: &Config) -> Vec<Vec<&'static str>> {
 /// collected rather than discarded — see `command_status`.
 fn install_schedule(
     config: &Config,
+    unit_dirs: &buttered_dasd::unit_links::UnitDirs<'_>,
     systemctl: UnitRunner,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let unit_errors: Vec<String> = schedule_unit_operations(config)
+    let mut unit_errors: Vec<String> = schedule_unit_operations(config)
         .iter()
         .filter_map(|op| systemctl(op).err())
         .collect();
+    // A scrub timer switched off in the config: stopped, disabled and linked
+    // again, so the unit stays for a manual run (bd DAS-Backup-Manager-atq,
+    // DAS-Backup-Manager-5237.7).
+    if config.init.system == crate::setup::config::InitSystem::Systemd
+        && !config.scrub.enabled
+        && let Err(e) =
+            buttered_dasd::unit_links::keep_disabled(unit_dirs, "das-scrub.timer", systemctl)
+    {
+        unit_errors.push(e);
+    }
 
     // A schedule that was not installed is not an install that succeeded.
     // This is the entire point of finding #5: the command's purpose is to
@@ -501,6 +531,15 @@ fn install_schedule(
     Ok(())
 }
 
+/// The unit name of a generated file that is a systemd unit: one directly
+/// in systemd's own directory, as the templates name it.
+fn systemd_unit_name(generated_path: &str) -> Option<&str> {
+    generated_path
+        .strip_prefix(buttered_dasd::unit_links::SYSTEMD_DIR)?
+        .strip_prefix('/')
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
 /// Install with a custom root prefix — the core of [`install`], which runs it
 /// on `/` under setup's locks; tests run it on a scratch tree. Private, so
 /// nothing outside this module writes the installed files without the proof
@@ -514,6 +553,22 @@ fn install_to_prefix(
     // Generate all files first: a config the renderer refuses (bd xtnq) must
     // leave config.toml and every installed file as they are.
     let generated = GeneratedFiles::generate(config)?;
+
+    // The systemd units go into a directory of their own, each linked from
+    // systemd's (bd DAS-Backup-Manager-5237.7). One that cannot be placed —
+    // a masked unit is a link to /dev/null, which a write would go through
+    // — refuses the install here, before config.toml or any file is written.
+    let units_dir = buttered_dasd::unit_links::units_dir(config_path)?;
+    let systemd_dir = under_root(root, buttered_dasd::unit_links::SYSTEMD_DIR);
+    let unit_dirs = buttered_dasd::unit_links::UnitDirs {
+        systemd: &systemd_dir,
+        units: &units_dir,
+    };
+    for (rel_path, _) in &generated.files {
+        if let Some(unit) = systemd_unit_name(rel_path) {
+            buttered_dasd::unit_links::placeable(&unit_dirs, unit)?;
+        }
+    }
 
     // Save config
     config.save(config_path)?;
@@ -540,6 +595,17 @@ fn install_to_prefix(
     let mut skipped_newer: Vec<String> = Vec::new();
 
     for (rel_path, content) in &generated.files {
+        // A unit: its file in the units directory, systemd's name the link
+        // to it. Both are in the manifest: the link so that the stale-file
+        // pass below, which removes what an older manifest lists and this
+        // one lacks, never takes systemd's name for a unit away.
+        if let Some(unit) = systemd_unit_name(rel_path) {
+            buttered_dasd::unit_links::place(&unit_dirs, unit, content, None)?;
+            for path in [unit_dirs.file(unit), unit_dirs.link(unit)] {
+                manifest_entries.push(path.to_string_lossy().into_owned());
+            }
+            continue;
+        }
         let full_path = if rel_path.starts_with('/') {
             root.join(rel_path.strip_prefix('/').unwrap_or(rel_path.as_ref()))
         } else {
@@ -717,16 +783,11 @@ fn uninstall_with(
     };
 
     // A timer left enabled after an uninstall keeps firing at 03:00 against
-    // files that are no longer there.
-    for unit in [
-        "das-backup.timer",
-        "das-backup-full.timer",
-        "das-scrub.timer",
-        "das-backup-doctor.timer",
-    ] {
-        if let Err(e) = systemctl(&["disable", "--now", unit]) {
-            eprintln!("Warning: {unit} may still be enabled: {e}");
-        }
+    // files that are no longer there. Each is stopped first and the eight
+    // units disabled with no reload: `disable --now` unlinks a linked unit
+    // while it is active, which leaves it failed (bd DAS-Backup-Manager-5237.7).
+    for w in buttered_dasd::unit_links::retire(&SETUP_UNITS, systemctl) {
+        eprintln!("Warning: {w}");
     }
     for w in remove_schedule_units(unit_dir, systemctl) {
         eprintln!("Warning: {w}");
@@ -748,6 +809,10 @@ fn uninstall_with(
     // has operator files in it" is the normal outcome, not a fault.
     if let Some(config_dir) = config_path.parent() {
         let _ = std::fs::remove_dir(config_dir);
+    }
+    // The units directory, once the manifest's files are out of it.
+    if let Ok(units_dir) = buttered_dasd::unit_links::units_dir(config_path) {
+        let _ = std::fs::remove_dir(units_dir);
     }
 
     if remove_db
@@ -868,7 +933,9 @@ fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
         .map(|l| PathBuf::from(l.trim()))
         .chain(siblings)
     {
-        if !path.exists() {
+        // Not `exists()`: that follows a link, and a unit's link whose file
+        // went a line earlier would be passed over and left dangling.
+        if std::fs::symlink_metadata(&path).is_err() {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -2843,6 +2910,103 @@ auth = "starttls""#,
         (config_path, manifest_path)
     }
 
+    /// The eight units setup writes, as the tests name them.
+    const EIGHT_UNITS: [&str; 8] = [
+        "das-backup.service",
+        "das-backup.timer",
+        "das-backup-full.service",
+        "das-backup-full.timer",
+        "das-scrub.service",
+        "das-scrub.timer",
+        "das-backup-doctor.service",
+        "das-backup-doctor.timer",
+    ];
+
+    /// bd 5237.7: the units are files in a directory of their own; systemd's
+    /// names for them are links to those files; the manifest holds both.
+    #[test]
+    fn install_writes_the_units_into_their_own_directory_and_links_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, manifest_path) = install_into(dir.path());
+        let own = dir.path().join("etc/das-backup-units");
+        let manifest = manifest_lines(&manifest_path);
+        for unit in EIGHT_UNITS {
+            let file = own.join(unit);
+            let link = units_dir(dir.path()).join(unit);
+            assert!(
+                std::fs::symlink_metadata(&file).unwrap().is_file(),
+                "{unit}"
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), file, "{unit}");
+            for path in [&file, &link] {
+                assert!(
+                    manifest.contains(&path.to_string_lossy().into_owned()),
+                    "{} is not in the manifest: {manifest:?}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// bd 5237.7: units a previous version wrote as regular files in
+    /// systemd's directory, and listed in its manifest, become the links —
+    /// and the stale-file pass, which removes what the old manifest lists
+    /// and the new one lacks, removes none of them.
+    #[test]
+    fn an_upgrade_turns_the_units_written_before_into_links_and_prunes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let systemd = units_dir(dir.path());
+        std::fs::create_dir_all(&systemd).unwrap();
+        let mut old = vec![config_path.to_string_lossy().into_owned()];
+        for unit in EIGHT_UNITS {
+            std::fs::write(systemd.join(unit), "old\n").unwrap();
+            old.push(systemd.join(unit).to_string_lossy().into_owned());
+        }
+        std::fs::write(&manifest_path, old.join("\n")).unwrap();
+
+        install_to_prefix(&Config::default(), dir.path(), &config_path, &manifest_path).unwrap();
+
+        let own = dir.path().join("etc/das-backup-units");
+        for unit in EIGHT_UNITS {
+            assert_eq!(
+                std::fs::read_link(systemd.join(unit)).unwrap(),
+                own.join(unit),
+                "{unit}"
+            );
+            assert_ne!(
+                std::fs::read_to_string(systemd.join(unit)).unwrap(),
+                "old\n",
+                "{unit}"
+            );
+        }
+    }
+
+    /// bd 5237.7: a masked unit (a link to /dev/null at its name) refuses the
+    /// install before its first write — root would write through the link.
+    #[test]
+    fn an_install_over_a_masked_unit_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        let systemd = units_dir(dir.path());
+        std::fs::create_dir_all(&systemd).unwrap();
+        std::os::unix::fs::symlink("/dev/null", systemd.join("das-scrub.timer")).unwrap();
+
+        let err = install_to_prefix(&Config::default(), dir.path(), &config_path, &manifest_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("systemctl unmask das-scrub.timer"), "{err}");
+        assert!(!config_path.exists(), "config.toml was written");
+        assert!(!manifest_path.exists(), "a manifest was written");
+        assert!(!dir.path().join("etc/das-backup-units").exists());
+        assert_eq!(
+            std::fs::read_link(systemd.join("das-scrub.timer")).unwrap(),
+            Path::new("/dev/null")
+        );
+    }
+
     fn manifest_lines(manifest_path: &Path) -> Vec<String> {
         std::fs::read_to_string(manifest_path)
             .unwrap()
@@ -2882,13 +3046,100 @@ auth = "starttls""#,
         }
     }
 
-    const UNINSTALL_UNIT_CALLS: [&str; 5] = [
-        "disable --now das-backup.timer",
-        "disable --now das-backup-full.timer",
-        "disable --now das-scrub.timer",
-        "disable --now das-backup-doctor.timer",
+    /// bd 5237.7: each timer stopped first, then all eight units disabled in
+    /// one call with no reload — never `disable --now`, which leaves a
+    /// linked, armed timer failed.
+    const UNINSTALL_UNIT_CALLS: [&str; 6] = [
+        "stop das-backup.timer",
+        "stop das-backup-full.timer",
+        "stop das-scrub.timer",
+        "stop das-backup-doctor.timer",
+        "--no-reload disable das-backup.service das-backup.timer das-backup-full.service \
+         das-backup-full.timer das-scrub.service das-scrub.timer das-backup-doctor.service \
+         das-backup-doctor.timer",
         "daemon-reload",
     ];
+
+    /// systemd's directory and the units directory under `base`, for
+    /// `install_schedule`.
+    fn schedule_dirs(base: &Path) -> (PathBuf, PathBuf) {
+        (units_dir(base), base.join("etc/das-backup-units"))
+    }
+
+    /// `install_schedule` under `base`.
+    fn install_schedule_in(
+        base: &Path,
+        config: &Config,
+        systemctl: &FakeSystemctl,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (systemd, units) = schedule_dirs(base);
+        install_schedule(
+            config,
+            &buttered_dasd::unit_links::UnitDirs {
+                systemd: &systemd,
+                units: &units,
+            },
+            &|args| systemctl.run(args),
+        )
+    }
+
+    /// bd 5237.7 (was atq's `disable --now`): a scrub timer switched off in
+    /// the config is stopped, disabled with no reload and linked again, so
+    /// the unit stays and is never left failed.
+    #[test]
+    fn a_disabled_scrub_timer_is_stopped_disabled_and_linked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = valid_config(dir.path());
+        config.init.system = InitSystem::Systemd;
+        config.scrub.enabled = false;
+        install_config_into(&config, dir.path());
+        let (systemd, _) = schedule_dirs(dir.path());
+        // As `systemctl disable` does to a linked unit: its link goes too.
+        let systemctl = FakeSystemctl::new(&[]);
+        let (systemd_dir, units_dir) = schedule_dirs(dir.path());
+        install_schedule(
+            &config,
+            &buttered_dasd::unit_links::UnitDirs {
+                systemd: &systemd_dir,
+                units: &units_dir,
+            },
+            &|args| {
+                if args.contains(&"disable") {
+                    std::fs::remove_file(systemd.join("das-scrub.timer")).unwrap();
+                }
+                systemctl.run(args)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            systemctl.calls(),
+            [
+                "daemon-reload",
+                "enable --now das-backup.timer",
+                "enable --now das-backup-full.timer",
+                "enable --now das-backup-doctor.timer",
+                "stop das-scrub.timer",
+                "--no-reload disable das-scrub.timer",
+                "daemon-reload",
+            ]
+        );
+        let (systemd, units) = schedule_dirs(dir.path());
+        assert_eq!(
+            std::fs::read_link(systemd.join("das-scrub.timer")).unwrap(),
+            units.join("das-scrub.timer")
+        );
+
+        // One that will not stop is not unlinked, and fails the install.
+        let systemctl = FakeSystemctl::new(&["stop"]);
+        let err = install_schedule_in(dir.path(), &config, &systemctl).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("1 systemd unit operation(s) failed"),
+            "{err}"
+        );
+        assert_eq!(systemctl.calls().last().unwrap(), "stop das-scrub.timer");
+    }
 
     #[test]
     fn command_status_separates_success_from_a_failed_or_missing_command() {
@@ -2938,7 +3189,6 @@ auth = "starttls""#,
                 "daemon-reload",
                 "enable --now das-backup.timer",
                 "enable --now das-backup-full.timer",
-                "disable --now das-scrub.timer",
                 "enable --now das-backup-doctor.timer",
             ]
         );
@@ -2954,20 +3204,25 @@ auth = "starttls""#,
             config.scrub.enabled = true;
             assert_eq!(schedule_ops(&config), Vec::<String>::new());
 
-            let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
-            install_schedule(&config, &|args| systemctl.run(args))
+            let dir = tempfile::tempdir().unwrap();
+            config.scrub.enabled = false;
+            let systemctl = FakeSystemctl::new(&["daemon-reload", "--now", "stop"]);
+            install_schedule_in(dir.path(), &config, &systemctl)
                 .expect("nothing to run, so nothing can fail");
             assert_eq!(systemctl.calls(), Vec::<String>::new());
+            assert!(!schedule_dirs(dir.path()).0.exists(), "no link is made");
         }
     }
 
     #[test]
     fn install_schedule_runs_every_operation_and_succeeds_when_all_do() {
+        let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.init.system = InitSystem::Systemd;
+        config.scrub.enabled = true;
         let systemctl = FakeSystemctl::new(&[]);
 
-        install_schedule(&config, &|args| systemctl.run(args)).expect("every operation succeeded");
+        install_schedule_in(dir.path(), &config, &systemctl).expect("every operation succeeded");
 
         assert_eq!(systemctl.calls(), schedule_ops(&config));
         assert_eq!(systemctl.calls().len(), 5);
@@ -2978,11 +3233,13 @@ auth = "starttls""#,
         // Finding #5: a schedule that was not installed is not an install that
         // succeeded. One failed timer must not stop the others being enabled,
         // and must not be reported as success.
+        let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.init.system = InitSystem::Systemd;
+        config.scrub.enabled = true;
 
         let systemctl = FakeSystemctl::new(&["das-backup.timer"]);
-        let err = install_schedule(&config, &|args| systemctl.run(args))
+        let err = install_schedule_in(dir.path(), &config, &systemctl)
             .expect_err("a timer that could not be enabled must fail the install");
         assert!(
             err.to_string()
@@ -2992,7 +3249,7 @@ auth = "starttls""#,
         assert_eq!(systemctl.calls(), schedule_ops(&config));
 
         let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
-        let err = install_schedule(&config, &|args| systemctl.run(args)).unwrap_err();
+        let err = install_schedule_in(dir.path(), &config, &systemctl).unwrap_err();
         assert!(
             err.to_string()
                 .starts_with("5 systemd unit operation(s) failed"),
@@ -3124,7 +3381,10 @@ auth = "starttls""#,
         // gone, so all four are disabled, then systemd is told.
         assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
         for entry in &installed {
-            assert!(!Path::new(entry).exists(), "{entry} was left behind");
+            assert!(
+                std::fs::symlink_metadata(entry).is_err(),
+                "{entry} was left behind"
+            );
         }
         assert!(!manifest_path.exists());
         assert!(
@@ -3241,7 +3501,7 @@ auth = "starttls""#,
         let (config_path, manifest_path) =
             install_config_into(&valid_config(dir.path()), dir.path());
         let installed = manifest_lines(&manifest_path);
-        let systemctl = FakeSystemctl::new(&["daemon-reload", "--now"]);
+        let systemctl = FakeSystemctl::new(&["daemon-reload", "stop", "disable"]);
 
         uninstall_with(
             &config_path,
@@ -3254,7 +3514,10 @@ auth = "starttls""#,
 
         assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
         for entry in &installed {
-            assert!(!Path::new(entry).exists(), "{entry} was left behind");
+            assert!(
+                std::fs::symlink_metadata(entry).is_err(),
+                "{entry} was left behind"
+            );
         }
     }
 
@@ -5256,12 +5519,15 @@ auth = "starttls""#,
         );
     }
 
-    const UNINSTALL_ALL_UNIT_CALLS: [&str; 7] = [
-        "disable --now das-backup.timer",
-        "disable --now das-backup-full.timer",
-        "disable --now das-scrub.timer",
-        "disable --now das-backup-doctor.timer",
-        "daemon-reload",
+    /// The helper's unit is a regular file cmake installed, not a linked
+    /// unit, so it keeps `disable --now`.
+    const UNINSTALL_ALL_UNIT_CALLS: [&str; 8] = [
+        UNINSTALL_UNIT_CALLS[0],
+        UNINSTALL_UNIT_CALLS[1],
+        UNINSTALL_UNIT_CALLS[2],
+        UNINSTALL_UNIT_CALLS[3],
+        UNINSTALL_UNIT_CALLS[4],
+        UNINSTALL_UNIT_CALLS[5],
         "disable --now btrdasd-helper.service",
         "daemon-reload",
     ];

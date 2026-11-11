@@ -627,14 +627,15 @@ The installer creates the following files (tracked in `/etc/das-backup/.manifest
 | `${prefix}/lib/das-backup/backup-run.sh` | Real production backup orchestrator script, installed flat (same layout `cmake --install` uses — no `scripts/` subdirectory, no wrapper) |
 | `${prefix}/lib/das-backup/backup-verify.sh` | Real production drive-verification script, installed flat |
 | `${prefix}/lib/das-backup/boot-archive-cleanup.sh` | Real production archive-pruner script, installed flat |
-| `/etc/systemd/system/das-backup.service` | Incremental backup service (systemd) |
-| `/etc/systemd/system/das-backup.timer` | Incremental backup timer (systemd) |
-| `/etc/systemd/system/das-backup-full.service` | Full backup service (systemd) |
-| `/etc/systemd/system/das-backup-full.timer` | Full backup timer (systemd) |
-| `/etc/systemd/system/das-scrub.service` | Scheduled BTRFS scrub service (systemd) — runs `btrdasd scrub run` |
-| `/etc/systemd/system/das-scrub.timer` | Scheduled BTRFS scrub timer (systemd) — `OnCalendar` from `[scrub].on_calendar`, enabled only when `[scrub].enabled = true` |
-| `/etc/systemd/system/das-backup-doctor.service` | Subvolume drift detector service (systemd) — runs `btrdasd doctor --check-drift --email` |
-| `/etc/systemd/system/das-backup-doctor.timer` | Subvolume drift detector timer (systemd) — fixed `Sun 02:00`, always enabled |
+| `/etc/das-backup-units/das-backup.service` | Incremental backup service (systemd) |
+| `/etc/das-backup-units/das-backup.timer` | Incremental backup timer (systemd) |
+| `/etc/das-backup-units/das-backup-full.service` | Full backup service (systemd) |
+| `/etc/das-backup-units/das-backup-full.timer` | Full backup timer (systemd) |
+| `/etc/das-backup-units/das-scrub.service` | Scheduled BTRFS scrub service (systemd) — runs `btrdasd scrub run` |
+| `/etc/das-backup-units/das-scrub.timer` | Scheduled BTRFS scrub timer (systemd) — `OnCalendar` from `[scrub].on_calendar`, enabled only when `[scrub].enabled = true` |
+| `/etc/das-backup-units/das-backup-doctor.service` | Subvolume drift detector service (systemd) — runs `btrdasd doctor --check-drift --email` |
+| `/etc/das-backup-units/das-backup-doctor.timer` | Subvolume drift detector timer (systemd) — fixed `Sun 02:00`, always enabled |
+| `/etc/systemd/system/das-*.{service,timer}` | A link to each unit above — the name systemd reads it under. The units directory is `<config dir>-units`; an upgrade replaces units an older version wrote here as regular files with these links, in place. Never run `systemctl disable --now` on one: it removes the link while the timer is armed and leaves it `failed`; use `btrdasd schedule disable`, or `systemctl stop` then `btrdasd setup --upgrade` |
 | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | udev rule hiding every backup target from udisks2, so no desktop session automounts it — one line per `[[target]]` serial, plus one per `mount_uuid`. Generated on every init system; `btrdasd setup --check` reads back whether each attached target actually carries the flag |
 
 `${prefix}` is `[general].install_prefix` (default `/usr/local`, `/usr` on the live system

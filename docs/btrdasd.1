@@ -1285,8 +1285,11 @@ Default:
 .IR /etc/das\-backup/config.toml .
 .\"
 .SS schedule disable
-Disable scheduled backups (the same two timers, with
-.BR "systemctl disable \-\-now" ).
+Disable scheduled backups: each of the same two timers is stopped, disabled
+and linked again, so its unit stays in place. Never
+.BR "systemctl disable \-\-now" :
+the units are linked from a directory of their own (see FILES), and that
+leaves an armed timer failed.
 .PP
 .B btrdasd schedule disable
 .RB [ \-\-config
@@ -3426,6 +3429,17 @@ generated, one per line; read by
 .B \-\-check
 and
 .BR \-\-uninstall .
+.TP
+.I /etc/das\-backup\-units/
+The systemd units
+.B btrdasd setup
+generates (the directory beside the config's own, named after it), each read
+by systemd through a link of the same name in
+.IR /etc/systemd/system .
+A unit an older version wrote there as a regular file becomes that link at
+the next
+.BR "setup \-\-upgrade" ;
+a masked unit or a foreign link at the name refuses the install.
 .TP
 .I /etc/udev/rules.d/99\-das\-backup\-udisks\-ignore.rules
 Generated udev rule that hides the backup targets from udisks, matched on the

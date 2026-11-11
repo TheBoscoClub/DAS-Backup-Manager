@@ -23,6 +23,7 @@ pub mod scanner;
 pub mod schedule;
 pub mod scrub;
 pub mod subvol;
+pub mod unit_links;
 
 /// The product version, all four segments, as `CMakeLists.txt` writes it
 /// (`build.rs` reads it there).

@@ -136,7 +136,8 @@ can absorb.
 ```bash
 # 1. Brake, then stop, the units that mount the enclosure so nothing (and no watchdog
 #    restarting a failed unit) starts them mid-move. `systemctl mask` cannot do this:
-#    the units are installed in /etc/systemd/system. The drop-ins live in /run, so a
+#    each unit's name in /etc/systemd/system is taken, by the link to its file in
+#    /etc/das-backup-units. The drop-ins live in /run, so a
 #    reboot removes them; to release earlier, delete them and daemon-reload.
 for u in das-backup.service das-backup-full.service das-scrub.service; do
     sudo mkdir -p "/run/systemd/system/$u.d"

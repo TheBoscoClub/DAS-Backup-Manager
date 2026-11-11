@@ -171,8 +171,9 @@ install(FILES
 # =============================================================================
 #
 # das-backup{,-full}.{service,timer} — like das-scrub and das-backup-doctor —
-# are rendered by `btrdasd setup` from config.toml into /etc/systemd/system
-# (cron entries on sysvinit and OpenRC): their schedule, prefix and scrub
+# are rendered by `btrdasd setup` from config.toml into /etc/das-backup-units,
+# each linked from /etc/systemd/system (bd DAS-Backup-Manager-5237.7; cron
+# entries on sysvinit and OpenRC): their schedule, prefix and scrub
 # state are the host's, so the only copy ever right is setup's. Until
 # bd DAS-Backup-Manager-7rf CMake also installed its own copies under
 # lib/systemd/system, which systemd ran whenever setup's were gone — with a

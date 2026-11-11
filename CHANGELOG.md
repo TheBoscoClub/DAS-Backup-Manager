@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The systemd units `btrdasd setup` generates live in a directory of their own, linked into systemd** (bd `DAS-Backup-Manager-5237.7`, operator decision 2026-11-09): the eight `das-*.{service,timer}` units sat loose in `/etc/systemd/system` among everything else there, so they could not be versioned as one directory
+  - Each unit is a file in `<config dir>-units` (`/etc/das-backup-units`; derived, not a config key) and `/etc/systemd/system/<unit>` is the link to it; unit names, drop-ins and the runtime brake are unchanged, and the manifest lists file and link
+  - `setup --upgrade` replaces a unit an older version wrote as a regular file with its link in one rename — an armed timer keeps its next elapse (observed on systemd 262, also across a reboot)
+  - `schedule disable` and a scrub timer switched off in the config stop the timer, disable it without a reload and link it again; `setup --uninstall` stops the four timers, then disables all eight units in one call — never `disable --now`, which removes a linked unit's link while it is active and leaves it `failed`, the state a supervisor restarts
+  - All of it goes through one module, `indexer/src/unit_links.rs`; the recovery-OS schedule units the helper writes still sit in `/etc/systemd/system` as before
+
 - **The installation's own recovery documents live beside the config's directory, not inside it** (bd `DAS-Backup-Manager-5237.6`, operator decision): `/etc/das-backup` held `docs/`, so it could not be versioned as flat files
   - New key `[recovery_os].local_docs_dir`; unset, `<config dir>-docs` (`/etc/das-backup-docs`); one inside the config's directory, or not a plain absolute path, is refused
   - Resolved once, by `config::local_docs_dir`; `btrdasd config dump-env` prints it as `DAS_RECOVERY_OS_LOCAL_DOCS_DIR` (or `DAS_RECOVERY_OS_LOCAL_DOCS_ERROR`, why not) and `recovery-os-vm.sh` never derives it
@@ -73,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - An old `config.toml` carrying the key still loads: each occurrence is warned about by name (`... is no longer read: manual_only was removed ...`, `config::REMOVED_KEYS`), and the next save takes it out of every subvolume entry, changed or not (`config::splice`)
 
 ### Fixed
+
+- **`btrdasd setup` refuses to install over a masked unit instead of writing through it** (bd `DAS-Backup-Manager-5237.7`): a masked unit is a link to `/dev/null` at the unit's name, and setup wrote each unit through whatever stood there — as root, replacing `/dev/null` with a regular file; a link to anything but the unit's own file now refuses the install before `config.toml` or any file is written, naming `systemctl unmask <unit>`
+- **`setup --uninstall` no longer passes over a dangling link the manifest lists**: it skipped every listed path that did not resolve, so a link whose file went a line earlier was left behind
 
 - **The GUI's backup history columns fit their text at any font size** (bd `DAS-Backup-Manager-5237.10`): the columns had fixed pixel widths, so at a desktop's larger font Mode, Status, Snapshots and Sent opened cut to "…" while Errors took the spare width — seen on the first look at the installed GUI; each column but Errors is now sized to its header and cells on every load, and the table's minimum width follows
 - **A retired subvolume entry back on disk is not revived beside a live entry of the same name** (bd `DAS-Backup-Manager-g4s`): reviving it made two live entries for one subvolume, which validation refuses, so every later sync reported CONFIG NOT UPDATED and no new subvolume was adopted until the file was fixed by hand; the retired entry is now kept, with its backups, and listed every run under `NOT REVIVED (a live entry of the same name backs it up)` in SUBVOLUME SYNC, naming both sources — not a failure, since the live entry backs the subvolume up

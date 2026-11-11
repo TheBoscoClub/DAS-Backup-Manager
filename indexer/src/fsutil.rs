@@ -83,6 +83,47 @@ pub fn write_atomic_root_owned(path: &Path, contents: &[u8], mode: Option<u32>) 
     )
 }
 
+/// Make `link` a symlink to `target` in one step: the link is made under a
+/// temp name of its own beside `link` ([`unique_temp_name`]; a taken name is
+/// passed over, never followed or removed) and renamed over it, then the
+/// directory is flushed. Whatever file or link stood at `link` is replaced
+/// whole, and a reader sees the old entry or the new one. A directory there
+/// fails the rename and is left. On a failed rename the temp link is removed.
+pub fn replace_with_symlink(link: &Path, target: &Path) -> io::Result<()> {
+    let named = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot link {} to {}: {e}",
+                link.display(),
+                target.display()
+            ),
+        )
+    };
+    let (Some(dir), Some(_)) = (link.parent(), link.file_name()) else {
+        return Err(named(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path has no file name",
+        )));
+    };
+    let mut passed_over = 0;
+    let temp = loop {
+        let temp = unique_temp_name(link);
+        match std::os::unix::fs::symlink(target, &temp) {
+            Ok(()) => break temp,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && passed_over < TEMP_TRIES => {
+                passed_over += 1;
+            }
+            Err(e) => return Err(named(e)),
+        }
+    };
+    if let Err(e) = fs::rename(&temp, link) {
+        let _ = fs::remove_file(&temp);
+        return Err(named(e));
+    }
+    File::open(dir).and_then(|d| d.sync_all()).map_err(named)
+}
+
 /// What a write asks of the system, so a test can stand in for each part.
 struct WriteHost<'a> {
     /// The writer's effective user id: an owner and group are kept only by

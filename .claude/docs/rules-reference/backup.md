@@ -783,6 +783,18 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
     - `tests/test_backup_exit_semantics.sh` runs the real script end to end (lock paths redirected to a temp dir, root check read from `DAS_TEST_EUID`, `env -i` with stubs for every system command) and pins every class above to its exact status
   - `das-scrub.service`'s generated unit file (`render_systemd_scrub_service` in `indexer/src/setup/templates.rs`) carries a one-line `# Exit semantics: ...` comment above `ExecStart=` so `systemctl cat das-scrub.service` documents this on its own, without sending a reader to the Rust source.
 
+**Linked units (bd `5237.7`, observed on systemd 262, 2026-11-11).** The units are files in
+`<config dir>-units`, linked from `/etc/systemd/system`. `systemctl disable <unit>` removes the unit's link
+as well as its install links. `disable <timer>` or `disable --now <timer>` on an armed linked timer: the
+link goes, systemd reloads, and the timer reads `is-active=failed`, `LoadState=not-found`; linking it again
+loads it and it stays failed. Stopped first, the same disable leaves it inactive and never failed, with
+or without `--no-reload`. `--no-reload disable` followed by a new link and one reload: the manager never
+sees the file missing. A regular unit file replaced by its link in one rename keeps an armed timer's next
+elapse, before and after the reload, and across a reboot. `enable --now <timer path>` while the timer's
+service has no file: `Job failed`, rc 1. The runtime brake drop-in applies to a linked unit; a drop-in
+directory inside the units directory is not read; `mask --runtime` is outranked. The probes and their raw
+results are in the bd issue's notes.
+
 <!-- full original lines moved from the rule file, 2026-11-01 -->
 - A supervisor (systemd `Restart=`, a monitor that restarts any unit it sees `failed`) must never meet a failure
   the next start would meet again: such a unit would loop. **To stop a unit deliberately: `systemctl stop` AND
