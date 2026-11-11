@@ -351,6 +351,39 @@ private Q_SLOTS:
         for (int c = 0; c + 1 < table->model()->columnCount(); ++c)
             counts += table->columnWidth(c);
         QVERIFY2(table->minimumWidth() >= counts, "the minimum width no longer covers the columns");
+
+        // A refresh of a shown view (a job finished, Load older runs) must
+        // still measure every row: the one run that could not count sits 40
+        // rows down, off screen. Measured from the text itself, not from the
+        // view's own size hint.
+        view.resize(900, 300);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        QStringList rows;
+        for (int i = 0; i < 50; ++i)
+            rows << QStringLiteral(R"({"id": %1, "timestamp": %2, "mode": "full",
+                "success": %3, "duration_secs": 60, "snaps_created": %4,
+                "snaps_sent": %4, "bytes_sent": %5, "errors": []})")
+                        .arg(1000 - i)
+                        .arg(1791000000 - i * 86400)
+                        .arg(i == 40 ? QStringLiteral("false") : QStringLiteral("true"))
+                        .arg(i == 40 ? QStringLiteral("null") : QStringLiteral("1"))
+                        .arg(i == 40 ? 0 : 1);
+        view.showHistory(QStringLiteral("[%1]").arg(rows.join(QLatin1Char(','))));
+        const QFontMetrics fm(table->font());
+        int unknownRow = -1;
+        for (int r = 0; r < table->model()->rowCount(); ++r)
+            if (table->model()->index(r, 5).data().toString() == QStringLiteral("unknown"))
+                unknownRow = r;
+        QVERIFY(unknownRow >= 0);
+        const QModelIndex unknownCell = table->model()->index(unknownRow, 5);
+        QVERIFY2(!table->viewport()->rect().intersects(table->visualRect(unknownCell)),
+                 "the uncounted run must be off screen for this check");
+        const QString unknown = unknownCell.data().toString();
+        QVERIFY2(table->columnWidth(5) > fm.horizontalAdvance(unknown),
+                 qPrintable(QStringLiteral("Sent is %1 px, an off-screen \"unknown\" needs %2")
+                                .arg(table->columnWidth(5))
+                                .arg(fm.horizontalAdvance(unknown))));
     }
 
     void historyShowsAnUnknownCountAsUnknown()
