@@ -10,7 +10,7 @@ use std::process::Command;
 
 use crate::btrbk_conf::{normalise_dir, resolve_snapshot_names, source_subdir, source_targets};
 use crate::caldate::{clock_far_past_last_run, date_of, day_number, untrusted_clock};
-use crate::config::{Config, Retention, Source};
+use crate::config::{Config, Retention, Source, TargetRole};
 use crate::fsutil::CommandRunner;
 
 /// The longest of a target's retention tiers, in whole days: a daily tier
@@ -162,6 +162,9 @@ pub struct LocationReport {
     pub place: String,
     pub state: LocationState,
     pub deleted_paths: Vec<PathBuf>,
+    /// A primary target: the place the nightly index walk covers, so every
+    /// snapshot deleted here should have had an index row at its path.
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +206,17 @@ impl ExpireOutcome {
         self.entries
             .iter()
             .flat_map(|e| &e.locations)
+            .flat_map(|l| l.deleted_paths.iter().cloned())
+            .collect()
+    }
+
+    /// The deleted paths on primary targets, where the index walk runs: each
+    /// should have had an index row at exactly that path.
+    pub fn indexed_deleted_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| &e.locations)
+            .filter(|l| l.indexed)
             .flat_map(|l| l.deleted_paths.iter().cloned())
             .collect()
     }
@@ -322,6 +336,7 @@ fn examine(
         place: place.clone(),
         state,
         deleted_paths: Vec::new(),
+        indexed: false,
     };
     if !is_mountpoint(mount_root) {
         return report(LocationState::Unreachable(format!(
@@ -428,6 +443,7 @@ fn examine(
         place,
         state,
         deleted_paths,
+        indexed: false,
     }
 }
 
@@ -527,6 +543,9 @@ pub fn expire_retired(
                     is_mountpoint,
                     live_user_of(&config, &snapshot_name, same_place),
                 ));
+                if let Some(last) = locations.last_mut() {
+                    last.indexed = target.role == TargetRole::Primary;
+                }
             }
             // Source-side snapshots only exist to be sent. Once the shortest
             // window among the targets examined this run has passed they have
@@ -641,21 +660,39 @@ pub fn expire_retired(
     })
 }
 
-/// Drop the index rows of snapshots an expiry just deleted. Returns how many
-/// rows were pruned.
+/// Drop the index rows of snapshots an expiry just deleted (`deleted`, by
+/// exact path). Returns a report line when some of `indexed` — the deleted
+/// paths on primary targets, which the index walk covers — had no row at that
+/// path: never indexed, or listed under another path, where the row now names
+/// a snapshot that is gone (bd DAS-Backup-Manager-12k). Not a failure; the
+/// line goes into the RETIRED SUBVOLUMES section.
 pub fn prune_deleted_from_index(
     db: &Path,
     deleted: &[PathBuf],
-) -> Result<usize, Box<dyn std::error::Error>> {
+    indexed: &[PathBuf],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let database = crate::db::Database::open(db)?;
-    let ids: Vec<i64> = database
+    let rows: Vec<(i64, String)> = database
         .list_snapshots()?
         .into_iter()
         .filter(|s| deleted.iter().any(|p| p.to_string_lossy() == s.path))
-        .map(|s| s.id)
+        .map(|s| (s.id, s.path))
         .collect();
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
     database.prune_snapshots(&ids)?;
-    Ok(ids.len())
+    let unlisted: Vec<&PathBuf> = indexed
+        .iter()
+        .filter(|p| !rows.iter().any(|(_, row)| p.to_string_lossy() == *row))
+        .collect();
+    let Some(example) = unlisted.first() else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "  INDEX: {} deleted snapshot{} on a primary target had no index row at that path (e.g. {}) — never indexed, or listed under another path, where the row now names a snapshot that is gone; `btrdasd reconcile` removes such rows\n",
+        unlisted.len(),
+        if unlisted.len() == 1 { "" } else { "s" },
+        example.display()
+    )))
 }
 
 /// The "RETIRED SUBVOLUMES" section of the run report. Empty when no entry
@@ -1816,6 +1853,7 @@ mod tests {
                     place: "p".into(),
                     state,
                     deleted_paths: Vec::new(),
+                    indexed: false,
                 }],
                 removed_from_config: false,
                 kept_reason: None,
@@ -1896,6 +1934,7 @@ mod tests {
             place: place.into(),
             state,
             deleted_paths: Vec::new(),
+            indexed: false,
         };
         let out = ExpireOutcome {
             entries: vec![RetiredReport {
@@ -2102,6 +2141,7 @@ mod tests {
                             example: "opt.2026100x".into(),
                         },
                         deleted_paths: Vec::new(),
+                        indexed: false,
                     },
                     LocationReport {
                         place: "target small".into(),
@@ -2110,6 +2150,7 @@ mod tests {
                             example: "opt.20261001T1421.partial".into(),
                         },
                         deleted_paths: Vec::new(),
+                        indexed: false,
                     },
                 ],
                 removed_from_config: false,
@@ -2484,6 +2525,7 @@ mod tests {
                     place: "target big".into(),
                     state: shared("other", "@opt"),
                     deleted_paths: Vec::new(),
+                    indexed: false,
                 }],
                 removed_from_config: false,
                 kept_reason: None,
@@ -2918,6 +2960,66 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         let text = format_expire_report(&out, false);
         assert!(text.contains("  NOTHING DELETED: "), "{text}");
+    }
+
+    /// A snapshot deleted from a primary target whose index row is not at
+    /// that path leaves the row behind: the report says so (bd
+    /// DAS-Backup-Manager-12k). Mirror and source deletions have no row of
+    /// their own and say nothing.
+    #[test]
+    fn a_deleted_primary_snapshot_missing_from_the_index_is_reported() {
+        let rig = rig();
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&big, &small, &src]);
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2028-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert_eq!(out.deleted_paths().len(), 3);
+        assert_eq!(out.indexed_deleted_paths(), vec![big.clone()]);
+
+        let db = rig.dir.path().join("index.db");
+        {
+            let d = crate::db::Database::open(&db).unwrap();
+            // Listed under another spelling of the same mount.
+            d.insert_snapshot(
+                "opt",
+                "20260930T0323",
+                "ssd",
+                "/elsewhere/ssd/opt.20260930T0323",
+            )
+            .unwrap();
+        }
+        let line =
+            prune_deleted_from_index(&db, &out.deleted_paths(), &out.indexed_deleted_paths())
+                .unwrap()
+                .expect("a shortfall is reported");
+        assert!(line.contains(&big.display().to_string()), "{line}");
+        assert!(line.contains("1 deleted snapshot "), "{line}");
+
+        // The row at the exact path is pruned, and then nothing is said.
+        let db2 = rig.dir.path().join("index2.db");
+        {
+            let d = crate::db::Database::open(&db2).unwrap();
+            d.insert_snapshot("opt", "20260930T0323", "ssd", &big.to_string_lossy())
+                .unwrap();
+        }
+        let line =
+            prune_deleted_from_index(&db2, &out.deleted_paths(), &out.indexed_deleted_paths())
+                .unwrap();
+        assert_eq!(line, None);
+        let left = crate::db::Database::open(&db2)
+            .unwrap()
+            .list_snapshots()
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
