@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI's backup history columns fit their text at any font size** (bd `DAS-Backup-Manager-5237.10`): the columns had fixed pixel widths, so at a desktop's larger font Mode, Status, Snapshots and Sent opened cut to "…" while Errors took the spare width — seen on the first look at the installed GUI; each column but Errors is now sized to its header and cells on every load, and the table's minimum width follows
 - **A retired subvolume entry back on disk is not revived beside a live entry of the same name** (bd `DAS-Backup-Manager-g4s`): reviving it made two live entries for one subvolume, which validation refuses, so every later sync reported CONFIG NOT UPDATED and no new subvolume was adopted until the file was fixed by hand; the retired entry is now kept, with its backups, and listed every run under `NOT REVIVED (a live entry of the same name backs it up)` in SUBVOLUME SYNC, naming both sources — not a failure, since the live entry backs the subvolume up
 
 - **The GUI's Run buttons come back when no D-Bus helper is reachable** (bd `DAS-Backup-Manager-qxxv`): the client dropped a job-starting call without a word when the helper was unavailable, so a panel that had marked its backup as requested kept Run and Dry Run disabled until the GUI was restarted; the client now sends a quiet, queued `callDropped(operation)` (no error dialog — `helperUnavailable` already said why) and the backup panel ends the request on it

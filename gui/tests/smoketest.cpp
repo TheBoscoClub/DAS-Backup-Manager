@@ -34,6 +34,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QHeaderView>
 #include <QTableView>
 #include <QTableWidget>
 #include <QComboBox>
@@ -314,6 +315,42 @@ private Q_SLOTS:
         for (int c = 0; c + 1 < table->model()->columnCount(); ++c)
             counts += table->columnWidth(c);
         QVERIFY2(table->minimumWidth() >= counts, "the count columns are cut off");
+    }
+
+    void historyColumnsFitTheirTextAtAnyFontSize()
+    {
+        // Seen live 2026-11-11 (bd 5237.10): at the desktop's font size the
+        // fixed pixel widths cut Mode, Status, Snapshots and Sent to "…".
+        DBusClient client;
+        BackupHistoryView view(&client);
+        QFont big = view.font();
+        big.setPointSize(20);
+        view.setFont(big);
+        view.showHistory(QStringLiteral(R"([
+            {"id": 2, "timestamp": 1791000000, "mode": "incremental", "success": false,
+             "duration_secs": 2615, "snaps_created": null, "snaps_sent": null,
+             "bytes_sent": 0, "errors": ["btrbk: exit code 10"]},
+            {"id": 1, "timestamp": 1790900000, "mode": "incremental", "success": true,
+             "duration_secs": 4740, "snaps_created": 128, "snaps_sent": 64,
+             "bytes_sent": 1, "errors": []}])"));
+        const auto *table = view.findChild<QTableView *>();
+        QVERIFY(table != nullptr);
+        const auto *hh = table->horizontalHeader();
+        for (int c = 0; c + 1 < table->model()->columnCount(); ++c) {
+            // Public on the base class, protected on QTableView.
+            const auto *items = static_cast<const QAbstractItemView *>(table);
+            const int need = std::max(items->sizeHintForColumn(c), hh->sectionSizeHint(c));
+            QVERIFY2(table->columnWidth(c) >= need,
+                     qPrintable(QStringLiteral("column %1 (%2) is %3 px, its text needs %4")
+                                    .arg(c)
+                                    .arg(table->model()->headerData(c, Qt::Horizontal).toString())
+                                    .arg(table->columnWidth(c))
+                                    .arg(need)));
+        }
+        int counts = 0;
+        for (int c = 0; c + 1 < table->model()->columnCount(); ++c)
+            counts += table->columnWidth(c);
+        QVERIFY2(table->minimumWidth() >= counts, "the minimum width no longer covers the columns");
     }
 
     void historyShowsAnUnknownCountAsUnknown()

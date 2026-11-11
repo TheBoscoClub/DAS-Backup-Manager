@@ -267,7 +267,6 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, QWidget *parent)
     m_loadOlder->setObjectName(QStringLiteral("loadOlderRuns"));
     m_loadOlder->setToolTip(i18n("Show %1 more of the older backup runs", PageSize));
     connect(m_loadOlder, &QPushButton::clicked, this, &BackupHistoryView::loadOlder);
-    refresh();
 
     m_proxy = new QSortFilterProxyModel(this);
     m_proxy->setSourceModel(m_model);
@@ -288,19 +287,10 @@ BackupHistoryView::BackupHistoryView(DBusClient *client, QWidget *parent)
     hh->setSectionsClickable(true);
     hh->setSortIndicatorShown(true);
 
-    // Reasonable initial column widths
-    m_view->setColumnWidth(BackupHistoryModel::Timestamp,        160);
-    m_view->setColumnWidth(BackupHistoryModel::Mode,              80);
-    m_view->setColumnWidth(BackupHistoryModel::Duration,          80);
-    m_view->setColumnWidth(BackupHistoryModel::Status,            80);
-    m_view->setColumnWidth(BackupHistoryModel::SnapshotsCreated,  80);
-    m_view->setColumnWidth(BackupHistoryModel::Sent,               50);
-    // Errors column stretches to fill remaining space. Wide enough for every
-    // column before it: opened narrower, only the timestamp showed (5237.5).
-    int fixedColumns = 0;
-    for (int c = 0; c + 1 < BackupHistoryModel::ColumnCount; ++c)
-        fixedColumns += m_view->columnWidth(c);
-    m_view->setMinimumWidth(fixedColumns + m_view->frameWidth() * 2);
+    // Errors column stretches to fill remaining space; the others fit
+    // their text, measured on every load, so the first one comes after the
+    // view exists.
+    refresh();
 
     // Sort by timestamp descending by default (most recent first)
     m_view->sortByColumn(BackupHistoryModel::Timestamp, Qt::DescendingOrder);
@@ -329,8 +319,23 @@ std::optional<qint64> BackupHistoryView::countFromJson(const QJsonValue &value)
 void BackupHistoryView::showHistory(const QString &json)
 {
     m_model->load(json);
+    fitColumns();
     // A full page may have older runs behind it; a short one is all there is.
     m_loadOlder->setEnabled(m_model->rowCount() >= m_limit);
+}
+
+void BackupHistoryView::fitColumns()
+{
+    // Measured from the font in use: fixed pixel widths cut Mode, Status,
+    // Snapshots and Sent to "…" at a desktop's larger font (bd 5237.10).
+    // Wide enough for every column before Errors: opened narrower, only the
+    // timestamp showed (5237.5).
+    int fixedColumns = 0;
+    for (int c = 0; c + 1 < BackupHistoryModel::ColumnCount; ++c) {
+        m_view->resizeColumnToContents(c);
+        fixedColumns += m_view->columnWidth(c);
+    }
+    m_view->setMinimumWidth(fixedColumns + m_view->frameWidth() * 2);
 }
 
 void BackupHistoryView::refresh()

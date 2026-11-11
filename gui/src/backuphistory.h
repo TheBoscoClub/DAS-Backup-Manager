@@ -35,6 +35,10 @@ public Q_SLOTS:
     void loadOlder();
 
 private:
+    // Size every column but the stretching last one to its header and
+    // cells, and keep the table at least that wide (bd 5237.10).
+    void fitColumns();
+
     DBusClient *m_client;
     BackupHistoryModel *m_model = nullptr;
     QSortFilterProxyModel *m_proxy = nullptr;
