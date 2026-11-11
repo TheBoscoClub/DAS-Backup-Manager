@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A slow `HealthQuery` line now accounts for all of its time** (bd `DAS-Backup-Manager-tobl`): the helper's journal line named only the slowest timed steps, and on 2026-11-01, during a DAS scrub, a 15.7 s reply's slowest step was 0.2 s — the wait was somewhere no step covered. The walk for the newest snapshot (`latest_snapshot_time`, which stats every snapshot on every target) is now the `last backup` step, the helper records its `config load` and the `queued` wait for a blocking thread, and the line ends `; untimed N s` with whatever is left
+
 - **`docs/DISASTER-RECOVERY-GUIDE.md`: a backed-up record of a repair still owed is history** (bd `DAS-Backup-Manager-9jrp`): a host's "rebuild pending" record, or a snapshot of the subvolume holding it, is never restored over a filesystem that still exists — the older copy can owe less than the live one and hide a debt; only onto a filesystem rebuilt from scratch, where the owning tool judges it, and that tool's own check is re-run after any rollback or restore
 
 - **The GUI backup's options are built by a tested library constructor** (bd `DAS-Backup-Manager-3npi`): the D-Bus helper's `BackupRun` built `BackupOptions` inside its zbus method, which no test reaches, so a regression passing `None` (every source, every target) for the GUI's tick lists would have gone unseen; it now calls `BackupOptions::from_gui`, whose test pins both lists as `Some` (an empty one refused by `empty_selection`, never widened to all) and each tick reaching its own step

@@ -905,12 +905,16 @@ pub fn slow_health_warning(
     threshold: Duration,
     steps: &StepTimes,
 ) -> Option<String> {
+    // The time no step accounts for: a large one says the wait was outside
+    // every timed step (on 2026-11-01, 15.4 of 15.7 s; bd tobl).
+    let timed: Duration = steps.0.iter().map(|(_, took)| *took).sum();
     (total >= threshold).then(|| {
         format!(
-            "HealthQuery took {:.1} s (warn at {} s); slowest steps: {}",
+            "HealthQuery took {:.1} s (warn at {} s); slowest steps: {}; untimed {:.1} s",
             total.as_secs_f64(),
             threshold.as_secs(),
-            steps.slowest(5)
+            steps.slowest(5),
+            total.saturating_sub(timed).as_secs_f64()
         )
     })
 }
@@ -1162,8 +1166,11 @@ pub fn get_health_timed(
     // 7. Determine overall status
     let status = determine_status(&target_healths, &warnings);
 
-    // 8. Last backup time (use effective mount paths)
-    let last_backup = latest_snapshot_time(&target_healths, &effective_mounts);
+    // 8. Last backup time (use effective mount paths). Timed: it stats every
+    // snapshot on every target (bd DAS-Backup-Manager-tobl).
+    let last_backup = times.time("last backup", || {
+        latest_snapshot_time(&target_healths, &effective_mounts)
+    });
 
     Ok(HealthReport {
         status,
@@ -1321,6 +1328,9 @@ daily = 7
             names.contains(&"noserial mount") && names.contains(&"recovery OS"),
             "{names:?}"
         );
+        // The walk for the newest snapshot stats every one on every target
+        // (bd DAS-Backup-Manager-tobl).
+        assert!(names.contains(&"last backup"), "{names:?}");
         assert!(
             report
                 .targets
@@ -1336,7 +1346,16 @@ daily = 7
         assert_eq!(
             slow_health_warning(Duration::from_millis(27_300), ten, &t).as_deref(),
             Some(
-                "HealthQuery took 27.3 s (warn at 10 s); slowest steps: primary usage 25.8 s, recovery OS 0.9 s"
+                "HealthQuery took 27.3 s (warn at 10 s); slowest steps: primary usage 25.8 s, recovery OS 0.9 s; untimed 0.6 s"
+            )
+        );
+        // 2026-11-01 09:36, during a DAS scrub: 15.7 s with no step over
+        // 0.2 s. The line must say where the time was not (bd tobl).
+        let quick = steps(&[("b smart", 200), ("a smart", 100)]);
+        assert_eq!(
+            slow_health_warning(Duration::from_millis(15_700), ten, &quick).as_deref(),
+            Some(
+                "HealthQuery took 15.7 s (warn at 10 s); slowest steps: b smart 0.2 s, a smart 0.1 s; untimed 15.4 s"
             )
         );
         assert!(

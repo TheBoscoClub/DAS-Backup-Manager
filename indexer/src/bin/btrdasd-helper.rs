@@ -1742,15 +1742,22 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.health").await?;
         let polkit_took = polkit_start.elapsed();
 
+        let load_start = std::time::Instant::now();
         let config = load_config()?;
+        let load_took = load_start.elapsed();
 
         // Run the entire health query (blocking I/O: smartctl, btrfs, mount)
         // inside spawn_blocking.  Do NOT auto-mount — the health report should
         // reflect the actual mount state so the user sees which targets are
         // available vs disconnected.
+        let handed_over = std::time::Instant::now();
         let json_str = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let mut times = health::StepTimes::default();
             times.record("polkit", polkit_took);
+            // Both outside get_health_timed, so a slow one would show only as
+            // untimed (bd DAS-Backup-Manager-tobl).
+            times.record("config load", load_took);
+            times.record("queued", handed_over.elapsed());
             let report = health::get_health_timed(&config, &mut times);
             // Logged whatever the outcome: a slow failure is still the slow step
             // the GUI timed out on (bd DAS-Backup-Manager-amsg).
