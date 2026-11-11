@@ -76,7 +76,7 @@ fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> Result<
         out.push_str("target_preserve_min     latest\n");
         out.push_str(&format!(
             "target_preserve         {}\n\n",
-            format_retention(&p.retention)
+            format_retention(&p.label, &p.retention)?
         ));
     }
 
@@ -124,7 +124,7 @@ fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> Result<
             {
                 out.push_str(&format!(
                     "    target_preserve     {}\n",
-                    format_retention(&target.retention)
+                    format_retention(&target.label, &target.retention)?
                 ));
             }
         }
@@ -140,7 +140,10 @@ fn render_with(config: &Config, keep: impl Fn(&SubvolConfig) -> bool) -> Result<
 }
 
 /// Format a Retention struct into btrbk's preserve format (e.g., "4w 12m 4y").
-fn format_retention(r: &Retention) -> String {
+/// `target_preserve`'s argument for `label`'s retention. All periods 0 is
+/// refused, never given a default: expiry reads it as keeping a retired
+/// series forever (bd DAS-Backup-Manager-iyq); `Config::validate` says so first.
+fn format_retention(label: &str, r: &Retention) -> Result<String, String> {
     let mut parts = Vec::new();
     if r.daily > 0 {
         parts.push(format!("{}d", r.daily));
@@ -155,10 +158,17 @@ fn format_retention(r: &Retention) -> String {
         parts.push(format!("{}y", r.yearly));
     }
     if parts.is_empty() {
-        "4w".to_string()
-    } else {
-        parts.join(" ")
+        return Err(retention_all_zero(label));
     }
+    Ok(parts.join(" "))
+}
+
+/// What a target whose every retention period is 0 is refused with.
+pub(crate) fn retention_all_zero(label: &str) -> String {
+    format!(
+        "Target '{label}' keeps no snapshots: every [target.retention] period is 0 — set at \
+         least one of daily, weekly, monthly, yearly"
+    )
 }
 
 /// The snapshot name btrbk would be given for a subvolume with no explicit
@@ -1205,16 +1215,27 @@ mod tests {
             (retention(0, 4, 12, 4), "4w 12m 4y"),
         ];
         for (retention, expected) in cases {
-            assert_eq!(format_retention(&retention), expected, "{retention:?}");
+            assert_eq!(
+                format_retention("t", &retention).unwrap(),
+                expected,
+                "{retention:?}"
+            );
         }
     }
 
+    /// An all-zero retention is refused, never rendered as an invented `4w`:
+    /// expiry reads the same target as keeping its retired series forever,
+    /// and one setting must not mean two opposite things (bd
+    /// DAS-Backup-Manager-iyq).
     #[test]
-    fn format_retention_falls_back_to_four_weeks_when_every_period_is_zero() {
-        // An all-zero retention must not leave `target_preserve` without an
-        // argument, nor render "0d 0w 0m 0y"; it gets the four-week fallback.
-        assert_eq!(format_retention(&retention(0, 0, 0, 0)), "4w");
-        assert_eq!(format_retention(&Retention::default()), "4w");
+    fn a_render_refuses_a_target_whose_retention_is_all_zero() {
+        let mut cfg = test_config();
+        cfg.targets[0].retention = Retention::default();
+        let err = render_btrbk_conf(&cfg).unwrap_err();
+        assert!(
+            err.contains(&cfg.targets[0].label) && err.contains("retention"),
+            "{err}"
+        );
     }
 
     fn snapshot_names(subvols: &[(&str, Option<&str>)]) -> Vec<String> {

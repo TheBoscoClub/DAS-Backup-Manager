@@ -3104,6 +3104,15 @@ impl Config {
             &self.schedule.full,
         ));
 
+        // btrbk would be told nothing (the renderer refuses it) and expiry
+        // would keep the target's retired series forever (bd iyq).
+        for tgt in &self.targets {
+            let r = &tgt.retention;
+            if r.daily == 0 && r.weekly == 0 && r.monthly == 0 && r.yearly == 0 {
+                errors.push(crate::btrbk_conf::retention_all_zero(&tgt.label));
+            }
+        }
+
         if self.doctor.max_snapshot_age_days == 0 {
             errors.push(
                 "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
@@ -3515,6 +3524,29 @@ mod tests {
         assert_eq!(
             Config::from_toml(&minimal_toml(&extra)).unwrap().validate(),
             Vec::<String>::new()
+        );
+    }
+
+    /// A target whose every retention period is 0 keeps nothing to btrbk and
+    /// everything to expiry: refused, naming it (bd DAS-Backup-Manager-iyq).
+    #[test]
+    fn validate_rejects_a_target_whose_retention_is_all_zero() {
+        let zero = ONE_TARGET.replace("daily = 7\n", "");
+        assert_ne!(zero, ONE_TARGET, "fixture must drop the only period");
+        let extra = format!("{}{zero}", source_with("s", "/vol", &[("a", None)]));
+        let errors = Config::from_toml(&minimal_toml(&extra)).unwrap().validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'t'") && e.contains("retention")),
+            "{errors:?}"
+        );
+        let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
+        assert!(
+            Config::from_toml(&minimal_toml(&extra))
+                .unwrap()
+                .validate()
+                .is_empty()
         );
     }
 
@@ -4656,7 +4688,10 @@ daily = 7
             mount_uuid: Some("5eed0007-0000-4000-8000-000000000007".into()),
             mount: "/mnt/backup".into(),
             role: TargetRole::Primary,
-            retention: Retention::default(),
+            retention: Retention {
+                daily: 7,
+                ..Retention::default()
+            },
             display_name: String::new(),
             esp_partuuid: None,
         });

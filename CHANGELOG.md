@@ -61,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A target whose every retention period is 0 is refused, not given an invented four weeks** (bd `DAS-Backup-Manager-iyq`): `btrbk.conf` rendered it as `target_preserve 4w` while expiry read the same target as keeping its retired series forever — one setting, two opposite meanings; `Config::validate` now names the target, and the renderer refuses it too
+
 - **The report footer and the stored `[general].version` give the version `btrdasd --version` gives** (bd `DAS-Backup-Manager-wpyc`): both used Cargo's three-part `0.7.23` where `--version` reads the four-part one from `CMakeLists.txt` (`0.7.23.3`); every use now reads `buttered_dasd::VERSION`, so the next `setup --upgrade` stamps the four-part version once
 
 - **`btrdasd backup boot-archive` refuses bad boot input before it takes a lock or mounts a target** (bd `DAS-Backup-Manager-2jkw`): it took both locks and mounted every target before the boot step refused a repeated or `.`/`..` `[boot].subvolumes` entry or a repeated target label or mount, then unmounted again; it now refuses first, exit 1 (could not start), nothing mounted. A target mount is compared as one directory however it is spelled (`/mnt/t` and `/mnt/t/` were two)
