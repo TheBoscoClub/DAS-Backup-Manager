@@ -435,7 +435,7 @@ check "boot, @ present, incremental, NO snapshot of its series: a WARN, not a sk
     "$(BOOT_PRESENT="/mnt/t/@ /mnt/t/@home" BOOT_FORCE=false run_boot_subvols "$WORK/none-big.txt")" "WARN|0 updated, 0 skipped, 2 warnings"
 check "boot plan with no subdirs: WARN, said" \
     "$(BOOT_PLAN='@\troot-\t-\n' BOOT_FORCE=false run_boot_subvols "$SHARED")" "WARN|0 updated, 0 skipped, 1 warnings"
-check "boot plan with no subdirs: the reason" "$(said_boot 'No source declares target_subdirs for @')" "1"
+check "boot plan with no subdirs: the reason" "$(said_boot 'No source lists @')" "1"
 # 5. full, @ present: archive -> build staging -> delete live -> rename, in that order.
 ONE='@\troot-\tnvme\n'
 check "boot full, @ present: replaced" \

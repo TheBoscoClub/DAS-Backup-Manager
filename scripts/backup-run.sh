@@ -1,9 +1,13 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.19.2
+# Version: 4.19.3
 # Date: 2026-11-11
 #
 # Features:
+#   - The boot step looks only where btrbk writes (v4.19.3, bd
+#     DAS-Backup-Manager-5237.11): `backup boot-plan` names, per source, the
+#     first target_subdirs entry, else the source label; the one absence left
+#     is "No source lists <subvol>".
 #   - The singleton is handed down to sync and expire (v4.19.2, bd
 #     DAS-Backup-Manager-5237.9): `btrdasd subvol sync` and `subvol expire`
 #     now hold /run/das-backup.lock while they read-modify-write config.toml
@@ -2558,7 +2562,7 @@ update_boot_subvol() {
         return
     fi
     if [[ "$subdirs" == "-" ]]; then
-        log_warn "  [$label] No source declares target_subdirs for $subvol — leaving it untouched"
+        log_warn "  [$label] No source lists $subvol — leaving it untouched"
         (( warned += 1 ))
         return
     fi
@@ -3879,7 +3883,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.19.2
+  backup-run.sh v4.19.3
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

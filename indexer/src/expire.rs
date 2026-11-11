@@ -2885,6 +2885,9 @@ mod tests {
             text.contains("2026-10-10") && text.contains("2026-10-02"),
             "{text}"
         );
+        // A real outage that long looks the same, so the report says when it
+        // clears on its own (operator, bd DAS-Backup-Manager-5237.11).
+        assert!(text.contains("clears on the next run"), "{text}");
         // Within the bound the same snapshot goes (the mirror's window ended
         // 2026-10-08).
         let out = expire_retired(

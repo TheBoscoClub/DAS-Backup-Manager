@@ -559,19 +559,22 @@ fn boot_plan_stdout(config: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The directory is the one btrbk writes (bd DAS-Backup-Manager-5237.11):
+/// the first `target_subdirs` entry, else the source label — never a later
+/// entry, and never `-` while a source lists the subvolume.
 #[test]
-fn backup_boot_plan_prints_the_subdirs_comma_joined_and_dash_when_there_are_none() {
+fn backup_boot_plan_prints_the_directory_btrbk_writes_first_subdir_else_label() {
     let one = tempfile::tempdir().unwrap();
     let config = boot_plan_config(one.path(), Some("[\"nvme\"]"));
     assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme\n");
 
     let two = tempfile::tempdir().unwrap();
     let config = boot_plan_config(two.path(), Some("[\"nvme\", \"ssd\"]"));
-    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme,ssd\n");
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\tnvme\n");
 
     let none = tempfile::tempdir().unwrap();
     let config = boot_plan_config(none.path(), None);
-    assert_eq!(boot_plan_stdout(&config), "@\troot-\t-\n");
+    assert_eq!(boot_plan_stdout(&config), "@\troot-\ts\n");
 }
 
 #[test]
@@ -666,7 +669,7 @@ fn backup_boot_plan_refuses_a_snapshot_name_the_script_could_not_parse() {
 fn backup_boot_plan_refuses_a_subdirectory_that_is_empty_dash_or_has_whitespace() {
     for (subdirs, needle) in [
         ("[\"/\"]", "empty"),
-        ("[\"nvme\", \"//\"]", "empty"),
+        ("[\"//\", \"nvme\"]", "empty"),
         ("[\"-\"]", "ambiguous"),
         ("[\"a b\"]", "whitespace"),
         ("[\"a\\tb\"]", "whitespace"),

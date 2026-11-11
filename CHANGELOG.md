@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Boot archival looks for `@` / `@home` in the directory btrbk writes, and only there** (bd `DAS-Backup-Manager-5237.11`, operator decision): `subdirs_for_subvol` searched every `target_subdirs` entry with no fallback, so it disagreed with btrbk's rule (first entry, else the source label, `btrbk_conf::source_subdir`) both ways — now it calls `source_subdir`, and the script's `boot-plan` gets the same answer
+  - A source with no `target_subdirs` has its boot subvolumes archived and replaced from the label's directory, instead of a WARN
+  - A later `target_subdirs` entry is no longer searched: btrbk does not write there, so a snapshot found there is an old series, and a full run used to rebuild `@` from it
+  - The one absence left reads `No source lists <subvol>` (was `No source declares target_subdirs for <subvol>`), on both paths
+
+- **The future-clock refusal says when it clears on its own** (bd `DAS-Backup-Manager-5237.11`, operator decision: it stays a FAIL): expiry's `more than 7 days after the newest recorded backup run` reason now adds that if backups were simply off that long, it clears on the next run, once this one is recorded — a real outage and a clock that jumped forward look the same from inside one run
+
 - **A slow `HealthQuery` line now accounts for all of its time** (bd `DAS-Backup-Manager-tobl`): the helper's journal line named only the slowest timed steps, and on 2026-11-01, during a DAS scrub, a 15.7 s reply's slowest step was 0.2 s — the wait was somewhere no step covered. The walk for the newest snapshot (`latest_snapshot_time`, which stats every snapshot on every target) is now the `last backup` step, the helper records its `config load` and the `queued` wait for a blocking thread, and the line ends `; untimed N s` with whatever is left
 
 - **Expiry reads a source's targets and target directory from `btrbk_conf::source_targets` / `source_subdir`** (bd `DAS-Backup-Manager-12k`): the private copies in `expire.rs` are gone, so deletion cannot drift from what btrbk writes — boot archival's `subdirs_for_subvol` still searches every `target_subdirs` entry with no label fallback, now documented as deliberate

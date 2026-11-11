@@ -112,7 +112,7 @@ pub fn clock_far_past_last_run(today: &str, newest_run_epoch: Option<i64>) -> Op
     let run_day = newest_run_epoch?.div_euclid(86_400);
     (day_number(today)? > run_day + MAX_DAYS_PAST_LAST_RUN).then(|| {
         format!(
-            "the system clock reads {today}, more than {MAX_DAYS_PAST_LAST_RUN} days after the newest recorded backup run ({}) — a clock that jumped forward would expire backups early",
+            "the system clock reads {today}, more than {MAX_DAYS_PAST_LAST_RUN} days after the newest recorded backup run ({}) — a clock that jumped forward would expire backups early; if backups were simply off that long, this clears on the next run, once this one is recorded",
             date_of(run_day)
         )
     })

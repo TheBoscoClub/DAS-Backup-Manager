@@ -1918,21 +1918,19 @@ pub fn boot_plan_line(item: &BootPlanItem) -> Result<String, String> {
     Ok(format!("{}\t{name}\t{dirs}", item.subvol))
 }
 
-/// Which `target_subdirs` a given boot subvolume's snapshots live under.
-///
-/// Deliberately NOT `btrbk_conf::source_subdir`, the directory btrbk writes
-/// (first entry, else the label): this searches every listed entry and has no
-/// label fallback, so a source with no `target_subdirs` leaves its boot
-/// subvolumes untouched (the `no-target-subdirs` case of the boot-step tests).
-/// Aligning it with btrbk would make the boot step replace `@` where it now
-/// refuses — a behaviour change to a destructive step, left to a decision of
-/// its own rather than made in passing (bd DAS-Backup-Manager-12k).
+/// The target directories a given boot subvolume's snapshots live under: for
+/// each source listing it, the directory btrbk writes
+/// ([`btrbk_conf::source_subdir`] — the first `target_subdirs` entry, else the
+/// source label). A later entry is never searched: btrbk does not write there,
+/// so a snapshot found there is an old series, never the one to rebuild `@`
+/// from (bd DAS-Backup-Manager-5237.11). Empty only when no source lists the
+/// subvolume.
 fn subdirs_for_subvol(config: &Config, subvol: &str) -> Vec<String> {
     let mut dirs: Vec<String> = config
         .sources
         .iter()
         .filter(|s| s.subvolumes.iter().any(|sv| sv.name == subvol))
-        .flat_map(|s| s.target_subdirs.iter().cloned())
+        .map(|s| btrbk_conf::source_subdir(s).to_string())
         .collect();
     dirs.sort();
     dirs.dedup();
@@ -2217,9 +2215,7 @@ fn update_boot_subvol(
     if item.subdirs.is_empty() {
         out.warn(
             progress,
-            format!(
-                "[{label}] No source declares target_subdirs for {subvol} — leaving it untouched"
-            ),
+            format!("[{label}] No source lists {subvol} — leaving it untouched"),
         );
         return;
     }
@@ -8057,7 +8053,7 @@ Legend:
     fn every_failure_of_the_boot_step_fails_the_run_and_every_absence_only_warns() {
         const SNAP: &str = "nvme/root-.20261005T0100";
         // (case, mode, status, updated, skipped)
-        let cases: [(&str, BackupMode, &str, usize, usize); 15] = [
+        let cases: [(&str, BackupMode, &str, usize, usize); 17] = [
             ("conf-unreadable", BackupMode::Full, "FAIL", 0, 0),
             ("listing-unreadable", BackupMode::Full, "FAIL", 0, 0),
             ("archive-fails", BackupMode::Full, "FAIL", 0, 0),
@@ -8066,7 +8062,19 @@ Legend:
             ("delete-fails", BackupMode::Full, "FAIL", 0, 0),
             ("rename-fails", BackupMode::Full, "FAIL", 0, 0),
             ("no-snapshot-name", BackupMode::Full, "WARN", 0, 0),
-            ("no-target-subdirs", BackupMode::Full, "WARN", 0, 0),
+            // The directory is btrbk's (bd 5237.11): the first target_subdirs
+            // entry, else the source label. No entry: the label's snapshot is
+            // found and used; a later entry, which btrbk never writes, is not
+            // searched; a boot subvolume no source lists is an absence.
+            (
+                "snapshot-only-under-later-subdir",
+                BackupMode::Full,
+                "WARN",
+                0,
+                0,
+            ),
+            ("no-target-subdirs-uses-label", BackupMode::Full, "OK", 1, 0),
+            ("no-source-lists-subvol", BackupMode::Full, "WARN", 0, 0),
             ("no-snapshot-of-series", BackupMode::Full, "WARN", 0, 0),
             // Creating an absent one fails, in either mode.
             ("absent-create-fails-full", BackupMode::Full, "FAIL", 0, 0),
@@ -8122,7 +8130,15 @@ Legend:
                     script.push((format!("btrfs subvolume delete {m}/@"), 0, String::new()));
                 }
                 "no-snapshot-name" => conf = write_btrbk_conf("@home", "home"),
-                "no-target-subdirs" => config.sources[0].target_subdirs.clear(),
+                "no-target-subdirs-uses-label" => {
+                    config.sources[0].target_subdirs.clear();
+                    let label_snap = format!("{}/root-.20261005T0100", config.sources[0].label);
+                    script[0].2 = format!("ID 257 gen 9 top level 5 path {label_snap}\n");
+                }
+                "snapshot-only-under-later-subdir" => {
+                    config.sources[0].target_subdirs = vec!["first".into(), "nvme".into()];
+                }
+                "no-source-lists-subvol" => config.sources[0].subvolumes[0].name = "@other".into(),
                 "no-snapshot-of-series" => {
                     script[0].2 = "ID 9 gen 1 top level 5 path other/x\n".into()
                 }
@@ -8144,7 +8160,8 @@ Legend:
             if let Some(f) = &failing {
                 scripted = scripted.failing_snapshots_of(f);
             }
-            if case == "replaced-cleanly" {
+            let replaces = matches!(case, "replaced-cleanly" | "no-target-subdirs-uses-label");
+            if replaces {
                 scripted = scripted.deleting_too(vec![format!("{m}/@")]);
             }
             let runner = QuietBtrbk(&scripted, case == "btrfs-unspawnable");
@@ -8198,7 +8215,7 @@ Legend:
                 !absent,
                 "{case}: the live subvolume survives"
             );
-            if case != "replaced-cleanly" && !absent {
+            if !replaces && !absent {
                 assert!(live.join("marker").exists(), "{case}: and it is untouched");
             }
             if case == "incremental-exists" {
