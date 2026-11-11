@@ -231,6 +231,39 @@ fn live_user_of(
         })
 }
 
+/// The retirement date a location's series is measured from: the LATEST
+/// date among every retired entry, in any source accepted by `same_place`,
+/// that resolves to `snapshot_name` — `own` included. Two such series share
+/// one directory and one name, so their snapshots cannot be told apart, and
+/// the earlier date must not delete what the later one still keeps (bd
+/// DAS-Backup-Manager-12k). An unreadable date among them wins outright: it
+/// never compares as expired, so nothing there is deleted.
+fn latest_retirement(
+    config: &Config,
+    snapshot_name: &str,
+    own: &str,
+    same_place: impl Fn(&Source) -> bool,
+) -> String {
+    let mut dates = vec![own.to_string()];
+    for other in config.sources.iter().filter(|o| same_place(o)) {
+        let names = resolve_snapshot_names(&other.subvolumes);
+        for (e, n) in other.subvolumes.iter().zip(names) {
+            if let Some(date) = &e.retired
+                && n == snapshot_name
+            {
+                dates.push(date.clone());
+            }
+        }
+    }
+    if let Some(unreadable) = dates.iter().find(|d| day_number(d).is_none()) {
+        return unreadable.clone();
+    }
+    dates
+        .into_iter()
+        .max_by_key(|d| day_number(d))
+        .unwrap_or_else(|| own.to_string())
+}
+
 /// The directory a source keeps its snapshots in, in its one spelling
 /// (`btrbk_conf::normalise_dir`): `<vol>/` + `./snaps` and `<vol>` + `snaps`
 /// are one place, and so is `<vol>` + `a/snaps` beside `<vol>/a` + `snaps`.
@@ -275,6 +308,9 @@ fn examine(
     dir: &Path,
     snapshot_name: &str,
     retired: &str,
+    // The date the window is measured from (`latest_retirement`): `retired`
+    // itself unless another retired series shares this directory.
+    measured_from: &str,
     window: Option<u32>,
     today: Option<&str>,
     dry_run: bool,
@@ -342,7 +378,7 @@ fn examine(
     }
     // An untrusted clock decides nothing: the series is kept, with its date.
     let due = match today {
-        Some(today) => window.and_then(|w| is_expired(retired, w, today)),
+        Some(today) => window.and_then(|w| is_expired(measured_from, w, today)),
         None => window.map(|_| false),
     };
     if due != Some(true) {
@@ -352,7 +388,7 @@ fn examine(
             // such a series is kept until someone decides.
             expires: window
                 .filter(|_| due.is_some())
-                .and_then(|w| expiry_date(retired, w)),
+                .and_then(|w| expiry_date(measured_from, w)),
         });
     }
     if dry_run {
@@ -459,23 +495,26 @@ pub fn expire_retired(
             let mut locations = Vec::new();
             for target in &targets {
                 let root = Path::new(&target.mount);
+                // Another source writing into this directory on this target.
+                let same_place = |other: &Source| {
+                    normalise_dir(source_subdir(other)) == normalise_dir(subdir)
+                        && source_targets(&config, other)
+                            .iter()
+                            .any(|t| t.label == target.label)
+                };
                 locations.push(examine(
                     format!("target {}", target.label),
                     root,
                     &root.join(subdir),
                     &snapshot_name,
                     &retired,
+                    &latest_retirement(&config, &snapshot_name, &retired, same_place),
                     longest_window_days(&target.retention),
                     trusted_today,
                     dry_run,
                     runner,
                     is_mountpoint,
-                    live_user_of(&config, &snapshot_name, |other| {
-                        normalise_dir(source_subdir(other)) == normalise_dir(subdir)
-                            && source_targets(&config, other)
-                                .iter()
-                                .any(|t| t.label == target.label)
-                    }),
+                    live_user_of(&config, &snapshot_name, same_place),
                 ));
             }
             // Source-side snapshots only exist to be sent. Once the shortest
@@ -485,20 +524,21 @@ pub fn expire_retired(
                 .filter_map(|t| longest_window_days(&t.retention))
                 .min();
             let root = Path::new(&source.volume);
+            let same_source_dir =
+                |other: &Source| source_snapshot_dir(other) == source_snapshot_dir(source);
             locations.push(examine(
                 format!("source {}", source.volume),
                 root,
                 &root.join(&source.snapshot_dir),
                 &snapshot_name,
                 &retired,
+                &latest_retirement(&config, &snapshot_name, &retired, same_source_dir),
                 shortest,
                 trusted_today,
                 dry_run,
                 runner,
                 is_mountpoint,
-                live_user_of(&config, &snapshot_name, |other| {
-                    source_snapshot_dir(other) == source_snapshot_dir(source)
-                }),
+                live_user_of(&config, &snapshot_name, same_source_dir),
             ));
             entries.push(RetiredReport {
                 source_label: source.label.clone(),
@@ -1929,6 +1969,54 @@ mod tests {
             states(&out)[..2],
             [shared("other", "@opt"), shared("other", "@opt")]
         );
+    }
+
+    /// Two retired entries whose series land in one directory (a hand edit:
+    /// two sources sharing a target subdirectory, the same snapshot name) and
+    /// different retirement dates. Their snapshots cannot be told apart, so
+    /// both entries wait for the LATER date: neither deletes what the other
+    /// may still keep (bd DAS-Backup-Manager-12k).
+    #[test]
+    fn two_retired_series_in_one_directory_expire_on_the_later_date() {
+        let rig = rig();
+        let vol2 = rig.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "./ssd",
+                SubvolConfig {
+                    name: "@opt".into(),
+                    retired: Some("2026-12-01".into()),
+                    ..Default::default()
+                },
+            ));
+            // Keeps the config from running out of entries.
+            c.sources[1].subvolumes.push(live("@keep"));
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big]);
+        // Past 2026-10-01 + 7 (the mirror's window), not past 2026-12-01 + 7.
+        let out = expire_retired(&rig.config_path, false, "2026-10-20", &runner, &mounted).unwrap();
+        assert!(small.exists() && big.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        for entry in &out.entries {
+            assert_eq!(
+                entry.locations[1].state,
+                LocationState::Kept {
+                    count: 1,
+                    expires: Some("2026-12-09".into())
+                },
+                "{}",
+                entry.source_label
+            );
+        }
+        // Past both dates: deleted once, by whichever entry comes first.
+        let out = expire_retired(&rig.config_path, false, "2026-12-09", &runner, &mounted).unwrap();
+        assert!(!small.exists() && big.exists());
+        assert_eq!(states(&out)[1], LocationState::Deleted { count: 1 });
     }
 
     #[test]
