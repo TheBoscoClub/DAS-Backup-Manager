@@ -772,18 +772,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup-run.sh");
         fs::write(&path, "old").unwrap();
-        let (uid, other_gid) = give_away(&path);
-        // SAFETY: getegid() has no preconditions and cannot fail.
-        let egid = unsafe { libc::getegid() };
-        assert_ne!(other_gid, egid, "fixture must start in another group");
+        let old = fs::metadata(&path).unwrap();
+        // Forced to a group the file does not start in and a new file would
+        // not get either: only the chown can put it there.
+        let forced_gid = another_group();
+        assert_ne!(old.gid(), forced_gid, "fixture must start in another group");
         let forced = WriteHost {
             euid: 0,
-            force_owner: Some((uid, egid)),
+            force_owner: Some((old.uid(), forced_gid)),
             ..host(&unique_temp_name, &real_rename, &real_sync_dir)
         };
         write_atomic_with(&path, b"new", Some(0o755), &forced).unwrap();
         let meta = fs::metadata(&path).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (uid, egid));
+        assert_eq!((meta.uid(), meta.gid()), (old.uid(), forced_gid));
         assert_eq!(meta.mode() & 0o7777, 0o755);
     }
 
