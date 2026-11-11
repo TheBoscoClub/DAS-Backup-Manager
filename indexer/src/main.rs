@@ -638,7 +638,7 @@ enum ScheduleAction {
         /// Incremental backup time (HH:MM)
         #[arg(long)]
         incremental: Option<String>,
-        /// Full backup schedule (cron-like, e.g., "Sun *-*-* 04:00:00")
+        /// Full backup schedule ("Day HH:MM", e.g., "Sun 04:00")
         #[arg(long)]
         full: Option<String>,
         /// Randomized delay in minutes

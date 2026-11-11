@@ -220,6 +220,9 @@ pub fn get_schedule(config: &Config) -> Result<ScheduleInfo, Box<dyn std::error:
 
 /// Modify the backup schedule — updates config fields in memory only.
 ///
+/// Refused, with nothing changed, when a new value is one `Config::validate`
+/// would reject at the next load (bd DAS-Backup-Manager-t8u).
+///
 /// The caller is responsible for persisting the config to disk and calling
 /// `install` to regenerate timer/cron files.
 pub fn set_schedule(
@@ -228,6 +231,13 @@ pub fn set_schedule(
     full: Option<&str>,
     delay: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let errors = crate::config::schedule_errors(
+        incremental.unwrap_or(&config.schedule.incremental),
+        full.unwrap_or(&config.schedule.full),
+    );
+    if !errors.is_empty() {
+        return Err(errors.join("; ").into());
+    }
     if let Some(inc) = incremental {
         config.schedule.incremental = inc.to_string();
     }
@@ -383,6 +393,28 @@ mod tests {
         assert_eq!(config.schedule.randomized_delay_min, 30);
         // Only the provided field changed.
         assert_eq!(config.schedule.full, "Wed 02:00");
+    }
+
+    /// A value the next load would refuse is refused here, naming the field,
+    /// and the config is left as it was — the help once showed a systemd
+    /// calendar for `--full`, which validation rejects (bd DAS-Backup-Manager-t8u).
+    #[test]
+    fn set_schedule_refuses_a_value_validation_rejects_and_changes_nothing() {
+        let mut config = Config::default();
+        let err = set_schedule(
+            &mut config,
+            Some("05:00"),
+            Some("Sun *-*-* 04:00:00"),
+            Some(15),
+        )
+        .expect_err("a systemd calendar is not a schedule.full");
+        assert!(err.to_string().contains("schedule.full"), "{err}");
+        let err =
+            set_schedule(&mut config, Some("25:00"), None, None).expect_err("25:00 is not a time");
+        assert!(err.to_string().contains("schedule.incremental"), "{err}");
+        assert_eq!(config.schedule.incremental, "03:00");
+        assert_eq!(config.schedule.full, "Sun 04:00");
+        assert_eq!(config.schedule.randomized_delay_min, 30);
     }
 
     /// get_schedule returns a ScheduleInfo populated from config values.

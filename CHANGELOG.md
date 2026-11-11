@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd schedule set` refuses a time or schedule the next load would reject** (bd `DAS-Backup-Manager-t8u`): its own `--help` showed a systemd calendar for `--full` (`Sun *-*-* 04:00:00`), which validation rejects, and the command wrote it, leaving a `config.toml` every later load refused; `schedule::set_schedule` now checks the new values with `config::schedule_errors` first and changes nothing when one is wrong (CLI and the GUI's `ScheduleSet` alike), the help shows `"Day HH:MM"`, and `btrdasd(1)` no longer says the command does not validate
+
 - **A full `cargo test` run no longer hangs, once in a while, in `recovery_os::hold_disk`** (bd `DAS-Backup-Manager-s5jv.9`): `an_inherited_ignore_does_not_survive_blocking` sets SIGHUP to `SIG_IGN`, which is process-wide, and setting `SIG_IGN` discards an instance already queued — so when it landed after `each_termination_signal_is_queued_until_waited_for` raised SIGHUP at its own thread and before that thread's `sigwait`, the signal was gone and the wait never returned (reproduced in a harness: queued, then ignored → lost; control → delivered). The three tests that set dispositions or block and wait now hold one lock, `DISPOSITIONS`; 0 failures in 300 runs of the module at 8 test threads. `btrdasd recovery-os hold-disk` itself is single-threaded and unaffected
   - `shell-suite-bounds` and `shell-recovery-os-vm` carry CTest `RUN_SERIAL`: the first sizes its task cap from the user's live task count, which suites beside it move (one false failure under `ctest -j4`), and the second's stub mistakes another suite's shell for its driver
 

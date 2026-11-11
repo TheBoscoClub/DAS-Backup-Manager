@@ -1201,9 +1201,9 @@ Default:
 Update schedule settings in config.toml. Only config.toml is written; the
 timer units change at the next
 .BR "btrdasd setup \-\-upgrade" .
-This command does not validate what it writes: check the result with
+A time or schedule that
 .B "btrdasd config validate"
-before the next backup run.
+would reject is refused, naming the field, and nothing is written.
 .PP
 .B btrdasd schedule set
 .RB [ \-\-config
