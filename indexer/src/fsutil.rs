@@ -142,7 +142,7 @@ fn write_atomic_with(
         return Err(named(e));
     }
     (host.sync_dir)(dir).map_err(|e| {
-        io::Error::new(
+        replaced_not_flushed(
             e.kind(),
             format!(
                 "{} was replaced, but its directory could not be flushed to disk: {e}",
@@ -150,6 +150,45 @@ fn write_atomic_with(
             ),
         )
     })
+}
+
+/// The error a write returns when the new file is already in place and only
+/// the flush of its directory failed: the write happened, its durability is
+/// unknown. A caller that would undo a failed write must not undo this one —
+/// the other files it rolls back would then disagree with it (bd
+/// DAS-Backup-Manager-akh). Tell it apart with [`was_replaced`].
+#[derive(Debug)]
+pub struct ReplacedNotFlushed(String);
+
+impl std::fmt::Display for ReplacedNotFlushed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReplacedNotFlushed {}
+
+/// An `io::Error` of `kind` saying `message`, marked [`ReplacedNotFlushed`].
+pub(crate) fn replaced_not_flushed(kind: io::ErrorKind, message: String) -> io::Error {
+    io::Error::new(kind, ReplacedNotFlushed(message))
+}
+
+/// Whether `e`, or an error it wraps, says the file was replaced and only its
+/// directory's flush failed.
+pub fn was_replaced(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.is::<ReplacedNotFlushed>()
+            || err
+                .downcast_ref::<io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.is::<ReplacedNotFlushed>())
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 /// Create this write's temp file under the first name `host` offers that
@@ -660,6 +699,38 @@ mod tests {
 
     fn real_sync_dir(dir: &Path) -> io::Result<()> {
         File::open(dir)?.sync_all()
+    }
+
+    /// Only the flush after the rename is "replaced": a write that failed
+    /// before it is not (bd DAS-Backup-Manager-akh).
+    #[test]
+    fn only_a_failed_directory_flush_reads_as_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        let no_flush = |_: &Path| Err(io::Error::other("EIO"));
+        let err = write_atomic_with(
+            &path,
+            b"new",
+            None,
+            &host(&unique_temp_name, &real_rename, &no_flush),
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(was_replaced(&err), "{err}");
+        let boxed: Box<dyn std::error::Error> = Box::new(err);
+        assert!(was_replaced(&*boxed));
+
+        let no_rename = |_: &Path, _: &Path| Err(io::Error::other("EXDEV"));
+        let err = write_atomic_with(
+            &path,
+            b"newer",
+            None,
+            &host(&unique_temp_name, &no_rename, &real_sync_dir),
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(!was_replaced(&err), "{err}");
     }
 
     /// The new file is flushed to disk before it is renamed over the old one

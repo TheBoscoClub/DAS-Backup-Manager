@@ -1038,6 +1038,11 @@ fn write_updated(
         return Some(e.to_string());
     }
     if let Err(e) = updated.save(config_path) {
+        // Replaced, only its directory unflushed: it and the confs written for
+        // it agree; putting the old confs back would break that (bd akh).
+        if crate::fsutil::was_replaced(&*e) {
+            return Some(e.to_string());
+        }
         // Put btrbk.conf (and the state conf) back so the files still agree.
         let restore = crate::btrbk_conf::write_rendered_confs(config);
         return Some(not_saved(&*e, restore));

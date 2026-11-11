@@ -379,9 +379,18 @@ fn save_config_and_btrbk_conf_with(
     let previous_state = read_previous(&state_path)?;
     // Both files, or the failure undone below as a failed config save is.
     // Every error here names its own file; the messages add no path.
-    let failure = write_rendered_confs(cfg)
-        .err()
-        .or_else(|| save(cfg, config_path).err());
+    // config.toml replaced and only its directory's flush failed: it stands,
+    // so the confs written for it stay too; undoing them would make the files
+    // disagree (bd DAS-Backup-Manager-akh). Still reported. Only the SAVE's
+    // error counts: a conf replaced while config.toml was never saved is
+    // rolled back as before.
+    let failure = match write_rendered_confs(cfg) {
+        Err(e) => Some(e),
+        Ok(()) => match save(cfg, config_path) {
+            Err(e) if crate::fsutil::was_replaced(&*e) => return Err(e.to_string().into()),
+            saved => saved.err(),
+        },
+    };
     if let Some(e) = failure {
         let mut failed = Vec::new();
         if let Err(re) = restore(conf_path, previous.as_deref()) {
@@ -1734,6 +1743,38 @@ enabled = false
         .unwrap_err();
         assert!(err.to_string().contains("live /etc/btrbk"), "{err}");
         assert!(!config_path.exists());
+    }
+
+    /// config.toml replaced and only its directory's flush failed: the save is
+    /// reported, and btrbk.conf is NOT rolled back to the old config's —
+    /// the files must agree with the config.toml that stands (bd
+    /// DAS-Backup-Manager-akh).
+    #[test]
+    fn a_config_replaced_but_not_flushed_keeps_the_btrbk_conf_that_matches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = saveable_config(dir.path());
+        let config_path = dir.path().join("config.toml");
+        let conf = dir.path().join("btrbk.conf");
+        std::fs::write(&conf, "# the old config's btrbk.conf\n").unwrap();
+        let replaced = |cfg: &Config, path: &Path| -> Result<(), Box<dyn std::error::Error>> {
+            cfg.save(path)?;
+            Err(crate::fsutil::replaced_not_flushed(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{} was replaced, but its directory could not be flushed",
+                    path.display()
+                ),
+            )
+            .into())
+        };
+        let err = save_config_and_btrbk_conf_with(&cfg, &config_path, &replaced).unwrap_err();
+        assert!(err.to_string().contains("was replaced"), "{err}");
+        assert!(config_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            render_btrbk_conf(&cfg).unwrap(),
+            "btrbk.conf rolled back to the old config's"
+        );
     }
 
     #[test]
