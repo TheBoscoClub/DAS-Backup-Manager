@@ -11,7 +11,7 @@ use crate::recovery_os::{self, RecordStatus};
 use crate::run_steps::{self, ExpireRun, ExpiryStep, UsbLinkStep};
 use crate::scrub;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::UNIX_EPOCH;
 
@@ -25,6 +25,19 @@ use std::time::UNIX_EPOCH;
 /// `btrdasd backup` and the 03:00 timer contend with each other rather than
 /// running two backups over one set of targets.
 pub const BACKUP_LOCK_PATH: &str = "/run/das-backup.lock";
+
+/// The singleton a CLI config edit takes: [`BACKUP_LOCK_PATH`], unless a test
+/// build (feature `test-overrides`) sets `DAS_BACKUP_LOCK` — the CLI's tests run
+/// unprivileged. A shipped binary never reads the variable (bd
+/// DAS-Backup-Manager-olyo).
+pub fn config_edit_lock_path() -> PathBuf {
+    if cfg!(feature = "test-overrides")
+        && let Some(path) = std::env::var_os("DAS_BACKUP_LOCK")
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(BACKUP_LOCK_PATH)
+}
 
 /// The backup singleton, held, with this process recorded in the lock file as
 /// its holder (`btrdasd setup --upgrade pid 4242`) — as the maintenance lock

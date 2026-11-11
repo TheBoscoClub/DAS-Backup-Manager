@@ -1313,7 +1313,13 @@ Default:
 Add a subvolume to a source. Validates the whole configuration, then saves
 config.toml and regenerates
 .I /etc/btrbk/btrbk.conf
-together (each replaced atomically), or changes neither file.
+together (each replaced atomically), or changes neither file. It holds
+.I /run/das\-backup.lock
+from reading config.toml to the last write, so it never loses an edit to a
+backup's subvolume sync or to setup; while either holds it, the command exits
+75 and touches nothing.
+.BR "subvol remove" " and " "schedule set"
+do the same.
 .PP
 With a
 .B \-\-config
@@ -3099,7 +3105,12 @@ or the DAS maintenance lock held \(em a backup or another job was running \(em
 or, with
 .BR \-\-modify ,
 found the configuration file changed while the wizard was open: nothing was
-written or removed. (EX_TEMPFAIL: try again later.)
+written or removed.
+.BR "subvol add" ", " "subvol remove" " and " "schedule set"
+found
+.I /run/das\-backup.lock
+held \(em a backup or setup was running and may rewrite config.toml itself:
+nothing was read or written. (EX_TEMPFAIL: try again later.)
 .SH ENVIRONMENT
 .TP
 .B EDITOR

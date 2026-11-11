@@ -963,6 +963,23 @@ impl ScrubTargetView {
     }
 }
 
+/// Run a CLI read-modify-write of config.toml holding the backup singleton, as
+/// the helper's edits do, so it cannot lose a write to a backup's subvolume
+/// sync or to setup. Held by another: say so and exit 75, nothing read or
+/// written (bd DAS-Backup-Manager-olyo).
+fn edit_config_cli<T>(
+    edit: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use buttered_dasd::btrbk_conf::{ConfigEdit, edit_config_under_backup_lock};
+    match edit_config_under_backup_lock(&buttered_dasd::backup::config_edit_lock_path(), edit)? {
+        ConfigEdit::Done(result) => result,
+        ConfigEdit::Busy(line) => {
+            eprintln!("{line}");
+            std::process::exit(75);
+        }
+    }
+}
+
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2786,11 +2803,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 full,
                 delay,
             } => {
-                let mut cfg = Config::load(&config)?;
-                schedule::set_schedule(&mut cfg, incremental.as_deref(), full.as_deref(), delay)?;
-                // Edited in place like every other save: comments and keys
-                // this version does not know stay (bd DAS-Backup-Manager-28il).
-                cfg.save(&config)?;
+                edit_config_cli(|| {
+                    let mut cfg = Config::load(&config)?;
+                    schedule::set_schedule(
+                        &mut cfg,
+                        incremental.as_deref(),
+                        full.as_deref(),
+                        delay,
+                    )?;
+                    // Edited in place like every other save: comments and keys
+                    // this version does not know stay (bd DAS-Backup-Manager-28il).
+                    cfg.save(&config)
+                })?;
                 println!("Schedule updated. Config written to {}", config.display());
             }
             ScheduleAction::Enable { config } => {
@@ -2859,9 +2883,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name,
                 config,
             } => {
-                let mut cfg = Config::load(&config)?;
-                subvol::add_subvolume(&mut cfg, &source, &name)?;
-                buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
+                edit_config_cli(|| {
+                    let mut cfg = Config::load(&config)?;
+                    subvol::add_subvolume(&mut cfg, &source, &name)?;
+                    buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)
+                })?;
                 println!("Added subvolume '{name}' to source '{source}'.");
             }
             SubvolAction::Remove {
@@ -2869,9 +2895,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name,
                 config,
             } => {
-                let mut cfg = Config::load(&config)?;
-                subvol::remove_subvolume(&mut cfg, &source, &name)?;
-                buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)?;
+                edit_config_cli(|| {
+                    let mut cfg = Config::load(&config)?;
+                    subvol::remove_subvolume(&mut cfg, &source, &name)?;
+                    buttered_dasd::btrbk_conf::save_config_and_btrbk_conf(&cfg, &config)
+                })?;
                 println!("Removed subvolume '{name}' from source '{source}'.");
             }
             SubvolAction::Coverage { action } => {

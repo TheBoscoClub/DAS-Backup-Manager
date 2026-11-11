@@ -66,10 +66,66 @@ fn btrdasd(args: &[&str]) -> std::process::Output {
         !(args.starts_with(&["subvol", "sync"]) && !args.contains(&"--db")),
         "a test ran `subvol sync` without --db: {args:?}"
     );
+    // A config edit takes the backup singleton (bd DAS-Backup-Manager-olyo);
+    // each run gets a lock of its own, so parallel tests never meet one.
+    let lock_dir = tempfile::tempdir().unwrap();
+    btrdasd_with_lock(args, &lock_dir.path().join("das-backup.lock"))
+}
+
+/// `btrdasd args` with the backup singleton at `lock` (a test build reads
+/// `DAS_BACKUP_LOCK`; a shipped one never does).
+fn btrdasd_with_lock(args: &[&str], lock: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_btrdasd"))
         .args(args)
+        .env("DAS_BACKUP_LOCK", lock)
         .output()
         .expect("spawn btrdasd")
+}
+
+/// While a backup or setup holds the singleton, `subvol add`, `subvol remove`
+/// and `schedule set` refuse with 75, saying so, and read and write nothing;
+/// once it is let go the same edit goes through (bd DAS-Backup-Manager-olyo).
+#[test]
+fn config_editors_refuse_while_the_backup_singleton_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    let lock = dir.path().join("das-backup.lock");
+    let edits: [&[&str]; 3] = [
+        &["subvol", "add", "s", "@home", "--config", config_s],
+        &["subvol", "remove", "s", "@", "--config", config_s],
+        &[
+            "schedule",
+            "set",
+            "--full",
+            "Sat 05:00",
+            "--config",
+            config_s,
+        ],
+    ];
+    let before = std::fs::read(&config).unwrap();
+    {
+        let _held = buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "backup-run.sh")
+            .unwrap()
+            .expect("the lock is free");
+        for args in edits {
+            let out = btrdasd_with_lock(args, &lock);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(75), "{args:?}: {err}");
+            assert!(
+                err.contains("Not saved, nothing changed"),
+                "{args:?}: {err}"
+            );
+            assert_eq!(std::fs::read(&config).unwrap(), before, "{args:?} wrote");
+        }
+    }
+    let out = btrdasd_with_lock(edits[0], &lock);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(std::fs::read(&config).unwrap(), before);
 }
 
 #[test]
