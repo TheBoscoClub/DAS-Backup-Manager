@@ -433,7 +433,7 @@ pub fn format_report_from(
     }
 
     // Footer
-    let version = env!("CARGO_PKG_VERSION");
+    let version = crate::VERSION;
     // Try to get next scheduled time from systemd.
     let next_scheduled = Command::new("systemctl")
         .args([
@@ -1012,6 +1012,12 @@ mod tests {
         let report = format_report(&result, &cfg);
         assert!(report.contains("ALL OPERATIONS SUCCESSFUL"));
         assert!(report.contains("60m 0s"));
+        // The one version, as `btrdasd --version` gives it (bd wpyc).
+        assert!(
+            report.contains(&format!("btrdasd v{}\n", crate::VERSION)),
+            "{report}"
+        );
+        assert_eq!(cfg.general.version, crate::VERSION);
         assert!(report.contains("1.00 GiB"));
         assert!(report.contains("BACKUP OPERATIONS"));
         assert!(report.contains("THROUGHPUT"));

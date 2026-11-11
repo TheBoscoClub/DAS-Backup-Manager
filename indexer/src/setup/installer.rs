@@ -1397,7 +1397,7 @@ fn restart_helper(
             "The D-Bus helper is not a systemd unit on this init system: if btrdasd-helper \
              is running, restart it — it keeps running the binary it started with, and one \
              older than {} cannot read a run whose snapshot counts are unknown.",
-            env!("CARGO_PKG_VERSION")
+            buttered_dasd::VERSION
         ));
         return Ok(HelperRestart::Deferred);
     }
@@ -1509,7 +1509,7 @@ fn prepare_upgrade(
 
     let mut config = Config::load(config_path)?;
     let old_version = config.general.version.clone();
-    config.general.version = env!("CARGO_PKG_VERSION").to_string();
+    config.general.version = buttered_dasd::VERSION.to_string();
 
     let migrations = migrate_config(&mut config);
 
@@ -3306,7 +3306,7 @@ auth = "starttls""#,
         config.general.version = "0.0.1".to_string();
         config.email.enabled = false;
         config.save(&config_path).unwrap();
-        let this = env!("CARGO_PKG_VERSION");
+        let this = buttered_dasd::VERSION;
 
         let (result, lines) = run_prepare_upgrade(&config_path, false);
 
@@ -3356,7 +3356,7 @@ auth = "starttls""#,
         );
         assert_eq!(
             Config::from_toml(&text).unwrap().general.version,
-            env!("CARGO_PKG_VERSION")
+            buttered_dasd::VERSION
         );
     }
 
@@ -3719,7 +3719,7 @@ auth = "starttls""#,
                      btrdasd-helper is running, restart it — it keeps running the binary it \
                      started with, and one older than {} cannot read a run whose snapshot \
                      counts are unknown.",
-                    env!("CARGO_PKG_VERSION")
+                    buttered_dasd::VERSION
                 )]
             );
         }
@@ -4203,7 +4203,7 @@ auth = "starttls""#,
         );
         // Written: the config is stamped with this version, and the files
         // the install owns were rewritten.
-        let this = env!("CARGO_PKG_VERSION");
+        let this = buttered_dasd::VERSION;
         assert_eq!(run.config.general.version, this);
         for written in ["etc/das-backup/config.toml", "lib/das-backup/backup-run.sh"] {
             assert!(
@@ -4391,7 +4391,7 @@ auth = "starttls""#,
             assert_eq!(exit_status(SetupOutcome::RestartDeferred), 3);
             assert_eq!(run.steps, steps_under_both_locks(false), "{init:?}");
             assert_eq!(run.locks_after, BOTH_FREE, "{init:?}");
-            assert_eq!(run.config.general.version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(run.config.general.version, buttered_dasd::VERSION);
             assert_eq!(
                 run.lines[run.lines.len() - 2..],
                 [
@@ -4400,7 +4400,7 @@ auth = "starttls""#,
                          btrdasd-helper is running, restart it — it keeps running the binary it \
                          started with, and one older than {} cannot read a run whose snapshot \
                          counts are unknown.",
-                        env!("CARGO_PKG_VERSION")
+                        buttered_dasd::VERSION
                     ),
                     "Files upgraded; the btrdasd-helper.service restart is deferred (exit 3)."
                         .to_string(),

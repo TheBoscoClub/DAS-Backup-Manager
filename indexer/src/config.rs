@@ -713,7 +713,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             general: General {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: crate::VERSION.to_string(),
                 install_prefix: "/usr/local".into(),
                 db_path: crate::db::DEFAULT_DB_PATH.into(),
                 log_file: default_log_file(),
@@ -4060,7 +4060,7 @@ mod tests {
         let cfg = Config::default();
         let toml_str = cfg.to_toml().expect("serialize default config");
         let parsed: Config = Config::from_toml(&toml_str).expect("deserialize default config");
-        assert_eq!(parsed.general.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.general.version, crate::VERSION);
         assert_eq!(parsed.init.system, InitSystem::Systemd);
         assert_eq!(parsed.schedule.incremental, "03:00");
         assert_eq!(parsed.schedule.full, "Sun 04:00");
