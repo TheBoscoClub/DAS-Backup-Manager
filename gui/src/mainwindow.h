@@ -51,6 +51,8 @@ private Q_SLOTS:
     void updateStatusBar();
     void restoreSelectedFiles();
     void showSettings();
+    // The dropped subvolume/target pairs, with Accept (bd sp78.4).
+    void showCoverage();
     void onJobStarted(const QString &jobId, const QString &operation);
     void onBackupFinished(const QString &jobId, bool success, const QString &summary);
     void notifyJobFinished(const QString &jobId, bool success, const QString &summary);

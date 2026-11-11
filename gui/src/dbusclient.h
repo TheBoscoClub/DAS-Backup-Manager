@@ -52,6 +52,15 @@ public:
     bool subvolRemove(const QString &source,
                       const QString &name);
     bool jobCancel(const QString &jobId);
+    // Subvolume coverage (bd DAS-Backup-Manager-sp78.4). The pairs no longer
+    // backed up and the accept log, as JSON; nullopt when the call failed
+    // (errorOccurred says why).
+    std::optional<QString> coverageList();
+    // Accept one pair, named whole; what the helper did, or nullopt when it
+    // refused (errorOccurred says why: polkit, or the pair is not reported).
+    std::optional<QString> coverageAccept(const QString &volume,
+                                          const QString &subvolume,
+                                          const QString &target);
 
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();

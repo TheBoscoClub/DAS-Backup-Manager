@@ -3,6 +3,7 @@
 #include "backuphistory.h"
 #include "backuppanel.h"
 #include "configdialog.h"
+#include "coveragedialog.h"
 #include "dbusclient.h"
 #include "filemodel.h"
 #include "healthdashboard.h"
@@ -203,6 +204,8 @@ void MainWindow::setupUi()
     // --- Progress dock panel ---
     m_progressPanel = new ProgressPanel(m_dbusClient, this);
     addDockWidget(Qt::BottomDockWidgetArea, m_progressPanel);
+    connect(m_progressPanel, &ProgressPanel::coverageReviewRequested,
+            this, &MainWindow::showCoverage);
 
     // --- Status bar ---
     m_statusLabel = new QLabel(this);
@@ -368,6 +371,13 @@ void MainWindow::setupActions()
     connect(configAction, &QAction::triggered, this, [this]() {
         m_sidebar->setCurrentSection(SidebarSection::Config);
     });
+
+    auto *coverageAction = new QAction(QIcon::fromTheme(QStringLiteral("dialog-warning")),
+                                       i18n("Subvolume Coverage…"), this);
+    coverageAction->setToolTip(i18n("List the subvolume/target pairs no longer backed up, "
+                                    "and accept one you meant to stop backing up"));
+    actionCollection()->addAction(QStringLiteral("subvol_coverage"), coverageAction);
+    connect(coverageAction, &QAction::triggered, this, &MainWindow::showCoverage);
 
     auto *searchAction = new QAction(QIcon::fromTheme(QStringLiteral("edit-find")),
                                       i18n("Find Files"), this);
@@ -665,4 +675,11 @@ void MainWindow::showSettings()
 
     auto *dialog = new SettingsDialog(this, QStringLiteral("settings"), config);
     dialog->show();
+}
+
+void MainWindow::showCoverage()
+{
+    auto *dlg = new CoverageDialog(m_dbusClient, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
 }

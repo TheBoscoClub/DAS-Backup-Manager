@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gui name="btrdasd-gui"
-     version="5"
+     version="6"
      xmlns="http://www.kde.org/standards/kxmlgui/1.0"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
      xsi:schemaLocation="http://www.kde.org/standards/kxmlgui/1.0
@@ -23,6 +23,7 @@
       <text>&amp;Tools</text>
       <Action name="health" />
       <Action name="config_editor" />
+      <Action name="subvol_coverage" />
     </Menu>
   </MenuBar>
   <ToolBar name="mainToolBar" >

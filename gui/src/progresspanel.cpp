@@ -46,10 +46,22 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     m_cancelButton = new QPushButton(
         QIcon::fromTheme(QStringLiteral("process-stop")),
         tr("Cancel"), this);
+    m_cancelButton->setObjectName(QStringLiteral("cancelButton"));
     showCancelIdle(false);
+
+    // Shown only after a job whose summary carries the coverage warning.
+    m_coverageButton = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("dialog-warning")),
+        tr("Review Coverage…"), this);
+    m_coverageButton->setObjectName(QStringLiteral("coverageReviewButton"));
+    m_coverageButton->setToolTip(
+        tr("List the subvolume/target pairs no longer backed up, and accept one "
+           "you meant to stop backing up"));
+    m_coverageButton->setVisible(false);
 
     row1->addWidget(m_operationLabel);
     row1->addWidget(m_stageLabel, 1);
+    row1->addWidget(m_coverageButton);
     row1->addWidget(m_cancelButton);
     mainLayout->addLayout(row1);
 
@@ -114,6 +126,8 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
             this, &ProgressPanel::cancelJob);
     connect(m_logToggle, &QToolButton::toggled,
             this, &ProgressPanel::toggleLog);
+    connect(m_coverageButton, &QPushButton::clicked,
+            this, &ProgressPanel::coverageReviewRequested);
 
     // Start hidden
     hide();
@@ -123,6 +137,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     m_currentJobId = jobId;
     m_operationLabel->setText(operation);
+    m_coverageButton->setVisible(false);
     m_stageLabel->clear();
     m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();
@@ -218,6 +233,9 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
     }
 
     showCancelIdle(false);
+    // The backup's finish text carries coverage::message_line's warning
+    // (bd sp78.4): offer the dialog that lists and accepts the pairs.
+    m_coverageButton->setVisible(summary.contains(QLatin1String("subvolume coverage WARN")));
 
     if (success) {
         m_progressBar->setValue(100);

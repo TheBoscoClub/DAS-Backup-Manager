@@ -257,6 +257,33 @@ bool DBusClient::subvolRemove(const QString &source,
     return true;
 }
 
+std::optional<QString> DBusClient::coverageList()
+{
+    if (!m_available) return std::nullopt;
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("CoverageList"));
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("CoverageList"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return std::nullopt;
+    }
+    return reply.value();
+}
+
+std::optional<QString> DBusClient::coverageAccept(const QString &volume,
+                                                  const QString &subvolume,
+                                                  const QString &target)
+{
+    if (!m_available) return std::nullopt;
+    QDBusReply<QString> reply = m_interface->call(QStringLiteral("CoverageAccept"),
+                                                  volume, subvolume, target);
+    if (!reply.isValid()) {
+        Q_EMIT errorOccurred(QStringLiteral("CoverageAccept"),
+                             mapDBusError(reply.error().name(), reply.error().message()));
+        return std::nullopt;
+    }
+    return reply.value();
+}
+
 bool DBusClient::jobCancel(const QString &jobId)
 {
     if (!m_available) return false;
