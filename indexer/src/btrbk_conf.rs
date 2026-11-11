@@ -199,14 +199,10 @@ pub fn resolve_snapshot_names(subvols: &[SubvolConfig]) -> Vec<String> {
 
     for (i, name) in names.clone().iter().enumerate() {
         if counts[name] > 1 && subvols[i].snapshot_name.is_none() {
-            // Disambiguate: use the full subvol name with @ → "" and special chars → "-"
-            let disambiguated = algorithmic_snapshot_name(&subvols[i].name);
-            // If still the same, prepend "root-" for the bare @ case
-            if disambiguated == *name {
-                names[i] = format!("root-{}", subvols[i].name.replace('@', ""));
-            } else {
-                names[i] = disambiguated;
-            }
+            // An unnamed entry's name IS its algorithmic name, so the only
+            // separation left is the `root-` prefix on the raw name; it can
+            // hold a '/', which `Config::validate` refuses (bd 31q).
+            names[i] = format!("root-{}", subvols[i].name.replace('@', ""));
         }
     }
 

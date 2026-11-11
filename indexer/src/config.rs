@@ -3140,11 +3140,12 @@ impl Config {
         // One volume under two spellings ('/vol' and '/vol/', '/vol/./x') is
         // two volumes to sync, which groups by the string: every subvolume was
         // adopted and sent twice (bd sp78.13). Sources may share a volume, so
-        // only different strings naming one path are refused. A symlinked
-        // spelling needs the filesystem and is not judged here.
-        let mut spellings: Vec<(&str, std::path::PathBuf)> = Vec::new();
+        // only different strings naming one path are refused. Compared as the
+        // expiry guard compares directories (`btrbk_conf::normalise_dir`, bd
+        // 31q). A symlinked spelling needs the filesystem and is not judged here.
+        let mut spellings: Vec<(&str, String)> = Vec::new();
         for source in &self.sources {
-            let normal: std::path::PathBuf = Path::new(&source.volume).components().collect();
+            let normal = crate::btrbk_conf::normalise_dir(&source.volume);
             if let Some((other, _)) = spellings
                 .iter()
                 .find(|(raw, n)| *n == normal && *raw != source.volume.as_str())
@@ -3617,6 +3618,22 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].contains("'/vol'") && errors[0].contains("'/vol/'"),
+            "{errors:?}"
+        );
+        // A leading './' is one more spelling (bd 31q, from 12k):
+        // `Path::components` kept it, so 'vol' and './vol' passed.
+        let dotted = format!(
+            "{}{}{ONE_TARGET}",
+            source_with("a", "vol", &[("@a", None)]),
+            source_with("b", "./vol", &[("@b", None)])
+        );
+        let errors = Config::from_toml(&minimal_toml(&dotted))
+            .unwrap()
+            .validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'vol'") && e.contains("'./vol'")),
             "{errors:?}"
         );
         // One spelling shared by two sources is how sync splits a volume: valid.
