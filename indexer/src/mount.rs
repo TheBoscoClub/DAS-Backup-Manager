@@ -736,6 +736,20 @@ fn ensure_targets_mounted_with(
                             target.label, actual, target.mount
                         ),
                     );
+                    // A bind mount takes that mount as another program made
+                    // it: the configured options cannot be applied, so say
+                    // which are not in force (bd DAS-Backup-Manager-804).
+                    if !config.das.mount_opts.is_empty() {
+                        progress.on_log(
+                            crate::progress::LogLevel::Warning,
+                            &format!(
+                                "Target '{}': mounted at {} by another program, not by this \
+                                 job: [das].mount_opts ({}) were not applied — that mount's \
+                                 own options are in force",
+                                target.label, actual, config.das.mount_opts
+                            ),
+                        );
+                    }
                 }
                 _ => {
                     progress.on_log(
@@ -3100,6 +3114,38 @@ mod tests {
                 &scratch.path("dev/sdc2"),
                 "not found",
             ],
+        );
+    }
+
+    /// A bind mount takes the other program's mount as it is: `[das].mount_opts`
+    /// cannot be applied, and that is said, never silently dropped (bd
+    /// DAS-Backup-Manager-804; fail-silent.md "accepted and ignored").
+    #[test]
+    fn a_bind_mount_says_the_configured_mount_options_were_not_applied() {
+        let scratch = Scratch::new();
+        let mnt = scratch.path("mnt/p");
+        let mut config = config_with(
+            vec![target("primary", "SER-P", &mnt, TargetRole::Primary)],
+            Vec::new(),
+        );
+        config.das.mount_opts = "noatime,compress=zstd,degraded".into();
+        let host = Host {
+            mounted_elsewhere: vec![("SER-P".into(), "/run/media/u/das".into())],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert_eq!(guard.count(), 1);
+        let logs = progress.logs();
+        assert!(
+            logs.iter().any(|(level, l)| *level == LogLevel::Warning
+                && l.contains("noatime,compress=zstd,degraded")
+                && l.contains("not applied")
+                && l.contains("/run/media/u/das")),
+            "{logs:?}"
         );
     }
 
