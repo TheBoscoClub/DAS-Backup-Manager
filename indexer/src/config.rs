@@ -2941,6 +2941,28 @@ impl Config {
                 ));
             }
         }
+        // Each source's series lives in its own target directory, and the boot
+        // step rebuilds from the newest snapshot it finds: a boot subvolume
+        // two sources list could be rebuilt from the other volume's OS. A
+        // retired entry counts, its series is still on the targets
+        // (bd DAS-Backup-Manager-5237.12).
+        let mut checked = std::collections::HashSet::new();
+        for sv in self.boot.subvolumes.iter().filter(|sv| checked.insert(*sv)) {
+            let listing: Vec<&str> = self
+                .sources
+                .iter()
+                .filter(|s| s.subvolumes.iter().any(|e| e.name == *sv))
+                .map(|s| s.label.as_str())
+                .collect();
+            if listing.len() > 1 {
+                errors.push(format!(
+                    "[boot].subvolumes entry '{sv}' is listed by more than one source ({}) — \
+                     the boot step cannot tell whose snapshots rebuild it; one source may list it \
+                     (or take it out of [boot].subvolumes)",
+                    listing.join(", ")
+                ));
+            }
+        }
         errors
     }
 
@@ -3824,7 +3846,9 @@ mod tests {
                 "{bad:?}: {errors:?}"
             );
         }
-        for ok in [".hidden", "..x", "a.b/c", "@"] {
+        // ('@data', not '@': the fixture's first source lists '@', a boot
+        // subvolume, and a second source may not: bd 5237.12.)
+        for ok in [".hidden", "..x", "a.b/c", "@data"] {
             let cfg = top_level_config(&primary_only("x", "/vol", &[(ok, Some("n"))]));
             assert!(cfg.validate().is_empty(), "{ok}: {:?}", cfg.validate());
         }
@@ -4043,6 +4067,44 @@ mod tests {
             cfg.boot.subvolumes = vec![ok.into()];
             assert!(cfg.boot_input_errors().is_empty(), "{ok}");
         }
+    }
+
+    #[test]
+    fn a_boot_subvolume_listed_by_two_sources_is_refused() {
+        // Each source's series lives in its own target directory; the boot
+        // step would take the newest snapshot across both, another volume's OS
+        // among them (bd DAS-Backup-Manager-5237.12).
+        let two = format!(
+            "{}{}{ONE_TARGET}",
+            source_with("nvme-root", "/vol-a", &[("@", None), ("@home", None)]),
+            source_with("sata-os", "/vol-b", &[("@", None), ("data", None)])
+        );
+        let mut cfg = Config::from_toml(&minimal_toml(&two)).unwrap();
+        cfg.boot.subvolumes = vec!["@".into(), "@home".into()];
+        let errors = cfg.boot_input_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("'@'")
+                && errors[0].contains("nvme-root")
+                && errors[0].contains("sata-os"),
+            "{errors:?}"
+        );
+        assert!(cfg.validate().contains(&errors[0]));
+        // A retired entry's series is still on the targets: it counts.
+        let retired = two.replace(
+            "volume = \"/vol-b\"\ndevice = \"/dev/sda\"\n[[source.subvolumes]]\nname = \"@\"\n",
+            "volume = \"/vol-b\"\ndevice = \"/dev/sda\"\n[[source.subvolumes]]\nname = \"@\"\nretired = \"2026-11-01\"\n",
+        );
+        assert_ne!(retired, two, "fixture must retire the second entry");
+        let mut cfg = Config::from_toml(&minimal_toml(&retired)).unwrap();
+        cfg.boot.subvolumes = vec!["@".into()];
+        assert_eq!(cfg.boot_input_errors().len(), 1);
+        // The same name in two sources is fine when it is not a boot subvolume,
+        // and one source listing each boot subvolume is the ordinary case.
+        cfg.boot.subvolumes = vec!["@home".into()];
+        assert!(cfg.boot_input_errors().is_empty());
+        cfg.boot.subvolumes = vec!["data".into()];
+        assert!(cfg.boot_input_errors().is_empty());
     }
 
     #[test]

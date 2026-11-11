@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A boot subvolume that two sources list is refused, never rebuilt from the newer of the two series** (bd `DAS-Backup-Manager-5237.12`): with `@` listed by a source `nvme-root` and again by a source `sata-os`, the boot step searched both sources' directories on the target and took the newest snapshot across them, so a full run could rebuild the target's `@` from the other volume's OS
+  - `[boot].subvolumes` entries are now each listed by one source — a second source listing one (a retired entry counts, its series is still on the targets) fails `config validate`, `backup boot-plan` (exit 2) and the boot step of a run, before any btrfs call, naming the sources
+
 - **`btrdasd setup` refuses to install over a masked unit instead of writing through it** (bd `DAS-Backup-Manager-5237.7`): a masked unit is a link to `/dev/null` at the unit's name, and setup wrote each unit through whatever stood there — as root, replacing `/dev/null` with a regular file; a link to anything but the unit's own file now refuses the install before `config.toml` or any file is written, naming `systemctl unmask <unit>`
 - **`setup --uninstall` no longer passes over a dangling link the manifest lists**: it skipped every listed path that did not resolve, so a link whose file went a line earlier was left behind
 

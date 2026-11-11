@@ -459,7 +459,7 @@ Each retention count defaults to `0` when omitted. Targets are mounted by `backu
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Enable boot subvolume archival (archive-then-recreate on `--full` runs) |
-| `subvolumes` | string[] | `["@", "@home"]` | Subvolumes archived and recreated |
+| `subvolumes` | string[] | `["@", "@home"]` | Subvolumes archived and recreated; each is listed by one source only (a second source listing one is refused) |
 | `archive_retention_days` | u32 | `60` | Days to retain `@.archive.*`/`@home.archive.*` snapshots before `boot-archive-cleanup.sh` prunes them |
 
 Snapshot names are read from `/etc/btrbk/btrbk.conf`, not derived from this section — if that file cannot be read, the boot-archive step declines rather than guessing. The replacement snapshot is located and built alongside the live subvolume **before** the live one is removed, so no failure path can leave `@` absent (`bd DAS-Backup-Manager-5ig`).

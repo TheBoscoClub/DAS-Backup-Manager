@@ -638,7 +638,9 @@ the binding summary; this is the full text it condenses:
   (`Config::boot_input_errors`, shared with `validate`) where it reads it: `backup::boot_plan`, called
   by `archive_boot_with` (whole-step FAIL before any btrfs call) and by `backup boot-plan` (exit 2,
   nothing on stdout, so the script's boot step FAILs). It refuses a repeated `[boot].subvolumes` entry,
-  a `.` or `..` path component in one, and a repeated `[[target]].label` or `mount`.
+  a `.` or `..` path component in one, an entry that more than one source lists (retired entries count: each
+  source's series lives in its own target directory, and the newest snapshot across them could be another
+  volume's OS, bd `5237.12`), and a repeated `[[target]].label` or `mount`.
 
 ### Delete vs mutate — send/receive chain safety
 
