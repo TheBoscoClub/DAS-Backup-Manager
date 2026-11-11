@@ -35,6 +35,7 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QTableView>
+#include <QTableWidget>
 #include <QComboBox>
 #include <QDateTimeEdit>
 
@@ -51,6 +52,7 @@
 #include "../src/backuphistory.h"
 #include "../src/backuppanel.h"
 #include "../src/configdialog.h"
+#include "../src/coveragedialog.h"
 #include "../src/backupsteps.h"
 #include "../src/statustext.h"
 #include "../src/panelconfig.h"
@@ -194,7 +196,7 @@ private Q_SLOTS:
     {
         DBusClient client;
         ProgressPanel panel(&client);
-        auto *cancel = panel.findChild<QPushButton *>();
+        auto *cancel = panel.findChild<QPushButton *>(QStringLiteral("cancelButton"));
         QVERIFY(cancel != nullptr);
 
         panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Backup"));
@@ -543,6 +545,85 @@ private Q_SLOTS:
         QVERIFY(ConfigDialog::savedStatus(typed, typed + QStringLiteral("[boot]\n"))
                     .contains(QLatin1String("written into the file")));
         QVERIFY(ConfigDialog::savedStatus(typed, QString()).contains(QLatin1String("Reload")));
+    }
+
+    // --- subvolume coverage: list and accept (bd sp78.4) ---------------------
+
+    void coverageDialogShowsTheDroppedPairsAndAcceptsOnlyASelectedOne()
+    {
+        // CoverageList's JSON as `subvol coverage list --json` prints it
+        // (coverage::list_json, pinned by its Rust tests); placeholders only.
+        const QString json = QStringLiteral(
+            "{\"accepted\":[],\"dropped\":["
+            "{\"volume\":\"/ssd\",\"subvolume\":\"@data\",\"target\":\"big\","
+            "\"dropped_since\":\"2026-10-03\",\"drop_rule\":\"excluded by pattern '@data' ([subvolumes].exclude); no config entry names it\"},"
+            "{\"volume\":\"/ssd\",\"subvolume\":\".\",\"target\":\"small\","
+            "\"dropped_since\":\"2026-10-04\",\"drop_rule\":\"target_labels of source 'ssd' no longer names 'small'\"}"
+            "],\"state\":{\"checks\":2}}");
+        DBusClient client;
+        CoverageDialog dlg(&client);
+        QVERIFY(dlg.applyJson(json));
+
+        auto *table = dlg.findChild<QTableWidget *>(QStringLiteral("coverageTable"));
+        QVERIFY(table);
+        QCOMPARE(table->rowCount(), 2);
+        const auto cell = [table](int r, int c) { return table->item(r, c)->text(); };
+        QCOMPARE(cell(0, 0), QStringLiteral("/ssd"));
+        QCOMPARE(cell(0, 1), QStringLiteral("@data"));
+        QCOMPARE(cell(0, 2), QStringLiteral("big"));
+        QCOMPARE(cell(0, 3), QStringLiteral("2026-10-03"));
+        QVERIFY2(cell(0, 4).startsWith(QStringLiteral("excluded by pattern '@data'")), qPrintable(cell(0, 4)));
+        // The top level reads as the CLI writes it
+        QCOMPARE(cell(1, 1), QStringLiteral(". (top level)"));
+        QCOMPARE(cell(1, 2), QStringLiteral("small"));
+
+        auto *accept = dlg.findChild<QPushButton *>(QStringLiteral("coverageAcceptButton"));
+        QVERIFY(accept);
+        QVERIFY(!accept->toolTip().isEmpty());
+        QVERIFY2(!accept->isEnabled(), "Accept with nothing selected");
+        // Every button has a tooltip (house rule)
+        for (QPushButton *b : dlg.findChildren<QPushButton *>())
+            QVERIFY2(!b->toolTip().isEmpty(), qPrintable(b->text()));
+        // One selected pair enables it; clearing the selection disables it again
+        table->selectRow(1);
+        QVERIFY(accept->isEnabled());
+        table->clearSelection();
+        QVERIFY(!accept->isEnabled());
+
+        // Not CoverageList's JSON: no rows, and the status says so
+        QVERIFY(!dlg.applyJson(QStringLiteral("not json")));
+        QCOMPARE(table->rowCount(), 0);
+        QVERIFY(!accept->isEnabled());
+        // None dropped: no rows, and nothing to accept
+        QVERIFY(dlg.applyJson(QStringLiteral("{\"accepted\":[],\"dropped\":[],\"state\":null}")));
+        QCOMPARE(table->rowCount(), 0);
+        QVERIFY(!accept->isEnabled());
+    }
+
+    void aCoverageWarningInTheFinishedSummaryOffersTheCoverageDialog()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        auto *review = panel.findChild<QPushButton *>(QStringLiteral("coverageReviewButton"));
+        QVERIFY(review);
+        QVERIFY(!review->toolTip().isEmpty());
+        QSignalSpy asked(&panel, &ProgressPanel::coverageReviewRequested);
+
+        // The finish text as backup.rs builds it (coverage::message_line)
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Backup"));
+        QVERIFY(review->isHidden());
+        panel.onJobFinished(QStringLiteral("job-1"), true,
+                            QStringLiteral("Backup complete; subvolume coverage WARN: "
+                                           "2 subvolume/target pairs no longer backed up"));
+        QVERIFY2(!review->isHidden(), "a coverage warning offers the dialog");
+        review->click();
+        QCOMPARE(asked.count(), 1);
+
+        // The next job starts without it, and a clean finish never shows it
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Backup"));
+        QVERIFY(review->isHidden());
+        panel.onJobFinished(QStringLiteral("job-2"), true, QStringLiteral("Backup complete"));
+        QVERIFY(review->isHidden());
     }
 
     // --- backup panel logic, driven with injected config text ---------------

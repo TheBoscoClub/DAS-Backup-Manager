@@ -29,6 +29,12 @@ public Q_SLOTS:
     // JobFinished arrives the button says "Cancelling…" and stays disabled.
     void showCancelRequested();
 
+Q_SIGNALS:
+    // The finished job's summary carried the subvolume coverage warning
+    // (`subvolume coverage WARN: …`, coverage::message_line) and its
+    // Review button was pressed (bd sp78.4).
+    void coverageReviewRequested();
+
 private Q_SLOTS:
     void cancelJob();
     void toggleLog();
@@ -48,6 +54,7 @@ private:
     QLabel *m_etaLabel = nullptr;
     QProgressBar *m_progressBar = nullptr;
     QPushButton *m_cancelButton = nullptr;
+    QPushButton *m_coverageButton = nullptr;
     QToolButton *m_logToggle = nullptr;
     QPlainTextEdit *m_logView = nullptr;
 };

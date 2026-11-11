@@ -56,6 +56,7 @@ target_sources(btrdasd-gui PRIVATE
     src/recoverystatus.cpp
     src/recoverypanel.cpp
     src/configdialog.cpp
+    src/coveragedialog.cpp
     src/snapshotbrowser.cpp
 )
 
@@ -113,6 +114,7 @@ if(BUILD_TESTING)
         src/statustext.cpp
         src/backuppanel.cpp
         src/configdialog.cpp
+        src/coveragedialog.cpp
         src/panelconfig.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp

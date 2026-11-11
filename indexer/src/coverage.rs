@@ -1015,6 +1015,49 @@ pub fn list_command(db: &Path, json: bool) -> (i32, String, String) {
     (0, out, String::new())
 }
 
+/// The helper's `CoverageList` (bd DAS-Backup-Manager-sp78.4): what
+/// `subvol coverage list --json` prints, or why the database could not be
+/// read. Read-only, as [`list_command`].
+pub fn list_json(db: &Path) -> Result<String, String> {
+    match list_command(db, true) {
+        (0, out, _) => Ok(out),
+        (_, _, err) => Err(err.trim_start_matches("Error: ").trim_end().to_string()),
+    }
+}
+
+/// The helper's `CoverageAccept` (bd DAS-Backup-Manager-sp78.4): accept
+/// exactly one pair, named whole — never a pattern, never every target of a
+/// subvolume (operator 2026-11-01). `Ok` is what `subvol coverage accept`
+/// prints; `Err` says why nothing was written.
+pub fn accept_pair(db: &Path, pair: &Pair, accepted_at: &str) -> Result<String, String> {
+    // An empty field would be a wildcard below (`None` matches every value):
+    // refuse it before the database is touched.
+    for (field, value) in [
+        ("volume", &pair.volume),
+        ("subvolume", &pair.subvolume),
+        ("target", &pair.target),
+    ] {
+        if value.is_empty() {
+            return Err(format!(
+                "the pair names no {field}: nothing accepted (a pair is accepted only whole: \
+                 volume, subvolume and target)"
+            ));
+        }
+    }
+    match accept_command(
+        db,
+        Some(&pair.volume),
+        Some(&pair.subvolume),
+        Some(&pair.target),
+        accepted_at,
+    ) {
+        (0, out, _) => Ok(out),
+        (_, out, err) => Err(format!("{out}{}", err.trim_start_matches("Error: "))
+            .trim_end()
+            .to_string()),
+    }
+}
+
 /// `epoch` seconds as an RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn rfc3339_utc(epoch: i64) -> String {
     let secs = epoch.rem_euclid(86_400);
@@ -2784,5 +2827,125 @@ mod tests {
         let (code, out, err) = list_command(dir.path(), false);
         assert_eq!((code, out.as_str()), (2, ""));
         assert!(err.starts_with("Error: index database "), "{err}");
+    }
+
+    fn pair(volume: &str, subvolume: &str, target: &str) -> Pair {
+        Pair {
+            volume: volume.into(),
+            subvolume: subvolume.into(),
+            target: target.into(),
+        }
+    }
+
+    /// The database the `accept_pair` tests start from: `@data` recorded on
+    /// DAY1, then dropped (to both `big` and `small`) by a recorded run.
+    fn db_with_two_dropped_pairs(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let db = dir.path().join("index.db");
+        let (plan, now) = plan_and_now(&cfg());
+        check(&db, true, false, Ok(now), &plan, &on_disk(), DAY1);
+        let mut gone = without(cfg(), "@data");
+        gone.subvolumes.exclude = vec!["@data".into()];
+        let plan = plan_sync(&gone, &on_disk());
+        check(&db, true, false, Ok(gone), &plan, &on_disk(), DAY2);
+        db
+    }
+
+    /// bd sp78.4: the GUI's list is the CLI's JSON, each dropped row naming
+    /// its volume, subvolume, target, date and the rule that dropped it.
+    #[test]
+    fn list_json_gives_the_gui_every_dropped_pair_with_its_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_two_dropped_pairs(&dir);
+        let json = list_json(&db).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let dropped = v["dropped"].as_array().unwrap();
+        assert_eq!(dropped.len(), 2, "{json}");
+        let targets: Vec<&str> = dropped
+            .iter()
+            .map(|r| r["target"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets, ["big", "small"], "{json}");
+        for r in dropped {
+            assert_eq!(r["volume"], "/ssd");
+            assert_eq!(r["subvolume"], "@data");
+            assert_eq!(r["dropped_since"], "2026-10-03");
+            assert!(
+                r["drop_rule"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("excluded by pattern '@data'"),
+                "{r}"
+            );
+        }
+        assert_eq!(v["accepted"].as_array().unwrap().len(), 0);
+        // No database: an empty list, and nothing created.
+        let none = dir.path().join("none.db");
+        assert_eq!(
+            list_json(&none).unwrap(),
+            "{\"accepted\":[],\"dropped\":[],\"state\":null}\n"
+        );
+        assert!(!none.exists());
+        // Unreadable: an error, never an empty list.
+        let err = list_json(dir.path()).unwrap_err();
+        assert!(err.starts_with("index database "), "{err}");
+    }
+
+    /// bd sp78.4: accepting one pair clears exactly that pair — the same
+    /// subvolume's other target stays reported.
+    #[test]
+    fn accept_pair_clears_exactly_the_pair_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_two_dropped_pairs(&dir);
+        let out = accept_pair(&db, &pair("/ssd", "@data", "small"), "T").unwrap();
+        assert!(out.starts_with("Accepted 1 pair;"), "{out}");
+        assert!(out.contains("-> small"), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&list_json(&db).unwrap()).unwrap();
+        let dropped = v["dropped"].as_array().unwrap();
+        assert_eq!(dropped.len(), 1, "{v}");
+        assert_eq!(dropped[0]["target"], "big");
+        let accepted = v["accepted"].as_array().unwrap();
+        assert_eq!(accepted.len(), 1, "{v}");
+        assert_eq!(accepted[0]["target"], "small");
+        assert_eq!(accepted[0]["accepted_at"], "T");
+    }
+
+    /// bd sp78.4: a pair not reported as dropped, or not named whole, is
+    /// refused with a reason, and nothing is written.
+    #[test]
+    fn accept_pair_refuses_an_unknown_or_partial_pair_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_with_two_dropped_pairs(&dir);
+        let before = crate::db::read_coverage_read_only(&db).unwrap();
+        let before_accepted = crate::db::read_accepted_read_only(&db).unwrap();
+        for (p, why) in [
+            (pair("/ssd", "@srv", "big"), "not dropped: nothing accepted"),
+            (
+                pair("/ssd", "@data", "nowhere"),
+                "not dropped: nothing accepted",
+            ),
+            (
+                pair("/elsewhere", "@data", "big"),
+                "not dropped: nothing accepted",
+            ),
+            (pair("", "@data", "big"), "names no volume"),
+            (pair("/ssd", "", "big"), "names no subvolume"),
+            (pair("/ssd", "@data", ""), "names no target"),
+        ] {
+            let err = accept_pair(&db, &p, "T").unwrap_err();
+            assert!(err.contains(why), "{p:?}: {err}");
+            assert_eq!(crate::db::read_coverage_read_only(&db).unwrap(), before);
+            assert_eq!(
+                crate::db::read_accepted_read_only(&db).unwrap(),
+                before_accepted
+            );
+        }
+        // No record yet: refused, and the database is not created.
+        let none = dir.path().join("none.db");
+        let err = accept_pair(&none, &pair("/ssd", "@data", "big"), "T").unwrap_err();
+        assert!(
+            err.contains("holds no subvolume coverage record yet"),
+            "{err}"
+        );
+        assert!(!none.exists());
     }
 }

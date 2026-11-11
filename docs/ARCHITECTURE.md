@@ -82,7 +82,7 @@ The system has six major components:
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
 | Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 24 modules: single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
-| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (27 methods, 8 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
+| D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (29 methods, 8 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
 | Interactive installer | Rust 2024 | `btrdasd setup` | Config-driven 9-step setup wizard with template generation |
 
@@ -332,7 +332,9 @@ btrdasd-gui
          │         ├──▶ RecoveryOsStatus()     → RecoveryPanel (recovery drives: records, schedules, sessions)
          │         ├──▶ PanelConfigGet()       → BackupPanel (labels, boot.enabled, from the parsed config)
          │         ├──▶ ConfigCheck()          → ConfigDialog (unknown-key warnings before a save)
-         │         └──▶ ConfigGet()            → ConfigDialog (the file's text, as it is)
+         │         ├──▶ ConfigGet()            → ConfigDialog (the file's text, as it is)
+         │         ├──▶ CoverageList()         → CoverageDialog (pairs no longer backed up; org.dasbackup.index.read)
+         │         └──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
          ├──▶ SnapshotWatcher             QFileSystemWatcher → auto-detect new snapshots
@@ -676,7 +678,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `btrbk_conf` | `src/btrbk_conf.rs` | ~2150 | `btrbk.conf` renderer (shared by setup, `subvol` commands and sync); retired entries are not rendered |
 | `caldate` | `src/caldate.rs` | ~450 | `YYYY-MM-DD` calendar-date arithmetic for adoption and retirement dates; local date and time for schedules (the zone read again on every call) |
 | `config` | `src/config.rs` | ~4780 | TOML config types, DAS/source/target models |
-| `coverage` | `src/coverage.rs` | ~2280 | Subvolume coverage run over run: the pairs a config schedules, compared with the record of the last backup run inside every sync; why each dropped pair is no longer backed up, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept/list` |
+| `coverage` | `src/coverage.rs` | ~2950 | Subvolume coverage run over run: the pairs a config schedules, compared with the record of the last backup run inside every sync; why each dropped pair is no longer backed up, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept/list`, and the helper's `CoverageList` / `CoverageAccept` (`list_json`, `accept_pair`: one pair, named whole) |
 | `db` | `src/db.rs` | ~4150 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1550 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk, and checks that every target holds a recent snapshot of every declared pair (`delivery_check`) |
 | `expire` | `src/expire.rs` | ~2430 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
@@ -711,7 +713,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
 | `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
-| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~3860 | D-Bus daemon (feature `dbus`): 27 methods, 3 signals, polkit checks, job ownership |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~3980 | D-Bus daemon (feature `dbus`): 29 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
@@ -724,7 +726,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
 | Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health, Recovery drives sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
-| ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, resizable raw log (native dock resize), smart auto-scroll |
+| ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, a Review Coverage button after a summary carrying the coverage warning, resizable raw log (native dock resize), smart auto-scroll |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
 | FileModel | `filemodel.h/cpp` | QAbstractTableModel with paginated loading (10k per page via D-Bus) |
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |
@@ -737,6 +739,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | RecoveryStatus | `recoverystatus.h/cpp` | Pure model (QtCore only) of `RecoveryOsStatus`'s document and the Recovery drives panel's enablement rules (`deriveActions`, `derivePairActions`); unit-tested in `gui-smoketest` against `gui/tests/fixtures/recovery-status.json`, which a `panel.rs` test writes and compares byte for byte |
 | RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Schedule / Clear schedule / Open console (TigerVNC's vncviewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
+| CoverageDialog | `coveragedialog.h/cpp` | The subvolume/target pairs no longer backed up (`CoverageList`), each with the rule that dropped it, and Accept for one selected pair (`CoverageAccept`); the list is read again after each accept. Opened from Tools → Subvolume Coverage… and the progress panel's Review Coverage button; its rows and button rules unit-tested in `gui-smoketest` |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
 | IndexRunner | `indexrunner.h/cpp` | D-Bus IndexWalk trigger (was QProcess, now D-Bus) |
 | SnapshotWatcher | `snapshotwatcher.h/cpp` | QFileSystemWatcher with 30s debounce |

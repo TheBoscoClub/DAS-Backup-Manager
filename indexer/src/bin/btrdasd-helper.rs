@@ -1728,6 +1728,57 @@ impl HelperInterface {
         })
     }
 
+    /// The subvolume/target pairs no longer backed up and the accept log,
+    /// as `btrdasd subvol coverage list --json` prints them (bd
+    /// DAS-Backup-Manager-sp78.4). A read-only open of the index, so the
+    /// index read action guards it, as `IndexBackupHistory`.
+    async fn coverage_list(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.index.read").await?;
+        let db_path = canonical_db_path()?;
+        tokio::task::spawn_blocking(move || {
+            buttered_dasd::coverage::list_json(Path::new(&db_path)).map_err(fdo::Error::Failed)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Coverage list task join failed: {e}")))?
+    }
+
+    /// Accept one dropped pair, named whole (bd DAS-Backup-Manager-sp78.4;
+    /// never per pattern, operator 2026-11-01): it leaves the coverage
+    /// record and is kept in the accept log. Returns what `subvol coverage
+    /// accept` prints; a pair not reported as dropped is refused, nothing
+    /// written. A write that silences a warning, so the config action
+    /// guards it, as `SubvolAdd`.
+    async fn coverage_accept(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        volume: &str,
+        subvolume: &str,
+        target: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.config").await?;
+        let db_path = canonical_db_path()?;
+        let pair = buttered_dasd::coverage::Pair {
+            volume: volume.to_string(),
+            subvolume: subvolume.to_string(),
+            target: target.to_string(),
+        };
+        tokio::task::spawn_blocking(move || {
+            buttered_dasd::coverage::accept_pair(
+                Path::new(&db_path),
+                &pair,
+                &buttered_dasd::coverage::now_rfc3339(),
+            )
+            .map_err(fdo::Error::Failed)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("Coverage accept task join failed: {e}")))?
+    }
+
     /// Query system health and return a JSON report.
     ///
     /// Auto-mounts targets first so disk space, SMART, and snapshot data are
