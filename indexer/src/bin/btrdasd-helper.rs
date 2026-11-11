@@ -266,14 +266,14 @@ fn load_config() -> Result<Config, fdo::Error> {
 /// alone left an added entry out of `btrbk.conf`, so it was not backed up.
 fn save_config(config: &Config) -> Result<(), fdo::Error> {
     btrbk_conf::save_config_and_btrbk_conf(config, Path::new(CANONICAL_CONFIG))
-        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
+        .map_err(|e| fdo::Error::Failed(format!("Config not saved: {e}")))
 }
 
 /// [`save_config`] for the GUI editor's whole text: written as typed, its
 /// comments and unknown keys kept, and btrbk.conf regenerated from it.
 fn save_config_text(text: &str) -> Result<(), fdo::Error> {
     btrbk_conf::save_config_text_and_btrbk_conf(text, Path::new(CANONICAL_CONFIG))
-        .map_err(|e| fdo::Error::Failed(format!("Failed to save config '{CANONICAL_CONFIG}': {e}")))
+        .map_err(|e| fdo::Error::Failed(format!("Config not saved: {e}")))
 }
 
 /// What `ConfigCheck` returns for `text`: its unknown-key warnings as a JSON

@@ -61,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The D-Bus helper's save error names the config file once** (bd `DAS-Backup-Manager-v4y`): it prefixed `Failed to save config '<path>':` to errors that already name the file (`cannot write <path>: …`); it now says `Config not saved: …`, and each error names its own file
+
 - **A target whose every retention period is 0 is refused, not given an invented four weeks** (bd `DAS-Backup-Manager-iyq`): `btrbk.conf` rendered it as `target_preserve 4w` while expiry read the same target as keeping its retired series forever — one setting, two opposite meanings; `Config::validate` now names the target, and the renderer refuses it too
 
 - **The report footer and the stored `[general].version` give the version `btrdasd --version` gives** (bd `DAS-Backup-Manager-wpyc`): both used Cargo's three-part `0.7.23` where `--version` reads the four-part one from `CMakeLists.txt` (`0.7.23.3`); every use now reads `buttered_dasd::VERSION`, so the next `setup --upgrade` stamps the four-part version once
