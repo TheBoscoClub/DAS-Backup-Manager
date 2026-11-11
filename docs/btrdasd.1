@@ -511,8 +511,10 @@ locks, a backup started meanwhile \(em by the timer, too \(em finds
 held and skips its run.
 .PP
 Every file setup writes is replaced whole: a new file, given its mode (scripts
-0755, any other file the mode it had) and, written by root, the old file's
-owner and group, before it is renamed over the old one. A
+0755, any other file the mode it had) and, written by root, owner and group
+root \(em whoever owned the file it replaces: each is run or trusted by root,
+and one left to another user would let them change what root runs \(em before
+it is renamed over the old one. A
 backup already reading
 .I backup\-run.sh
 keeps reading the old file to its end, and a write that fails leaves the old

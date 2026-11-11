@@ -196,6 +196,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - One that will not come down even with `umount -f` refuses the job before it mounts anything: `backup-run.sh` aborts with 3 and one ABORTED report (`What aborted: a leftover mount`), so a supervisor never restarts into the same refusal; a filesystem at the path that is not the target is refused and never unmounted — not even by the abort's cleanup, which before this release took it down on the way out — and the DAS is then not called safe to disconnect (`a mount at a target's path`)
   - Never `umount -l`: measured on a busy loop btrfs, it takes the path out of the mount table while the filesystem stays live and its device held — the state the "safe to disconnect" check exists to catch; `umount -f` there is refused like the plain unmount, since btrfs has no forced unmount
 
+### Security
+
+- **`btrdasd setup` installs every script, unit, udev rule and `btrbk.conf` as `root:root`** (bd `DAS-Backup-Manager-ztp`): written by root, each kept the owner and group of the file it replaced, so a script root runs that someone had chowned to another user stayed theirs across every upgrade — a path for that user to change what root runs; `fsutil::write_atomic_root_owned` now gives each file root's ownership before it is renamed into place (other writers, `config.toml` among them, keep the replaced file's owner as before)
+
 ## [0.7.23.3] - 2026-11-08
 
 ### Added

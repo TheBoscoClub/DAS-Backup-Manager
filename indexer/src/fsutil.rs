@@ -52,6 +52,29 @@ pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> io:
         &WriteHost {
             // SAFETY: geteuid() has no preconditions and cannot fail.
             euid: unsafe { libc::geteuid() },
+            force_owner: None,
+            temp_name: &unique_temp_name,
+            sync_file: &|file| file.sync_all(),
+            rename: &|from, to| fs::rename(from, to),
+            sync_dir: &|dir| File::open(dir)?.sync_all(),
+        },
+    )
+}
+
+/// [`write_atomic_mode`] for a file root runs or trusts (a script, a unit, a
+/// udev rule, btrbk.conf): written by root it is owned by root:root whatever
+/// owned the file it replaces — one left to another user would let them
+/// change what root runs (bd DAS-Backup-Manager-ztp). Written by anyone else,
+/// as [`write_atomic_mode`].
+pub fn write_atomic_root_owned(path: &Path, contents: &[u8], mode: Option<u32>) -> io::Result<()> {
+    write_atomic_with(
+        path,
+        contents,
+        mode,
+        &WriteHost {
+            // SAFETY: geteuid() has no preconditions and cannot fail.
+            euid: unsafe { libc::geteuid() },
+            force_owner: Some((0, 0)),
             temp_name: &unique_temp_name,
             sync_file: &|file| file.sync_all(),
             rename: &|from, to| fs::rename(from, to),
@@ -65,6 +88,9 @@ struct WriteHost<'a> {
     /// The writer's effective user id: an owner and group are kept only by
     /// root, the one writer that can give a file away.
     euid: u32,
+    /// When root writes: this owner and group, not the replaced file's
+    /// ([`write_atomic_root_owned`], bd DAS-Backup-Manager-ztp).
+    force_owner: Option<(u32, u32)>,
     /// The next name to try for the temp file beside the target.
     temp_name: &'a dyn Fn(&Path) -> PathBuf,
     /// Flushes the finished temp file to disk, before it is renamed: else a
@@ -118,9 +144,14 @@ fn write_atomic_with(
         },
     };
     let mode = mode.or(old.as_ref().map(|meta| meta.mode() & 0o7777));
-    let owner = old
-        .filter(|_| host.euid == 0)
-        .map(|meta| (meta.uid(), meta.gid()));
+    // Only root can give a file away: forced when asked, else the replaced
+    // file's (bd DAS-Backup-Manager-ztp).
+    let owner = match host.force_owner {
+        Some(forced) if host.euid == 0 => Some(forced),
+        _ => old
+            .filter(|_| host.euid == 0)
+            .map(|meta| (meta.uid(), meta.gid())),
+    };
     let (tmp, mut file) = create_temp(&target, mode, host).map_err(named)?;
     let written = (|| {
         if let Some((uid, gid)) = owner {
@@ -733,6 +764,29 @@ mod tests {
         assert!(!was_replaced(&err), "{err}");
     }
 
+    /// Root installing a file root will run or trust forces its owner:
+    /// a script someone chowned to another user must not stay theirs (bd
+    /// DAS-Backup-Manager-ztp). Simulated with ids this process may give.
+    #[test]
+    fn a_forced_owner_replaces_the_old_files_owner_when_root_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-run.sh");
+        fs::write(&path, "old").unwrap();
+        let (uid, other_gid) = give_away(&path);
+        // SAFETY: getegid() has no preconditions and cannot fail.
+        let egid = unsafe { libc::getegid() };
+        assert_ne!(other_gid, egid, "fixture must start in another group");
+        let forced = WriteHost {
+            euid: 0,
+            force_owner: Some((uid, egid)),
+            ..host(&unique_temp_name, &real_rename, &real_sync_dir)
+        };
+        write_atomic_with(&path, b"new", Some(0o755), &forced).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (uid, egid));
+        assert_eq!(meta.mode() & 0o7777, 0o755);
+    }
+
     /// The new file is flushed to disk before it is renamed over the old one
     /// (bd DAS-Backup-Manager-9df, H3).
     #[test]
@@ -795,6 +849,7 @@ mod tests {
     ) -> WriteHost<'a> {
         WriteHost {
             euid: real_euid(),
+            force_owner: None,
             temp_name,
             sync_file: &|file| file.sync_all(),
             rename,
@@ -1051,6 +1106,7 @@ mod tests {
         };
         let as_root = WriteHost {
             euid: 0,
+            force_owner: None,
             temp_name: &unique_temp_name,
             sync_file: &|file| file.sync_all(),
             rename: &watch,

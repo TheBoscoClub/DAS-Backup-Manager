@@ -591,7 +591,9 @@ fn install_to_prefix(
         // file whole. Scripts are made executable; any other file keeps the
         // mode it had, as `write_atomic` keeps it for every caller.
         let mode = (full_path.extension().and_then(|e| e.to_str()) == Some("sh")).then_some(0o755);
-        buttered_dasd::fsutil::write_atomic_mode(&full_path, content.as_bytes(), mode)?;
+        // Root-owned whatever owned the old file: each of these is run or
+        // trusted by root (bd DAS-Backup-Manager-ztp).
+        buttered_dasd::fsutil::write_atomic_root_owned(&full_path, content.as_bytes(), mode)?;
 
         manifest_entries.push(full_path.to_string_lossy().to_string());
     }
