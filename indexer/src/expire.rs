@@ -518,10 +518,16 @@ pub fn expire_retired(
                 ));
             }
             // Source-side snapshots only exist to be sent. Once the shortest
-            // target window has passed they have no further use.
+            // window among the targets examined this run has passed they have
+            // no further use. A target that could not be reached does not
+            // count: what it holds was not seen, and a minimum over fewer
+            // targets is never shorter, so the source copy is kept at least as
+            // long (bd DAS-Backup-Manager-12k). None reached: no window, kept.
             let shortest = targets
                 .iter()
-                .filter_map(|t| longest_window_days(&t.retention))
+                .zip(&locations)
+                .filter(|(_, l)| !matches!(l.state, LocationState::Unreachable(_)))
+                .filter_map(|(t, _)| longest_window_days(&t.retention))
                 .min();
             let root = Path::new(&source.volume);
             let same_source_dir =
@@ -1253,6 +1259,56 @@ mod tests {
             expire_retired(&rig.config_path, false, "2027-10-09", &runner, &mounted).unwrap();
         assert!(!src.exists());
         assert_eq!(states(&late)[2], LocationState::Deleted { count: 1 });
+    }
+
+    /// Source-side window = shortest among the targets that could be
+    /// examined this run. An unattached target's window says nothing about
+    /// copies that can be checked, and a minimum over fewer targets is never
+    /// shorter, so the source copy is kept at least as long (bd
+    /// DAS-Backup-Manager-12k).
+    #[test]
+    fn an_unattached_target_does_not_set_the_source_window() {
+        let rig = rig();
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&src]);
+        let small_absent = |p: &Path| !p.ends_with("small");
+        // Past the mirror's 7 days, inside the primary's 372.
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2026-10-09",
+            &runner,
+            &small_absent,
+        )
+        .unwrap();
+        assert!(src.exists(), "{:?}", states(&out));
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(matches!(states(&out)[1], LocationState::Unreachable(_)));
+        assert_eq!(
+            states(&out)[2],
+            LocationState::Kept {
+                count: 1,
+                expires: Some("2027-10-09".into())
+            }
+        );
+        // Nothing attached: no window at all, so the source copy is kept undated.
+        let none_attached = |p: &Path| !p.ends_with("small") && !p.ends_with("big");
+        let out = expire_retired(
+            &rig.config_path,
+            false,
+            "2030-01-01",
+            &runner,
+            &none_attached,
+        )
+        .unwrap();
+        assert!(src.exists());
+        assert_eq!(
+            states(&out)[2],
+            LocationState::Kept {
+                count: 1,
+                expires: None
+            }
+        );
     }
 
     #[test]
