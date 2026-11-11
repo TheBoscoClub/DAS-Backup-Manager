@@ -197,46 +197,7 @@ impl MaintenanceHeld {
     /// [`UNKNOWN_HOLDER`], and a backup waits on it. Inherent to `flock`, which
     /// has no "lock only if held by this description".
     pub fn delegated_at(path: &Path, fd: RawFd) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
-        let lock = path.display();
-        let want = std::fs::metadata(path).map_err(|e| format!("cannot stat {lock}: {e}"))?;
-        // SAFETY: `fstat` writes one `stat` through a pointer to a zeroed
-        // one; a descriptor that is not open is EBADF, not undefined
-        // behaviour.
-        let mut got: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut got) } != 0 {
-            return Err(format!(
-                "{DELEGATED_FD_ENV}={fd} is not an open descriptor ({})",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if got.st_dev != want.dev() || got.st_ino != want.ino() {
-            return Err(format!("{DELEGATED_FD_ENV}={fd} is not {lock}"));
-        }
-        // A fresh open that can take the lock finds it free: then `fd` holds
-        // nothing. The probe lets go when it drops.
-        if FileLock::try_acquire(path)
-            .map_err(|e| format!("{DELEGATED_FD_ENV}={fd}: cannot look at {lock}: {e}"))?
-            .is_some()
-        {
-            return Err(format!(
-                "{DELEGATED_FD_ENV}={fd} does not hold {lock}: the lock is free"
-            ));
-        }
-        // Held, then — by whom? A duplicate of `fd` shares its open file
-        // description, so locking through it succeeds only if that description
-        // is the holder. Closing the duplicate releases nothing: the caller's
-        // descriptor still refers to the description.
-        // SAFETY: `fstat` above proved `fd` open, and nothing in this process
-        // closes it during this one borrow.
-        let shared = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
-            .try_clone_to_owned()
-            .map_err(|e| format!("{DELEGATED_FD_ENV}={fd} cannot be duplicated ({e})"))?;
-        if let Err(e) = std::fs::File::from(shared).try_lock() {
-            return Err(format!(
-                "{DELEGATED_FD_ENV}={fd} does not hold {lock} ({e})"
-            ));
-        }
+        prove_handed_down(path, fd, DELEGATED_FD_ENV)?;
         Ok(Self {
             path: path.to_path_buf(),
             how: How::Delegated,
@@ -271,6 +232,52 @@ impl MaintenanceHeld {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// The proof behind [`MaintenanceHeld::delegated_at`] and behind the backup
+/// singleton's (`backup::SingletonHeld::delegated_at`, bd
+/// DAS-Backup-Manager-5237.9): `fd`, named in the environment variable `env`,
+/// is an open descriptor on the lock file at `path`, the lock is held, and it
+/// is held through `fd`. `Ok` only then, and the caller then holds nothing it
+/// may release: the open file description is its parent's.
+pub(crate) fn prove_handed_down(path: &Path, fd: RawFd, env: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = path.display();
+    let want = std::fs::metadata(path).map_err(|e| format!("cannot stat {lock}: {e}"))?;
+    // SAFETY: `fstat` writes one `stat` through a pointer to a zeroed
+    // one; a descriptor that is not open is EBADF, not undefined
+    // behaviour.
+    let mut got: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut got) } != 0 {
+        return Err(format!(
+            "{env}={fd} is not an open descriptor ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if got.st_dev != want.dev() || got.st_ino != want.ino() {
+        return Err(format!("{env}={fd} is not {lock}"));
+    }
+    // A fresh open that can take the lock finds it free: then `fd` holds
+    // nothing. The probe lets go when it drops.
+    if FileLock::try_acquire(path)
+        .map_err(|e| format!("{env}={fd}: cannot look at {lock}: {e}"))?
+        .is_some()
+    {
+        return Err(format!("{env}={fd} does not hold {lock}: the lock is free"));
+    }
+    // Held, then — by whom? A duplicate of `fd` shares its open file
+    // description, so locking through it succeeds only if that description
+    // is the holder. Closing the duplicate releases nothing: the caller's
+    // descriptor still refers to the description.
+    // SAFETY: `fstat` above proved `fd` open, and nothing in this process
+    // closes it during this one borrow.
+    let shared = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map_err(|e| format!("{env}={fd} cannot be duplicated ({e})"))?;
+    if let Err(e) = std::fs::File::from(shared).try_lock() {
+        return Err(format!("{env}={fd} does not hold {lock} ({e})"));
+    }
+    Ok(())
 }
 
 impl Drop for MaintenanceHeld {

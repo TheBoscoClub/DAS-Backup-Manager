@@ -36,6 +36,7 @@ cat >"$BTRDASD_BIN" <<'STUB'
 #!/bin/bash
 here="$(dirname "$0")"
 echo "$*" >>"$here/calls"
+echo "$1 $2 fd=${DAS_BACKUP_LOCK_FD-unset}" >>"$here/fd_calls"
 case "$1 $2" in
     "config dump-env")
         if [[ -f "$here/env_fail" ]]; then
@@ -379,6 +380,23 @@ OP_STATUS=([subvol_sync]=OK)
 expire_retired_subvolumes run
 check "sync OK: expire is real" "$(grep -c -- '--dry-run' "$WORK/calls" || true)" "0"
 check "sync OK: recorded OK" "${OP_STATUS[subvol_expire]}" "OK"
+
+# --- the singleton is handed down to sync and expire, no wider (bd 5237.9) ----
+# They take /run/das-backup.lock themselves unless handed the run's own fd 9;
+# without it every nightly sync and expire would meet the run's own lock.
+unset DAS_BACKUP_LOCK_FD
+: >"$WORK/fd_calls"
+printf 'SUBVOLUME SYNC\n' >"$WORK/sync_out"; echo 0 >"$WORK/sync_rc"
+: >"$WORK/expire_out"; echo 0 >"$WORK/expire_rc"
+sync_subvolumes run
+OP_STATUS[subvol_sync]=OK
+expire_retired_subvolumes run
+expire_retired_subvolumes dryrun
+check "sync is handed fd 9" "$(grep -c '^subvol sync fd=9$' "$WORK/fd_calls")" "1"
+check "expire is handed fd 9, real and dry run" "$(grep -c '^subvol expire fd=9$' "$WORK/fd_calls")" "2"
+check "the config reload is not handed it" "$(grep -c '^config dump-env fd=unset$' "$WORK/fd_calls")" "1"
+check "nothing else is handed it" "$(grep -vc -e '^subvol sync fd=9$' -e '^subvol expire fd=9$' -e 'fd=unset$' "$WORK/fd_calls" || true)" "0"
+check "the variable does not leak into the run" "${DAS_BACKUP_LOCK_FD-unset}" "unset"
 
 # --- subvolume coverage (bd DAS-Backup-Manager-sp78.1) -----------------------
 # The sync prints its coverage row; record_subvol_coverage takes it as printed

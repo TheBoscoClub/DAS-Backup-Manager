@@ -980,6 +980,32 @@ fn edit_config_cli<T>(
     }
 }
 
+/// The backup singleton for a `subvol sync` or `subvol expire`, which
+/// read-modify-write config.toml (and, for expire, delete), taken before
+/// either reads anything (bd DAS-Backup-Manager-5237.9). `backup-run.sh` runs
+/// both while it holds the singleton and hands its hold down
+/// (`DAS_BACKUP_LOCK_FD`), proven before it is used; a refused hand-down
+/// exits 1, never runs unlocked. A hand run takes it itself, recorded as a
+/// config edit so a backup that meets it waits for it; held by another, the
+/// busy line and exit 75, nothing read or written.
+fn singleton_for_subvol_cli() -> buttered_dasd::backup::SingletonHeld {
+    use buttered_dasd::backup::{DELEGATED_SINGLETON_FD_ENV, SingletonHeld};
+    use buttered_dasd::btrbk_conf::{CONFIG_EDIT_JOB, config_busy_line};
+    let path = buttered_dasd::backup::config_edit_lock_path();
+    let delegated = std::env::var_os(DELEGATED_SINGLETON_FD_ENV);
+    match SingletonHeld::handed_down_or_taken(&path, delegated.as_deref(), CONFIG_EDIT_JOB) {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            eprintln!("{}", config_busy_line(&path));
+            std::process::exit(75);
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2969,6 +2995,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     std::process::exit(2);
                 }
+                // Held to the end of this arm: through the sync's read and
+                // write of config.toml and btrbk.conf (bd DAS-Backup-Manager-5237.9).
+                let _singleton = singleton_for_subvol_cli();
                 let coverage = if record_coverage {
                     buttered_dasd::adopt::CoverageMode::Record { db: &db }
                 } else {
@@ -3008,6 +3037,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 dry_run,
             } => {
+                // Held to the end of this arm: through expiry's read of
+                // config.toml, its deletions and its save (bd
+                // DAS-Backup-Manager-5237.9).
+                let _singleton = singleton_for_subvol_cli();
                 let outcome = match buttered_dasd::expire::expire_retired(
                     &config,
                     &db,

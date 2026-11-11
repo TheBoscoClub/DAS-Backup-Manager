@@ -1403,6 +1403,18 @@ report is text only:
 .B \-\-json
 is refused (exit 2) before anything runs.
 .PP
+It holds
+.I /run/das\-backup.lock
+from reading config.toml to its last write, as
+.B "subvol add"
+does: run by hand while a backup or setup holds it, it exits 75 and touches
+nothing.
+.B backup\-run.sh
+runs it while holding that lock and hands its hold down through
+.B DAS_BACKUP_LOCK_FD
+(see
+.BR ENVIRONMENT ).
+.PP
 Each subvolume that exists on a source volume and is not excluded gets a
 .I [[source.subvolumes]]
 entry. A nested subvolume joins its nearest configured ancestor's source and
@@ -1673,7 +1685,12 @@ the database could not be read.
 .SS subvol expire
 Delete the backups of retired subvolumes whose window has passed. Run by
 .B backup\-run.sh
-directly after btrbk, while the targets are mounted.
+directly after btrbk, while the targets are mounted. It holds
+.I /run/das\-backup.lock
+from reading config.toml through its deletions to its save, as
+.B "subvol sync"
+does (exit 75 by hand while it is held; handed down by
+.BR backup\-run.sh ).
 .PP
 A retired entry's snapshots are looked for in each
 .I location:
@@ -3128,7 +3145,9 @@ or, with
 .BR \-\-modify ,
 found the configuration file changed while the wizard was open: nothing was
 written or removed.
-.BR "subvol add" ", " "subvol remove" " and " "schedule set"
+.BR "subvol add" ", " "subvol remove" ", " "schedule set" ,
+and a hand\-run
+.BR "subvol sync" " or " "subvol expire" ,
 found
 .I /run/das\-backup.lock
 held \(em a backup or setup was running and may rewrite config.toml itself:
@@ -3171,6 +3190,22 @@ fails. A descriptor on a free lock is refused rather than allowed to take it.
 If the real holder lets go at the very moment of the check, a descriptor that
 held nothing may still end up holding the lock: its process then holds it,
 with no holder recorded, until it exits.
+.TP
+.B DAS_BACKUP_LOCK_FD
+The number of an open descriptor on
+.I /run/das\-backup.lock
+through which the calling process holds the backup singleton.
+.BR "subvol sync" " and " "subvol expire"
+then use that hold instead of taking the lock, which the caller holds until
+they finish.
+.B backup\-run.sh
+sets it for exactly those two commands. Checked as
+.B DAS_MAINTENANCE_LOCK_FD
+is, with the same caveat: a value that is not a descriptor number, a
+descriptor not open, one on another file, or one that does not hold the lock
+fails the command (exit 1) before it reads anything \(em it never falls back
+to taking the lock. The command leaves the caller's record in the lock file
+as it is.
 .TP
 .B DAS_RECOVERY_OS_STATE
 Override the recovery OS record
