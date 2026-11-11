@@ -61,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A retired subvolume entry back on disk is not revived beside a live entry of the same name** (bd `DAS-Backup-Manager-g4s`): reviving it made two live entries for one subvolume, which validation refuses, so every later sync reported CONFIG NOT UPDATED and no new subvolume was adopted until the file was fixed by hand; the retired entry is now kept, with its backups, and listed every run under `NOT REVIVED (a live entry of the same name backs it up)` in SUBVOLUME SYNC, naming both sources — not a failure, since the live entry backs the subvolume up
+
 - **The GUI's Run buttons come back when no D-Bus helper is reachable** (bd `DAS-Backup-Manager-qxxv`): the client dropped a job-starting call without a word when the helper was unavailable, so a panel that had marked its backup as requested kept Run and Dry Run disabled until the GUI was restarted; the client now sends a quiet, queued `callDropped(operation)` (no error dialog — `helperUnavailable` already said why) and the backup panel ends the request on it
 
 - **The D-Bus helper's save error names the config file once** (bd `DAS-Backup-Manager-v4y`): it prefixed `Failed to save config '<path>':` to errors that already name the file (`cannot write <path>: …`); it now says `Config not saved: …`, and each error names its own file

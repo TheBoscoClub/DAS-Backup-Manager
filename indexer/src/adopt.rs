@@ -257,6 +257,10 @@ pub struct SyncPlan {
     pub revive: Vec<EntryRef>,
     pub skipped: Vec<Skip>,
     pub unplaceable: Vec<Unplaceable>,
+    /// Retired entries back on disk that are not revived because a live
+    /// entry of the same name elsewhere on the volume backs them up (bd
+    /// DAS-Backup-Manager-g4s): reported every run, not a failure.
+    pub not_revived: Vec<Unplaceable>,
     pub failed_volumes: Vec<(String, String)>,
 }
 
@@ -372,7 +376,33 @@ pub fn plan_sync(config: &Config, listings: &[VolumeListing]) -> SyncPlan {
                 };
                 match (present, entry.retired.is_some()) {
                     (false, false) => plan.retire.push(reference),
-                    (true, true) => plan.revive.push(reference),
+                    (true, true) => {
+                        // A live entry of this name elsewhere on the volume
+                        // already backs it up: reviving makes two, the config
+                        // fails validation, and no sync could write again
+                        // (bd DAS-Backup-Manager-g4s). Kept retired, said.
+                        let live_elsewhere = sources.iter().find(|other| {
+                            other.label != source.label
+                                && other
+                                    .subvolumes
+                                    .iter()
+                                    .any(|e| e.name == entry.name && e.retired.is_none())
+                        });
+                        match live_elsewhere {
+                            Some(other) => plan.not_revived.push(Unplaceable {
+                                volume: volume.to_string(),
+                                name: entry.name.clone(),
+                                why: format!(
+                                    "back on disk, but not revived in source '{}': source '{}' \
+                                     has a live entry of that name, which backs it up; this \
+                                     retired entry and its backups are kept — remove the \
+                                     entry by hand once its series is no longer wanted",
+                                    source.label, other.label
+                                ),
+                            }),
+                            None => plan.revive.push(reference),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1198,6 +1228,17 @@ fn sync_lines(outcome: &SyncOutcome, dry_run: bool) -> String {
             ));
         }
     }
+    if !plan.not_revived.is_empty() {
+        r.push_str("  NOT REVIVED (a live entry of the same name backs it up):\n");
+        for u in &plan.not_revived {
+            r.push_str(&format!(
+                "    {}  [{}: {}]\n",
+                display_name(&u.name),
+                u.volume,
+                u.why
+            ));
+        }
+    }
     if !plan.unplaceable.is_empty() {
         r.push_str("  COULD NOT BE PLACED (not backed up):\n");
         for u in &plan.unplaceable {
@@ -1599,6 +1640,35 @@ mod tests {
                 name: "@opt".into()
             }]
         );
+        assert!(plan.adopt.is_empty());
+    }
+
+    /// A retired entry back on disk is not revived while a live entry of the
+    /// same name in another source on the volume backs it up: two live
+    /// entries fail validation, and every later sync would then write
+    /// nothing (bd DAS-Backup-Manager-g4s item 2). Kept retired, and said.
+    #[test]
+    fn a_retired_entry_is_not_revived_beside_a_live_one_of_the_same_name() {
+        let mut c = config();
+        c.sources[0].subvolumes[1].retired = Some("2026-09-01".into()); // @opt
+        let mut other = c.sources[0].clone();
+        other.label = "ssd-opt".into();
+        other.subvolumes = vec![SubvolConfig {
+            name: "@opt".into(),
+            ..Default::default()
+        }];
+        c.sources.push(other);
+        let plan = plan_sync(&c, &all_present());
+        assert!(plan.revive.is_empty(), "{:?}", plan.revive);
+        assert!(
+            plan.not_revived
+                .iter()
+                .any(|u| u.name == "@opt" && u.why.contains("ssd-opt")),
+            "{:?}",
+            plan.not_revived
+        );
+        // Backed up by the live entry: said every run, never a failure.
+        assert!(!plan.failed(), "{plan:?}");
         assert!(plan.adopt.is_empty());
     }
 
@@ -2753,6 +2823,7 @@ mod tests {
                 name: "top".into(),
                 why: "no primary".into(),
             }],
+            not_revived: Vec::new(),
             failed_volumes: vec![("/nvme".into(), "not mounted".into())],
         };
         let text = format_sync_report(
