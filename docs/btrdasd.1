@@ -1671,19 +1671,31 @@ x1, weekly x7, monthly x31, yearly x366 days), then all deleted from that
 target together; until then the report reads
 .RI \(dq N " snapshots kept, deleted on or after " YYYY\-MM\-DD \(dq.
 On the source side they are kept until the retirement date
-plus the shortest of the targets' windows, then deleted. A target with no
+plus the shortest window among the targets reached this run (an unattached
+target does not count; none reached keeps them), then deleted. Two retired
+entries whose series share one directory and name both wait for the later of
+their retirement dates. A target with no
 retention configured keeps them and says
 so. Expiry mounts nothing; a location whose mount point is not mounted is
 reported as not reachable and left alone. Nothing is deleted from a location that is not a mountpoint or cannot be
-read completely, that is also used by a live entry of the same series name,
+read completely, that is also used by a live entry of the same series name
+(directories compared in one spelling:
+.I /vol/
+is
+.IR /vol ,
+.I ./ssd
+is
+.IR ssd ),
 or that holds names resembling the series that are not recognised btrbk
 snapshots; nor at a location whose newest snapshot of the series is dated
 more than a day after the retirement date (that date is wrong). Nothing of an
 entry is deleted while a path with its name exists on its mounted source
-volume, and nothing at all while the system clock reads before 2026\-01\-01
-(reported, exit 1). A clock that wrongly reads far in the future at expiry time
-is not detected and would expire retired series early; live subvolumes are
-never touched by expiry. Run by hand, it keeps every retired entry whose source
+volume, and nothing at all while the system clock reads before 2026\-01\-01,
+or more than 7 days after the newest backup run recorded in
+.BR \-\-db ,
+or while that database is there but cannot be read (reported, exit 1). With no
+database, or no run recorded in it, only the 2026 check applies. Live
+subvolumes are never touched by expiry. Run by hand, it keeps every retired entry whose source
 volume is not mounted. When the run's sync failed,
 .B backup\-run.sh
 runs this command with
@@ -1691,7 +1703,10 @@ runs this command with
 only. The entry leaves config.toml only once nothing remains to expire
 (never if it is the last entry, or its source sends to no target, and never
 on a dry run); a source left with no entries by that leaves with it. The
-search index is pruned of the deleted snapshots.
+search index is pruned of the deleted snapshots; a snapshot deleted from a
+primary target that had no index row at its path is named on an
+.B INDEX:
+line (not a failure).
 .PP
 Prints a
 .B "RETIRED SUBVOLUMES"

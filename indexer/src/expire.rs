@@ -184,7 +184,7 @@ pub struct ExpireOutcome {
     /// Why a fully expired entry could not be removed from the config.
     pub config_error: Option<String>,
     /// Why nothing was judged expired: the system clock cannot be trusted
-    /// (`caldate::untrusted_clock`). Set only when a retired entry exists.
+    /// (`caldate::untrusted_clock`, `caldate::clock_far_past_last_run`, or an index that cannot be read). Set only when a retired entry exists.
     pub clock_error: Option<String>,
 }
 

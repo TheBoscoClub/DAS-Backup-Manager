@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Expiry reads a source's targets and target directory from `btrbk_conf::source_targets` / `source_subdir`** (bd `DAS-Backup-Manager-12k`): the private copies in `expire.rs` are gone, so deletion cannot drift from what btrbk writes — boot archival's `subdirs_for_subvol` still searches every `target_subdirs` entry with no label fallback, now documented as deliberate
+
 - **`docs/DISASTER-RECOVERY-GUIDE.md`: a backed-up record of a repair still owed is history** (bd `DAS-Backup-Manager-9jrp`): a host's "rebuild pending" record, or a snapshot of the subvolume holding it, is never restored over a filesystem that still exists — the older copy can owe less than the live one and hide a debt; only onto a filesystem rebuilt from scratch, where the owning tool judges it, and that tool's own check is re-run after any rollback or restore
 
 - **The GUI backup's options are built by a tested library constructor** (bd `DAS-Backup-Manager-3npi`): the D-Bus helper's `BackupRun` built `BackupOptions` inside its zbus method, which no test reaches, so a regression passing `None` (every source, every target) for the GUI's tick lists would have gone unseen; it now calls `BackupOptions::from_gui`, whose test pins both lists as `Some` (an empty one refused by `empty_selection`, never widened to all) and each tick reaching its own step
@@ -51,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - An old `config.toml` carrying the key still loads: each occurrence is warned about by name (`... is no longer read: manual_only was removed ...`, `config::REMOVED_KEYS`), and the next save takes it out of every subvolume entry, changed or not (`surgical::drop_removed_keys`)
 
 ### Fixed
+
+- **Retired-subvolume expiry is more cautious in five more cases** (bd `DAS-Backup-Manager-12k`): each was a way a retired series' backups could go early
+  - A clock more than 7 days past the newest run in `backup_runs` (`caldate::MAX_DAYS_PAST_LAST_RUN`), or an index that is there but cannot be read, deletes nothing and fails the step with `NOTHING DELETED:` — a clock that jumped forward is no longer trusted; with no index, or no run in it, only the 2026 floor applies, as before
+  - The Shared guard compares directories in one spelling (`btrbk_conf::normalise_dir`): a live series in the same directory written `/vol/`, `./.btrbk-snapshots` or `./ssd` is no longer deleted as the retired one's
+  - Two retired entries whose series share one directory and name both wait for the later retirement date — the earlier one deleted the shared snapshots on its own date
+  - Source-side snapshots expire on the shortest window among the targets reached this run, not every configured one — an unattached short-window target no longer shortens the source copy's keep; none reached keeps them undated
+  - A snapshot deleted from a primary target that had no index row at its path is named on an `INDEX:` line of the RETIRED SUBVOLUMES section (`btrdasd subvol expire` and `btrdasd backup run`) — a stale row was left behind without a word; not a failure
 
 - **`btrdasd schedule set` refuses a time or schedule the next load would reject** (bd `DAS-Backup-Manager-t8u`): its own `--help` showed a systemd calendar for `--full` (`Sun *-*-* 04:00:00`), which validation rejects, and the command wrote it, leaving a `config.toml` every later load refused; `schedule::set_schedule` now checks the new values with `config::schedule_errors` first and changes nothing when one is wrong (CLI and the GUI's `ScheduleSet` alike), the help shows `"Day HH:MM"`, and `btrdasd(1)` no longer says the command does not validate
 
