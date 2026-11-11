@@ -3440,6 +3440,11 @@ A unit an older version wrote there as a regular file becomes that link at
 the next
 .BR "setup \-\-upgrade" ;
 a masked unit or a foreign link at the name refuses the install.
+The pair the helper writes to schedule an unattended recovery\-drive session
+.RI ( das\-recovery\-os\-update\-* )
+is written the same way, is in no manifest, and is moved by the same
+.B "setup \-\-upgrade"
+if an older version left it as regular files.
 .TP
 .I /etc/udev/rules.d/99\-das\-backup\-udisks\-ignore.rules
 Generated udev rule that hides the backup targets from udisks, matched on the

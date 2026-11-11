@@ -664,6 +664,11 @@ fn install_to_prefix(
         manifest_entries.push(full_path.to_string_lossy().to_string());
     }
 
+    // The helper's recovery-OS schedule units, written by an older version as
+    // regular files in systemd's directory, move over (they are in no
+    // manifest); the caller's daemon-reload follows.
+    migrate_schedule_units(&unit_dirs);
+
     // No `after_index` entry: no state conf. One a sync wrote earlier, or an
     // earlier setup, must not outlive the entry that justified it.
     let state_conf = buttered_dasd::btrbk_conf::state_conf_path(config);
@@ -749,13 +754,13 @@ pub fn uninstall(remove_db: bool, _held: &SetupLocks) -> Result<(), Box<dyn std:
 /// Where the helper writes the recovery-OS schedule units.
 const SCHEDULE_UNIT_DIR: &str = buttered_dasd::recovery_os::panel::UNIT_DIR;
 
-/// `uninstall` against an explicit config, manifest and directory of the
-/// recovery-OS schedule units (for testing).
+/// `uninstall` against an explicit config, manifest and systemd unit
+/// directory (for testing); the units directory comes from the config's path.
 fn uninstall_with(
     config_path: &Path,
     manifest_path: &Path,
     remove_db: bool,
-    unit_dir: &Path,
+    systemd_dir: &Path,
     systemctl: UnitRunner,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !manifest_path.exists() {
@@ -789,8 +794,17 @@ fn uninstall_with(
     for w in buttered_dasd::unit_links::retire(&SETUP_UNITS, systemctl) {
         eprintln!("Warning: {w}");
     }
-    for w in remove_schedule_units(unit_dir, systemctl) {
-        eprintln!("Warning: {w}");
+    match buttered_dasd::unit_links::units_dir(config_path) {
+        Ok(units) => {
+            let dirs = buttered_dasd::unit_links::UnitDirs {
+                systemd: systemd_dir,
+                units: &units,
+            };
+            for w in remove_schedule_units(&dirs, systemctl) {
+                eprintln!("Warning: {w}");
+            }
+        }
+        Err(e) => eprintln!("Warning: {e} — recovery-OS schedule units, if any, are LEFT BEHIND"),
     }
 
     let (removed, problems) = uninstall_from_manifest(manifest_path);
@@ -831,26 +845,27 @@ fn uninstall_with(
     Ok(())
 }
 
-/// Remove the recovery-OS schedule units the helper wrote in `unit_dir`
-/// (`das-recovery-os-update-*.{service,timer}`; they are in no manifest):
-/// `disable --now` each timer, then remove every such file. A schedule left
-/// behind would start a VM session from a script that is gone. Every failure
-/// is a warning, returned (without its `Warning: ` prefix) for the caller to print, as for the other units; the caller's daemon-reload follows.
-fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) -> Vec<String> {
-    let mut warnings: Vec<String> = Vec::new();
+/// The names of the recovery-OS schedule units (`das-recovery-os-update-*`
+/// `.service` and `.timer`) standing in `dir`, sorted. Where `dir` is
+/// missing there are none; one that cannot be listed is a warning, the units
+/// there left behind.
+fn schedule_unit_names_in(
+    dir: &Path,
+    found: &mut std::collections::BTreeSet<String>,
+) -> Vec<String> {
     use buttered_dasd::recovery_os::panel::UNIT_PREFIX;
-    let entries = match std::fs::read_dir(unit_dir) {
+    let mut warnings = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return warnings,
         Err(e) => {
             warnings.push(format!(
                 "could not list {} ({e}) — recovery-OS schedule units there, if any, are LEFT BEHIND",
-                unit_dir.display()
+                dir.display()
             ));
             return warnings;
         }
     };
-    let mut found: Vec<String> = Vec::new();
     for entry in entries {
         match entry {
             Ok(e) => {
@@ -858,29 +873,82 @@ fn remove_schedule_units(unit_dir: &Path, systemctl: UnitRunner) -> Vec<String> 
                 if name.starts_with(UNIT_PREFIX)
                     && (name.ends_with(".timer") || name.ends_with(".service"))
                 {
-                    found.push(name);
+                    found.insert(name);
                 }
             }
             Err(e) => warnings.push(format!(
                 "could not read an entry of {} ({e}) — a recovery-OS schedule unit may be LEFT BEHIND",
-                unit_dir.display()
+                dir.display()
             )),
         }
     }
-    found.sort();
-    for timer in found.iter().filter(|n| n.ends_with(".timer")) {
-        if let Err(e) = systemctl(&["disable", "--now", timer]) {
-            warnings.push(format!("{timer} may still be enabled: {e}"));
+    warnings
+}
+
+/// Remove the recovery-OS schedule units the helper wrote
+/// (`das-recovery-os-update-*.{service,timer}`; they are in no manifest),
+/// found in the units directory and in systemd's own, whichever layout they
+/// are in: each timer stopped, all disabled in one call without a reload
+/// ([`buttered_dasd::unit_links::retire`]), then each unit's files removed. A schedule left
+/// behind would start a VM session from a script that is gone. A unit whose
+/// name at systemd's is a link that is not its own (a masked one) is left
+/// alone and said so. Every failure is a warning, returned (without its
+/// `Warning: ` prefix) for the caller to print, as for the other units; the
+/// caller's daemon-reload follows.
+fn remove_schedule_units(
+    dirs: &buttered_dasd::unit_links::UnitDirs<'_>,
+    systemctl: UnitRunner,
+) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut warnings = schedule_unit_names_in(dirs.units, &mut found);
+    warnings.extend(schedule_unit_names_in(dirs.systemd, &mut found));
+    let mut ours: Vec<&str> = Vec::new();
+    for name in &found {
+        match buttered_dasd::unit_links::slot(dirs, name) {
+            Ok(_) => ours.push(name),
+            Err(e) => warnings.push(format!("{name} left in place: {e}")),
         }
     }
-    for name in &found {
-        let path = unit_dir.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => println!("Removed schedule unit: {}", path.display()),
-            Err(e) => warnings.push(format!("could not remove {}: {e}", path.display())),
+    warnings.extend(buttered_dasd::unit_links::retire(&ours, systemctl));
+    for name in ours {
+        match buttered_dasd::unit_links::remove_files(dirs, name) {
+            Ok(()) => println!("Removed schedule unit: {}", dirs.link(name).display()),
+            Err(e) => warnings.push(e),
         }
     }
     warnings
+}
+
+/// A recovery-OS schedule unit an older version left as a regular file in
+/// systemd's directory becomes the link to a file of the same text in the
+/// units directory, services before timers, so the helper's units are laid
+/// out like setup's own. Not in the manifest. One that cannot be moved —
+/// unreadable, or a name another project holds — is a warning and stays as it
+/// is. The caller reloads systemd.
+fn migrate_schedule_units(dirs: &buttered_dasd::unit_links::UnitDirs<'_>) {
+    let mut found = std::collections::BTreeSet::new();
+    for w in schedule_unit_names_in(dirs.systemd, &mut found) {
+        eprintln!("Warning: {w}");
+    }
+    let mut regular: Vec<&String> = found
+        .iter()
+        .filter(|n| {
+            matches!(
+                buttered_dasd::unit_links::slot(dirs, n),
+                Ok(buttered_dasd::unit_links::Slot::Regular)
+            )
+        })
+        .collect();
+    regular.sort_by_key(|n| (n.ends_with(".timer"), n.as_str()));
+    for name in regular {
+        let moved = std::fs::read_to_string(dirs.link(name))
+            .map_err(|e| format!("cannot read {}: {e}", dirs.link(name).display()))
+            .and_then(|text| buttered_dasd::unit_links::place(dirs, name, &text, None));
+        match moved {
+            Ok(()) => println!("Moved schedule unit into {}: {name}", dirs.units.display()),
+            Err(e) => eprintln!("Warning: schedule unit {name} left as it is: {e}"),
+        }
+    }
 }
 
 /// Create the parent directory of `db_path`, describing the failure instead of
@@ -3423,37 +3491,106 @@ auth = "starttls""#,
         );
     }
 
+    /// A schedule pair as the helper writes it now: files in the units
+    /// directory, systemd's names links to them; or as an older version wrote
+    /// it: regular files in systemd's directory.
+    fn write_schedule_pair(base: &Path, name: &str, linked: bool) -> [PathBuf; 2] {
+        let systemd = units_dir(base);
+        let own = base.join("etc/das-backup-units");
+        std::fs::create_dir_all(&systemd).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        ["service", "timer"].map(|suffix| {
+            let file = format!("{name}.{suffix}");
+            if linked {
+                std::fs::write(own.join(&file), "[Unit]\n").unwrap();
+                std::os::unix::fs::symlink(own.join(&file), systemd.join(&file)).unwrap();
+            } else {
+                std::fs::write(systemd.join(&file), "[Unit]\n").unwrap();
+            }
+            systemd.join(file)
+        })
+    }
+
     #[test]
-    fn uninstall_removes_schedule_units_it_finds() {
+    fn uninstall_retires_and_removes_a_schedule_pair_in_either_layout_and_leaves_another_projects_unit()
+     {
+        for linked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (config_path, manifest_path) =
+                install_config_into(&valid_config(dir.path()), dir.path());
+            let name = "das-recovery-os-update-both";
+            let pair = write_schedule_pair(dir.path(), name, linked);
+            let own = dir.path().join("etc/das-backup-units");
+            let other = units_dir(dir.path()).join("someone-elses.timer");
+            let other_own = own.join("someone-elses.service");
+            std::fs::write(&other, "[Unit]\n").unwrap();
+            std::fs::write(&other_own, "[Unit]\n").unwrap();
+            let systemctl = FakeSystemctl::new(&[]);
+
+            uninstall_with(
+                &config_path,
+                &manifest_path,
+                false,
+                &units_dir(dir.path()),
+                &|args| systemctl.run(args),
+            )
+            .unwrap();
+
+            // The pair is stopped, then disabled in one call without a
+            // reload, then (files gone) systemd is told once, last.
+            let mut expected: Vec<String> = UNINSTALL_UNIT_CALLS[..5]
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+            expected.push(format!("stop {name}.timer"));
+            expected.push(format!("--no-reload disable {name}.service {name}.timer"));
+            expected.push("daemon-reload".to_string());
+            assert_eq!(systemctl.calls(), expected, "linked={linked}");
+            for f in &pair {
+                assert!(
+                    std::fs::symlink_metadata(f).is_err(),
+                    "linked={linked}: {} was left",
+                    f.display()
+                );
+            }
+            for unit in ["service", "timer"] {
+                assert!(
+                    std::fs::symlink_metadata(own.join(format!("{name}.{unit}"))).is_err(),
+                    "linked={linked}: the file in the units directory was left"
+                );
+            }
+            assert!(other.exists(), "a unit this tool did not write survives");
+            assert!(other_own.exists(), "and so does its file");
+        }
+    }
+
+    #[test]
+    fn uninstall_leaves_a_masked_schedule_unit_alone_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let (config_path, manifest_path) =
             install_config_into(&valid_config(dir.path()), dir.path());
-        let units = units_dir(dir.path());
-        std::fs::create_dir_all(&units).unwrap();
-        let service = units.join("das-recovery-os-update-both.service");
-        let timer = units.join("das-recovery-os-update-both.timer");
-        let other = units.join("someone-elses.timer");
-        for f in [&service, &timer, &other] {
-            std::fs::write(f, "[Unit]\n").unwrap();
-        }
+        let masked = units_dir(dir.path()).join("das-recovery-os-update-x.timer");
+        std::os::unix::fs::symlink("/dev/null", &masked).unwrap();
         let systemctl = FakeSystemctl::new(&[]);
 
-        uninstall_with(&config_path, &manifest_path, false, &units, &|args| {
-            systemctl.run(args)
-        })
+        uninstall_with(
+            &config_path,
+            &manifest_path,
+            false,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
         .unwrap();
 
-        let calls = systemctl.calls();
-        assert!(
-            calls.contains(&"disable --now das-recovery-os-update-both.timer".to_string()),
-            "{calls:?}"
+        assert_eq!(
+            std::fs::read_link(&masked).unwrap(),
+            PathBuf::from("/dev/null")
         );
-        assert_eq!(calls.last().map(String::as_str), Some("daemon-reload"));
-        assert!(
-            !service.exists() && !timer.exists(),
-            "both schedule units are removed"
+        assert_eq!(
+            systemctl.calls(),
+            UNINSTALL_UNIT_CALLS,
+            "nothing asked of it"
         );
-        assert!(other.exists(), "a unit this tool did not write survives");
     }
 
     #[test]
@@ -3463,8 +3600,15 @@ auth = "starttls""#,
         let systemctl = FakeSystemctl::new(&[]);
         // Nothing to remove, nothing to say.
         let missing = dir.path().join("no-such-dir");
+        let units = dir.path().join("no-such-units");
         assert_eq!(
-            remove_schedule_units(&missing, &|a| systemctl.run(a)),
+            remove_schedule_units(
+                &buttered_dasd::unit_links::UnitDirs {
+                    systemd: &missing,
+                    units: &units,
+                },
+                &|a| systemctl.run(a)
+            ),
             Vec::<String>::new()
         );
         // A directory that cannot be listed may hide a schedule that would
@@ -3479,7 +3623,13 @@ auth = "starttls""#,
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable = std::fs::read_dir(&locked).is_err();
-        let warnings = remove_schedule_units(&locked, &|a| systemctl.run(a));
+        let warnings = remove_schedule_units(
+            &buttered_dasd::unit_links::UnitDirs {
+                systemd: &locked,
+                units: &units,
+            },
+            &|a| systemctl.run(a),
+        );
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             unreadable,
@@ -3491,6 +3641,49 @@ auth = "starttls""#,
             "{warnings:?}"
         );
         assert!(systemctl.calls().is_empty(), "{:?}", systemctl.calls());
+    }
+
+    #[test]
+    fn a_schedule_pair_an_older_version_left_as_regular_files_becomes_links_on_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd = units_dir(dir.path());
+        let own = dir.path().join("etc/das-backup-units");
+        let name = "das-recovery-os-update-both";
+        let pair = write_schedule_pair(dir.path(), name, false);
+        std::fs::write(&pair[0], "[Service]\nExecStart=/x\n").unwrap();
+        std::fs::write(&pair[1], "[Timer]\nOnCalendar=2026-01-01\n").unwrap();
+        // Not ours to move: another project's unit, a masked schedule unit.
+        let other = systemd.join("someone-elses.timer");
+        std::fs::write(&other, "[Timer]\n").unwrap();
+        let masked = systemd.join("das-recovery-os-update-masked.timer");
+        std::os::unix::fs::symlink("/dev/null", &masked).unwrap();
+
+        let (_, manifest_path) = install_into(dir.path());
+
+        for (f, text) in [
+            (&pair[0], "[Service]\nExecStart=/x\n"),
+            (&pair[1], "[Timer]\nOnCalendar=2026-01-01\n"),
+        ] {
+            let file = own.join(f.file_name().unwrap());
+            assert_eq!(std::fs::read_link(f).unwrap(), file, "systemd's name");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+            assert!(file.is_file() && !file.is_symlink());
+        }
+        // Not in the manifest: the helper's, not setup's.
+        let manifest = manifest_lines(&manifest_path).join("\n");
+        assert!(!manifest.contains("recovery-os-update"), "{manifest}");
+        assert!(other.is_file() && !other.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&masked).unwrap(),
+            PathBuf::from("/dev/null"),
+            "a unit that cannot be migrated is left as it is"
+        );
+        // Again: still the links, nothing changed.
+        install_into(dir.path());
+        assert_eq!(
+            std::fs::read_link(&pair[1]).unwrap(),
+            own.join(pair[1].file_name().unwrap())
+        );
     }
 
     #[test]

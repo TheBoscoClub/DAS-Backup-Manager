@@ -519,6 +519,8 @@ unit differently from a file in its own directory (systemd 262, observed):
   anything is written. Drop-ins stay in `/etc/systemd/system/<unit>.d` and `/run/systemd/system/<unit>.d`;
   one inside the units directory is not read.
 
+The recovery-OS schedule units the helper writes (`das-recovery-os-update-<label|both>.{service,timer}`, in no manifest) are placed the same way, through `unit_links` only: a file each in the units directory, systemd's name the link. The helper's set refuses a masked or foreign link before it writes or asks anything of systemd, and its undo and clear stop the timer, disable the pair in one `--no-reload` call, remove both units' files and links, then reload. `setup --upgrade` moves a pair an older version left as regular files; `setup --uninstall` retires and removes a pair in either layout.
+
 The manifest lists each unit's file and its link. They are the only copies: CMake installs
 just `btrdasd-helper.service`. Until bd `DAS-Backup-Manager-7rf` it also installed its own
 `das-backup{,-full}.{service,timer}` under `<prefix>/lib/systemd/system` — a second writer of the
