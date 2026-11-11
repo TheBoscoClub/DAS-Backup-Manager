@@ -1921,7 +1921,8 @@ pub fn boot_plan_line(item: &BootPlanItem) -> Result<String, String> {
 /// The target directories a given boot subvolume's snapshots live under: for
 /// each source listing it, the directory btrbk writes
 /// ([`btrbk_conf::source_subdir`] — the first `target_subdirs` entry, else the
-/// source label). A later entry is never searched: btrbk does not write there,
+/// source label). It is searched on every non-mirror target, whatever the
+/// source's `target_labels` (a target it does not send to holds no series). A later entry is never searched: btrbk does not write there,
 /// so a snapshot found there is an old series, never the one to rebuild `@`
 /// from (bd DAS-Backup-Manager-5237.11). Empty only when no source lists the
 /// subvolume.

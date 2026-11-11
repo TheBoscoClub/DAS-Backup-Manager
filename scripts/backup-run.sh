@@ -2706,7 +2706,7 @@ update_boot_subvolumes() {
 
     log_info "Updating stable boot subvolumes..."
 
-    # The plan — which subvolumes, their snapshot_name and target_subdirs — is
+    # The plan — which subvolumes, their snapshot_name and target directory — is
     # `btrdasd backup boot-plan`'s answer, read ONCE: the same answer the Rust
     # step reads, from btrbk.conf, so the two cannot name different snapshots.
     # Its status travels inside its own capture (bash returns 0 and an empty
