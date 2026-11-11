@@ -533,6 +533,46 @@ mod tests {
         assert!(calls.seen.borrow().is_empty());
     }
 
+    /// A path that cannot be examined is never "nothing there": each lookup
+    /// tells "not found" from any other failure. Here the failure is
+    /// ENOTDIR, a directory on the way that is a regular file.
+    #[test]
+    fn a_path_that_cannot_be_examined_is_refused_never_read_as_absent() {
+        let t = Tree::new();
+        let not_a_dir = t.systemd.join("plain");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        // systemd's directory unreadable: no slot, nothing placed or removed.
+        let blind = UnitDirs {
+            systemd: &not_a_dir,
+            units: &t.units,
+        };
+        let err = slot(&blind, "das-x.timer").unwrap_err();
+        assert!(err.contains("cannot examine"), "{err}");
+        assert!(place(&blind, "das-x.timer", "text\n", None).is_err());
+        assert!(!t.units.exists(), "nothing was written");
+        // The units directory unreadable: the unit's own file is not writable,
+        // and removing it is an error, not "already gone".
+        let blind = UnitDirs {
+            systemd: &t.systemd,
+            units: &not_a_dir,
+        };
+        let err = placeable(&blind, "das-x.timer").unwrap_err();
+        assert!(err.contains("cannot examine"), "{err}");
+        let err = remove_files(&blind, "das-x.timer").unwrap_err();
+        assert!(err.contains("could not be removed"), "{err}");
+    }
+
+    /// Linking again needs a regular file to link to: a directory where the
+    /// unit's file belongs is not one.
+    #[test]
+    fn linking_again_refuses_a_non_file_where_the_units_file_belongs() {
+        let t = Tree::new();
+        std::fs::create_dir_all(t.units.join("das-x.timer")).unwrap();
+        let err = link(&t.dirs(), "das-x.timer").unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(slot(&t.dirs(), "das-x.timer"), Ok(Slot::Absent));
+    }
+
     #[test]
     fn removing_a_unit_takes_its_file_and_its_link_or_its_old_regular_file() {
         let t = Tree::new();

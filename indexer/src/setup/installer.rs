@@ -2990,6 +2990,25 @@ auth = "starttls""#,
         "das-backup-doctor.timer",
     ];
 
+    /// Only a file directly in systemd's directory is a unit: not the
+    /// directory itself, nothing below it, nothing elsewhere.
+    #[test]
+    fn a_generated_path_is_a_unit_only_directly_in_systemds_directory() {
+        assert_eq!(
+            systemd_unit_name("/etc/systemd/system/das-backup.timer"),
+            Some("das-backup.timer")
+        );
+        for not_a_unit in [
+            "/etc/systemd/system/",
+            "/etc/systemd/system",
+            "/etc/systemd/system/das-backup.service.d/x.conf",
+            "/etc/systemd/systemx/das-backup.timer",
+            "/etc/btrbk/btrbk.conf",
+        ] {
+            assert_eq!(systemd_unit_name(not_a_unit), None, "{not_a_unit}");
+        }
+    }
+
     /// bd 5237.7: the units are files in a directory of their own; systemd's
     /// names for them are links to those files; the manifest holds both.
     #[test]
