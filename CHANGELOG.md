@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`docs/DISASTER-RECOVERY-GUIDE.md`: a backed-up record of a repair still owed is history** (bd `DAS-Backup-Manager-9jrp`): a host's "rebuild pending" record, or a snapshot of the subvolume holding it, is never restored over a filesystem that still exists — the older copy can owe less than the live one and hide a debt; only onto a filesystem rebuilt from scratch, where the owning tool judges it, and that tool's own check is re-run after any rollback or restore
+
 - **The GUI backup's options are built by a tested library constructor** (bd `DAS-Backup-Manager-3npi`): the D-Bus helper's `BackupRun` built `BackupOptions` inside its zbus method, which no test reaches, so a regression passing `None` (every source, every target) for the GUI's tick lists would have gone unseen; it now calls `BackupOptions::from_gui`, whose test pins both lists as `Some` (an empty one refused by `empty_selection`, never widened to all) and each tick reaching its own step
 
 - **`backup snapshot` and `backup send` run through one tested library step** (bd `DAS-Backup-Manager-r1tr`): the CLI arms each did locks, mount sources, sync, mount targets, the step and the unmount inline, so deleting the send arm's sync left every test green; both now call `backup::run_manual_step` on `BackupJobHost` (new `sync_manual`, `snapshot` and `send` steps), whose tests pin the order, that a failed sync reaches no step and still releases the sources, and that a declined lock does nothing

@@ -1186,6 +1186,12 @@ sudo umount /mnt/snapshot /mnt/target
 - Boot entries in `/boot/loader/entries/` — root UUID must be correct
 - Regenerate initramfs, with the ESP mounted inside the restored root first — where `/boot` is the ESP (as on many systems), skipping the mount writes the initramfs into the subvolume's own `/boot` directory, which the bootloader never reads. Method 1 (`/mnt/target` is the top level): `sudo mount LABEL=EFI /mnt/target/@/boot && sudo arch-chroot /mnt/target/@ mkinitcpio -P`. Method 2 (with the target mounted again): `sudo mount LABEL=EFI /mnt/target/boot && sudo arch-chroot /mnt/target mkinitcpio -P`. Use your primary ESP's label; unmount it before unmounting the target
 
+**A backed-up record of a repair still owed is history, never state to put back.** Some hosts keep a record on disk that a filesystem still owes work — for example a "rebuild pending" record that a degraded BTRFS RAID-1 must be rebuilt and scrubbed — often in a subvolume of its own, which this tool then backs up like any other:
+
+- Never restore such a record, or a snapshot of the subvolume that holds it, over a filesystem that still exists. The copy is older than the live record, so it can owe less than the live one does: putting it back can hide a debt the host has not paid
+- Restoring it makes sense only onto a filesystem rebuilt from scratch, and then the tool that owns the record decides what is still owed — never the restore
+- After any rollback or restore on such a host, re-run the owning tool's own install or check step so its live record is rebuilt from the filesystem's real state
+
 ### Restoring from a recovery drive's own copy
 
 A recovery drive holds its own short window of the snapshots (see [Where Each Backup Lives on a Target](#where-each-backup-lives-on-a-target)). When the host is gone and you boot a recovery drive, the primary pair may not be attached; restore from what this drive holds.
