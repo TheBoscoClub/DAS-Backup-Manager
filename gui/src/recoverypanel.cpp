@@ -92,6 +92,14 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
             refresh();
         rederive();
     });
+    // No helper: the session call was never made, so the request is over
+    // too (bd DAS-Backup-Manager-qxxv); helperUnavailable already said why.
+    connect(m_client, &DBusClient::callDropped, this, [this](const QString &op) {
+        if (op == Operation) {
+            m_jobRequested = false;
+            rederive();
+        }
+    });
 
     if (!m_client->isAvailable()) {
         m_parseError = m_client->unavailableReason();
