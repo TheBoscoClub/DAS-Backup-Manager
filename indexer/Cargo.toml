@@ -33,9 +33,10 @@ clap_complete = "4"
 walkdir = "2.5"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-toml = { version = "1.1", features = ["preserve_order"] }  # key order kept: a key the surgical save inserts is written in field order
-# Surgical config.toml writes: keys this binary does not know, and comments,
-# survive every save (bd DAS-Backup-Manager-28il).
+toml = { version = "1.1", features = ["preserve_order"] }  # key order kept: a key a config save inserts is written in field order
+# config.toml saves are byte splices at the spans toml_edit's Document keeps:
+# keys this binary does not know, comments and layout survive every save (bd
+# DAS-Backup-Manager-28il, DAS-Backup-Manager-5237.4).
 toml_edit = "0.25"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"

@@ -899,7 +899,7 @@ fn relay_reachable(config: &Config) -> bool {
 /// place (bd DAS-Backup-Manager-28il). A key the file leaves out takes the
 /// running binary's compiled default, so a default change reaches an existing
 /// host for such a key — except the keys that decide what is backed up, where
-/// and for how long (`surgical::PINNED` in `config.rs`, and each subvolume
+/// and for how long (`splice::PINNED` in `config.rs`, and each subvolume
 /// entry's snapshot name): every save writes those out with their current
 /// values. A default change to one of them therefore reaches only a file no
 /// pinning version (this one or later) has saved yet — a fresh install, or a
