@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI's backup history reaches older runs** (bd `DAS-Backup-Manager-5237.5`): the view asked the helper for the newest 50 runs and offered nothing older, so the 52nd newest — the last run with unknown counts, checked on 2026-11-09 — could not be shown; a **Load older runs** button now asks for 50 more each time, and is greyed out once the helper returns fewer than asked (there are no older ones). The table opens wide enough for every column before Errors, where it could open showing only the timestamp
+
 - **`btrdasd setup` refuses contradictory flags instead of dropping one** (bd `DAS-Backup-Manager-pz6`): two modes at once (`--uninstall --uninstall-all`, `--check --upgrade`, `--modify --upgrade`, …) ran one and silently ignored the other, and `--force --modify` ran a forced install, skipping the wizard `--modify` asked for; clap now refuses each (exit 2) before anything runs. `--force` beside `--upgrade`, `--uninstall`, `--uninstall-all` or `--check` stays, meaning that mode without prompts, as `docs/INSTALL.md` shows
   - `setup`'s dependency check searches `PATH` itself for each tool, where it ran `which`: a host without a `which` binary reported every dependency missing
 

@@ -276,6 +276,44 @@ private Q_SLOTS:
         QVERIFY(!BackupHistoryView::countFromJson(QJsonValue(QStringLiteral("5"))).has_value());
     }
 
+    // The view asked for the newest 50 runs and nothing older could be shown
+    // (bd DAS-Backup-Manager-5237.5): a full page offers the older runs, a short
+    // one says there are none, and each request asks for 50 more. The counts
+    // columns fit without widening the view by hand.
+    void historyLoadsOlderRunsOnRequest()
+    {
+        DBusClient client;
+        BackupHistoryView view(&client);
+        const auto page = [](int n) {
+            QStringList rows;
+            for (int i = 0; i < n; ++i)
+                rows << QStringLiteral(R"({"id": %1, "timestamp": %2, "mode": "incremental",
+                    "success": true, "duration_secs": 60, "snaps_created": 1,
+                    "snaps_sent": 1, "bytes_sent": 1, "errors": []})")
+                            .arg(1000 - i)
+                            .arg(1791000000 - i * 86400);
+            return QStringLiteral("[%1]").arg(rows.join(QLatin1Char(',')));
+        };
+        auto *older = view.findChild<QPushButton *>(QStringLiteral("loadOlderRuns"));
+        QVERIFY2(older != nullptr, "no way to reach older runs");
+        QVERIFY(!older->toolTip().isEmpty());
+        QCOMPARE(view.property("historyLimit").toLongLong(), qint64(50));
+        view.showHistory(page(50));
+        QVERIFY2(older->isEnabled(), "a full page may have older runs");
+        view.showHistory(page(3));
+        QVERIFY2(!older->isEnabled(), "a short page is everything there is");
+        view.showHistory(page(50));
+        older->click();
+        QCOMPARE(view.property("historyLimit").toLongLong(), qint64(100));
+
+        const auto *table = view.findChild<QTableView *>();
+        QVERIFY(table != nullptr);
+        int counts = 0;
+        for (int c = 0; c + 1 < table->model()->columnCount(); ++c)
+            counts += table->columnWidth(c);
+        QVERIFY2(table->minimumWidth() >= counts, "the count columns are cut off");
+    }
+
     void historyShowsAnUnknownCountAsUnknown()
     {
         DBusClient client;
