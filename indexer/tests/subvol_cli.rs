@@ -82,6 +82,28 @@ fn btrdasd_with_lock(args: &[&str], lock: &Path) -> std::process::Output {
         .expect("spawn btrdasd")
 }
 
+/// `backup boot-archive` refuses a bad boot input before it takes a lock or
+/// mounts a target (bd DAS-Backup-Manager-2jkw): run unprivileged, it fails on
+/// the input, never on `/run/das-backup.lock`.
+#[test]
+fn boot_archive_refuses_bad_boot_input_before_taking_any_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[boot]\nenabled = true\nsubvolumes = [\"..\"]\n");
+    std::fs::write(&config, text).unwrap();
+    let out = btrdasd(&[
+        "backup",
+        "boot-archive",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("'.' or '..'"), "{err}");
+    assert!(!err.contains("lock"), "reached the locks: {err}");
+}
+
 /// While a backup or setup holds the singleton, `subvol add`, `subvol remove`
 /// and `schedule set` refuse with 75, saying so, and read and write nothing;
 /// once it is let go the same edit goes through (bd DAS-Backup-Manager-olyo).

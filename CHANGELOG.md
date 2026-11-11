@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd backup boot-archive` refuses bad boot input before it takes a lock or mounts a target** (bd `DAS-Backup-Manager-2jkw`): it took both locks and mounted every target before the boot step refused a repeated or `.`/`..` `[boot].subvolumes` entry or a repeated target label or mount, then unmounted again; it now refuses first, exit 1 (could not start), nothing mounted. A target mount is compared as one directory however it is spelled (`/mnt/t` and `/mnt/t/` were two)
+
 - **A `config.toml` that was replaced but whose directory could not be flushed no longer has its `btrbk.conf` rolled back** (bd `DAS-Backup-Manager-akh`): `write_atomic` reports that case as an error although the new file is in place, and the two writers that save `config.toml` after the `btrbk.conf` files it renders to (`subvol sync`'s adopt/retire save and `save_config_and_btrbk_conf`) then put the old `btrbk.conf` back, leaving the two files disagreeing until the next sync; the error now carries a marker (`fsutil::ReplacedNotFlushed`, `fsutil::was_replaced`), both writers still report it and keep the `btrbk.conf` that matches the `config.toml` that stands
 
 - **A CLI/GUI job that finds a target already mounted elsewhere says its mount options were not applied** (bd `DAS-Backup-Manager-804`): it bind-mounts that mount at the configured path, which takes it as the other program made it, so `[das].mount_opts` (`degraded`, `compress`, …) silently did not apply; the job now logs a WARN naming the options and the other mount point

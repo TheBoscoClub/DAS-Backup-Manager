@@ -2856,7 +2856,9 @@ impl Config {
                     tgt.label
                 ));
             }
-            if !mounts.insert(tgt.mount.as_str()) {
+            // Compared as one directory however it is spelled ('/mnt/t',
+            // '/mnt/t/'): bd DAS-Backup-Manager-2jkw.
+            if !mounts.insert(crate::btrbk_conf::normalise_dir(&tgt.mount)) {
                 errors.push(format!(
                     "Target mount '{}' is used by more than one [[target]] — mounts must be unique",
                     tgt.mount
@@ -3917,6 +3919,17 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("mount '/mnt/t'"), "{errors:?}");
         assert_eq!(cfg.validate(), errors);
+        // One mount spelled two ways is still one mount (bd 2jkw item 2).
+        let slashed = second.replace("mount = \"/mnt/t\"", "mount = \"/mnt/t/\"");
+        assert_ne!(slashed, second, "fixture must spell the mount differently");
+        let extra = format!(
+            "{}{ONE_TARGET}{slashed}",
+            source_with("s", "/vol", &[("a", None)])
+        );
+        let errors = Config::from_toml(&minimal_toml(&extra))
+            .unwrap()
+            .boot_input_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
         for bad in [".", "..", "a/../b", "./a"] {
             let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a", None)]));
             let mut cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();

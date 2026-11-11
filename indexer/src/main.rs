@@ -2578,6 +2578,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;
+                // Bad boot input refuses before any lock or mount: nothing to
+                // take back, and 1, "could not start" (bd
+                // DAS-Backup-Manager-2jkw). `archive_boot` checks it again.
+                // Disabled is checked first there too: then nothing is done.
+                let bad = if cfg.boot.enabled {
+                    cfg.boot_input_errors()
+                } else {
+                    Vec::new()
+                };
+                if !bad.is_empty() {
+                    for e in &bad {
+                        eprintln!("Error: {e}");
+                    }
+                    std::process::exit(1);
+                }
                 let progress = CliProgress;
                 // Manual backups mount and unmount the DAS filesystems, so they
                 // join the same interlock as the scheduled path (bd DAS-Backup-Manager-pe6).
