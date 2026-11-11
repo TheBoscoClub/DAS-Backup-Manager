@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`DAS_TARGET_<n>_RETENTION_{DAILY,WEEKLY,MONTHLY,YEARLY}` from `btrdasd config dump-env`** (bd `DAS-Backup-Manager-9yj`): exported since 2026-02-21 and read by nothing — retention reaches btrbk through the rendered `btrbk.conf`, and the one retention a script reads, `DAS_BOOT_ARCHIVE_RETENTION_DAYS`, is still exported
+
 - **`manual_only`, `btrdasd subvol set-manual` / `set-auto` and `subvol add --manual-only`** (bd `DAS-Backup-Manager-9ry`, operator 2026-11-09): the flag was accepted and almost ignored — `btrbk.conf` rendering and `backup-run.sh` never read it, so it kept nothing out of the nightly backup, and only a CLI/GUI run naming no source skipped a source whose every entry carried it
   - A run naming no source now backs up every source, as the nightly run always did; a configuration with no source at all is refused, never handed to btrbk as "no filter"
   - The D-Bus helper's `SubvolSetManual` and the GUI client's unused `subvolSetManual` are gone; adoption no longer copies the flag; `subvol list` drops its `Schedule` column and its JSON the `manual_only` field

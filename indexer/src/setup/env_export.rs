@@ -142,17 +142,6 @@ pub fn dump_env(config: &Config) -> String {
         if !tgt.display_name.is_empty() {
             out.push_str(&kv(&format!("{p}_DISPLAY_NAME"), &tgt.display_name));
         }
-        out.push_str(&format!("{p}_RETENTION_WEEKLY={}\n", tgt.retention.weekly));
-        out.push_str(&format!(
-            "{p}_RETENTION_MONTHLY={}\n",
-            tgt.retention.monthly
-        ));
-        if tgt.retention.daily > 0 {
-            out.push_str(&format!("{p}_RETENTION_DAILY={}\n", tgt.retention.daily));
-        }
-        if tgt.retention.yearly > 0 {
-            out.push_str(&format!("{p}_RETENTION_YEARLY={}\n", tgt.retention.yearly));
-        }
     }
 
     // Convenience: serial map and all target mounts.
@@ -325,8 +314,6 @@ mod tests {
         assert!(output.contains("DAS_TARGET_0_MOUNT='/mnt/backup-22tb'"));
         assert!(output.contains("DAS_TARGET_0_ROLE='primary'"));
         assert!(output.contains("DAS_TARGET_0_DISPLAY_NAME='22TB Primary (Bay 2)'"));
-        assert!(output.contains("DAS_TARGET_0_RETENTION_DAILY=365"));
-        assert!(output.contains("DAS_TARGET_0_RETENTION_YEARLY=4"));
         assert!(output.contains("DAS_TARGET_1_LABEL='system-recovery-B-2tb'"));
         assert!(output.contains("DAS_TARGET_1_SERIALS='SERIAL02'"));
         // mount_uuid not set on the 2tb recovery copy — emits empty string
@@ -417,24 +404,20 @@ mod tests {
         assert!(dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER='recovery'\n"));
     }
 
-    /// A retention of 0 means "not configured", and the key is left out so a
-    /// consumer's `${VAR:-default}` applies. 1 is a real setting and must be
-    /// exported — the boundary between the two is exactly 0.
+    /// Retention reaches btrbk through the rendered btrbk.conf; no script reads
+    /// it from the environment, so none is exported (bd DAS-Backup-Manager-9yj).
     #[test]
-    fn dump_env_omits_unset_daily_and_yearly_retention() {
+    fn dump_env_exports_no_per_target_retention() {
         let mut config = test_config();
-        let output = dump_env(&config);
-        // Target 1 has daily = 0 and yearly = 0.
-        assert!(!output.contains("DAS_TARGET_1_RETENTION_DAILY"));
-        assert!(!output.contains("DAS_TARGET_1_RETENTION_YEARLY"));
-        // Weekly and monthly are unconditional.
-        assert!(output.contains("DAS_TARGET_1_RETENTION_WEEKLY=4\n"));
-        assert!(output.contains("DAS_TARGET_1_RETENTION_MONTHLY=2\n"));
-
         config.targets[1].retention.daily = 1;
         config.targets[1].retention.yearly = 1;
         let output = dump_env(&config);
-        assert!(output.contains("DAS_TARGET_1_RETENTION_DAILY=1\n"));
-        assert!(output.contains("DAS_TARGET_1_RETENTION_YEARLY=1\n"));
+        assert!(output.contains("DAS_TARGET_1_LABEL="));
+        assert!(
+            !output
+                .lines()
+                .any(|l| l.starts_with("DAS_TARGET_") && l.contains("_RETENTION_")),
+            "{output}"
+        );
     }
 }
