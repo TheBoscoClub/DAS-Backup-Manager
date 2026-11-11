@@ -919,177 +919,1366 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Surgical edits of config.toml (bd DAS-Backup-Manager-28il)
+// Config saves as byte splices on config.toml (bd DAS-Backup-Manager-28il,
+// DAS-Backup-Manager-5237.4)
 // ---------------------------------------------------------------------------
 
-/// The document edits behind [`Config::save`]: `old` is what this binary
-/// knows of the file (its own serialisation of what it loaded), `new` what it
-/// is saving. Rules: `Config::edited_into_with`.
-mod surgical {
-    use toml_edit::{ArrayOfTables, Item, Table, TableLike, Value};
+/// The edits behind [`Config::save`]. The file is parsed with spans kept
+/// (`toml_edit::Document`), `old` (what this binary knows of the file: its own
+/// serialisation of what it loaded) is compared with `new` (what it saves), and
+/// every difference becomes a splice on the ORIGINAL text: a value's bytes
+/// replaced, a line or an element's text taken out, new text put in. Bytes
+/// outside a splice are copied as they are, so nothing a save does not mean to
+/// change can move or change. Rules: `Config::edited_into_with`.
+///
+/// Text is only ever looked into between the parser's spans (where TOML allows
+/// nothing but spacing, commas, line ends and comments) or inside a decor span
+/// (spacing and comments only): a comma or `#` inside a string is never seen.
+mod splice {
+    use std::ops::Range;
+    use toml_edit::{Array, ArrayOfTables, InlineTable, Item, Table, TableLike, Value};
 
-    /// Apply `new` onto `doc`, where `old` is what this binary knew of `doc`.
-    /// Sets `reordered` when an array of tables kept elements in a new order.
-    pub(super) fn merge_table(
-        doc: &mut dyn TableLike,
+    /// The bytes `at` of the original text replaced by `text` (an insertion
+    /// when `at` is empty, a deletion when `text` is).
+    #[derive(Debug, Clone)]
+    pub(super) struct Edit {
+        at: Range<usize>,
+        text: String,
+    }
+
+    /// Where a walk is in the config: `warn` names elements by their index
+    /// in the file (`source[1].subvolumes[0]`), `schema` with `*` for every
+    /// element (`source.*.subvolumes`), `header` is the header path a new
+    /// table here would be written under (`source.subvolumes`).
+    #[derive(Clone, Default)]
+    struct At {
+        warn: String,
+        schema: Vec<String>,
+        header: Vec<String>,
+    }
+
+    impl At {
+        fn key(&self, k: &str) -> At {
+            At {
+                warn: match self.warn.is_empty() {
+                    true => k.to_string(),
+                    false => format!("{}.{k}", self.warn),
+                },
+                schema: self.schema.iter().cloned().chain([k.to_string()]).collect(),
+                header: self.header.iter().cloned().chain([key_repr(k)]).collect(),
+            }
+        }
+
+        fn element(&self, i: usize) -> At {
+            At {
+                warn: format!("{}[{i}]", self.warn),
+                schema: self
+                    .schema
+                    .iter()
+                    .cloned()
+                    .chain(["*".to_string()])
+                    .collect(),
+                header: self.header.clone(),
+            }
+        }
+
+        fn schema_with<'a>(&'a self, k: &'a str) -> Vec<&'a str> {
+            self.schema.iter().map(String::as_str).chain([k]).collect()
+        }
+    }
+
+    fn key_repr(k: &str) -> String {
+        toml_edit::Key::new(k).to_string()
+    }
+
+    /// An entry of an inline table or array: its text `start..end` (an inline
+    /// table's from its first key, dotted or not, to its value's end), its
+    /// dotted key path (inline tables), the comma after it on its line, and
+    /// the shape of its line.
+    #[derive(Debug, Clone)]
+    struct Entry {
+        start: usize,
+        end: usize,
+        path: Vec<String>,
+        comma: Option<usize>,
+        /// The content end of its line, when nothing but a comma, spacing
+        /// and a comment follows it there.
+        last_on_line: Option<usize>,
+        first_on_line: bool,
+    }
+
+    /// The pending edits of one inline table or array: entries removed,
+    /// entries appended (their text), moves. Turned into splices once
+    /// everything inside it was walked ([`Plan::finish_seq`]).
+    struct Seq {
+        span: Range<usize>,
+        inline: bool,
+        entries: Vec<Entry>,
+        removed: Vec<bool>,
+        appended: Vec<String>,
+    }
+
+    /// What a table's keys live in: the lines of a `[table]` body (the root,
+    /// a `[header]` table, an `[[array]]` element), or an inline table.
+    enum Cont<'a> {
+        Body(&'a Table),
+        Seq(Seq),
+    }
+
+    pub(super) struct Plan<'r> {
+        raw: &'r str,
+        edits: Vec<Edit>,
+        pub(super) warnings: Vec<String>,
+        /// Where every comment of the file starts (its `#`), sorted.
+        comments: Vec<usize>,
+        /// Where every table header of the file starts, sorted.
+        headers: Vec<usize>,
+        /// Set when an edit could not be placed: the save is refused.
+        pub(super) unplaceable: Vec<String>,
+        /// A section was already written at the end of the file.
+        appended_at_end: bool,
+    }
+
+    /// The splices that turn `doc` (parsed from `raw`) from `old` into `new`.
+    pub(super) fn plan<'r>(
+        raw: &'r str,
+        doc: &'r toml_edit::Document<&'r str>,
         old: &toml::Table,
         new: &toml::Table,
-        reordered: &mut bool,
-    ) {
-        for (key, nv) in new {
-            let ov = old.get(key);
-            match doc.get_mut(key) {
-                Some(item) => {
-                    let was_value = item.is_value();
-                    match ov {
-                        Some(ov) if ov == nv => {}
-                        Some(ov) => merge_item(item, ov, nv, reordered),
-                        None => replace(item, nv),
-                    }
-                    // A `[[header]]` turned into `key = []` (or back) needs
-                    // the spacing of its new kind.
-                    if item.is_value() != was_value
-                        && let Some(mut k) = doc.key_mut(key)
-                    {
-                        k.fmt();
-                    }
+    ) -> Plan<'r> {
+        let mut p = Plan {
+            raw,
+            edits: Vec::new(),
+            warnings: Vec::new(),
+            comments: Vec::new(),
+            headers: Vec::new(),
+            unplaceable: Vec::new(),
+            appended_at_end: false,
+        };
+        p.index(doc);
+        let root = doc.as_table();
+        let mut cont = Cont::Body(root);
+        p.merge_table(&mut cont, &[], root, old, new, &At::default());
+        p
+    }
+
+    impl<'r> Plan<'r> {
+        // -- reading the original text ------------------------------------
+
+        fn bom(&self) -> usize {
+            if self.raw.starts_with('\u{feff}') {
+                3
+            } else {
+                0
+            }
+        }
+
+        fn line_start(&self, p: usize) -> usize {
+            self.raw[..p]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0)
+                .max(self.bom().min(p))
+        }
+
+        /// The content end of the line holding `p` and the start of the next
+        /// (both the text's end on a last line without a line end).
+        fn line_end(&self, p: usize) -> (usize, usize) {
+            match self.raw[p..].find('\n') {
+                Some(i) => {
+                    let nl = p + i;
+                    let ce = if nl > p && self.raw.as_bytes()[nl - 1] == b'\r' {
+                        nl - 1
+                    } else {
+                        nl
+                    };
+                    (ce, nl + 1)
                 }
-                // Omitted, and the default it stands for is unchanged.
-                None if ov == Some(nv) => {}
-                None => insert_key(doc, key, fresh_item(nv)),
+                None => (self.raw.len(), self.raw.len()),
             }
         }
-        for key in old.keys() {
-            if !new.contains_key(key) {
-                remove_key(doc, key);
-            }
-        }
-        // A legacy key this binary reads but never writes goes when the key it
-        // feeds changes: kept, it is stale, and it may override the change.
-        for (legacy, fed) in LEGACY_KEYS {
-            if old.get(*fed) != new.get(*fed) {
-                remove_key(doc, legacy);
-            }
-        }
-    }
 
-    /// The part of a value's suffix past its own line: a comment block
-    /// [`attach_trailing_comments`] hung on a table's last line, or the
-    /// spacing before an inline table's `}`. Taken off the value.
-    fn take_tail(v: &mut Value) -> String {
-        let s = suffix(v.decor());
-        let keep = if s.trim().is_empty() {
-            0
-        } else {
-            s.find('\n').unwrap_or(s.len())
-        };
-        if keep == s.len() {
-            return String::new();
-        }
-        v.decor_mut().set_suffix(s[..keep].to_string());
-        s[keep..].to_string()
-    }
-
-    fn suffix(decor: &toml_edit::Decor) -> String {
-        decor
-            .suffix()
-            .and_then(toml_edit::RawString::as_str)
-            .unwrap_or("")
-            .to_string()
-    }
-
-    fn prefix(decor: &toml_edit::Decor) -> String {
-        decor
-            .prefix()
-            .and_then(toml_edit::RawString::as_str)
-            .unwrap_or("")
-            .to_string()
-    }
-
-    fn append_suffix(v: &mut Value, tail: &str) {
-        let s = suffix(v.decor());
-        v.decor_mut().set_suffix(format!("{s}{tail}"));
-    }
-
-    fn last_value_mut(doc: &mut dyn TableLike) -> Option<&mut Value> {
-        doc.iter_mut().filter_map(|(_, i)| i.as_value_mut()).last()
-    }
-
-    /// Insert `key` at the end of `doc`; what followed the last value (its
-    /// entry's trailing comment block, an inline table's closing spacing)
-    /// now follows the new one.
-    fn insert_key(doc: &mut dyn TableLike, key: &str, item: Item) {
-        let tail = match item.is_value() {
-            true => last_value_mut(doc).map(take_tail).unwrap_or_default(),
-            false => String::new(),
-        };
-        doc.insert(key, item);
-        if let Some(v) = doc.get_mut(key).and_then(Item::as_value_mut) {
-            append_suffix(v, &tail);
-        }
-    }
-
-    /// Remove `key` from `doc`; what followed it, if it was the last value,
-    /// now follows the value before it.
-    fn remove_key(doc: &mut dyn TableLike, key: &str) {
-        let tail = doc
-            .get_mut(key)
-            .and_then(Item::as_value_mut)
-            .map(take_tail)
-            .unwrap_or_default();
-        doc.remove(key);
-        if let Some(v) = last_value_mut(doc) {
-            append_suffix(v, &tail);
-        }
-    }
-
-    /// Each subvolume entry's removed keys ([`super::REMOVED_KEYS`]) taken
-    /// out, whether the entry changed or not: nothing reads them, and every
-    /// load warns about them until a save drops them (bd 9ry).
-    pub(super) fn drop_removed_keys(doc: &mut toml_edit::Table) {
-        let Some(sources) = doc.get_mut("source").and_then(Item::as_array_of_tables_mut) else {
-            return;
-        };
-        for source in sources.iter_mut() {
-            let mut entries: Vec<&mut dyn TableLike> = match source.get_mut("subvolumes") {
-                Some(Item::ArrayOfTables(subs)) => {
-                    subs.iter_mut().map(|t| t as &mut dyn TableLike).collect()
-                }
-                Some(Item::Value(Value::Array(a))) => a
-                    .iter_mut()
-                    .filter_map(Value::as_inline_table_mut)
-                    .map(|t| t as &mut dyn TableLike)
-                    .collect(),
-                _ => Vec::new(),
+        /// The line end `p`'s line has, else the one of the line before it,
+        /// else `\n`.
+        fn eol(&self, p: usize) -> &'static str {
+            let (ce, next) = self.line_end(p);
+            let has = |ce: usize, next: usize| match &self.raw[ce..next] {
+                "\r\n" => Some("\r\n"),
+                "\n" => Some("\n"),
+                _ => None,
             };
-            for entry in &mut entries {
-                for (table, key, _) in super::REMOVED_KEYS {
-                    if *table == "source.subvolumes" && entry.contains_key(key) {
-                        remove_key(*entry, key);
+            if let Some(e) = has(ce, next) {
+                return e;
+            }
+            let ls = self.line_start(p);
+            if ls > 0 {
+                let (ce, next) = self.line_end(self.line_start(ls - 1));
+                if let Some(e) = has(ce, next) {
+                    return e;
+                }
+            }
+            "\n"
+        }
+
+        fn indent(&self, p: usize) -> &'r str {
+            let ls = self.line_start(p);
+            let rest = &self.raw[ls..];
+            let n = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            &self.raw[ls..ls + n]
+        }
+
+        fn blank(&self, a: usize, b: usize) -> bool {
+            self.raw[a..b].bytes().all(|c| c == b' ' || c == b'\t')
+        }
+
+        fn has_comment(&self, r: Range<usize>) -> bool {
+            let i = self.comments.partition_point(|&c| c < r.start);
+            self.comments.get(i).is_some_and(|&c| c < r.end)
+        }
+
+        /// Is the line starting at `ls` empty but for spacing?
+        fn blank_line(&self, ls: usize) -> bool {
+            ls < self.raw.len() && {
+                let (ce, _) = self.line_end(ls);
+                self.blank(ls, ce)
+            }
+        }
+
+        /// Is the line starting at `ls` only a comment?
+        fn comment_line(&self, ls: usize) -> bool {
+            ls < self.raw.len() && {
+                let (ce, _) = self.line_end(ls);
+                let t = self.raw[ls..ce].trim_start_matches([' ', '\t']);
+                t.starts_with('#') && self.has_comment(ls..ce)
+            }
+        }
+
+        fn index(&mut self, doc: &toml_edit::Document<&'r str>) {
+            fn decor(raw: &str, d: &toml_edit::Decor, out: &mut Vec<usize>) {
+                for s in [d.prefix(), d.suffix()].into_iter().flatten() {
+                    raw_comments(raw, s, out);
+                }
+            }
+            fn raw_comments(raw: &str, s: &toml_edit::RawString, out: &mut Vec<usize>) {
+                if let Some(r) = s.span() {
+                    let text = &raw[r.clone()];
+                    let mut at = 0;
+                    while let Some(i) = text[at..].find('#') {
+                        let c = r.start + at + i;
+                        out.push(c);
+                        at += i + text[at + i..].find('\n').unwrap_or(text.len() - at - i);
+                    }
+                }
+            }
+            fn value(raw: &str, v: &Value, out: &mut Vec<usize>) {
+                decor(raw, v.decor(), out);
+                match v {
+                    Value::Array(a) => {
+                        raw_comments(raw, a.trailing(), out);
+                        for e in a.iter() {
+                            value(raw, e, out);
+                        }
+                    }
+                    Value::InlineTable(t) => {
+                        raw_comments(raw, t.trailing(), out);
+                        table_like(raw, t, out, &mut Vec::new());
+                    }
+                    _ => {}
+                }
+            }
+            fn table_like(
+                raw: &str,
+                t: &dyn TableLike,
+                out: &mut Vec<usize>,
+                headers: &mut Vec<usize>,
+            ) {
+                for (k, item) in t.iter() {
+                    if let Some(key) = t.key(k) {
+                        decor(raw, key.leaf_decor(), out);
+                        decor(raw, key.dotted_decor(), out);
+                    }
+                    match item {
+                        Item::Value(v) => value(raw, v, out),
+                        Item::Table(t) => {
+                            decor(raw, t.decor(), out);
+                            if !t.is_dotted()
+                                && let Some(s) = t.span()
+                            {
+                                headers.push(s.start);
+                            }
+                            table_like(raw, t, out, headers);
+                        }
+                        Item::ArrayOfTables(a) => {
+                            for t in a.iter() {
+                                decor(raw, t.decor(), out);
+                                if let Some(s) = t.span() {
+                                    headers.push(s.start);
+                                }
+                                table_like(raw, t, out, headers);
+                            }
+                        }
+                        Item::None => {}
+                    }
+                }
+            }
+            let mut comments = Vec::new();
+            let mut headers = Vec::new();
+            table_like(self.raw, doc.as_table(), &mut comments, &mut headers);
+            raw_comments(self.raw, doc.trailing(), &mut comments);
+            comments.sort_unstable();
+            comments.dedup();
+            headers.sort_unstable();
+            self.comments = comments;
+            self.headers = headers;
+        }
+
+        fn edit(&mut self, at: Range<usize>, text: impl Into<String>) {
+            self.edits.push(Edit {
+                at,
+                text: text.into(),
+            });
+        }
+
+        fn refuse(&mut self, what: String) {
+            self.unplaceable.push(what);
+        }
+
+        // -- the walk -------------------------------------------------------
+
+        /// Apply `new` onto `logical` (a table read from `cont` under the
+        /// dotted key `prefix`), `old` being what this binary knew of it.
+        fn merge_table(
+            &mut self,
+            cont: &mut Cont<'r>,
+            prefix: &[String],
+            logical: &'r dyn TableLike,
+            old: &toml::Table,
+            new: &toml::Table,
+            at: &At,
+        ) {
+            for (key, nv) in new {
+                let ov = old.get(key);
+                let here = at.key(key);
+                let schema = at.schema_with(key);
+                match logical.get(key) {
+                    None => {
+                        let write = match ov {
+                            Some(ov) if ov == nv => pinned_part(&schema, nv),
+                            Some(toml::Value::Table(ot)) => match nv {
+                                toml::Value::Table(nt) => {
+                                    Some(toml::Value::Table(changed_part(&schema, ot, nt)))
+                                }
+                                _ => Some(nv.clone()),
+                            },
+                            _ => Some(nv.clone()),
+                        };
+                        if let Some(v) = write {
+                            self.insert(cont, prefix, key, &v, &here);
+                        }
+                    }
+                    Some(item) => self.merge_item(cont, prefix, key, item, ov, nv, &here),
+                }
+            }
+            for key in old.keys() {
+                if !new.contains_key(key)
+                    && let Some(item) = logical.get(key)
+                {
+                    self.remove(cont, prefix, key, item);
+                }
+            }
+            // A legacy key this binary reads but never writes goes when the
+            // key it feeds changes: kept, it is stale, and it may override the
+            // change.
+            for (legacy, fed) in LEGACY_KEYS {
+                if old.get(*fed) != new.get(*fed)
+                    && !new.contains_key(*legacy)
+                    && let Some(item) = logical.get(legacy)
+                {
+                    self.remove(cont, prefix, legacy, item);
+                }
+            }
+            // A subvolume entry's removed keys (`super::REMOVED_KEYS`) go
+            // whether the entry changed or not: nothing reads them, and every
+            // load warns about them until a save drops them (bd 9ry).
+            let table = super::strip_indices(&at.warn);
+            for (t, key, _) in super::REMOVED_KEYS {
+                if *t == table
+                    && !new.contains_key(*key)
+                    && let Some(item) = logical.get(key)
+                {
+                    self.remove(cont, prefix, key, item);
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn merge_item(
+            &mut self,
+            cont: &mut Cont<'r>,
+            prefix: &[String],
+            key: &str,
+            item: &'r Item,
+            ov: Option<&toml::Value>,
+            nv: &toml::Value,
+            at: &At,
+        ) {
+            let empty = toml::Table::new();
+            let old_t = ov.and_then(toml::Value::as_table).unwrap_or(&empty);
+            match (item, nv) {
+                (Item::Table(t), toml::Value::Table(nt)) if t.is_dotted() => {
+                    let p = extend(prefix, key);
+                    self.merge_table(cont, &p, t, old_t, nt, at);
+                }
+                (Item::Table(t), toml::Value::Table(nt)) => {
+                    let mut c = Cont::Body(t);
+                    self.merge_table(&mut c, &[], t, old_t, nt, at);
+                }
+                (Item::Value(Value::InlineTable(t)), toml::Value::Table(nt)) if t.is_dotted() => {
+                    let p = extend(prefix, key);
+                    self.merge_table(cont, &p, t, old_t, nt, at);
+                }
+                (Item::Value(Value::InlineTable(t)), toml::Value::Table(nt)) => {
+                    let mut c = Cont::Seq(self.inline_seq(t));
+                    self.merge_table(&mut c, &[], t, old_t, nt, at);
+                    if let Cont::Seq(s) = c {
+                        self.finish_seq(s);
+                    }
+                }
+                (Item::ArrayOfTables(aot), toml::Value::Array(na)) => {
+                    let oa = ov
+                        .and_then(toml::Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    self.merge_aot(cont, prefix, key, aot, oa, na, at);
+                }
+                (Item::Value(Value::Array(arr)), toml::Value::Array(na)) => {
+                    let oa = ov
+                        .and_then(toml::Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if ov != Some(nv) || na.iter().any(toml::Value::is_table) {
+                        self.merge_array(arr, oa, na, at);
+                    }
+                }
+                (Item::Value(v), _) => {
+                    if ov != Some(nv) {
+                        self.set_value(v, nv);
+                    }
+                }
+                _ => {
+                    if ov != Some(nv) {
+                        self.refuse(at.warn.clone());
                     }
                 }
             }
         }
+
+        fn set_value(&mut self, v: &Value, nv: &toml::Value) {
+            match v.span() {
+                Some(s) => self.edit(s, fresh_value(nv).to_string()),
+                None => self.refuse("a value without a place in the file".into()),
+            }
+        }
+
+        // -- arrays of tables -------------------------------------------------
+
+        #[allow(clippy::too_many_arguments)]
+        fn merge_aot(
+            &mut self,
+            cont: &mut Cont<'r>,
+            prefix: &[String],
+            key: &str,
+            aot: &'r ArrayOfTables,
+            oa: &[toml::Value],
+            na: &[toml::Value],
+            at: &At,
+        ) {
+            let picks = pick(oa, na);
+            let elems: Vec<&'r Table> = aot.iter().collect();
+            if elems.len() != oa.len() {
+                self.refuse(at.warn.clone());
+                return;
+            }
+            let mut kept = vec![false; oa.len()];
+            for i in picks.iter().flatten() {
+                kept[*i] = true;
+            }
+            // Dropped elements first: their warnings name file positions, the
+            // outer before the inner.
+            for (i, t) in elems.iter().enumerate() {
+                if kept[i] {
+                    continue;
+                }
+                let ranges = self.subtree_ranges(t);
+                let comment = ranges.iter().any(|r| self.has_comment(r.clone()));
+                if let Some(old_t) = oa[i].as_table() {
+                    self.warnings
+                        .extend(dropped_warning(&at.warn, i, *t, old_t, comment));
+                }
+                for r in ranges {
+                    self.delete_lines(r);
+                }
+            }
+            // Kept elements, each edited on its own; in a new order, each
+            // one's edited text moves to the place the element now has.
+            let order: Vec<usize> = picks.iter().flatten().copied().collect();
+            let moved = !order.is_sorted();
+            let mut own: Vec<(usize, Vec<Edit>)> = Vec::new();
+            for (j, ne) in na.iter().enumerate() {
+                let (Some(i), Some(nt)) = (picks[j], ne.as_table()) else {
+                    continue;
+                };
+                let old_t = oa[i].as_table().cloned().unwrap_or_default();
+                let saved = std::mem::take(&mut self.edits);
+                let mut c = Cont::Body(elems[i]);
+                self.merge_table(&mut c, &[], elems[i], &old_t, nt, &at.element(i));
+                let mine = std::mem::replace(&mut self.edits, saved);
+                own.push((i, mine));
+            }
+            if moved {
+                // Slot k (the k-th kept element in the file) takes the k-th
+                // element in the new order.
+                let mut slots: Vec<usize> = order.clone();
+                slots.sort_unstable();
+                let ranges: Option<Vec<Range<usize>>> =
+                    slots.iter().map(|&i| self.move_range(elems[i])).collect();
+                let Some(ranges) = ranges else {
+                    self.refuse(format!("{} (reordered)", at.warn));
+                    return;
+                };
+                for (k, (src, mine)) in own.iter().enumerate() {
+                    let from = ranges[slots.iter().position(|s| s == src).unwrap_or(k)].clone();
+                    match apply_within(self.raw, &from, mine) {
+                        Ok(t) => self.edit(ranges[k].clone(), t),
+                        Err(e) => self.refuse(e),
+                    }
+                }
+            } else {
+                for (_, mine) in own {
+                    self.edits.extend(mine);
+                }
+            }
+            // New elements: written after the last element in the file.
+            let fresh: Vec<&toml::Table> = na
+                .iter()
+                .zip(&picks)
+                .filter(|(_, p)| p.is_none())
+                .filter_map(|(ne, _)| ne.as_table())
+                .collect();
+            if !fresh.is_empty()
+                && let Some(last) = elems.last()
+            {
+                let end = self.subtree_end(last);
+                let (_, pos) = self.line_end(end);
+                let eol = self.eol(end);
+                let gap = self.blank_line_above(last);
+                let mut text = String::new();
+                if pos == self.raw.len() && !self.raw[..pos].ends_with('\n') {
+                    text.push_str(eol);
+                }
+                for nt in fresh {
+                    if gap {
+                        text.push_str(eol);
+                    }
+                    text.push_str(&section(&at.header, true, nt, eol));
+                }
+                self.edit(pos..pos, text);
+            }
+            // Emptied: a required array (a source's `subvolumes`) is written
+            // as `key = []`; at the top level an absent array of tables reads
+            // as empty.
+            if na.is_empty() && !oa.is_empty() && at.header.len() > 1 {
+                self.insert(cont, prefix, key, &toml::Value::Array(Vec::new()), at);
+            }
+        }
+
+        /// Was the line above `t`'s header blank?
+        fn blank_line_above(&self, t: &Table) -> bool {
+            let Some(h) = t.span() else { return false };
+            let ls = self.line_start(h.start);
+            ls > 0 && self.blank_line(self.line_start(ls - 1))
+        }
+
+        /// Every span inside `t` and its sub-tables: (header starts, max end).
+        fn subtree(&self, t: &Table, headers: &mut Vec<usize>, end: &mut usize) {
+            if let Some(s) = t.span() {
+                if !t.is_dotted() {
+                    headers.push(s.start);
+                }
+                *end = (*end).max(s.end);
+            }
+            for (_, v) in t.get_values() {
+                if let Some(s) = v.span() {
+                    *end = (*end).max(s.end);
+                }
+            }
+            for (_, item) in t.iter() {
+                match item {
+                    Item::Table(c) => self.subtree(c, headers, end),
+                    Item::ArrayOfTables(a) => {
+                        for c in a.iter() {
+                            self.subtree(c, headers, end);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn subtree_end(&self, t: &Table) -> usize {
+            let mut end = 0;
+            self.subtree(t, &mut Vec::new(), &mut end);
+            end
+        }
+
+        /// The text of `t` and every table under it: its header's line to the
+        /// line of the last thing under it, in one piece when no other table
+        /// starts inside it, else table by table.
+        fn subtree_ranges(&self, t: &Table) -> Vec<Range<usize>> {
+            let mut headers = Vec::new();
+            let mut end = 0;
+            self.subtree(t, &mut headers, &mut end);
+            let Some(start) = headers.iter().min().copied() else {
+                return Vec::new();
+            };
+            let whole = self.line_start(start)..self.line_end(end).1;
+            let foreign = self
+                .headers
+                .iter()
+                .any(|h| whole.contains(h) && !headers.contains(h));
+            if !foreign {
+                return vec![whole];
+            }
+            let mut out = Vec::new();
+            self.each_table(t, &mut out);
+            out
+        }
+
+        fn each_table(&self, t: &Table, out: &mut Vec<Range<usize>>) {
+            if let Some(s) = t.span().filter(|_| !t.is_dotted()) {
+                let end = t
+                    .get_values()
+                    .iter()
+                    .filter_map(|(_, v)| v.span())
+                    .map(|r| r.end)
+                    .max()
+                    .unwrap_or(s.end)
+                    .max(s.end);
+                out.push(self.line_start(s.start)..self.line_end(end).1);
+            }
+            for (_, item) in t.iter() {
+                match item {
+                    Item::Table(c) => self.each_table(c, out),
+                    Item::ArrayOfTables(a) => a.iter().for_each(|c| self.each_table(c, out)),
+                    _ => {}
+                }
+            }
+        }
+
+        /// What moves with an element kept in a new order: the comment lines
+        /// above its header (after a blank line), its own text, and the
+        /// comment lines touching its last line.
+        fn move_range(&self, t: &Table) -> Option<Range<usize>> {
+            let ranges = self.subtree_ranges(t);
+            let [whole] = ranges.as_slice() else {
+                return None;
+            };
+            let mut start = whole.start;
+            let mut top = start;
+            while top > 0 {
+                let ls = self.line_start(top - 1);
+                if !self.comment_line(ls) {
+                    break;
+                }
+                top = ls;
+            }
+            if top < start && (top == 0 || self.blank_line(self.line_start(top - 1))) {
+                start = top;
+            }
+            let mut end = whole.end;
+            while self.comment_line(end) {
+                end = self.line_end(end).1;
+            }
+            Some(start..end)
+        }
+
+        // -- inline tables and arrays ----------------------------------------
+
+        fn entry(&self, start: usize, end: usize, path: Vec<String>) -> Entry {
+            let b = self.raw.as_bytes();
+            let mut p = end;
+            while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
+                p += 1;
+            }
+            let comma = (p < b.len() && b[p] == b',').then_some(p);
+            let mut q = comma.map(|c| c + 1).unwrap_or(end);
+            while q < b.len() && (b[q] == b' ' || b[q] == b'\t') {
+                q += 1;
+            }
+            let last_on_line =
+                (q >= b.len() || matches!(b[q], b'#' | b'\r' | b'\n')).then(|| self.line_end(q).0);
+            let first_on_line = self.blank(self.line_start(start), start);
+            Entry {
+                start,
+                end,
+                path,
+                comma,
+                last_on_line,
+                first_on_line,
+            }
+        }
+
+        fn inline_seq(&self, t: &InlineTable) -> Seq {
+            let mut entries: Vec<Entry> = t
+                .get_values()
+                .into_iter()
+                .filter_map(|(keys, v)| {
+                    let start = keys.first()?.span()?.start;
+                    let end = v.span()?.end;
+                    let path = keys.iter().map(|k| k.get().to_string()).collect();
+                    Some(self.entry(start, end, path))
+                })
+                .collect();
+            entries.sort_by_key(|e| e.start);
+            Seq {
+                span: t.span().unwrap_or_default(),
+                inline: true,
+                removed: vec![false; entries.len()],
+                entries,
+                appended: Vec::new(),
+            }
+        }
+
+        fn array_seq(&self, a: &Array) -> Seq {
+            let entries: Vec<Entry> = a
+                .iter()
+                .filter_map(|v| v.span())
+                .map(|s| self.entry(s.start, s.end, Vec::new()))
+                .collect();
+            Seq {
+                span: a.span().unwrap_or_default(),
+                inline: false,
+                removed: vec![false; entries.len()],
+                entries,
+                appended: Vec::new(),
+            }
+        }
+
+        fn merge_array(&mut self, arr: &'r Array, oa: &[toml::Value], na: &[toml::Value], at: &At) {
+            let mut seq = self.array_seq(arr);
+            let vals: Vec<&'r Value> = arr.iter().collect();
+            if seq.entries.len() != vals.len() || vals.len() != oa.len() {
+                self.refuse(at.warn.clone());
+                return;
+            }
+            let picks = pick(oa, na);
+            let mut kept = vec![false; oa.len()];
+            for i in picks.iter().flatten() {
+                kept[*i] = true;
+            }
+            for (i, v) in vals.iter().enumerate() {
+                if kept[i] {
+                    continue;
+                }
+                seq.removed[i] = true;
+                // An entry (a table to this binary), inline or a bare string.
+                if let Some(old_t) = oa[i].as_table() {
+                    let e = &seq.entries[i];
+                    let reach = e.last_on_line.unwrap_or(e.end);
+                    let comment = self.has_comment(e.start..reach.max(e.end));
+                    let bare = InlineTable::new();
+                    let t = v.as_inline_table().unwrap_or(&bare);
+                    self.warnings
+                        .extend(dropped_warning(&at.warn, i, t, old_t, comment));
+                }
+            }
+            let order: Vec<usize> = picks.iter().flatten().copied().collect();
+            let moved = !order.is_sorted();
+            let mut own: Vec<(usize, Vec<Edit>)> = Vec::new();
+            for (j, ne) in na.iter().enumerate() {
+                let Some(i) = picks[j] else { continue };
+                let saved = std::mem::take(&mut self.edits);
+                self.merge_element(vals[i], &oa[i], ne, &at.element(i));
+                let mine = std::mem::replace(&mut self.edits, saved);
+                own.push((i, mine));
+            }
+            if moved {
+                let mut slots = order.clone();
+                slots.sort_unstable();
+                for (k, (src, mine)) in own.iter().enumerate() {
+                    let slot = &seq.entries[slots[k]];
+                    let from = &seq.entries[*src];
+                    let value = match apply_within(self.raw, &(from.start..from.end), mine) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.refuse(e);
+                            continue;
+                        }
+                    };
+                    let (to, text) = match slot.last_on_line {
+                        Some(ce) => {
+                            let tail = match from.last_on_line {
+                                Some(fce) => {
+                                    let after = from.comma.map(|c| c + 1).unwrap_or(from.end);
+                                    self.raw[after..fce].to_string()
+                                }
+                                None => String::new(),
+                            };
+                            let comma = if slot.comma.is_some() { "," } else { "" };
+                            (slot.start..ce, format!("{value}{comma}{tail}"))
+                        }
+                        None => (slot.start..slot.end, value),
+                    };
+                    self.edit(to, text);
+                }
+            } else {
+                for (_, mine) in own {
+                    self.edits.extend(mine);
+                }
+            }
+            for (ne, p) in na.iter().zip(&picks) {
+                if p.is_none() {
+                    seq.appended.push(fresh_value(ne).to_string());
+                }
+            }
+            self.finish_seq(seq);
+        }
+
+        /// A kept element of an inline array: an inline table edited in place;
+        /// a bare string (a subvolume entry written `"@"`) kept while unchanged
+        /// and, when it changes, written as a table holding its name and only
+        /// the values that differ from what the bare string meant.
+        fn merge_element(&mut self, v: &'r Value, ov: &toml::Value, nv: &toml::Value, at: &At) {
+            match (v, ov, nv) {
+                (Value::InlineTable(t), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
+                    let mut c = Cont::Seq(self.inline_seq(t));
+                    self.merge_table(&mut c, &[], t, old_t, nt, at);
+                    if let Cont::Seq(s) = c {
+                        self.finish_seq(s);
+                    }
+                }
+                (Value::String(_), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
+                    if old_t != nt {
+                        let changed: toml::Table = nt
+                            .iter()
+                            .filter(|(k, val)| *k == "name" || old_t.get(*k) != Some(*val))
+                            .map(|(k, val)| (k.clone(), val.clone()))
+                            .collect();
+                        self.set_value(v, &toml::Value::Table(changed));
+                    }
+                }
+                _ => {
+                    if ov != nv {
+                        self.set_value(v, nv);
+                    }
+                }
+            }
+        }
+
+        /// The splices for `seq`'s removed and appended entries.
+        fn finish_seq(&mut self, seq: Seq) {
+            let Seq {
+                span,
+                inline,
+                entries,
+                removed,
+                appended,
+            } = seq;
+            if span.is_empty() {
+                if removed.iter().any(|r| *r) || !appended.is_empty() {
+                    self.refuse("an inline table or array without a place in the file".into());
+                }
+                return;
+            }
+            let kept: Vec<usize> = (0..entries.len()).filter(|&i| !removed[i]).collect();
+            let mut first_removal: Option<Range<usize>> = None;
+            for i in (0..entries.len()).filter(|&i| removed[i]) {
+                let e = &entries[i];
+                let before = kept.iter().rev().find(|&&k| k < i).map(|&k| &entries[k]);
+                let after_kept = kept.iter().any(|&k| k > i);
+                let prev_tok = {
+                    let b = self.raw.as_bytes();
+                    let mut p = e.start;
+                    while p > 0 && (b[p - 1] == b' ' || b[p - 1] == b'\t') {
+                        p -= 1;
+                    }
+                    p
+                };
+                let after_comma = e.comma.map(|c| {
+                    let b = self.raw.as_bytes();
+                    let mut p = c + 1;
+                    while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
+                        p += 1;
+                    }
+                    p
+                });
+                // The comma of the kept entry before, when on this line (or
+                // only spacing and a line end between).
+                let sep = before.and_then(|b| b.comma).filter(|&c| {
+                    self.line_start(c) == self.line_start(e.start)
+                        || (self.blank_text(c + 1, e.start) && !self.has_comment(c + 1..e.start))
+                });
+                let r = match (e.first_on_line, e.last_on_line) {
+                    (true, Some(ce)) => self.line_start(e.start)..self.line_end(ce).1,
+                    (false, Some(ce)) => match (e.comma, after_kept, sep) {
+                        (None, false, Some(c)) => c..ce,
+                        _ => prev_tok..ce,
+                    },
+                    (_, None) => match (e.comma, after_kept, sep) {
+                        (Some(_), _, _) => e.start..after_comma.unwrap_or(e.end),
+                        (None, _, Some(c)) => c..e.end,
+                        (None, _, None) => e.start..e.end,
+                    },
+                };
+                if first_removal.is_none() {
+                    first_removal = Some(r.clone());
+                }
+                self.edit(r, "");
+            }
+            if appended.is_empty() {
+                return;
+            }
+            let one_line = !self.raw[span.clone()].contains('\n');
+            if let Some(&k) = kept.last() {
+                let k_e = &entries[k];
+                let removed_after = (k + 1..entries.len()).any(|i| removed[i]);
+                if one_line {
+                    let text: String = appended.iter().map(|a| format!(", {a}")).collect();
+                    self.edit(k_e.end..k_e.end, text);
+                } else if let Some(ce) = k_e.last_on_line {
+                    let eol = self.eol(ce);
+                    let indent = self.indent(k_e.start).to_string();
+                    let had_comma = k_e.comma.is_some();
+                    if !had_comma {
+                        self.edit(k_e.end..k_e.end, ",");
+                    }
+                    let n = appended.len();
+                    let text: String = appended
+                        .iter()
+                        .enumerate()
+                        .map(|(t, a)| {
+                            let c = if t + 1 < n || had_comma { "," } else { "" };
+                            format!("{indent}{a}{c}{eol}")
+                        })
+                        .collect();
+                    let pos = self.line_end(ce).1;
+                    self.edit(pos..pos, text);
+                } else {
+                    let eol = self.eol(k_e.end);
+                    let indent = self.indent(k_e.start).to_string();
+                    match (k_e.comma, removed_after) {
+                        (Some(c), false) => {
+                            let text: String = appended
+                                .iter()
+                                .map(|a| format!("{eol}{indent}{a},"))
+                                .collect();
+                            self.edit(c + 1..c + 1, text);
+                        }
+                        _ => {
+                            let text: String = appended
+                                .iter()
+                                .map(|a| format!(",{eol}{indent}{a}"))
+                                .collect();
+                            self.edit(k_e.end..k_e.end, text);
+                        }
+                    }
+                }
+            } else if let Some(e0) = entries.first() {
+                let r = first_removal.unwrap_or(e0.start..e0.start);
+                if e0.first_on_line && e0.last_on_line.is_some() {
+                    let eol = self.eol(e0.start);
+                    let indent = self.indent(e0.start).to_string();
+                    let n = appended.len();
+                    let text: String = appended
+                        .iter()
+                        .enumerate()
+                        .map(|(t, a)| {
+                            let c = if t + 1 < n || e0.comma.is_some() {
+                                ","
+                            } else {
+                                ""
+                            };
+                            format!("{indent}{a}{c}{eol}")
+                        })
+                        .collect();
+                    self.edit(r.start..r.start, text);
+                } else {
+                    let lead = self.raw[r.start..e0.start.max(r.start)].to_string();
+                    self.edit(r.start..r.start, format!("{lead}{}", appended.join(", ")));
+                }
+            } else {
+                let open = span.start + 1;
+                let close = span.end - 1;
+                if one_line {
+                    let text = match inline {
+                        true => format!(" {} ", appended.join(", ")),
+                        false => appended.join(", "),
+                    };
+                    if self.blank(open, close) {
+                        self.edit(open..close, text);
+                    } else {
+                        self.refuse("an empty inline table or array".into());
+                    }
+                } else {
+                    let (ce, pos) = self.line_end(open);
+                    let eol = self.eol(ce);
+                    let indent = self.indent(close).to_string();
+                    let n = appended.len();
+                    let text: String = appended
+                        .iter()
+                        .enumerate()
+                        .map(|(t, a)| {
+                            let c = if t + 1 < n { "," } else { "" };
+                            format!("{indent}{a}{c}{eol}")
+                        })
+                        .collect();
+                    self.edit(pos..pos, text);
+                }
+            }
+        }
+
+        /// Only spacing and line ends between `a` and `b`.
+        fn blank_text(&self, a: usize, b: usize) -> bool {
+            a <= b
+                && self.raw[a..b]
+                    .bytes()
+                    .all(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+        }
+
+        // -- keys --------------------------------------------------------------
+
+        /// Write `key = v` (or a `[table]`, or `[[array]]` entries) where
+        /// `cont` keeps its keys.
+        fn insert(
+            &mut self,
+            cont: &mut Cont<'r>,
+            prefix: &[String],
+            key: &str,
+            v: &toml::Value,
+            at: &At,
+        ) {
+            let dotted: String = prefix
+                .iter()
+                .map(|k| format!("{}.", key_repr(k)))
+                .chain([key_repr(key)])
+                .collect();
+            match cont {
+                Cont::Seq(seq) => {
+                    seq.appended.push(format!("{dotted} = {}", fresh_value(v)));
+                }
+                Cont::Body(t) => {
+                    let t: &'r Table = t;
+                    let is_root = at.header.len() == 1;
+                    if prefix.is_empty() && (v.is_table() || is_aot(v)) {
+                        self.insert_section(t, is_root, v, at);
+                    } else {
+                        self.insert_line(t, &format!("{dotted} = {}", fresh_value(v)));
+                    }
+                }
+            }
+        }
+
+        /// A new `[table]` or `[[array]]` entries under `t`: at the end of the
+        /// file for a top-level one, else after everything under `t`.
+        fn insert_section(&mut self, t: &'r Table, is_root: bool, v: &toml::Value, at: &At) {
+            let first_at_end = !self.appended_at_end;
+            let (pos, eol, gap) = if is_root {
+                let end = self.raw.len();
+                let eol = self.eol(end.saturating_sub(1));
+                // One blank line before each new section.
+                let gap =
+                    self.appended_at_end || (!self.raw.is_empty() && !self.blank_line_before_end());
+                self.appended_at_end = true;
+                (end, eol, gap)
+            } else {
+                let end = self.subtree_end(t);
+                (self.line_end(end).1, self.eol(end), false)
+            };
+            let mut text = String::new();
+            if pos == self.raw.len()
+                && (first_at_end || !is_root)
+                && !self.raw.is_empty()
+                && !self.raw.ends_with('\n')
+            {
+                text.push_str(eol);
+            }
+            match v {
+                toml::Value::Table(nt) => {
+                    if gap {
+                        text.push_str(eol);
+                    }
+                    text.push_str(&section(&at.header, false, nt, eol));
+                }
+                toml::Value::Array(a) => {
+                    for nt in a.iter().filter_map(toml::Value::as_table) {
+                        if gap {
+                            text.push_str(eol);
+                        }
+                        text.push_str(&section(&at.header, true, nt, eol));
+                    }
+                }
+                _ => {}
+            }
+            self.edit(pos..pos, text);
+        }
+
+        fn blank_line_before_end(&self) -> bool {
+            self.raw.ends_with("\n\n") || self.raw.ends_with("\n\r\n")
+        }
+
+        /// A line after the last key line of `t`'s body, indented like it.
+        fn insert_line(&mut self, t: &'r Table, line: &str) {
+            let last = t
+                .get_values()
+                .into_iter()
+                .filter_map(|(keys, v)| Some((keys.first()?.span()?.start, v.span()?.end)))
+                .max_by_key(|(_, end)| *end);
+            let (anchor, indent_at) = match (last, t.span()) {
+                (Some((ks, ve)), _) => (ve, ks),
+                (None, Some(h)) => (h.end, h.start),
+                (None, None) if t.is_implicit() => {
+                    self.refuse("a key in a table with no header".into());
+                    return;
+                }
+                (None, None) => {
+                    let p = self.bom();
+                    let eol = self.eol(p);
+                    self.edit(p..p, format!("{line}{eol}"));
+                    return;
+                }
+            };
+            let indent = self.indent(indent_at);
+            let (ce, next) = self.line_end(anchor);
+            let eol = self.eol(anchor);
+            let text = if next == ce {
+                format!("{eol}{indent}{line}")
+            } else {
+                format!("{indent}{line}{eol}")
+            };
+            self.edit(next..next, text);
+        }
+
+        /// Take `key` (under `prefix`) out of `cont`.
+        fn remove(&mut self, cont: &mut Cont<'r>, prefix: &[String], key: &str, item: &'r Item) {
+            match (cont, item) {
+                (_, Item::ArrayOfTables(a)) => {
+                    for t in a.iter() {
+                        for r in self.subtree_ranges(t) {
+                            self.delete_lines(r);
+                        }
+                    }
+                }
+                (_, Item::Table(t)) if !t.is_dotted() => {
+                    for r in self.subtree_ranges(t) {
+                        self.delete_lines(r);
+                    }
+                }
+                (Cont::Seq(seq), _) => {
+                    for (i, e) in seq.entries.iter().enumerate() {
+                        if e.path.len() > prefix.len()
+                            && e.path[..prefix.len()] == *prefix
+                            && e.path[prefix.len()] == key
+                        {
+                            seq.removed[i] = true;
+                        }
+                    }
+                }
+                (Cont::Body(t), _) => {
+                    let lines: Vec<(usize, usize)> = t
+                        .get_values()
+                        .into_iter()
+                        .filter(|(keys, _)| {
+                            keys.len() > prefix.len()
+                                && keys[..prefix.len()]
+                                    .iter()
+                                    .map(|k| k.get())
+                                    .eq(prefix.iter().map(String::as_str))
+                                && keys[prefix.len()].get() == key
+                        })
+                        .filter_map(|(keys, v)| Some((keys.last()?.span()?.start, v.span()?.end)))
+                        .collect();
+                    for (ks, ve) in lines {
+                        let ls = self.line_start(ks);
+                        let (_, next) = self.line_end(ve);
+                        self.delete_lines(ls..next);
+                    }
+                }
+            }
+        }
+
+        /// Delete whole lines `r`; the last line of a file without a final
+        /// line end takes the line end before it, so the file still has none.
+        fn delete_lines(&mut self, r: Range<usize>) {
+            if r.end == self.raw.len() && !self.raw.ends_with('\n') && r.start > 0 {
+                let before = if self.raw[..r.start].ends_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+                self.edit(r.start - before..r.end, "");
+            } else {
+                self.edit(r, "");
+            }
+        }
+
+        // -- applying -----------------------------------------------------------
+
+        /// The edited text.
+        pub(super) fn apply(&self) -> Result<String, String> {
+            apply_within(self.raw, &(0..self.raw.len()), &self.edits)
+        }
+    }
+
+    fn extend(prefix: &[String], key: &str) -> Vec<String> {
+        prefix.iter().cloned().chain([key.to_string()]).collect()
+    }
+
+    fn is_aot(v: &toml::Value) -> bool {
+        matches!(v, toml::Value::Array(a) if !a.is_empty() && a.iter().all(toml::Value::is_table))
+    }
+
+    /// `raw[within]` with `edits` (all inside it) applied: overlapping and
+    /// touching deletions merged, one blank line kept where a deletion of
+    /// whole lines would make two meet.
+    fn apply_within(raw: &str, within: &Range<usize>, edits: &[Edit]) -> Result<String, String> {
+        let mut edits: Vec<Edit> = edits.to_vec();
+        edits.sort_by_key(|e| (e.at.start, e.at.end));
+        // Merge deletions that overlap, touch, or are apart by blank lines.
+        let mut merged: Vec<Edit> = Vec::new();
+        for e in edits {
+            if let Some(last) = merged.last_mut()
+                && last.text.is_empty()
+                && e.text.is_empty()
+                && !last.at.is_empty()
+                && !e.at.is_empty()
+                && (e.at.start <= last.at.end
+                    || (blank_lines_between(raw, last.at.end, e.at.start)
+                        && raw.as_bytes()[e.at.start - 1] == b'\n'))
+            {
+                last.at.end = last.at.end.max(e.at.end);
+                continue;
+            }
+            merged.push(e);
+        }
+        // One blank line where two would meet.
+        let n = merged.len();
+        for i in 0..n {
+            let e = &merged[i];
+            if !e.text.is_empty() || e.at.is_empty() {
+                continue;
+            }
+            let (a, b) = (e.at.start, e.at.end);
+            let whole = (a == 0 || raw.as_bytes()[a - 1] == b'\n')
+                && (b == raw.len() || raw.as_bytes()[b - 1] == b'\n');
+            let next_starts_here = merged.get(i + 1).is_some_and(|f| f.at.start == b);
+            if whole && a > 0 && b < raw.len() && !next_starts_here {
+                let prev_ls = raw[..a - 1].rfind('\n').map(|x| x + 1).unwrap_or(0);
+                let next_end = raw[b..].find('\n').map(|x| b + x + 1).unwrap_or(raw.len());
+                let is_blank = |s: &str| s.trim().is_empty();
+                if is_blank(&raw[prev_ls..a]) && is_blank(&raw[b..next_end]) {
+                    merged[i].at.end = next_end;
+                }
+            }
+        }
+        let mut out = String::with_capacity(within.len());
+        let mut cursor = within.start;
+        for e in &merged {
+            if e.at.start < cursor || e.at.end > within.end {
+                return Err("two edits of the file overlap".into());
+            }
+            out.push_str(&raw[cursor..e.at.start]);
+            out.push_str(&e.text);
+            cursor = e.at.end;
+        }
+        out.push_str(&raw[cursor..within.end]);
+        Ok(out)
+    }
+
+    fn blank_lines_between(raw: &str, a: usize, b: usize) -> bool {
+        a <= b
+            && (a == 0 || raw.as_bytes()[a - 1] == b'\n')
+            && raw[a..b].trim().is_empty()
+            && raw[a..b].contains('\n')
+    }
+
+    /// A new `[header]` (or `[[header]]`) section holding `t`: its values,
+    /// then its tables as sections of their own.
+    fn section(header: &[String], aot: bool, t: &toml::Table, eol: &str) -> String {
+        let h = header.join(".");
+        let mut out = match aot {
+            true => format!("[[{h}]]{eol}"),
+            false => format!("[{h}]{eol}"),
+        };
+        for (k, v) in t {
+            if !v.is_table() && !is_aot(v) {
+                out.push_str(&format!("{} = {}{eol}", key_repr(k), fresh_value(v)));
+            }
+        }
+        for (k, v) in t {
+            let sub: Vec<String> = header.iter().cloned().chain([key_repr(k)]).collect();
+            match v {
+                toml::Value::Table(st) => out.push_str(&section(&sub, false, st, eol)),
+                toml::Value::Array(a) if is_aot(v) => {
+                    for st in a.iter().filter_map(toml::Value::as_table) {
+                        out.push_str(&section(&sub, true, st, eol));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// What of `nv` (a value the file leaves out, unchanged) a save writes
+    /// out: the [`PINNED`] keys at or under `schema`.
+    fn pinned_part(schema: &[&str], nv: &toml::Value) -> Option<toml::Value> {
+        if PINNED.contains(&schema) {
+            return Some(nv.clone());
+        }
+        let below = PINNED
+            .iter()
+            .any(|p| p.len() > schema.len() && p[..schema.len()] == *schema);
+        if !below {
+            return None;
+        }
+        match nv {
+            toml::Value::Table(t) => {
+                let part: toml::Table = t
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let s: Vec<&str> = schema.iter().copied().chain([k.as_str()]).collect();
+                        Some((k.clone(), pinned_part(&s, v)?))
+                    })
+                    .collect();
+                (!part.is_empty()).then_some(toml::Value::Table(part))
+            }
+            _ => None,
+        }
+    }
+
+    /// What of table `nt` a save writes into a file that left the table out
+    /// while `ot` held its defaults: the keys that changed, and the pinned.
+    fn changed_part(schema: &[&str], ot: &toml::Table, nt: &toml::Table) -> toml::Table {
+        nt.iter()
+            .filter_map(|(k, v)| {
+                let s: Vec<&str> = schema.iter().copied().chain([k.as_str()]).collect();
+                match ot.get(k) {
+                    Some(o) if o == v => Some((k.clone(), pinned_part(&s, v)?)),
+                    Some(toml::Value::Table(ost)) => match v {
+                        toml::Value::Table(nst) => {
+                            Some((k.clone(), toml::Value::Table(changed_part(&s, ost, nst))))
+                        }
+                        _ => Some((k.clone(), v.clone())),
+                    },
+                    _ => Some((k.clone(), v.clone())),
+                }
+            })
+            .collect()
     }
 
     /// `(legacy key, the key it feeds)`: read on load, never written. A
     /// target's `serial` feeds `serials` (`TargetRaw`).
     const LEGACY_KEYS: &[(&str, &str)] = &[("serial", "serials")];
-
-    fn merge_item(item: &mut Item, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
-        match (ov, nv) {
-            (toml::Value::Table(old_t), toml::Value::Table(new_t)) => {
-                match item.as_table_like_mut() {
-                    Some(table) => merge_table(table, old_t, new_t, reordered),
-                    None => replace(item, nv),
-                }
-            }
-            (toml::Value::Array(oa), toml::Value::Array(na)) => {
-                merge_elements(item, oa, na, reordered)
-            }
-            _ => replace(item, nv),
-        }
-    }
 
     /// What matches an array element across a save: its `label` (sources,
     /// targets) or `name` (subvolume entries). Nothing else is matched.
@@ -1104,7 +2293,10 @@ mod surgical {
     /// one whose content went), then the unused one of the same identity that
     /// shares the most known values with it, the earlier on a tie.
     /// Same-named entries whose known content is identical cannot be told
-    /// apart; the earlier ones are taken first.
+    /// apart; the earlier ones are taken first. A rename is never inferred:
+    /// an element whose `label` / `name` changed is written fresh and the old
+    /// one dropped (bd DAS-Backup-Manager-m0pr.2), so a writer that renames
+    /// must carry over whatever the element should keep itself.
     fn pick(oa: &[toml::Value], na: &[toml::Value]) -> Vec<Option<usize>> {
         let mut used = vec![false; oa.len()];
         let mut picks = vec![None; na.len()];
@@ -1139,206 +2331,108 @@ mod surgical {
         }
     }
 
-    fn merge_elements(
-        item: &mut Item,
-        oa: &[toml::Value],
-        na: &[toml::Value],
-        reordered: &mut bool,
-    ) {
-        let picks = pick(oa, na);
-        let kept: Vec<usize> = picks.iter().flatten().copied().collect();
-        match item {
-            // An empty array of tables is no key at all: written as `[]`.
-            Item::ArrayOfTables(aot) if !na.is_empty() => {
-                if !kept.is_sorted() {
-                    *reordered = true;
-                }
-                let mut out = Vec::new();
-                for (ne, pick) in na.iter().zip(&picks) {
-                    let Some(nt) = ne.as_table() else { continue };
-                    let table = match pick.and_then(|i| Some((oa[i].as_table()?, aot.get(i)?))) {
-                        Some((old_t, kept)) => {
-                            let mut t = kept.clone();
-                            merge_table(&mut t, old_t, nt, reordered);
-                            t
-                        }
-                        None => fresh_table(nt),
-                    };
-                    out.push(table);
-                }
-                *aot = out.into_iter().collect::<ArrayOfTables>();
+    /// The warning for old element `i` of the array at `path`, dropped from
+    /// the file (`t`, what this binary knew of it: `old_t`), when it took
+    /// keys this binary does not read, or a comment of its own, with it. None
+    /// when it held only known keys: those are this config's to remove.
+    fn dropped_warning(
+        path: &str,
+        i: usize,
+        t: &dyn TableLike,
+        old_t: &toml::Table,
+        comment: bool,
+    ) -> Option<String> {
+        // What the loader reads, not what the serialiser writes: a key it
+        // leaves out at its default (`after_index = false`) is still known.
+        let schema = element_schema(path).unwrap_or_else(|| old_t.clone());
+        let mut unknown = Vec::new();
+        unknown_in(t, &schema, "", &mut unknown);
+        let what = match (unknown.is_empty(), comment) {
+            (true, false) => return None,
+            (true, true) => "its comments".to_string(),
+            (false, false) => format!("keys this version does not read ({})", unknown.join(", ")),
+            (false, true) => format!(
+                "keys this version does not read ({}) and its comments",
+                unknown.join(", ")
+            ),
+        };
+        let named = old_t
+            .get("label")
+            .or_else(|| old_t.get("name"))
+            .and_then(toml::Value::as_str)
+            .map(|id| format!(" \"{id}\""))
+            .unwrap_or_default();
+        Some(format!(
+            "{path}[{i}]{named} is no longer in the config and was removed with {what}; \
+             a renamed element is written fresh, so anything it should keep must be \
+             added to it again"
+        ))
+    }
+
+    /// What this version reads of an element of the array at `path`
+    /// (`source[0].subvolumes`): that element in [`super::key_schema`].
+    fn element_schema(path: &str) -> Option<toml::Table> {
+        let mut at = toml::Value::Table(super::key_schema());
+        for step in path.split('.') {
+            let name = step.split('[').next().unwrap_or(step);
+            at = at.as_table()?.get(name)?.clone();
+            if let toml::Value::Array(a) = &at {
+                at = a.first()?.clone();
             }
-            Item::Value(Value::Array(arr)) => {
-                let lines = ArrayLines::of(arr);
-                let mut out = Vec::new();
-                for (ne, pick) in na.iter().zip(&picks) {
-                    let kept = pick.and_then(|i| Some((i, &oa[i], arr.get(i)?)));
-                    let (v, lead, tail) = match kept {
-                        Some((i, ov, kept)) => {
-                            let mut v = kept.clone();
-                            merge_value(&mut v, ov, ne, reordered);
-                            (v, lines.leads[i].clone(), lines.tails[i].clone())
-                        }
-                        None => (fresh_value(ne), String::new(), lines.fresh_tail()),
-                    };
-                    out.push((v, lead, tail));
-                }
-                lines.rebuild(arr, out);
-            }
-            _ => replace(item, &toml::Value::Array(na.to_vec())),
+        }
+        match at {
+            toml::Value::Table(t) => Some(t),
+            _ => None,
         }
     }
 
-    /// How an inline array is laid out, per element. toml_edit files the text
-    /// after an element's comma (`"@x", # about x`) as the NEXT element's
-    /// prefix, and the last element's in the array's trailing; here each
-    /// element owns it as its `tail` — the text up to and including the first
-    /// newline — and its `lead` is the rest of its prefix (indentation, comment
-    /// lines above it). `opening` is the rest of the `[` line.
-    struct ArrayLines {
-        opening: String,
-        leads: Vec<String>,
-        tails: Vec<String>,
-        closing: String,
-        first_ws: String,
-        other_ws: String,
-        multi_line: bool,
-    }
-
-    /// `s` split after its first newline; all of it is the second part when
-    /// it has none.
-    fn split_line(s: &str) -> (String, String) {
-        match s.find('\n') {
-            Some(i) => (s[..=i].to_string(), s[i + 1..].to_string()),
-            None => (String::new(), s.to_string()),
-        }
-    }
-
-    impl ArrayLines {
-        fn of(arr: &toml_edit::Array) -> Self {
-            let heads: Vec<(String, String)> =
-                arr.iter().map(|v| split_line(&prefix(v.decor()))).collect();
-            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
-            let (last_tail, closing) = split_line(&trailing);
-            let mut tails: Vec<String> = heads.iter().skip(1).map(|(t, _)| t.clone()).collect();
-            tails.push(last_tail);
-            let opening = heads.first().map(|(o, _)| o.clone()).unwrap_or_default();
-            let leads: Vec<String> = heads.iter().map(|(_, l)| l.clone()).collect();
-            let multi_line = tails.iter().any(|t| t.contains('\n'));
-            let blank = |l: &String| l.trim().is_empty();
-            let first_ws = leads
-                .first()
-                .filter(|l| blank(l))
-                .cloned()
-                .unwrap_or_default();
-            let other_ws = match leads.get(1).filter(|l| blank(l)) {
-                Some(l) => l.clone(),
-                None if multi_line => first_ws.clone(),
-                None => " ".to_string(),
+    /// The keys of `doc` — and of the tables and array elements inside it —
+    /// that `schema` (what this version reads there) lacks, dotted from `doc`.
+    fn unknown_in(doc: &dyn TableLike, schema: &toml::Table, at: &str, out: &mut Vec<String>) {
+        for (k, item) in doc.iter() {
+            let here = match at.is_empty() {
+                true => k.to_string(),
+                false => format!("{at}.{k}"),
             };
-            ArrayLines {
-                opening,
-                leads,
-                tails,
-                closing,
-                first_ws,
-                other_ws,
-                multi_line,
+            match schema.get(k) {
+                None => out.push(here),
+                Some(toml::Value::Table(st)) => {
+                    if let Some(sub) = item.as_table_like() {
+                        unknown_in(sub, st, &here, out);
+                    }
+                }
+                Some(toml::Value::Array(sa)) => {
+                    if let Some(toml::Value::Table(est)) = sa.first() {
+                        for (i, el) in table_elements(item) {
+                            unknown_in(el, est, &format!("{here}[{i}]"), out);
+                        }
+                    }
+                }
+                Some(_) => {}
             }
-        }
-
-        /// A new element's tail: its own line in a multi-line array.
-        fn fresh_tail(&self) -> String {
-            if self.multi_line {
-                "\n".into()
-            } else {
-                String::new()
-            }
-        }
-
-        /// `arr` holding `out` — (value, lead, tail) in their new order —
-        /// each tail after its own element. A lead that is only spacing is
-        /// the spacing of the place the element now has.
-        fn rebuild(&self, arr: &mut toml_edit::Array, out: Vec<(Value, String, String)>) {
-            arr.clear();
-            let mut before = self.opening.clone();
-            for (j, (mut v, lead, tail)) in out.into_iter().enumerate() {
-                let lead = match (lead.trim().is_empty(), j) {
-                    (false, _) => lead,
-                    (true, 0) => self.first_ws.clone(),
-                    (true, _) => self.other_ws.clone(),
-                };
-                v.decor_mut().set_prefix(format!("{before}{lead}"));
-                arr.push_formatted(v);
-                before = tail;
-            }
-            arr.set_trailing(format!("{before}{}", self.closing));
         }
     }
 
-    /// An element of an inline array: an inline table is edited in place, a
-    /// bare string (a subvolume entry written as `"@"`) kept while unchanged
-    /// and, when it changes, written as a table holding its name and only the
-    /// values that differ from what the bare string meant.
-    fn merge_value(v: &mut Value, ov: &toml::Value, nv: &toml::Value, reordered: &mut bool) {
-        match (&mut *v, ov, nv) {
-            (Value::InlineTable(t), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
-                merge_table(t, old_t, nt, reordered)
-            }
-            (Value::String(_), toml::Value::Table(old_t), toml::Value::Table(nt)) => {
-                let changed: toml::Table = nt
-                    .iter()
-                    .filter(|(k, val)| *k == "name" || old_t.get(*k) != Some(*val))
-                    .map(|(k, val)| (k.clone(), val.clone()))
-                    .collect();
-                set_value(v, &toml::Value::Table(changed));
-            }
-            // A plain value is kept only when unchanged (matched exactly):
-            // nothing to do. Anything else the read-back check refuses.
-            _ => {}
-        }
-    }
-
-    /// `item` now holds `nv`; a plain value keeps its comment and spacing.
-    fn replace(item: &mut Item, nv: &toml::Value) {
+    /// The elements of an array of tables, or the inline tables of an inline
+    /// array (a bare string spells out no keys), each with its index in the
+    /// array as the file writes it: a bare string counts.
+    fn table_elements(item: &Item) -> Vec<(usize, &dyn TableLike)> {
         match item {
-            Item::Value(v) => set_value(v, nv),
-            other => *other = fresh_item(nv),
+            Item::ArrayOfTables(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i, t as &dyn TableLike))
+                .collect(),
+            Item::Value(Value::Array(a)) => a
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| Some((i, v.as_inline_table()? as &dyn TableLike)))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
-    fn set_value(v: &mut Value, nv: &toml::Value) {
-        let decor = v.decor().clone();
-        *v = fresh_value(nv);
-        *v.decor_mut() = decor;
-    }
-
-    /// A key that was not in the file: tables as `[section]`, arrays of tables
-    /// as `[[section]]`, the rest as values. (Inserted into an inline table,
-    /// toml_edit makes them inline.)
-    fn fresh_item(v: &toml::Value) -> Item {
-        match v {
-            toml::Value::Table(t) => Item::Table(fresh_table(t)),
-            toml::Value::Array(a) if !a.is_empty() && a.iter().all(toml::Value::is_table) => {
-                Item::ArrayOfTables(
-                    a.iter()
-                        .filter_map(toml::Value::as_table)
-                        .map(fresh_table)
-                        .collect(),
-                )
-            }
-            _ => Item::Value(fresh_value(v)),
-        }
-    }
-
-    fn fresh_table(t: &toml::Table) -> Table {
-        let mut out = Table::new();
-        for (k, v) in t {
-            out.insert(k, fresh_item(v));
-        }
-        out
-    }
-
+    /// A value as toml_edit writes a new one.
     fn fresh_value(v: &toml::Value) -> Value {
         match v {
             toml::Value::String(s) => Value::from(s.as_str()),
@@ -1395,56 +2489,6 @@ mod surgical {
         &["target", "*", "retention", "yearly"],
     ];
 
-    /// Write every [`PINNED`] key `doc` leaves out, with its value in `new`.
-    /// Run after the merge, when `doc`'s arrays hold `new`'s elements in
-    /// `new`'s order.
-    pub(super) fn pin(doc: &mut Table, new: &toml::Table) {
-        for path in PINNED {
-            pin_path(doc, new, path);
-        }
-    }
-
-    fn pin_path(doc: &mut dyn TableLike, new: &toml::Table, path: &[&str]) {
-        let Some((head, rest)) = path.split_first() else {
-            return;
-        };
-        let Some(nv) = new.get(*head) else { return };
-        match rest.first() {
-            None => {
-                if !doc.contains_key(head) {
-                    insert_key(doc, head, fresh_item(nv));
-                }
-            }
-            Some(&"*") => {
-                let (Some(item), Some(na)) = (doc.get_mut(head), nv.as_array()) else {
-                    return;
-                };
-                for (i, ne) in na.iter().enumerate() {
-                    let el: Option<&mut dyn TableLike> = match &mut *item {
-                        Item::ArrayOfTables(a) => a.get_mut(i).map(|t| t as &mut dyn TableLike),
-                        Item::Value(Value::Array(a)) => a
-                            .get_mut(i)
-                            .and_then(Value::as_inline_table_mut)
-                            .map(|t| t as &mut dyn TableLike),
-                        _ => None,
-                    };
-                    if let (Some(el), Some(nt)) = (el, ne.as_table()) {
-                        pin_path(el, nt, &rest[1..]);
-                    }
-                }
-            }
-            Some(_) => {
-                let Some(nt) = nv.as_table() else { return };
-                if !doc.contains_key(head) {
-                    doc.insert(head, Item::Table(Table::new()));
-                }
-                if let Some(t) = doc.get_mut(head).and_then(Item::as_table_like_mut) {
-                    pin_path(t, nt, rest);
-                }
-            }
-        }
-    }
-
     /// Every path at which `a` and `b` differ, dotted (`target[1].serials`):
     /// `a`'s keys in order, then keys only `b` has. Elements of arrays of
     /// tables are compared one by one; any other value whole.
@@ -1492,156 +2536,6 @@ mod surgical {
                 if a != b {
                     out.push(path.to_string());
                 }
-            }
-        }
-    }
-
-    /// A step from a table to one inside it: a key, or an element of an array
-    /// of tables.
-    #[derive(Clone)]
-    enum Step {
-        Key(String),
-        At(usize),
-    }
-
-    /// Every table toml_edit prints, in the order it prints them (its own
-    /// rule: a table without a place takes the place of the one before it).
-    fn printed_tables(root: &Table) -> Vec<Vec<Step>> {
-        fn walk(
-            t: &Table,
-            path: &mut Vec<Step>,
-            last: &mut isize,
-            out: &mut Vec<(isize, Vec<Step>)>,
-        ) {
-            if !t.is_dotted() {
-                if let Some(p) = t.position() {
-                    *last = p;
-                }
-                if !t.is_implicit() || t.iter().any(|(_, i)| i.is_value()) {
-                    out.push((*last, path.clone()));
-                }
-            }
-            for (k, item) in t.iter() {
-                match item {
-                    Item::Table(c) => {
-                        path.push(Step::Key(k.to_string()));
-                        walk(c, path, last, out);
-                        path.pop();
-                    }
-                    Item::ArrayOfTables(a) => {
-                        for (i, c) in a.iter().enumerate() {
-                            path.extend([Step::Key(k.to_string()), Step::At(i)]);
-                            walk(c, path, last, out);
-                            path.truncate(path.len() - 2);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(root, &mut Vec::new(), &mut 0, &mut out);
-        out.sort_by_key(|(pos, path)| (!path.is_empty(), *pos));
-        out.into_iter().map(|(_, p)| p).collect()
-    }
-
-    fn table_at<'a>(t: &'a mut Table, path: &[Step]) -> Option<&'a mut Table> {
-        match path {
-            [] => Some(t),
-            [Step::Key(k), Step::At(n), rest @ ..] => {
-                let a = t.get_mut(k)?.as_array_of_tables_mut()?;
-                table_at(a.get_mut(*n)?, rest)
-            }
-            [Step::Key(k), rest @ ..] => table_at(t.get_mut(k)?.as_table_mut()?, rest),
-            _ => None,
-        }
-    }
-
-    /// `s` split at its first blank line: the lines before it, and the rest.
-    fn split_at_blank(s: &str) -> (String, String) {
-        let mut at = 0;
-        for line in s.split_inclusive('\n') {
-            if line.trim().is_empty() {
-                break;
-            }
-            at += line.len();
-        }
-        (s[..at].to_string(), s[at..].to_string())
-    }
-
-    /// Hang `block` (comment lines) after `t`'s last line: its last value,
-    /// else its header. False when there is neither (the root with no keys).
-    fn append_block(t: &mut Table, block: &str, is_root: bool) -> bool {
-        let tail = format!("\n{}", block.trim_end_matches('\n'));
-        if let Some(v) = t.iter_mut().filter_map(|(_, i)| i.as_value_mut()).last() {
-            append_suffix(v, &tail);
-            return true;
-        }
-        if is_root {
-            return false;
-        }
-        let s = suffix(t.decor());
-        t.decor_mut().set_suffix(format!("{s}{tail}"));
-        true
-    }
-
-    /// Who owns a comment block between two tables. A block touching a
-    /// table's last line (no blank line between them) belongs to that table;
-    /// one separated from it by a blank line belongs to the header below.
-    /// toml_edit files both as the next header's prefix (the last table's in
-    /// the document's trailing), so an edit that removed or moved the next
-    /// table took the first kind with it. Before any edit, each such block is
-    /// hung on its own table's last line (in that line's suffix, which prints
-    /// the same text), so it stays and moves with its table. Printed, the
-    /// document is unchanged.
-    pub(super) fn attach_trailing_comments(doc: &mut toml_edit::DocumentMut) {
-        let order = printed_tables(doc.as_table());
-        for w in 1..order.len() {
-            let Some(t) = table_at(doc.as_table_mut(), &order[w]) else {
-                continue;
-            };
-            let (block, rest) = split_at_blank(&prefix(t.decor()));
-            if !block.contains('#') {
-                continue;
-            }
-            let Some(prev) = table_at(doc.as_table_mut(), &order[w - 1]) else {
-                continue;
-            };
-            if append_block(prev, &block, order[w - 1].is_empty())
-                && let Some(t) = table_at(doc.as_table_mut(), &order[w])
-            {
-                t.decor_mut().set_prefix(rest);
-            }
-        }
-        let trailing = doc.trailing().as_str().unwrap_or("").to_string();
-        let (block, rest) = split_at_blank(&trailing);
-        if block.contains('#')
-            && let Some(last) = order.last()
-            && let Some(t) = table_at(doc.as_table_mut(), last)
-            && append_block(t, &block, last.is_empty())
-        {
-            doc.set_trailing(rest);
-        }
-    }
-
-    /// Elements kept in a new order still carry their old places in the file,
-    /// and toml_edit writes tables by place: TOML reads an array of tables in
-    /// the order its headers appear, so the file would read back in the OLD
-    /// order. Without places, every table is written in document order.
-    pub(super) fn forget_positions(table: &mut Table) {
-        for (_, item) in table.iter_mut() {
-            match item {
-                Item::Table(t) => {
-                    t.set_position(None);
-                    forget_positions(t);
-                }
-                Item::ArrayOfTables(a) => {
-                    for t in a.iter_mut() {
-                        t.set_position(None);
-                        forget_positions(t);
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -1694,20 +2588,38 @@ impl Config {
         self.save_with(path, &|_| {})
     }
 
-    /// [`Config::save`] with a hook run on the edited document before it is
-    /// checked: a test seam, so a test can inject the merge fault the
-    /// read-back check exists to stop.
+    /// [`Config::save`] with a hook run on the edited text before it is
+    /// checked: a test seam, so a test can inject the edit fault the
+    /// read-back check exists to stop. Each warning of the save goes to
+    /// stderr as `Warning: <path>: …`.
     #[doc(hidden)]
     pub fn save_with(
         &self,
         path: &Path,
-        fault: &dyn Fn(&mut toml_edit::DocumentMut),
+        fault: &dyn Fn(&mut String),
+    ) -> Result<(), Box<dyn Error>> {
+        self.save_reporting(path, fault, &mut |w| {
+            eprintln!("Warning: {}: {w}", path.display())
+        })
+    }
+
+    /// [`Config::save_with`] handing each warning of the save to `warn` once
+    /// the file is written, instead of printing it on stderr (where the CLI's
+    /// terminal and the helper's journal see it): an array element removed
+    /// with keys this version does not read, or with comments of its own
+    /// (`Config::edited_into_with`). A warning never refuses the save.
+    #[doc(hidden)]
+    pub fn save_reporting(
+        &self,
+        path: &Path,
+        fault: &dyn Fn(&mut String),
+        warn: &mut dyn FnMut(String),
     ) -> Result<(), Box<dyn Error>> {
         let named = |e: &dyn std::fmt::Display| format!("cannot write {}: {e}", path.display());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| named(&e))?;
         }
-        let text = match fs::read_to_string(path) {
+        let (text, warnings) = match fs::read_to_string(path) {
             Ok(existing) => self
                 .edited_into_with(&existing, fault)
                 .map_err(|e| named(&e))?,
@@ -1716,11 +2628,18 @@ impl Config {
                     .with_pinned_snapshot_names()
                     .to_toml()
                     .map_err(|e| named(&e))?;
-                format!("{FRESH_HEADER}{body}")
+                (format!("{FRESH_HEADER}{body}"), Vec::new())
             }
             Err(e) => return Err(named(&e).into()),
         };
-        crate::fsutil::write_atomic(path, &text)?;
+        let written = crate::fsutil::write_atomic(path, &text);
+        // Reported once the new file is in place — even when a step after
+        // the rename (the directory flush) failed: the removal reached the
+        // disk. Read back, never inferred from the error.
+        if written.is_ok() || fs::read_to_string(path).is_ok_and(|on_disk| on_disk == text) {
+            warnings.into_iter().for_each(warn);
+        }
+        written?;
         Ok(())
     }
 
@@ -1743,7 +2662,9 @@ impl Config {
                  the file was left unchanged"
             ))
         })?;
-        let out = cfg.edited_into_with(text, &|_| {}).map_err(|e| named(&e))?;
+        // `text` is edited into itself: no element is ever dropped, so there
+        // is nothing to warn about.
+        let (out, _) = cfg.edited_into_with(text, &|_| {}).map_err(|e| named(&e))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| named(&e))?;
         }
@@ -1752,50 +2673,63 @@ impl Config {
     }
 
     /// `existing` (the text of `config.toml`) with this config written into
-    /// it surgically. What this binary KNOWS of the file is what it would
-    /// write after loading it (`from_toml` then `to_toml`); everything else
-    /// in the document is left exactly as it is. Then, per key:
+    /// it, and the save's warnings. What this binary KNOWS of the file is
+    /// what it would write after loading it (`from_toml` then `to_toml`).
+    /// The file is parsed with its spans (`toml_edit::Document`) and every
+    /// difference between what is known and this config becomes a splice on
+    /// the original bytes (`mod splice`); every byte outside a splice is
+    /// copied as it is — strings, comments, blank lines, indentation, line
+    /// endings (inside multi-line strings too), a byte-order mark, a missing
+    /// final newline, the order of dotted keys. Per key:
     ///
     /// - known and unchanged: untouched, in the operator's spelling;
-    /// - changed: the value is replaced, keeping its comment and spacing;
-    /// - new: inserted (an omitted key whose default is unchanged stays omitted);
+    /// - changed: its value's bytes replaced, its comment and spacing kept;
+    /// - new: written on a line of its own after the last key line of its
+    ///   table, indented like that line, with that line's line ending (in an
+    ///   inline table or array, after the last entry: on its line in a
+    ///   one-line one, on a line of its own in a multi-line one); a new table
+    ///   at the top level goes at the end of the file. An omitted key whose
+    ///   default is unchanged stays omitted;
     /// - known but no longer in this config (an entry deleted, an `Option`
-    ///   cleared): removed;
+    ///   cleared): its own text taken out — a key alone on its line, the
+    ///   line; an inline entry, itself, its comma and the comment ending its
+    ///   line when it ends it (the comma before it, when it was the last one);
     /// - unknown: kept.
     ///
     /// Arrays of tables (`[[source]]`, `[[target]]`, subvolume entries) are
     /// matched element by element on their `label` (or `name`): a matched
     /// element is edited by the same rules and keeps its own unknown keys
     /// and comments, wherever it moves; an element with no match is written
-    /// fresh, and an old one with no match is removed with everything in it.
-    /// An element renamed is therefore a removal plus an addition (bd
-    /// DAS-Backup-Manager-m0pr.2). Elements are matched on unchanged known
+    /// fresh after the last one in the file, and an old one with no match is
+    /// removed with everything in it — its header's line to its last line,
+    /// its own tables and entries included. The comment and blank lines
+    /// around a removed element (above its header, under its last line)
+    /// stay; one blank line is kept where two would meet. An element renamed
+    /// is a removal plus an addition: renames are never inferred (bd
+    /// DAS-Backup-Manager-m0pr.2), and a removed element that held keys this
+    /// version does not read, or comments of its own, is named in a warning,
+    /// by its index in the file. Elements are matched on unchanged known
     /// content first, so a plain array's comments stay with their values and
     /// of two same-named entries the right one goes.
     ///
     /// A legacy key this version reads but never writes (a target's `serial`)
-    /// is removed when the key it feeds changes. Then every backup-scoping key
+    /// is removed when the key it feeds changes, and a removed key
+    /// (`REMOVED_KEYS`) from every subvolume entry. Every backup-scoping key
     /// the file leaves out is written out with its current value
-    /// (`surgical::PINNED`), and so is every entry's snapshot name
+    /// (`splice::PINNED`), and so is every entry's snapshot name
     /// ([`Config::with_pinned_snapshot_names`]).
     ///
-    /// Comments: one after an array element's comma stays with that element;
-    /// a comment block touching a table's last line stays with that table
-    /// (`surgical::attach_trailing_comments`); one after a blank line stays
-    /// with the header below it. A key added at the end of a table goes above
-    /// that table's trailing block, and a removed last key hands it up.
-    ///
     /// Refused, with nothing written, when `existing` is not TOML, is not a
-    /// config this version can read, or the edited text would not read back
-    /// as exactly this config; the refusal names the paths that would differ.
+    /// config this version can read, an edit has no place in the file, or the
+    /// edited text would not read back as exactly this config; the refusal
+    /// names the paths that would differ.
     fn edited_into_with(
         &self,
         existing: &str,
-        fault: &dyn Fn(&mut toml_edit::DocumentMut),
-    ) -> Result<String, String> {
+        fault: &dyn Fn(&mut String),
+    ) -> Result<(String, Vec<String>), String> {
         let unchanged = "the file was left unchanged";
-        let mut doc: toml_edit::DocumentMut = existing
-            .parse()
+        let doc = toml_edit::Document::parse(existing)
             .map_err(|e| format!("the file on disk is not TOML ({e}); {unchanged}"))?;
         let known = Self::from_toml(existing).map_err(|e| {
             format!("the file on disk is not a config this version can read ({e}); {unchanged}")
@@ -1807,16 +2741,15 @@ impl Config {
         let as_table = |text: &str| toml::from_str::<toml::Table>(text).map_err(|e| e.to_string());
         let old = as_table(&known.to_toml().map_err(|e| e.to_string())?)?;
         let new = as_table(&want)?;
-        let mut reordered = false;
-        surgical::attach_trailing_comments(&mut doc);
-        surgical::merge_table(doc.as_table_mut(), &old, &new, &mut reordered);
-        surgical::pin(doc.as_table_mut(), &new);
-        surgical::drop_removed_keys(doc.as_table_mut());
-        fault(&mut doc);
-        if reordered {
-            surgical::forget_positions(doc.as_table_mut());
+        let plan = splice::plan(existing, &doc, &old, &new);
+        if !plan.unplaceable.is_empty() {
+            return Err(format!(
+                "the edit has no place in the file ({}); {unchanged}",
+                plan.unplaceable.join(", ")
+            ));
         }
-        let out = doc.to_string();
+        let mut out = plan.apply().map_err(|e| format!("{e}; {unchanged}"))?;
+        fault(&mut out);
         let back = Self::from_toml(&out)
             .map_err(|e| e.to_string())
             .and_then(|c| c.to_toml().map_err(|e| e.to_string()))
@@ -1826,10 +2759,10 @@ impl Config {
             return Err(format!(
                 "the edited file would not read back as the config being saved \
                  ({} would differ); {unchanged}",
-                surgical::differing_paths(&new, &back).join(", ")
+                splice::differing_paths(&new, &back).join(", ")
             ));
         }
-        Ok(out)
+        Ok((out, plan.warnings))
     }
 
     /// This config with every subvolume entry's snapshot name written out:
@@ -4335,7 +5268,7 @@ enabled = false
     }
 
     /// `file` as a save by this version leaves it with nothing changed: the
-    /// backup-scoping keys it left out written in (`surgical::PINNED`).
+    /// backup-scoping keys it left out written in (`splice::PINNED`).
     fn pinned(file: &str) -> String {
         saved_after(file, |_| {})
     }
@@ -4510,18 +5443,18 @@ enabled = false
         )
         .unwrap();
         assert_eq!(
-            surgical::differing_paths(&a, &b),
+            splice::differing_paths(&a, &b),
             ["x", "s.k", "t[1].v", "new"]
         );
-        assert!(surgical::differing_paths(&a, &a).is_empty());
+        assert!(splice::differing_paths(&a, &a).is_empty());
         let short: toml::Table = toml::from_str("[[t]]\nv = 1\n").unwrap();
         let long: toml::Table = toml::from_str("[[t]]\nv = 1\n[[t]]\nv = 2\n").unwrap();
-        assert_eq!(surgical::differing_paths(&short, &long), ["t[1]"]);
-        assert_eq!(surgical::differing_paths(&long, &short), ["t[1]"]);
+        assert_eq!(splice::differing_paths(&short, &long), ["t[1]"]);
+        assert_eq!(splice::differing_paths(&long, &short), ["t[1]"]);
         // A plain array is one value.
         let one: toml::Table = toml::from_str("l = [1]\n").unwrap();
         let two: toml::Table = toml::from_str("l = [1, 2]\n").unwrap();
-        assert_eq!(surgical::differing_paths(&one, &two), ["l"]);
+        assert_eq!(splice::differing_paths(&one, &two), ["l"]);
     }
 
     /// Comments inside a plain array stay with the elements still present
@@ -4759,9 +5692,11 @@ enabled = false
         assert!(line_with(&t, "name = \"@home\"").contains("# homes"), "{t}");
     }
 
-    /// Arrays of tables: a comment block touching an entry's last line belongs
-    /// to that entry; one separated from it by a blank line belongs to the
-    /// header below.
+    /// Arrays of tables: an entry kept in a new order moves with the comment
+    /// block touching its last line and the one above its header (after a
+    /// blank line). An entry removed takes only its own lines — header to
+    /// last line — and the comment lines around it stay where they are (bd
+    /// DAS-Backup-Manager-5237.4; 0.7.23.2 dropped them with the entry).
     #[test]
     fn an_array_of_tables_keeps_each_comment_block_with_its_own_entry() {
         let file = minimal_toml(
@@ -4784,24 +5719,37 @@ enabled = false
             );
         };
         let gone = |t: &str, n: &str| {
-            assert!(
-                !t.contains(&format!("after {n}")) && !t.contains(&format!("above {n}")),
-                "{n}:\n{t}"
-            );
+            assert!(!t.contains(&format!("name = \"@{n}\"")), "{n}:\n{t}");
         };
         let without =
             |n: &'static str| move |c: &mut Config| c.sources[0].subvolumes.retain(|e| e.name != n);
         let t = saved_after(&file, without("@b"));
         kept(&t, "c");
         gone(&t, "b");
-        assert!(t.contains("snapshot_name = \"a\"\n# after a\n"), "{t}");
+        assert!(
+            t.contains(
+                "snapshot_name = \"a\"\n# after a\n\n# above b\n# after b\n\n# above c\n\
+                 [[source.subvolumes]]\nname = \"@c\""
+            ),
+            "{t}"
+        );
         let t = saved_after(&file, without("@c"));
         kept(&t, "b");
         gone(&t, "c");
+        assert!(
+            t.contains("snapshot_name = \"b\"\n# after b\n\n# above c\n# after c\n"),
+            "{t}"
+        );
         let t = saved_after(&file, without("@a"));
         kept(&t, "b");
         kept(&t, "c");
-        assert!(!t.contains("after a"), "{t}");
+        gone(&t, "a");
+        assert!(
+            t.contains(
+                "target_labels = []\n# after a\n\n# above b\n[[source.subvolumes]]\nname = \"@b\""
+            ),
+            "{t}"
+        );
         let t = saved_after(&file, |c| c.sources[0].subvolumes.swap(0, 2));
         kept(&t, "b");
         assert!(t.find("name = \"@c\"") < t.find("# after c"), "{t}");
@@ -4862,9 +5810,10 @@ enabled = false
         std::fs::write(&path, &file).unwrap();
         let mut cfg = Config::load(&path).unwrap();
         cfg.schedule.full = "Sat 05:00".into();
-        let fault = |doc: &mut toml_edit::DocumentMut| {
-            doc["schedule"]["full"] = toml_edit::value("Mon 01:00");
-            doc["target"][0]["retention"]["daily"] = toml_edit::value(1);
+        let fault = |text: &mut String| {
+            *text = text
+                .replace("full = \"Sat 05:00\"", "full = \"Mon 01:00\"")
+                .replace("daily = 7", "daily = 1");
         };
         let err = cfg.save_with(&path, &fault).unwrap_err().to_string();
         assert!(err.contains("would not read back"), "{err}");
@@ -5214,5 +6163,964 @@ enabled = false
         assert!(t.contains("[[source.subvolumes]]\nname = \".\"\n"), "{t}");
         let back = Config::from_toml(&t).unwrap();
         assert_eq!(back.sources[0].subvolumes[0].snapshot_name, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Byte-exact saves (bd DAS-Backup-Manager-5237.4): each case asserts the
+    // saved file IS the input with only the planned splices — never a
+    // semantic comparison. The cases are verify4's findings on the m0pr
+    // scanner (`m0pr-verify4-result.json`, numbered as there) and bd 5237.1,
+    // 5237.2, 5237.3 and m0pr.3.
+    // -----------------------------------------------------------------------
+
+    /// A head holding every backup-scoping key, so a save pins nothing in it.
+    const SPLICE_HEAD: &str = "[general]\nversion = \"0.4.0\"\ninstall_prefix = \"/usr/local\"\n\
+        db_path = \"/var/lib/das-backup/backup-index.db\"\nbtrbk_conf = \"/etc/btrbk/btrbk.conf\"\n\
+        \n[init]\nsystem = \"systemd\"\n\
+        \n[schedule]\nincremental = \"03:00\"\nfull = \"Sun 04:00\"\nrandomized_delay_min = 30\n\
+        \n[boot]\nenabled = true\nsubvolumes = [\"@\", \"@home\"]\narchive_retention_days = 60\n\
+        \n[subvolumes]\nexclude = []\n\
+        \n[doctor]\nexclude = []\n\
+        \n[restore]\nallowed_roots = [\"/home\", \"/tmp\"]\n\
+        \n[email]\nenabled = false\n\
+        \n[gui]\nenabled = false\n\n";
+
+    /// A `[[source]]` holding every pinned key, `label` = `s`, then `rest`
+    /// (its `subvolumes`, inline or as entries).
+    fn src(label: &str, rest: &str) -> String {
+        format!(
+            "[[source]]\nlabel = \"{label}\"\nvolume = \"/vol\"\ndevice = \"/dev/sda\"\n\
+             snapshot_dir = \".btrbk-snapshots\"\ntarget_subdirs = []\ntarget_labels = []\n{rest}"
+        )
+    }
+
+    /// A `[[target]]` holding every pinned key.
+    fn tgt(i: usize) -> String {
+        format!(
+            "[[target]]\nlabel = \"t{i}\"\nserials = [\"SERIAL0{i}\"]\nmount = \"/mnt/backup-{i}\"\n\
+             role = \"primary\"\nretention = {{ daily = 1, weekly = 0, monthly = 0, yearly = 0 }}\n"
+        )
+    }
+
+    /// `file` with each `(from, to)` replaced; each `from` must occur exactly
+    /// once, so the expected text names the only bytes a save may change.
+    fn spliced(file: &str, edits: &[(&str, &str)]) -> String {
+        let mut out = file.to_string();
+        for (from, to) in edits {
+            assert_eq!(
+                out.matches(from).count(),
+                1,
+                "{from:?} is not unique in:\n{out}"
+            );
+            out = out.replacen(from, to, 1);
+        }
+        out
+    }
+
+    /// Save `edit` of `file` through a real file: the bytes written and the
+    /// save's warnings.
+    fn exact(file: &str, edit: impl FnOnce(&mut Config)) -> (String, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, file).unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        edit(&mut cfg);
+        let mut warnings = Vec::new();
+        cfg.save_reporting(&path, &|_| {}, &mut |w| warnings.push(w))
+            .unwrap();
+        (std::fs::read_to_string(&path).unwrap(), warnings)
+    }
+
+    fn exact_text(file: &str, edit: impl FnOnce(&mut Config)) -> String {
+        exact(file, edit).0
+    }
+
+    fn sub(name: &str, snap: &str) -> SubvolConfig {
+        SubvolConfig {
+            name: name.into(),
+            snapshot_name: Some(snap.into()),
+            ..Default::default()
+        }
+    }
+
+    const SUB_A: &str = "subvolumes = [{ name = \"@a\", snapshot_name = \"a\" }]\n";
+
+    /// #0: a key added to a multi-line inline table whose `}` shares the last
+    /// value's line goes on a line of its own, at the lines' indentation.
+    #[test]
+    fn splice_a_key_added_to_a_multi_line_inline_table_takes_a_line_of_its_own() {
+        let egress = |c: &mut Config| c.recovery_os.egress_org = Some("AS64500".into());
+        let body = format!("{SPLICE_HEAD}{}{}", src("s", SUB_A), tgt(0));
+        for (table, want) in [
+            (
+                "recovery_os = {\n  max_age_days = 30 }\n",
+                "recovery_os = {\n  max_age_days = 30,\n  egress_org = \"AS64500\" }\n",
+            ),
+            (
+                "recovery_os = {\n  max_age_days = 30, }\n",
+                "recovery_os = {\n  max_age_days = 30,\n  egress_org = \"AS64500\", }\n",
+            ),
+            (
+                "recovery_os = {\n  install_user = \"user\" } # after\n",
+                "recovery_os = {\n  install_user = \"user\",\n  egress_org = \"AS64500\" } # after\n",
+            ),
+        ] {
+            let file = format!("{table}{body}");
+            assert_eq!(exact_text(&file, egress), spliced(&file, &[(table, want)]));
+        }
+        // A pinned key the same way.
+        let file = format!("{SPLICE_HEAD}{}", src("s", SUB_A))
+            + "[[target]]\nlabel = \"t0\"\nserials = [\"SERIAL01\"]\nmount = \"/mnt/backup-0\"\n\
+               role = \"primary\"\nretention = {\n    daily = 7 }\n";
+        assert_eq!(
+            exact_text(&file, |_| {}),
+            spliced(
+                &file,
+                &[(
+                    "    daily = 7 }",
+                    "    daily = 7,\n    weekly = 0,\n    monthly = 0,\n    yearly = 0 }"
+                )]
+            )
+        );
+    }
+
+    /// #1: removing the last entry of an inline array leaves a `]` that stood
+    /// on its own line there.
+    #[test]
+    fn splice_removing_the_last_inline_entry_keeps_a_closing_bracket_on_its_line() {
+        let first = "{ name = \"@\", snapshot_name = \"root\" }";
+        let b = "{ name = \"@b\", snapshot_name = \"b\" }";
+        let drop_b = |c: &mut Config| c.sources[0].subvolumes.retain(|e| e.name != "@b");
+        for (line, want, warned) in [
+            (
+                format!("subvolumes = [{first}, {b},\n]\n"),
+                format!("subvolumes = [{first},\n]\n"),
+                false,
+            ),
+            (
+                format!("subvolumes = [{first}, {b}\n]\n"),
+                format!("subvolumes = [{first}\n]\n"),
+                false,
+            ),
+            (
+                format!("subvolumes = [{first}, {b}, # b note\n]\n"),
+                format!("subvolumes = [{first},\n]\n"),
+                true,
+            ),
+        ] {
+            let file = format!("{SPLICE_HEAD}{}{}", src("s", &line), tgt(0));
+            let (text, warnings) = exact(&file, drop_b);
+            assert_eq!(text, spliced(&file, &[(line.as_str(), want.as_str())]));
+            assert_eq!(warnings.len(), usize::from(warned), "{warnings:?}");
+        }
+    }
+
+    /// #2: removing the first entry, on the `[` line, leaves the next line
+    /// where it was.
+    #[test]
+    fn splice_removing_the_first_inline_entry_leaves_the_next_line_alone() {
+        let line = "subvolumes = [{ name = \"@\", snapshot_name = \"root\" },\n    \
+                    { name = \"@b\", snapshot_name = \"b\" },\n]\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", line), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[("[{ name = \"@\", snapshot_name = \"root\" },\n", "[\n")]
+            )
+        );
+    }
+
+    /// #3: an entry added to a multi-line array whose `]` shares the last
+    /// entry's line goes on its own line at the entries' indentation; removing
+    /// it again gives back the input.
+    #[test]
+    fn splice_an_entry_added_beside_a_shared_closing_bracket() {
+        let line = "subvolumes = [ { name = \"@\", snapshot_name = \"root\" },\n               \
+                    { name = \"@b\", snapshot_name = \"b\" } ]\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", line), tgt(0));
+        let added = exact_text(&file, |c| c.sources[0].subvolumes.push(sub("@new", "new")));
+        assert_eq!(
+            added,
+            spliced(
+                &file,
+                &[(
+                    "snapshot_name = \"b\" } ]",
+                    "snapshot_name = \"b\" },\n               \
+                     { name = \"@new\", snapshot_name = \"new\" } ]"
+                )]
+            )
+        );
+        let back = exact_text(&added, |c| {
+            c.sources[0].subvolumes.pop();
+        });
+        assert_eq!(back, file);
+    }
+
+    /// #4, #19: bytes inside a multi-line string are never rewritten, whatever
+    /// the file's line endings.
+    #[test]
+    fn splice_line_endings_inside_multi_line_strings_are_kept() {
+        let retire =
+            |c: &mut Config| c.sources[0].subvolumes[0].retired = Some("2026-01-01".into());
+        let target = "[[target]]\nlabel = \"t0\"\nserials = [\"SERIAL01\"]\nmount = \"/mnt/backup-0\"\n\
+                      role = \"primary\"\ndisplay_name = \"\"\"two\r\nlines\"\"\"\n\
+                      retention = { daily = 1, weekly = 0, monthly = 0, yearly = 0 }\n";
+        let file = format!("{SPLICE_HEAD}{}{target}", src("s", SUB_A));
+        let want = spliced(&file, &[("\"a\" }]", "\"a\", retired = \"2026-01-01\" }]")]);
+        assert_eq!(exact_text(&file, retire), want);
+        // An unknown key's multi-line string, LF inside a CRLF file and CRLF
+        // inside an LF file.
+        let lf = format!(
+            "{}{}{}",
+            SPLICE_HEAD.replace(
+                "randomized_delay_min = 30\n",
+                "randomized_delay_min = 30\nfuture_text = \"\"\"line one\r\nline two\"\"\"\n"
+            ),
+            src("s", SUB_A),
+            tgt(0)
+        );
+        assert_eq!(
+            exact_text(&lf, retire),
+            spliced(&lf, &[("\"a\" }]", "\"a\", retired = \"2026-01-01\" }]")])
+        );
+        let crlf = format!("{SPLICE_HEAD}{}{}", src("s", SUB_A), tgt(0))
+            .replace('\n', "\r\n")
+            .replace(
+                "randomized_delay_min = 30\r\n",
+                "randomized_delay_min = 30\r\nfuture_text = \"\"\"line one\nline two\"\"\"\r\n",
+            );
+        assert_eq!(
+            exact_text(&crlf, retire),
+            spliced(&crlf, &[("\"a\" }]", "\"a\", retired = \"2026-01-01\" }]")])
+        );
+    }
+
+    /// #5, #13: an entry whose `[[header]]` is indented takes its indentation
+    /// with it, and the comment lines above it stay.
+    #[test]
+    fn splice_an_indented_header_goes_with_its_entry() {
+        let indented = |i: usize| tgt(i).replacen("[[target]]", "  [[target]]", 1);
+        let file = format!(
+            "{SPLICE_HEAD}{}{}\n{}",
+            src("s", SUB_A),
+            indented(0),
+            indented(1)
+        );
+        let text = exact_text(&file, |c| {
+            c.targets.remove(0);
+        });
+        assert_eq!(text, spliced(&file, &[(indented(0).as_str(), "")]));
+        // The comment above a dropped indented entry stays.
+        let file = format!(
+            "{SPLICE_HEAD}{}{}\n# the second drive\n{}",
+            src("s", SUB_A),
+            tgt(0),
+            indented(1)
+        );
+        let text = exact_text(&file, |c| {
+            c.targets.remove(1);
+        });
+        assert_eq!(text, spliced(&file, &[(indented(1).as_str(), "")]));
+        // An indented subvolume entry.
+        let entries = "  [[source.subvolumes]]\n  name = \"@a\"\n  snapshot_name = \"a\"\n\
+                       # note about b\n[[source.subvolumes]]\nname = \"@b\"\nsnapshot_name = \"b\"\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "  [[source.subvolumes]]\n  name = \"@a\"\n  snapshot_name = \"a\"\n",
+                    ""
+                )]
+            )
+        );
+    }
+
+    /// #6: two adjacent entries removed in one save leave one blank line where
+    /// three would meet.
+    #[test]
+    fn splice_adjacent_removals_leave_one_blank_line() {
+        let file = format!(
+            "{SPLICE_HEAD}{}\n{}\n{}\n{}",
+            src("s", SUB_A),
+            tgt(0),
+            tgt(1),
+            tgt(2)
+        );
+        let text = exact_text(&file, |c| {
+            c.targets.drain(0..2);
+        });
+        assert_eq!(
+            text,
+            spliced(&file, &[(format!("{}\n{}\n", tgt(0), tgt(1)).as_str(), "")])
+        );
+        // The last source and the first target after it.
+        let file = format!(
+            "{SPLICE_HEAD}{}\n{}\n{}\n{}",
+            src("s", SUB_A),
+            src(
+                "s1",
+                "subvolumes = [{ name = \"@b\", snapshot_name = \"b\" }]\n"
+            ),
+            tgt(0),
+            tgt(1)
+        );
+        let text = exact_text(&file, |c| {
+            c.sources.pop();
+            c.targets.remove(0);
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    format!(
+                        "{}\n{}\n",
+                        src(
+                            "s1",
+                            "subvolumes = [{ name = \"@b\", snapshot_name = \"b\" }]\n"
+                        ),
+                        tgt(0)
+                    )
+                    .as_str(),
+                    ""
+                )]
+            )
+        );
+    }
+
+    fn sub_entry(name: &str) -> String {
+        format!("[[source.subvolumes]]\nname = \"@{name}\"\nsnapshot_name = \"{name}\"\n")
+    }
+
+    /// #7, #15, #21: a dropped `[[source]]` takes its own entries with it; the
+    /// comment lines around it — above its header, under its last entry —
+    /// stay where they are.
+    #[test]
+    fn splice_a_dropped_source_takes_its_entries_and_leaves_the_lines_around_it() {
+        let s1 = src(
+            "s1",
+            "subvolumes = [{ name = \"@b\", snapshot_name = \"b\" }]\n",
+        );
+        let file = format!(
+            "{SPLICE_HEAD}{}\n# about s1\n{s1}{}",
+            src("s", &sub_entry("a")),
+            tgt(0)
+        );
+        let (text, warnings) = exact(&file, |c| {
+            c.sources.pop();
+        });
+        assert_eq!(text, spliced(&file, &[(s1.as_str(), "")]));
+        assert_eq!(warnings, Vec::<String>::new());
+        let s0 = src("s", &sub_entry("a"));
+        let file = format!("{SPLICE_HEAD}{s0}# note under @a\n\n{s1}{}", tgt(0));
+        let (text, warnings) = exact(&file, |c| {
+            c.sources.remove(0);
+        });
+        assert_eq!(text, spliced(&file, &[(s0.as_str(), "")]));
+        assert_eq!(warnings, Vec::<String>::new());
+        // #21: the block under a dropped source's last nested line stays.
+        let gone = src(
+            "gone",
+            "[[source.subvolumes]]\nname = \"@old\"\nretired = \"2020-01-01\"\n",
+        )
+        .replace("/vol", "/vol2");
+        let keep = src("keep", &sub_entry("x"));
+        let file = format!(
+            "{SPLICE_HEAD}{gone}# block under the last line\n\n{keep}{}",
+            tgt(0)
+        );
+        let (text, warnings) = exact(&file, |c| {
+            c.sources.remove(0);
+        });
+        assert_eq!(text, spliced(&file, &[(gone.as_str(), "")]));
+        assert_eq!(warnings, Vec::<String>::new());
+    }
+
+    /// #8: removing an entry and the last key of the entry before it, in one
+    /// save, keeps both comment blocks in their order.
+    #[test]
+    fn splice_two_removals_keep_the_comment_blocks_in_order() {
+        let entries = "[[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"a\"\n\
+                       retired = \"2026-01-01\"\n# under a\n\n\
+                       [[source.subvolumes]]\nname = \"@b\"\nsnapshot_name = \"b\"\n# under b\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes[0].retired = None;
+            c.sources[0].subvolumes.remove(1);
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[
+                    ("retired = \"2026-01-01\"\n", ""),
+                    (
+                        "[[source.subvolumes]]\nname = \"@b\"\nsnapshot_name = \"b\"\n",
+                        ""
+                    ),
+                ]
+            )
+        );
+    }
+
+    /// #9, #16: replacing or dropping every entry keeps the comment and blank
+    /// lines around them; an emptied `[[target]]` writes nothing in its place.
+    #[test]
+    fn splice_replacing_or_emptying_every_entry_keeps_the_lines_around_them() {
+        let entries =
+            "\n# above a\n[[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"a\"\n# under a\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+            c.sources[0].subvolumes.push(sub("@b", "b"));
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "name = \"@a\"\nsnapshot_name = \"a\"\n",
+                    "name = \"@b\"\nsnapshot_name = \"b\"\n"
+                )]
+            )
+        );
+        let file = format!(
+            "{SPLICE_HEAD}{}\n# above t0\n{}# under t0\n",
+            src("s", SUB_A),
+            tgt(0)
+        );
+        let text = exact_text(&file, |c| c.targets.clear());
+        assert_eq!(text, spliced(&file, &[(tgt(0).as_str(), "")]));
+        let file = format!(
+            "# file header\n{SPLICE_HEAD}{}\n# about t\n[[target]]\nlabel = \"t\"\n\
+             serials = [\"SERIAL01\"]\nmount = \"/mnt/backup-0\"\nrole = \"primary\"\n\
+             [target.retention]\ndaily = 7\nweekly = 0\nmonthly = 0\nyearly = 0\n# under t\n\
+             \n[email2]\nx = 1\n",
+            src("s", SUB_A)
+        );
+        let text = exact_text(&file, |c| c.targets.clear());
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "[[target]]\nlabel = \"t\"\nserials = [\"SERIAL01\"]\nmount = \"/mnt/backup-0\"\n\
+                     role = \"primary\"\n[target.retention]\ndaily = 7\nweekly = 0\nmonthly = 0\n\
+                     yearly = 0\n",
+                    ""
+                )]
+            )
+        );
+    }
+
+    /// #10: removing the first element of a multi-line array leaves the next
+    /// one's indentation and the blank line above it.
+    #[test]
+    fn splice_removing_the_first_element_keeps_the_next_ones_spacing() {
+        let line = "subvolumes = [\n  { name = \"@a\", snapshot_name = \"a\" },\n\n    \
+                    { name = \"@b\", snapshot_name = \"b\" },\n]\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", line), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes.remove(0);
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[("  { name = \"@a\", snapshot_name = \"a\" },\n", "")]
+            )
+        );
+    }
+
+    /// #11: a key added at the end of a table leaves the line above it, its
+    /// trailing whitespace included, as it was.
+    #[test]
+    fn splice_a_key_added_after_trailing_whitespace_leaves_that_line_alone() {
+        let entries = "[[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"a\"\t\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes[0].retired = Some("2026-01-01".into())
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "snapshot_name = \"a\"\t\n",
+                    "snapshot_name = \"a\"\t\nretired = \"2026-01-01\"\n"
+                )]
+            )
+        );
+    }
+
+    /// #12: a no-op save of a file with no final newline changes nothing; a
+    /// key added at its end gets the newline it needs, no more.
+    #[test]
+    fn splice_a_file_without_a_final_newline_keeps_it_that_way() {
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", SUB_A), tgt(0));
+        let bare = file.strip_suffix('\n').unwrap().to_string();
+        assert_eq!(exact_text(&bare, |_| {}), bare);
+        let commented = format!("{file}# eof");
+        assert_eq!(exact_text(&commented, |_| {}), commented);
+        let text = exact_text(&bare, |c| {
+            c.targets[0].mount_uuid = Some("5eed0016-0000-4000-8000-000000000016".into())
+        });
+        assert_eq!(
+            text,
+            format!("{bare}\nmount_uuid = \"5eed0016-0000-4000-8000-000000000016\"")
+        );
+    }
+
+    /// #14, #18: removing a key alone on its line takes that line and nothing
+    /// else — commas and `#` inside the strings and comments around it stay.
+    #[test]
+    fn splice_removing_a_key_never_touches_the_line_above() {
+        let clear = |c: &mut Config| c.recovery_os.egress_org = None;
+        for above in [
+            "note = \"\\\",#\"\n",
+            "install_user = \"a\\\",#\"\n",
+            "note = \"\\\"\" # list,\n",
+            "note = \"\"\"x\"y,#\"\"\"\n",
+            "note = '''it's''' # c,\n",
+            "note = '''\nfirst,\n#'''\n",
+        ] {
+            let file = format!(
+                "{SPLICE_HEAD}[recovery_os]\n{above}egress_org = \"AS64500\"\n\n{}{}",
+                src("s", SUB_A),
+                tgt(0)
+            );
+            assert_eq!(
+                exact_text(&file, clear),
+                spliced(&file, &[("egress_org = \"AS64500\"\n", "")]),
+                "{above:?}"
+            );
+        }
+        // The nightly revive under a multi-line note.
+        let entries = "[[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"root\"\n\
+                       [[source.subvolumes]]\nname = \"@x\"\nsnapshot_name = \"x\"\n\
+                       note = \"\"\"\nmoved to the new pool,\nsee ticket, #42\"\"\"\n\
+                       retired = \"2026-01-01\"\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        assert_eq!(
+            exact_text(&file, |c| c.sources[0].subvolumes[1].retired = None),
+            spliced(&file, &[("retired = \"2026-01-01\"\n", "")])
+        );
+        // A known key above: the save goes through.
+        let known = entries
+            .replace("snapshot_name = \"x\"\nnote", "note")
+            .replace("retired", "snapshot_name = \"a\\\"b, #c\"\nretired");
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", &known), tgt(0));
+        assert_eq!(
+            exact_text(&file, |c| c.sources[0].subvolumes[1].retired = None),
+            spliced(&file, &[("retired = \"2026-01-01\"\n", "")])
+        );
+        // A legacy serial removed under a comment holding commas.
+        let target = "[[target]]\nlabel = \"t0\"\nmount = \"/mnt/backup-0\"\nrole = \"primary\"\n\
+                      retention = { daily = 1, weekly = 0, monthly = 0, yearly = 0 }\n\
+                      display_name = \"12\\\" bay\" # left, cold,\nserial = \"SERIAL01\"\n";
+        let file = format!("{SPLICE_HEAD}{}{target}", src("s", SUB_A));
+        assert_eq!(
+            exact_text(&file, |c| {
+                c.targets[0].serials = vec!["SERIAL01".into(), "SERIAL02".into()]
+            }),
+            spliced(
+                &file,
+                &[(
+                    "serial = \"SERIAL01\"\n",
+                    "serials = [\"SERIAL01\", \"SERIAL02\"]\n"
+                )]
+            )
+        );
+        // A key alone on its line inside a multi-line inline entry.
+        let line = "subvolumes = [{\n  name = \"@x\",\n  snapshot_name = \"x\\\",#\",\n  \
+                    retired = \"2026-10-01\"\n}]\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", line), tgt(0));
+        assert_eq!(
+            exact_text(&file, |c| c.sources[0].subvolumes[0].retired = None),
+            spliced(&file, &[("  retired = \"2026-10-01\"\n", "")])
+        );
+    }
+
+    /// #17: an entry added to an empty multi-line array keeps the comment on
+    /// its `[` line.
+    #[test]
+    fn splice_an_entry_added_to_an_empty_array_keeps_its_comment() {
+        let file = format!(
+            "{SPLICE_HEAD}{}{}",
+            src("s", "subvolumes = [ # c\n]\n"),
+            tgt(0)
+        );
+        let text = exact_text(&file, |c| {
+            c.sources[0].subvolumes.push(SubvolConfig {
+                name: "@new".into(),
+                snapshot_name: Some("new".into()),
+                adopted: Some("2026-11-01".into()),
+                ..Default::default()
+            })
+        });
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "[ # c\n]",
+                    "[ # c\n{ name = \"@new\", snapshot_name = \"new\", adopted = \"2026-11-01\" }\n]"
+                )]
+            )
+        );
+    }
+
+    /// #20 and the m0pr.2 warning: a dropped element is named by its index
+    /// in the file, and so is the element that holds it.
+    #[test]
+    fn splice_a_nested_warning_names_its_parent_by_its_place_in_the_file() {
+        let gone = "[[source]]\nlabel = \"gone\"\nvolume = \"/vol2\"\ndevice = \"/dev/sdb\"\n\
+                    snapshot_dir = \".btrbk-snapshots\"\ntarget_subdirs = []\ntarget_labels = []\n\
+                    [[source.subvolumes]]\nname = \"@old\"\nsnapshot_name = \"old\"\n\
+                    retired = \"2020-01-01\"\nfuture = \"g\"\n";
+        let keep = src(
+            "keep",
+            "[[source.subvolumes]]\nname = \"@\"\nsnapshot_name = \"root\"\n\
+             [[source.subvolumes]]\nname = \"@old\"\nsnapshot_name = \"old\"\n\
+             retired = \"2020-01-01\"\nfuture = \"k\"\n",
+        );
+        let file = format!("{SPLICE_HEAD}{gone}{keep}{}", tgt(0));
+        let (text, warnings) = exact(&file, |c| {
+            c.sources.remove(0);
+            c.sources[0].subvolumes.remove(1);
+        });
+        let tail = "; a renamed element is written fresh, so anything it should keep must be \
+                    added to it again";
+        assert_eq!(
+            warnings,
+            [
+                format!(
+                    "source[0] \"gone\" is no longer in the config and was removed with keys \
+                     this version does not read (subvolumes[0].future){tail}"
+                ),
+                format!(
+                    "source[1].subvolumes[1] \"@old\" is no longer in the config and was \
+                     removed with keys this version does not read (future){tail}"
+                ),
+            ]
+        );
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[
+                    (gone, ""),
+                    (
+                        "[[source.subvolumes]]\nname = \"@old\"\nsnapshot_name = \"old\"\n\
+                         retired = \"2020-01-01\"\nfuture = \"k\"\n",
+                        ""
+                    ),
+                ]
+            )
+        );
+    }
+
+    /// 5237.1: dotted keys inside an inline table are read, edited and pinned
+    /// where they are.
+    #[test]
+    fn splice_dotted_keys_inside_an_inline_table() {
+        let target = "target = [{ label = \"t0\", serials = [\"SERIAL01\"], mount = \"/mnt/backup-0\", \
+                      role = \"primary\", retention.daily = 7 }]\n";
+        let file = format!("{target}{SPLICE_HEAD}{}", src("s", SUB_A));
+        assert_eq!(
+            exact_text(&file, |_| {}),
+            spliced(
+                &file,
+                &[(
+                    "retention.daily = 7 }",
+                    "retention.daily = 7, retention.weekly = 0, retention.monthly = 0, \
+                     retention.yearly = 0 }"
+                )]
+            )
+        );
+        let file = format!(
+            "recovery_os = {{ egress_org = \"AS64500\", future.x = 1 }}\n{SPLICE_HEAD}{}{}",
+            src("s", SUB_A),
+            tgt(0)
+        );
+        assert_eq!(
+            exact_text(&file, |c| c.recovery_os.egress_org = None),
+            spliced(&file, &[("egress_org = \"AS64500\", ", "")])
+        );
+        assert_eq!(
+            exact_text(&file, |c| c.recovery_os.max_age_days = 30),
+            spliced(
+                &file,
+                &[("future.x = 1 }", "future.x = 1, max_age_days = 30 }")]
+            )
+        );
+    }
+
+    /// 5237.2: the comment line above a removed plain-string entry stays,
+    /// with or without a comma after the entry.
+    #[test]
+    fn splice_a_comment_above_a_removed_plain_entry_stays() {
+        for b in ["  \"@b\",\n", "  \"@b\"\n"] {
+            let exclude = format!("exclude = [\n  \"@a\",\n  # keep b out: scratch\n{b}]\n");
+            let file = format!("{SPLICE_HEAD}{}{}", src("s", SUB_A), tgt(0)).replace(
+                "[subvolumes]\nexclude = []\n",
+                &format!("[subvolumes]\n{exclude}"),
+            );
+            let (text, warnings) = exact(&file, |c| c.subvolumes.exclude.retain(|e| e != "@b"));
+            assert_eq!(text, spliced(&file, &[(b, "")]));
+            assert_eq!(warnings, Vec::<String>::new());
+        }
+    }
+
+    /// 5237.3: interleaved dotted keys keep their order on any save.
+    #[test]
+    fn splice_interleaved_dotted_keys_keep_their_order() {
+        let target = "[[target]]\nlabel = \"t0\"\nretention.daily = 7\nserials = [\"SERIAL01\"]\n\
+                      retention.weekly = 4\nmount = \"/mnt/backup-0\"\nretention.monthly = 1\n\
+                      role = \"primary\"\nretention.yearly = 0\n";
+        let file = format!("{SPLICE_HEAD}{}{target}", src("s", SUB_A));
+        assert_eq!(
+            exact_text(&file, |c| c.schedule.full = "Sat 05:00".into()),
+            spliced(&file, &[("Sun 04:00", "Sat 05:00")])
+        );
+        assert_eq!(
+            exact_text(&file, |c| c.targets[0].retention.weekly = 5),
+            spliced(&file, &[("retention.weekly = 4", "retention.weekly = 5")])
+        );
+    }
+
+    /// m0pr.3: the comment block under a table's only value stays when that
+    /// value is removed.
+    #[test]
+    fn splice_a_comment_under_a_tables_only_value_stays() {
+        let file = format!(
+            "{SPLICE_HEAD}[recovery_os]\negress_org = \"AS64500\"\n# about recovery\n\n{}{}",
+            src("s", SUB_A),
+            tgt(0)
+        );
+        assert_eq!(
+            exact_text(&file, |c| c.recovery_os.egress_org = None),
+            spliced(&file, &[("egress_org = \"AS64500\"\n", "")])
+        );
+    }
+
+    /// A save that changes nothing writes the bytes it read: the operator's
+    /// file, CRLF, a byte-order mark.
+    #[test]
+    fn splice_a_no_op_save_is_byte_identical() {
+        let file = pinned(OPERATOR_FILE);
+        assert_eq!(exact_text(&file, |_| {}), file);
+        let crlf = file.replace('\n', "\r\n");
+        assert_eq!(exact_text(&crlf, |_| {}), crlf);
+        let bom = format!("\u{feff}{file}");
+        assert_eq!(exact_text(&bom, |_| {}), bom);
+    }
+
+    /// A key added to a CRLF file ends its line with CRLF; nothing else moves.
+    #[test]
+    fn splice_a_key_added_to_a_crlf_file_is_crlf() {
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", SUB_A), tgt(0)).replace('\n', "\r\n");
+        let text = exact_text(&file, |c| {
+            c.targets[0].mount_uuid = Some("5eed0016-0000-4000-8000-000000000016".into())
+        });
+        assert_eq!(
+            text,
+            format!("{file}mount_uuid = \"5eed0016-0000-4000-8000-000000000016\"\r\n")
+        );
+    }
+
+    /// The m0pr.2 warning: an element dropped with keys this version does not
+    /// read is named with them; one dropped with only comments of its own
+    /// says so; the lines around it are not its own.
+    #[test]
+    fn splice_a_dropped_element_with_unknown_keys_or_its_own_comments_is_warned() {
+        let tail = "; a renamed element is written fresh, so anything it should keep must be \
+                    added to it again";
+        let b = "[[target]]\nlabel = \"b\"\nmount = \"/mnt/b\"\nrole = \"mirror\"\nfuture = \"of b\"\n\
+                 [target.retention]\ndaily = 3\nweekly = 0\nmonthly = 0\nyearly = 0\nfuture_r = 1\n";
+        let file = format!("{SPLICE_HEAD}{}{}{b}", src("s", SUB_A), tgt(0));
+        let (text, warnings) = exact(&file, |c| {
+            c.targets.pop();
+        });
+        assert_eq!(text, spliced(&file, &[(b, "")]));
+        assert_eq!(
+            warnings,
+            [format!(
+                "target[1] \"b\" is no longer in the config and was removed with keys this \
+                 version does not read (future, retention.future_r){tail}"
+            )]
+        );
+        // Comments: on the header line, above a key, above a sub-table, in an
+        // array it holds.
+        for own in [
+            b.replace("[[target]]\n", "[[target]] # the mirror\n"),
+            b.replace("mount = ", "# where b mounts\nmount = "),
+            b.replace("[target.retention]", "\n# three days\n[target.retention]"),
+            b.replace("role = ", "serials = [\n    \"S1\", # bay 1\n]\nrole = "),
+        ] {
+            let own = own
+                .replace("future = \"of b\"\n", "")
+                .replace("future_r = 1\n", "");
+            let file = format!("{SPLICE_HEAD}{}{}{own}", src("s", SUB_A), tgt(0));
+            let (text, warnings) = exact(&file, |c| {
+                c.targets.pop();
+            });
+            assert_eq!(text, spliced(&file, &[(own.as_str(), "")]));
+            assert_eq!(
+                warnings,
+                [format!(
+                    "target[1] \"b\" is no longer in the config and was removed with its \
+                     comments{tail}"
+                )],
+                "{own}"
+            );
+        }
+        // Around it: above its header, under its last line. Not warned.
+        let plain = b
+            .replace("future = \"of b\"\n", "")
+            .replace("future_r = 1\n", "");
+        let file = format!(
+            "{SPLICE_HEAD}{}{}\n# the mirror\n{plain}# under b\n",
+            src("s", SUB_A),
+            tgt(0)
+        );
+        let (text, warnings) = exact(&file, |c| {
+            c.targets.pop();
+        });
+        assert_eq!(text, spliced(&file, &[(plain.as_str(), "")]));
+        assert_eq!(warnings, Vec::<String>::new());
+        // Inline entries: unknown key, a comment after its comma, inside it;
+        // a bare string counts in the index; a key the loader reads but the
+        // serialiser omits (`after_index = false`) is known.
+        for (line, gone, warned) in [
+            (
+                "subvolumes = [\"@\", {name = \"@x\", future = 1}]\n",
+                ", {name = \"@x\", future = 1}",
+                Some("keys this version does not read (future)"),
+            ),
+            (
+                "subvolumes = [\n    \"@\",\n    \"@x\", # scratch\n]\n",
+                "    \"@x\", # scratch\n",
+                Some("its comments"),
+            ),
+            (
+                "subvolumes = [\"@\", { name = \"@x\", # scratch\n    snapshot_name = \"x\" }]\n",
+                ", { name = \"@x\", # scratch\n    snapshot_name = \"x\" }",
+                Some("its comments"),
+            ),
+            (
+                "subvolumes = [\"@\", { name = \"@x\", after_index = false }]\n",
+                ", { name = \"@x\", after_index = false }",
+                None,
+            ),
+        ] {
+            let file = format!("{SPLICE_HEAD}{}{}", src("s", line), tgt(0));
+            let (text, warnings) = exact(&file, |c| {
+                c.sources[0].subvolumes.pop();
+            });
+            // The bare `"@"` kept is pinned into a table at the same time.
+            let want = line.replace(gone, "").replacen(
+                "\"@\"",
+                "{ name = \"@\", snapshot_name = \"root\" }",
+                1,
+            );
+            assert_eq!(text, spliced(&file, &[(line, want.as_str())]), "{line}");
+            match warned {
+                Some(what) => assert_eq!(
+                    warnings,
+                    [format!(
+                        "source[0].subvolumes[1] \"@x\" is no longer in the config and was \
+                         removed with {what}{tail}"
+                    )],
+                    "{line}"
+                ),
+                None => assert_eq!(warnings, Vec::<String>::new(), "{line}"),
+            }
+        }
+        // A dropped source's own entries' unknown keys, a bare string counted.
+        let s2 = src(
+            "s2",
+            "subvolumes = [\"@a\", { name = \"@x\", snapshot_name = \"x\", future = 1 }]\n",
+        )
+        .replace("/vol", "/vol2");
+        let file = format!("{SPLICE_HEAD}{}{s2}{}", src("s", SUB_A), tgt(0));
+        let (text, warnings) = exact(&file, |c| {
+            c.sources.pop();
+        });
+        assert_eq!(text, spliced(&file, &[(s2.as_str(), "")]));
+        assert_eq!(
+            warnings,
+            [format!(
+                "source[1] \"s2\" is no longer in the config and was removed with keys this \
+                 version does not read (subvolumes[1].future){tail}"
+            )]
+        );
+    }
+
+    /// A save that fails to write reports nothing; once the new file is in
+    /// place the warning is reported, even when flushing its directory then
+    /// fails.
+    #[test]
+    fn splice_warnings_are_reported_only_once_the_file_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory modes do not deny it");
+            return;
+        }
+        let file = format!(
+            "{SPLICE_HEAD}{}{}[[target]]\nlabel = \"b\"\nmount = \"/mnt/b\"\nrole = \"mirror\"\n\
+             future = 1\nretention = {{ daily = 3, weekly = 0, monthly = 0, yearly = 0 }}\n",
+            src("s", SUB_A),
+            tgt(0)
+        );
+        for (mode, saved) in [(0o555, false), (0o333, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &file).unwrap();
+            let mut cfg = Config::load(&path).unwrap();
+            cfg.targets.pop();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            let mut warnings = Vec::new();
+            let result = cfg.save_reporting(&path, &|_| {}, &mut |w| warnings.push(w));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                result.is_err(),
+                "mode {mode:o}: the save was expected to fail"
+            );
+            assert_eq!(
+                warnings.len(),
+                usize::from(saved),
+                "mode {mode:o}: {warnings:?}"
+            );
+        }
+    }
+
+    /// Renames are never inferred: an added element never takes a removed
+    /// one's unknown keys.
+    #[test]
+    fn splice_a_rename_never_carries_keys_to_the_added_element() {
+        let entries = "[[source.subvolumes]]\nname = \"@a\"\nsnapshot_name = \"a\"\nfuture = 1\n";
+        let file = format!("{SPLICE_HEAD}{}{}", src("s", entries), tgt(0));
+        let (text, warnings) = exact(&file, |c| c.sources[0].subvolumes[0].name = "@b".into());
+        assert_eq!(
+            text,
+            spliced(
+                &file,
+                &[(
+                    "name = \"@a\"\nsnapshot_name = \"a\"\nfuture = 1\n",
+                    "name = \"@b\"\nsnapshot_name = \"a\"\n"
+                )]
+            )
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 }

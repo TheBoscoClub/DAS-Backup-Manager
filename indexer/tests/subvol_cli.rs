@@ -127,6 +127,40 @@ fn subvol_add_and_remove_regenerate_btrbk_conf() {
     assert!(!conf.contains("@home"), "{conf}");
     // Added, then removed: the operator's file is back as it was.
     assert_eq!(std::fs::read_to_string(&config).unwrap(), baseline);
+    // Nothing of the operator's went with it: no warning.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Warning:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An entry removed with a key this version does not read: the save goes
+/// ahead and says so on stderr, naming the file, the entry and the key (bd
+/// DAS-Backup-Manager-m0pr.2) — the warning every `Config::save` caller
+/// prints, seen from the command line.
+#[test]
+fn subvol_remove_warns_on_stderr_when_the_entry_held_an_unknown_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let config_s = config.to_str().unwrap();
+    let text = std::fs::read_to_string(&config).unwrap().replace(
+        "[[source.subvolumes]]\nname = \"@\"\n",
+        "[[source.subvolumes]]\nname = \"@\"\n[[source.subvolumes]]\nname = \"@home\"\nfuture_entry = 1\n",
+    );
+    std::fs::write(&config, &text).unwrap();
+    let out = btrdasd(&["subvol", "remove", "s", "@home", "--config", config_s]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(!saved.contains("future_entry"), "{stderr}");
+    // Only the entry's own lines went.
+    assert!(!saved.contains("name = \"@home\""), "{saved}");
+    let want = format!(
+        "Warning: {config_s}: source[0].subvolumes[1] \"@home\" is no longer in the config \
+         and was removed with keys this version does not read (future_entry);"
+    );
+    assert!(stderr.contains(&want), "{stderr}");
 }
 
 /// `btrdasd schedule set` wrote `to_toml()` over the file with `fs::write`:
