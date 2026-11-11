@@ -53,6 +53,7 @@ pub fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> io:
             // SAFETY: geteuid() has no preconditions and cannot fail.
             euid: unsafe { libc::geteuid() },
             temp_name: &unique_temp_name,
+            sync_file: &|file| file.sync_all(),
             rename: &|from, to| fs::rename(from, to),
             sync_dir: &|dir| File::open(dir)?.sync_all(),
         },
@@ -66,6 +67,9 @@ struct WriteHost<'a> {
     euid: u32,
     /// The next name to try for the temp file beside the target.
     temp_name: &'a dyn Fn(&Path) -> PathBuf,
+    /// Flushes the finished temp file to disk, before it is renamed: else a
+    /// crash after the rename can leave an empty file at the path.
+    sync_file: &'a dyn Fn(&File) -> io::Result<()>,
     /// Moves the finished temp file over the target.
     rename: &'a dyn Fn(&Path, &Path) -> io::Result<()>,
     /// Flushes the directory the target is in, so the rename lasts.
@@ -128,7 +132,7 @@ fn write_atomic_with(
             // a write by anyone but root clears set-id bits.
             file.set_permissions(fs::Permissions::from_mode(mode))?;
         }
-        file.sync_all()?;
+        (host.sync_file)(&file)?;
         (host.rename)(&tmp, &target)
     })();
     if let Err(e) = written {
@@ -658,6 +662,55 @@ mod tests {
         File::open(dir)?.sync_all()
     }
 
+    /// The new file is flushed to disk before it is renamed over the old one
+    /// (bd DAS-Backup-Manager-9df, H3).
+    #[test]
+    fn the_temp_file_is_flushed_before_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        let steps = Mutex::new(Vec::new());
+        let sync = |file: &File| {
+            steps.lock().unwrap().push("sync");
+            file.sync_all()
+        };
+        let rename = |from: &Path, to: &Path| {
+            steps.lock().unwrap().push("rename");
+            fs::rename(from, to)
+        };
+        let traced = WriteHost {
+            sync_file: &sync,
+            ..host(&unique_temp_name, &rename, &real_sync_dir)
+        };
+        write_atomic_with(&path, b"new", None, &traced).unwrap();
+        assert_eq!(*steps.lock().unwrap(), ["sync", "rename"]);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A temp file is created no wider than the file it becomes: a 0600
+    /// config.toml is never world-readable while it is written (9df, H4).
+    #[test]
+    fn a_temp_file_starts_no_wider_than_its_final_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let real = host(&unique_temp_name, &real_rename, &real_sync_dir);
+        let (tmp, _file) = create_temp(&target, Some(0o600), &real).unwrap();
+        assert_eq!(mode_of(&tmp) & !0o600, 0, "{:o}", mode_of(&tmp));
+    }
+
+    /// Temp names carry the writer's pid, so two processes are never offered
+    /// one name (9df, H5).
+    #[test]
+    fn a_temp_name_carries_the_pid() {
+        let name = unique_temp_name(Path::new("/etc/das-backup/config.toml"));
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!(".config.toml.{}.", std::process::id())),
+            "{name}"
+        );
+        assert!(name.ends_with(".tmp"), "{name}");
+    }
+
     fn real_euid() -> u32 {
         // SAFETY: geteuid() has no preconditions and cannot fail.
         unsafe { libc::geteuid() }
@@ -672,6 +725,7 @@ mod tests {
         WriteHost {
             euid: real_euid(),
             temp_name,
+            sync_file: &|file| file.sync_all(),
             rename,
             sync_dir,
         }
@@ -927,6 +981,7 @@ mod tests {
         let as_root = WriteHost {
             euid: 0,
             temp_name: &unique_temp_name,
+            sync_file: &|file| file.sync_all(),
             rename: &watch,
             sync_dir: &real_sync_dir,
         };
