@@ -396,12 +396,14 @@ enum Commands {
     /// because the singleton/maintenance lock was held (a backup or scrub is
     /// in progress, or another doctor run is already checking — never
     /// treated as a failure). 1 means DRIFT WAS FOUND: missing or stale
-    /// subvolumes. This is a finding, not a malfunction — the check did its
+    /// subvolumes, or a declared pair a target holds no recent snapshot of
+    /// (UNDELIVERED). This is a finding, not a malfunction — the check did its
     /// job — so das-backup-doctor.service carries SuccessExitStatus=1 and
     /// systemd does not mark the unit failed for it. 3 means at least one
     /// configured volume failed to mount/list while others were checked
-    /// successfully, or a volume the check mounted could not be unmounted
-    /// again: those subvolumes went unexamined (or a volume was left
+    /// successfully, an attached target could not be verified, mounted or
+    /// listed, or a volume the check mounted could not be unmounted again:
+    /// those subvolumes or pairs went unexamined (or a volume was left
     /// mounted), which is an
     /// operational fault rather than a finding, so the unit DOES fail on it
     /// (and it outranks 1 when both occur). 2 means the check could not run
