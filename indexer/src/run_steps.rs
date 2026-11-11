@@ -213,7 +213,8 @@ pub fn expire_at(
     is_mountpoint: &dyn Fn(&Path) -> bool,
 ) -> ExpireRun {
     let outcome =
-        match crate::expire::expire_retired(config_path, dry_run, today, runner, is_mountpoint) {
+        match crate::expire::expire_retired(config_path, db, dry_run, today, runner, is_mountpoint)
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 return ExpireRun::Performed {
@@ -222,17 +223,25 @@ pub fn expire_at(
                 };
             }
         };
-    let section = crate::expire::format_expire_report(&outcome, dry_run);
+    let mut section = crate::expire::format_expire_report(&outcome, dry_run);
     let mut failure = outcome.failed().then(|| "exit code 1".to_string());
     // Snapshots are gone and the index still lists them: the run's history
     // would show backups that no longer exist.
     let deleted = outcome.deleted_paths();
-    if !deleted.is_empty()
-        && let Err(e) = crate::expire::prune_deleted_from_index(db, &deleted)
-    {
-        failure = Some(format!(
-            "deleted snapshots could not be removed from the index: {e}"
-        ));
+    if !deleted.is_empty() {
+        match crate::expire::prune_deleted_from_index(
+            db,
+            &deleted,
+            &outcome.indexed_deleted_paths(),
+        ) {
+            Ok(Some(shortfall)) => section.push_str(&shortfall),
+            Ok(None) => {}
+            Err(e) => {
+                failure = Some(format!(
+                    "deleted snapshots could not be removed from the index: {e}"
+                ));
+            }
+        }
     }
     ExpireRun::Performed { section, failure }
 }

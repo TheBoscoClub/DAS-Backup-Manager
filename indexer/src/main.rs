@@ -1555,14 +1555,27 @@ fn backup_run_line(result: &backup::BackupResult) -> String {
 
 /// Whether `subvol expire` failed overall: the expiry itself did, or snapshots
 /// are gone and the index still lists them. The database is not opened at all
-/// when nothing was deleted (it may not exist yet).
-fn expire_failed(outcome_failed: bool, deleted: &[PathBuf], db: &Path) -> bool {
+/// when nothing was deleted (it may not exist yet). A deleted primary-target
+/// snapshot with no index row at its path is printed on stdout, after the
+/// report section it belongs to, and is not a failure (bd
+/// DAS-Backup-Manager-12k).
+fn expire_failed(
+    outcome_failed: bool,
+    deleted: &[PathBuf],
+    indexed: &[PathBuf],
+    db: &Path,
+) -> bool {
     let mut failed = outcome_failed;
-    if !deleted.is_empty()
-        && let Err(e) = buttered_dasd::expire::prune_deleted_from_index(db, deleted)
-    {
-        eprintln!("Warning: deleted snapshots could not be removed from the index: {e}");
-        failed = true;
+    if deleted.is_empty() {
+        return failed;
+    }
+    match buttered_dasd::expire::prune_deleted_from_index(db, deleted, indexed) {
+        Ok(Some(shortfall)) => print!("{shortfall}"),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Warning: deleted snapshots could not be removed from the index: {e}");
+            failed = true;
+        }
     }
     failed
 }
@@ -2982,6 +2995,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let outcome = match buttered_dasd::expire::expire_retired(
                     &config,
+                    &db,
                     dry_run,
                     &buttered_dasd::caldate::today(),
                     &buttered_dasd::fsutil::SystemRunner,
@@ -2997,7 +3011,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "{}",
                     buttered_dasd::expire::format_expire_report(&outcome, dry_run)
                 );
-                if expire_failed(outcome.failed(), &outcome.deleted_paths(), &db) {
+                if expire_failed(
+                    outcome.failed(),
+                    &outcome.deleted_paths(),
+                    &outcome.indexed_deleted_paths(),
+                    &db,
+                ) {
                     std::process::exit(1);
                 }
             }
@@ -4377,10 +4396,10 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     fn expire_failed_does_not_open_the_database_when_nothing_was_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");
-        assert!(!expire_failed(false, &[], &db));
+        assert!(!expire_failed(false, &[], &[], &db));
         assert!(!db.exists(), "the database must not be created");
         assert!(
-            expire_failed(true, &[], &db),
+            expire_failed(true, &[], &[], &db),
             "an expiry failure stays a failure"
         );
     }
@@ -4390,7 +4409,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let dir = tempfile::tempdir().unwrap();
         // A directory is not a database.
         let deleted = [PathBuf::from("/mnt/t/gone.20260101")];
-        assert!(expire_failed(false, &deleted, dir.path()));
+        assert!(expire_failed(false, &deleted, &deleted, dir.path()));
     }
 
     #[test]
@@ -4405,7 +4424,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
                 .unwrap();
         }
         let deleted = [PathBuf::from("/mnt/t/gone.20260101")];
-        assert!(!expire_failed(false, &deleted, &db_path));
+        assert!(!expire_failed(false, &deleted, &deleted, &db_path));
 
         let left = Database::open(&db_path).unwrap().list_snapshots().unwrap();
         assert_eq!(left.len(), 1);

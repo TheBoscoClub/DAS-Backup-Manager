@@ -205,15 +205,22 @@ entries must exist at all, and the history of the manual regime; the mechanism's
   series that are not recognised btrbk snapshot names (a `long-iso` timestamp with an offset is
   one; the generated config never sets `timestamp_format`): nothing deleted, entry kept. A target
   with no retention: kept and reported. Source-side snapshots use the shortest window of the
-  targets. The entry is removed only when every location is empty, deleted or shared — never the
+  targets reached this run (an `Unreachable` target does not count; none reached: kept). Directories
+  are compared through `btrbk_conf::normalise_dir`; a source's targets and target directory come
+  from `btrbk_conf::source_targets` / `source_subdir`, what btrbk writes. Two retired entries
+  sharing a directory and series name are measured from the later retirement date
+  (`latest_retirement`). A primary-target deletion with no index row at its path is an `INDEX:`
+  report line, not a failure (bd DAS-Backup-Manager-12k). The entry is removed only when every location is empty, deleted or shared — never the
   last config entry, never one whose source sends to no target, never on a dry run.
 - **A wrong date mostly costs a late deletion** (final review, Rulings 26–27). A
   location whose newest series snapshot is dated more than a day after `retired` is kept
   (`RetiredBeforeNewest`: the clock was wrong at retirement, or the date was edited; one day is
   allowed because snapshot names are local time and `retired` is UTC). A retired entry whose
   source volume is not mounted, or has a path of that name, is kept everywhere (until sync revives it
-  or the path goes). A clock that wrongly reads far in the future at expiry time is NOT detected and
-  would expire retired series early; live subvolumes are never touched by expiry.
+  or the path goes). A clock more than `caldate::MAX_DAYS_PAST_LAST_RUN` (7) days past the newest
+  `backup_runs` row, or an index that exists but cannot be read, deletes nothing and fails; no
+  index or no row: only the 2026 floor applies. A jump inside the bound, or one that persists past
+  the run that records its row, is not caught; live subvolumes are never touched by expiry.
   `caldate::untrusted_clock` refuses a clock before 2026-01-01: sync stamps no retirement (adoption
   goes on), expiry deletes nothing; both fail loudly. `backup-run.sh` passes `--dry-run` to
   expire when that run's sync failed. Units carry `Wants=`/`After=time-sync.target`, a courtesy

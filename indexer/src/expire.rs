@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::btrbk_conf::resolve_snapshot_names;
-use crate::caldate::{date_of, day_number, untrusted_clock};
-use crate::config::{Config, Retention, Source, Target, TargetRole};
+use crate::btrbk_conf::{normalise_dir, resolve_snapshot_names, source_subdir, source_targets};
+use crate::caldate::{clock_far_past_last_run, date_of, day_number, untrusted_clock};
+use crate::config::{Config, Retention, Source, TargetRole};
 use crate::fsutil::CommandRunner;
 
 /// The longest of a target's retention tiers, in whole days: a daily tier
@@ -162,6 +162,9 @@ pub struct LocationReport {
     pub place: String,
     pub state: LocationState,
     pub deleted_paths: Vec<PathBuf>,
+    /// A primary target: the place the nightly index walk covers, so every
+    /// snapshot deleted here should have had an index row at its path.
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +184,7 @@ pub struct ExpireOutcome {
     /// Why a fully expired entry could not be removed from the config.
     pub config_error: Option<String>,
     /// Why nothing was judged expired: the system clock cannot be trusted
-    /// (`caldate::untrusted_clock`). Set only when a retired entry exists.
+    /// (`caldate::untrusted_clock`, `caldate::clock_far_past_last_run`, or an index that cannot be read). Set only when a retired entry exists.
     pub clock_error: Option<String>,
 }
 
@@ -206,15 +209,17 @@ impl ExpireOutcome {
             .flat_map(|l| l.deleted_paths.iter().cloned())
             .collect()
     }
-}
 
-fn targets_of<'a>(config: &'a Config, source: &Source) -> Vec<&'a Target> {
-    config
-        .targets
-        .iter()
-        .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
-        .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
-        .collect()
+    /// The deleted paths on primary targets, where the index walk runs: each
+    /// should have had an index row at exactly that path.
+    pub fn indexed_deleted_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| &e.locations)
+            .filter(|l| l.indexed)
+            .flat_map(|l| l.deleted_paths.iter().cloned())
+            .collect()
+    }
 }
 
 /// The first LIVE entry, in any source accepted by `same_place`, that
@@ -240,8 +245,48 @@ fn live_user_of(
         })
 }
 
-fn target_subdir(source: &Source) -> &String {
-    source.target_subdirs.first().unwrap_or(&source.label)
+/// The retirement date a location's series is measured from: the LATEST
+/// date among every retired entry, in any source accepted by `same_place`,
+/// that resolves to `snapshot_name` — `own` included. Two such series share
+/// one directory and one name, so their snapshots cannot be told apart, and
+/// the earlier date must not delete what the later one still keeps (bd
+/// DAS-Backup-Manager-12k). An unreadable date among them wins outright: it
+/// never compares as expired, so nothing there is deleted.
+fn latest_retirement(
+    config: &Config,
+    snapshot_name: &str,
+    own: &str,
+    same_place: impl Fn(&Source) -> bool,
+) -> String {
+    let mut dates = vec![own.to_string()];
+    for other in config.sources.iter().filter(|o| same_place(o)) {
+        let names = resolve_snapshot_names(&other.subvolumes);
+        for (e, n) in other.subvolumes.iter().zip(names) {
+            if let Some(date) = &e.retired
+                && n == snapshot_name
+            {
+                dates.push(date.clone());
+            }
+        }
+    }
+    if let Some(unreadable) = dates.iter().find(|d| day_number(d).is_none()) {
+        return unreadable.clone();
+    }
+    dates
+        .into_iter()
+        .max_by_key(|d| day_number(d))
+        .unwrap_or_else(|| own.to_string())
+}
+
+/// The directory a source keeps its snapshots in, in its one spelling
+/// (`btrbk_conf::normalise_dir`): `<vol>/` + `./snaps` and `<vol>` + `snaps`
+/// are one place, and so is `<vol>` + `a/snaps` beside `<vol>/a` + `snaps`.
+fn source_snapshot_dir(source: &Source) -> String {
+    normalise_dir(
+        &Path::new(&source.volume)
+            .join(&source.snapshot_dir)
+            .to_string_lossy(),
+    )
 }
 
 /// Every entry name of a directory, or why the listing cannot be trusted. A
@@ -277,6 +322,9 @@ fn examine(
     dir: &Path,
     snapshot_name: &str,
     retired: &str,
+    // The date the window is measured from (`latest_retirement`): `retired`
+    // itself unless another retired series shares this directory.
+    measured_from: &str,
     window: Option<u32>,
     today: Option<&str>,
     dry_run: bool,
@@ -288,6 +336,7 @@ fn examine(
         place: place.clone(),
         state,
         deleted_paths: Vec::new(),
+        indexed: false,
     };
     if !is_mountpoint(mount_root) {
         return report(LocationState::Unreachable(format!(
@@ -344,7 +393,7 @@ fn examine(
     }
     // An untrusted clock decides nothing: the series is kept, with its date.
     let due = match today {
-        Some(today) => window.and_then(|w| is_expired(retired, w, today)),
+        Some(today) => window.and_then(|w| is_expired(measured_from, w, today)),
         None => window.map(|_| false),
     };
     if due != Some(true) {
@@ -354,7 +403,7 @@ fn examine(
             // such a series is kept until someone decides.
             expires: window
                 .filter(|_| due.is_some())
-                .and_then(|w| expiry_date(retired, w)),
+                .and_then(|w| expiry_date(measured_from, w)),
         });
     }
     if dry_run {
@@ -394,6 +443,7 @@ fn examine(
         place,
         state,
         deleted_paths,
+        indexed: false,
     }
 }
 
@@ -402,6 +452,7 @@ fn examine(
 /// location whose mount root is not mounted is reported and left alone.
 pub fn expire_retired(
     config_path: &Path,
+    db: &Path,
     dry_run: bool,
     today: &str,
     runner: &dyn CommandRunner,
@@ -409,7 +460,17 @@ pub fn expire_retired(
 ) -> Result<ExpireOutcome, String> {
     let config = Config::load(config_path)
         .map_err(|e| format!("could not load {}: {e}", config_path.display()))?;
-    let clock_error = untrusted_clock(today);
+    // A clock before 2026, or far past the newest recorded backup run (bd
+    // DAS-Backup-Manager-12k). An index that is there but cannot be read
+    // leaves the second unchecked, so it refuses too.
+    let clock_error = untrusted_clock(today).or_else(|| {
+        match crate::db::newest_backup_run_read_only(db) {
+            Ok(newest) => clock_far_past_last_run(today, newest),
+            Err(e) => Some(format!(
+                "the newest backup run could not be read from the index ({e}) — the system clock cannot be checked against it"
+            )),
+        }
+    });
     // `None`: nothing may be judged expired against this clock.
     let trusted_today = clock_error.is_none().then_some(today);
     let mut entries = Vec::new();
@@ -456,51 +517,64 @@ pub fn expire_retired(
                 });
                 continue;
             }
-            let targets = targets_of(&config, source);
-            let subdir = target_subdir(source);
+            let targets = source_targets(&config, source);
+            let subdir = source_subdir(source);
             let mut locations = Vec::new();
             for target in &targets {
                 let root = Path::new(&target.mount);
+                // Another source writing into this directory on this target.
+                let same_place = |other: &Source| {
+                    normalise_dir(source_subdir(other)) == normalise_dir(subdir)
+                        && source_targets(&config, other)
+                            .iter()
+                            .any(|t| t.label == target.label)
+                };
                 locations.push(examine(
                     format!("target {}", target.label),
                     root,
                     &root.join(subdir),
                     &snapshot_name,
                     &retired,
+                    &latest_retirement(&config, &snapshot_name, &retired, same_place),
                     longest_window_days(&target.retention),
                     trusted_today,
                     dry_run,
                     runner,
                     is_mountpoint,
-                    live_user_of(&config, &snapshot_name, |other| {
-                        target_subdir(other) == subdir
-                            && targets_of(&config, other)
-                                .iter()
-                                .any(|t| t.label == target.label)
-                    }),
+                    live_user_of(&config, &snapshot_name, same_place),
                 ));
+                if let Some(last) = locations.last_mut() {
+                    last.indexed = target.role == TargetRole::Primary;
+                }
             }
             // Source-side snapshots only exist to be sent. Once the shortest
-            // target window has passed they have no further use.
+            // window among the targets examined this run has passed they have
+            // no further use. A target that could not be reached does not
+            // count: what it holds was not seen, and a minimum over fewer
+            // targets is never shorter, so the source copy is kept at least as
+            // long (bd DAS-Backup-Manager-12k). None reached: no window, kept.
             let shortest = targets
                 .iter()
-                .filter_map(|t| longest_window_days(&t.retention))
+                .zip(&locations)
+                .filter(|(_, l)| !matches!(l.state, LocationState::Unreachable(_)))
+                .filter_map(|(t, _)| longest_window_days(&t.retention))
                 .min();
             let root = Path::new(&source.volume);
+            let same_source_dir =
+                |other: &Source| source_snapshot_dir(other) == source_snapshot_dir(source);
             locations.push(examine(
                 format!("source {}", source.volume),
                 root,
                 &root.join(&source.snapshot_dir),
                 &snapshot_name,
                 &retired,
+                &latest_retirement(&config, &snapshot_name, &retired, same_source_dir),
                 shortest,
                 trusted_today,
                 dry_run,
                 runner,
                 is_mountpoint,
-                live_user_of(&config, &snapshot_name, |other| {
-                    other.volume == source.volume && other.snapshot_dir == source.snapshot_dir
-                }),
+                live_user_of(&config, &snapshot_name, same_source_dir),
             ));
             entries.push(RetiredReport {
                 source_label: source.label.clone(),
@@ -586,21 +660,39 @@ pub fn expire_retired(
     })
 }
 
-/// Drop the index rows of snapshots an expiry just deleted. Returns how many
-/// rows were pruned.
+/// Drop the index rows of snapshots an expiry just deleted (`deleted`, by
+/// exact path). Returns a report line when some of `indexed` — the deleted
+/// paths on primary targets, which the index walk covers — had no row at that
+/// path: never indexed, or listed under another path, where the row now names
+/// a snapshot that is gone (bd DAS-Backup-Manager-12k). Not a failure; the
+/// line goes into the RETIRED SUBVOLUMES section.
 pub fn prune_deleted_from_index(
     db: &Path,
     deleted: &[PathBuf],
-) -> Result<usize, Box<dyn std::error::Error>> {
+    indexed: &[PathBuf],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let database = crate::db::Database::open(db)?;
-    let ids: Vec<i64> = database
+    let rows: Vec<(i64, String)> = database
         .list_snapshots()?
         .into_iter()
         .filter(|s| deleted.iter().any(|p| p.to_string_lossy() == s.path))
-        .map(|s| s.id)
+        .map(|s| (s.id, s.path))
         .collect();
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
     database.prune_snapshots(&ids)?;
-    Ok(ids.len())
+    let unlisted: Vec<&PathBuf> = indexed
+        .iter()
+        .filter(|p| !rows.iter().any(|(_, row)| p.to_string_lossy() == *row))
+        .collect();
+    let Some(example) = unlisted.first() else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "  INDEX: {} deleted snapshot{} on a primary target had no index row at that path (e.g. {}) — never indexed, or listed under another path, where the row now names a snapshot that is gone; `btrdasd reconcile` removes such rows\n",
+        unlisted.len(),
+        if unlisted.len() == 1 { "" } else { "s" },
+        example.display()
+    )))
 }
 
 /// The "RETIRED SUBVOLUMES" section of the run report. Empty when no entry
@@ -928,6 +1020,25 @@ mod tests {
                     .collect(),
             )
         }
+        /// The index database: absent unless a test records runs in it.
+        fn db(&self) -> PathBuf {
+            self.dir.path().join("backup-index.db")
+        }
+        /// Record one backup run at noon UTC on `date` (`YYYY-MM-DD`).
+        fn record_run(&self, date: &str) {
+            let db = crate::db::Database::open(self.db()).unwrap();
+            db.insert_backup_run(&crate::db::NewBackupRun {
+                timestamp: day_number(date).unwrap() * 86_400 + 43_200,
+                success: true,
+                mode: "incremental",
+                snaps_created: Some(0),
+                snaps_sent: Some(0),
+                bytes_sent: Some(0),
+                duration_secs: 1,
+                errors: &[],
+            })
+            .unwrap();
+        }
         fn edit(&self, f: impl FnOnce(&mut Config)) {
             let mut c = Config::load(&self.config_path).unwrap();
             f(&mut c);
@@ -987,7 +1098,15 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let runner = Scripted::new(&[]);
-        let out = expire_retired(&rig.config_path, false, "2026-10-08", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-08",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists() && big.exists());
         assert!(runner.calls().is_empty());
         assert!(!out.failed());
@@ -1024,7 +1143,15 @@ mod tests {
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
 
         let runner = rig.deleting(&[&small_a, &small_b, &src]);
-        let out = expire_retired(&rig.config_path, false, "2026-10-09", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
 
         assert!(
             !small_a.exists() && !small_b.exists(),
@@ -1060,7 +1187,15 @@ mod tests {
         let rig = rig();
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&big]);
-        let out = expire_retired(&rig.config_path, false, "2028-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2028-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(out.entries[0].removed_from_config);
         assert_eq!(rig.saved_names(), ["@srv"]);
     }
@@ -1084,7 +1219,15 @@ mod tests {
         std::fs::write(&rig.config_path, &hand).unwrap();
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&big]);
-        let out = expire_retired(&rig.config_path, false, "2028-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2028-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(out.entries[0].removed_from_config);
         assert_eq!(out.config_error, None);
         assert_eq!(rig.saved_names(), ["@srv"]);
@@ -1105,6 +1248,7 @@ mod tests {
         let only_big_missing: &dyn Fn(&Path) -> bool = &|p| p != big_mount.as_path();
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2028-01-01",
             &Scripted::new(&[]),
@@ -1141,8 +1285,15 @@ mod tests {
             p != small_mount.as_path()
         };
         let runner = rig.deleting(&[&small, &src]);
-        let out =
-            expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted_but).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted_but,
+        )
+        .unwrap();
         assert!(small.exists(), "the unmounted target is untouched");
         assert!(!src.exists(), "the mounted source side still expires");
         assert_eq!(runner.calls().len(), 1, "{:?}", runner.calls());
@@ -1160,7 +1311,15 @@ mod tests {
         rig.edit(|c| c.targets[1].retention = r(0, 0, 0, 0));
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let runner = Scripted::new(&[]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists());
         assert_eq!(
             out.entries[0].locations[1].state,
@@ -1181,7 +1340,15 @@ mod tests {
         });
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20200101T0000");
         let runner = rig.deleting(&[&src]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(src.exists());
         assert!(runner.calls().is_empty());
         assert_eq!(
@@ -1201,8 +1368,15 @@ mod tests {
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&src]);
         // primary window 372 days: retired 2026-10-01 -> deletable from 2027-10-09.
-        let early =
-            expire_retired(&rig.config_path, false, "2027-10-08", &runner, &mounted).unwrap();
+        let early = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2027-10-08",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(src.exists());
         assert_eq!(
             states(&early)[2],
@@ -1211,10 +1385,69 @@ mod tests {
                 expires: Some("2027-10-09".into())
             }
         );
-        let late =
-            expire_retired(&rig.config_path, false, "2027-10-09", &runner, &mounted).unwrap();
+        let late = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2027-10-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!src.exists());
         assert_eq!(states(&late)[2], LocationState::Deleted { count: 1 });
+    }
+
+    /// Source-side window = shortest among the targets that could be
+    /// examined this run. An unattached target's window says nothing about
+    /// copies that can be checked, and a minimum over fewer targets is never
+    /// shorter, so the source copy is kept at least as long (bd
+    /// DAS-Backup-Manager-12k).
+    #[test]
+    fn an_unattached_target_does_not_set_the_source_window() {
+        let rig = rig();
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&src]);
+        let small_absent = |p: &Path| !p.ends_with("small");
+        // Past the mirror's 7 days, inside the primary's 372.
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-09",
+            &runner,
+            &small_absent,
+        )
+        .unwrap();
+        assert!(src.exists(), "{:?}", states(&out));
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(matches!(states(&out)[1], LocationState::Unreachable(_)));
+        assert_eq!(
+            states(&out)[2],
+            LocationState::Kept {
+                count: 1,
+                expires: Some("2027-10-09".into())
+            }
+        );
+        // Nothing attached: no window at all, so the source copy is kept undated.
+        let none_attached = |p: &Path| !p.ends_with("small") && !p.ends_with("big");
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &none_attached,
+        )
+        .unwrap();
+        assert!(src.exists());
+        assert_eq!(
+            states(&out)[2],
+            LocationState::Kept {
+                count: 1,
+                expires: None
+            }
+        );
     }
 
     #[test]
@@ -1223,7 +1456,15 @@ mod tests {
         rig.edit(|c| c.sources[0].target_labels = vec!["big".into()]);
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let runner = rig.deleting(&[&small]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists(), "small is not a target of this source");
         assert!(runner.calls().is_empty());
         assert_eq!(
@@ -1249,7 +1490,15 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let elsewhere = rig.snap("small/other", "opt.20200101T0000");
         let runner = rig.deleting(&[&small, &elsewhere]);
-        expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!small.exists());
         assert!(elsewhere.exists());
 
@@ -1259,7 +1508,15 @@ mod tests {
         let second = rig2.snap("small/second", "opt.20200101T0000");
         let label = rig2.snap("small/ssd", "opt.20200101T0000");
         let runner = rig2.deleting(&[&first, &second, &label]);
-        expire_retired(&rig2.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        expire_retired(
+            &rig2.config_path,
+            &rig2.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!first.exists());
         assert!(second.exists() && label.exists());
     }
@@ -1269,7 +1526,15 @@ mod tests {
         let rig = rig();
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&small]);
-        let out = expire_retired(&rig.config_path, true, "2026-10-09", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            true,
+            "2026-10-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists());
         assert!(runner.calls().is_empty());
         assert_eq!(
@@ -1295,6 +1560,7 @@ mod tests {
         // No delete is scripted to succeed.
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2026-10-09",
             &Scripted::new(&[]),
@@ -1316,7 +1582,15 @@ mod tests {
         let a = rig.snap("small/ssd", "opt.20260929T0323");
         let b = rig.snap("small/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&a]);
-        let out = expire_retired(&rig.config_path, false, "2026-10-09", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!a.exists() && b.exists());
         match &out.entries[0].locations[1].state {
             LocationState::DeleteFailed { deleted, errors } => {
@@ -1337,6 +1611,7 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1358,7 +1633,15 @@ mod tests {
         let rig = rig();
         let small = rig.snap("small/ssd", "opt.20200101T0000");
         let runner = rig.deleting(&[&small]);
-        let out = expire_retired(&rig.config_path, false, "garbage", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "garbage",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists());
         assert!(runner.calls().is_empty());
         assert!(matches!(
@@ -1374,6 +1657,7 @@ mod tests {
         std::fs::remove_dir(rig.dir.path().join("small/ssd")).unwrap();
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1390,6 +1674,7 @@ mod tests {
         std::fs::write(rig.dir.path().join("small/ssd"), "a file, not a directory").unwrap();
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1420,6 +1705,7 @@ mod tests {
         let kept = rig.snap("big/ssd", "new.20280601T0000");
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2028-01-01",
             &Scripted::new(&[]),
@@ -1454,7 +1740,15 @@ mod tests {
         });
         let live_snap = rig.snap("vol/.btrbk-snapshots", "opt.20280101T0000");
         let runner = rig.deleting(&[&live_snap]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(live_snap.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(out.entries.len(), 1, "only the retired entry is examined");
@@ -1484,6 +1778,7 @@ mod tests {
         });
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1511,6 +1806,7 @@ mod tests {
         let before = std::fs::read_to_string(&rig.config_path).unwrap();
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1534,6 +1830,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = expire_retired(
             &dir.path().join("absent.toml"),
+            &dir.path().join("absent.db"),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1556,6 +1853,7 @@ mod tests {
                     place: "p".into(),
                     state,
                     deleted_paths: Vec::new(),
+                    indexed: false,
                 }],
                 removed_from_config: false,
                 kept_reason: None,
@@ -1596,6 +1894,7 @@ mod tests {
         rig.edit(|c| c.sources[0].subvolumes[1].retired = None);
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2026-10-08",
             &Scripted::new(&[]),
@@ -1608,6 +1907,7 @@ mod tests {
         rig.snap("small/ssd", "opt.20260930T0323");
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2026-10-08",
             &Scripted::new(&[]),
@@ -1634,6 +1934,7 @@ mod tests {
             place: place.into(),
             state,
             deleted_paths: Vec::new(),
+            indexed: false,
         };
         let out = ExpireOutcome {
             entries: vec![RetiredReport {
@@ -1730,7 +2031,15 @@ mod tests {
         let rig = rig();
         let odd = rig.snap("small/ssd", "opt.20200101T000000+0200");
         let runner = rig.deleting(&[&odd]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(odd.exists());
         assert!(runner.calls().is_empty());
         assert_eq!(
@@ -1751,7 +2060,15 @@ mod tests {
         let good = rig.snap("small/ssd", "opt.20200101T0000");
         let odd = rig.snap("small/ssd", "opt.20200101T0000.partial");
         let runner = rig.deleting(&[&good, &odd]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(good.exists() && odd.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(
@@ -1771,6 +2088,7 @@ mod tests {
         rig.snap("small/ssd", "opt.20200101aaa");
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1792,6 +2110,7 @@ mod tests {
         let odd = rig.snap("vol/.btrbk-snapshots", "opt.20200101T0000_x");
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -1822,6 +2141,7 @@ mod tests {
                             example: "opt.2026100x".into(),
                         },
                         deleted_paths: Vec::new(),
+                        indexed: false,
                     },
                     LocationReport {
                         place: "target small".into(),
@@ -1830,6 +2150,7 @@ mod tests {
                             example: "opt.20261001T1421.partial".into(),
                         },
                         deleted_paths: Vec::new(),
+                        indexed: false,
                     },
                 ],
                 removed_from_config: false,
@@ -1877,11 +2198,146 @@ mod tests {
         });
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&src]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(src.exists(), "the live series' send parent");
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(states(&out)[2], shared("other", "@opt"));
         assert!(!out.failed());
+    }
+
+    /// One directory spelled two ways is still one directory: a live series
+    /// there is never deleted as the retired one's (bd DAS-Backup-Manager-12k).
+    #[test]
+    fn a_live_series_in_the_same_directory_spelled_differently_is_never_deleted() {
+        // Source side: `<vol>/` + `./.btrbk-snapshots/` is `<vol>` + `.btrbk-snapshots`.
+        let rig1 = rig();
+        rig1.edit(|c| {
+            let volume = format!("{}/", c.sources[0].volume);
+            c.sources.push(other_source(
+                "other",
+                volume,
+                "./.btrbk-snapshots/",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let src = rig1.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig1.deleting(&[&src]);
+        let out = expire_retired(
+            &rig1.config_path,
+            &rig1.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(src.exists(), "the live series' send parent");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(states(&out)[2], shared("other", "@opt"));
+
+        // Target side: `./ssd/` is `ssd`.
+        let rig2 = rig();
+        let vol2 = rig2.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig2.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "./ssd/",
+                live("@opt"),
+            ));
+        });
+        let small = rig2.snap("small/ssd", "opt.20260930T0323");
+        let big = rig2.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig2.deleting(&[&small, &big]);
+        let out = expire_retired(
+            &rig2.config_path,
+            &rig2.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(small.exists() && big.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(
+            states(&out)[..2],
+            [shared("other", "@opt"), shared("other", "@opt")]
+        );
+    }
+
+    /// Two retired entries whose series land in one directory (a hand edit:
+    /// two sources sharing a target subdirectory, the same snapshot name) and
+    /// different retirement dates. Their snapshots cannot be told apart, so
+    /// both entries wait for the LATER date: neither deletes what the other
+    /// may still keep (bd DAS-Backup-Manager-12k).
+    #[test]
+    fn two_retired_series_in_one_directory_expire_on_the_later_date() {
+        let rig = rig();
+        let vol2 = rig.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "./ssd",
+                SubvolConfig {
+                    name: "@opt".into(),
+                    retired: Some("2026-12-01".into()),
+                    ..Default::default()
+                },
+            ));
+            // Keeps the config from running out of entries.
+            c.sources[1].subvolumes.push(live("@keep"));
+        });
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small, &big]);
+        // Past 2026-10-01 + 7 (the mirror's window), not past 2026-12-01 + 7.
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-20",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(small.exists() && big.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        for entry in &out.entries {
+            assert_eq!(
+                entry.locations[1].state,
+                LocationState::Kept {
+                    count: 1,
+                    expires: Some("2026-12-09".into())
+                },
+                "{}",
+                entry.source_label
+            );
+        }
+        // Past both dates: deleted once, by whichever entry comes first.
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-12-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(!small.exists() && big.exists());
+        assert_eq!(states(&out)[1], LocationState::Deleted { count: 1 });
     }
 
     #[test]
@@ -1904,7 +2360,15 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&small, &big]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists() && big.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(
@@ -1934,7 +2398,15 @@ mod tests {
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&small, &big, &src]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!small.exists() && !big.exists());
         assert!(src.exists());
         assert_eq!(
@@ -1967,7 +2439,15 @@ mod tests {
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&small, &big, &src]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!small.exists() && !big.exists() && !src.exists());
         assert!(out.entries[0].removed_from_config);
         assert_eq!(runner.calls().len(), 3);
@@ -1988,7 +2468,15 @@ mod tests {
         });
         let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&src]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!src.exists());
         assert_eq!(states(&out)[2], LocationState::Deleted { count: 1 });
     }
@@ -2007,7 +2495,15 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let big = rig.snap("big/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&small, &big]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(big.exists(), "shared with the live entry");
         assert!(
             !small.exists(),
@@ -2029,6 +2525,7 @@ mod tests {
                     place: "target big".into(),
                     state: shared("other", "@opt"),
                     deleted_paths: Vec::new(),
+                    indexed: false,
                 }],
                 removed_from_config: false,
                 kept_reason: None,
@@ -2057,7 +2554,15 @@ mod tests {
             .join(std::ffi::OsStr::from_bytes(b"opt.20200101T0000\xff"));
         std::fs::write(&odd, "x").unwrap();
         let runner = rig.deleting(&[&old]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(old.exists() && odd.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         match &states(&out)[1] {
@@ -2115,6 +2620,7 @@ mod tests {
         let rig = rig_with_only_the_retired_entry();
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -2151,6 +2657,7 @@ mod tests {
         });
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -2175,6 +2682,7 @@ mod tests {
         });
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -2203,6 +2711,7 @@ mod tests {
         });
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -2227,6 +2736,7 @@ mod tests {
         rig.edit(|c| c.sources[0].target_labels = vec!["no-such-target".into()]);
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "2030-01-01",
             &Scripted::new(&[]),
@@ -2256,7 +2766,15 @@ mod tests {
         let old = rig.snap("small/ssd", "opt.20260930T0323");
         let new = rig.snap("small/ssd", "opt.20261003T0323");
         let runner = rig.deleting(&[&old, &new]);
-        let out = expire_retired(&rig.config_path, false, "2027-12-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2027-12-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(old.exists() && new.exists());
         assert!(
             !runner.calls().iter().any(|c| c.contains("small/ssd")),
@@ -2289,8 +2807,15 @@ mod tests {
             let rig = rig();
             let snap = rig.snap("small/ssd", &format!("opt.{stamp}"));
             let runner = rig.deleting(&[&snap]);
-            let out =
-                expire_retired(&rig.config_path, false, "2026-10-20", &runner, &mounted).unwrap();
+            let out = expire_retired(
+                &rig.config_path,
+                &rig.db(),
+                false,
+                "2026-10-20",
+                &runner,
+                &mounted,
+            )
+            .unwrap();
             assert!(!snap.exists(), "{stamp}: must be deleted");
             assert_eq!(
                 out.entries[0].locations[1].state,
@@ -2307,7 +2832,8 @@ mod tests {
         let runner = rig.deleting(&[&small]);
         // A clock that wrapped to the epoch; and one that is merely early.
         for today in ["1970-01-01", "2025-06-01"] {
-            let out = expire_retired(&rig.config_path, false, today, &runner, &mounted).unwrap();
+            let out = expire_retired(&rig.config_path, &rig.db(), false, today, &runner, &mounted)
+                .unwrap();
             assert!(small.exists(), "{today}");
             assert!(out.failed(), "{today}");
             assert!(out.deleted_paths().is_empty());
@@ -2317,8 +2843,183 @@ mod tests {
         }
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         // Control: with a real date the same snapshot goes.
-        let out = expire_retired(&rig.config_path, false, "2026-10-20", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-20",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!small.exists() && !out.failed());
+    }
+
+    /// A clock far AHEAD of the newest recorded backup run deletes nothing:
+    /// it would bring every retired series' expiry forward by the jump (bd
+    /// DAS-Backup-Manager-12k).
+    #[test]
+    fn a_clock_far_ahead_of_the_newest_backup_run_deletes_nothing_and_fails_loudly() {
+        let rig = rig();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small]);
+        rig.record_run("2026-09-01");
+        rig.record_run("2026-10-02");
+        // 2026-10-02 + 7 days is the last date still trusted.
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-10",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(small.exists());
+        assert!(out.failed());
+        assert!(out.deleted_paths().is_empty());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        let text = format_expire_report(&out, false);
+        assert!(text.contains("  NOTHING DELETED: "), "{text}");
+        assert!(
+            text.contains("2026-10-10") && text.contains("2026-10-02"),
+            "{text}"
+        );
+        // Within the bound the same snapshot goes (the mirror's window ended
+        // 2026-10-08).
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-09",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(
+            !small.exists() && !out.failed(),
+            "{}",
+            format_expire_report(&out, false)
+        );
+    }
+
+    /// No index database, or one with no run in it: no run is recorded, and
+    /// only the pre-2026 check applies, as before.
+    #[test]
+    fn with_no_recorded_run_only_the_early_clock_check_applies() {
+        let rig1 = rig();
+        let small = rig1.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig1.deleting(&[&small]);
+        assert!(!rig1.db().exists());
+        let out = expire_retired(
+            &rig1.config_path,
+            &rig1.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(!small.exists() && !out.failed());
+
+        let rig2 = rig();
+        crate::db::Database::open(rig2.db()).unwrap();
+        let small = rig2.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig2.deleting(&[&small]);
+        let out = expire_retired(
+            &rig2.config_path,
+            &rig2.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(!small.exists() && !out.failed());
+    }
+
+    /// A database that is there but cannot be read is not "no run recorded":
+    /// the clock cannot be checked, so nothing is deleted.
+    #[test]
+    fn an_unreadable_index_database_deletes_nothing() {
+        let rig = rig();
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let runner = rig.deleting(&[&small]);
+        std::fs::write(rig.db(), b"not a sqlite database at all, just text").unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-10-20",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert!(small.exists());
+        assert!(out.failed());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        let text = format_expire_report(&out, false);
+        assert!(text.contains("  NOTHING DELETED: "), "{text}");
+    }
+
+    /// A snapshot deleted from a primary target whose index row is not at
+    /// that path leaves the row behind: the report says so (bd
+    /// DAS-Backup-Manager-12k). Mirror and source deletions have no row of
+    /// their own and say nothing.
+    #[test]
+    fn a_deleted_primary_snapshot_missing_from_the_index_is_reported() {
+        let rig = rig();
+        let big = rig.snap("big/ssd", "opt.20260930T0323");
+        let small = rig.snap("small/ssd", "opt.20260930T0323");
+        let src = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig.deleting(&[&big, &small, &src]);
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2028-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
+        assert_eq!(out.deleted_paths().len(), 3);
+        assert_eq!(out.indexed_deleted_paths(), vec![big.clone()]);
+
+        let db = rig.dir.path().join("index.db");
+        {
+            let d = crate::db::Database::open(&db).unwrap();
+            // Listed under another spelling of the same mount.
+            d.insert_snapshot(
+                "opt",
+                "20260930T0323",
+                "ssd",
+                "/elsewhere/ssd/opt.20260930T0323",
+            )
+            .unwrap();
+        }
+        let line =
+            prune_deleted_from_index(&db, &out.deleted_paths(), &out.indexed_deleted_paths())
+                .unwrap()
+                .expect("a shortfall is reported");
+        assert!(line.contains(&big.display().to_string()), "{line}");
+        assert!(line.contains("1 deleted snapshot "), "{line}");
+
+        // The row at the exact path is pruned, and then nothing is said.
+        let db2 = rig.dir.path().join("index2.db");
+        {
+            let d = crate::db::Database::open(&db2).unwrap();
+            d.insert_snapshot("opt", "20260930T0323", "ssd", &big.to_string_lossy())
+                .unwrap();
+        }
+        let line =
+            prune_deleted_from_index(&db2, &out.deleted_paths(), &out.indexed_deleted_paths())
+                .unwrap();
+        assert_eq!(line, None);
+        let left = crate::db::Database::open(&db2)
+            .unwrap()
+            .list_snapshots()
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
@@ -2327,6 +3028,7 @@ mod tests {
         rig.edit(|c| c.sources[0].subvolumes[1].retired = None);
         let out = expire_retired(
             &rig.config_path,
+            &rig.db(),
             false,
             "1970-01-01",
             &Scripted::new(&[]),
@@ -2348,7 +3050,15 @@ mod tests {
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let source = rig.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
         let runner = rig.deleting(&[&small, &source]);
-        let out = expire_retired(&rig.config_path, false, "2026-12-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2026-12-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists() && source.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         let entry = &out.entries[0];
@@ -2381,7 +3091,15 @@ mod tests {
         let small = rig.snap("small/ssd", "vol-toplevel.20260930T0323");
         let source = rig.snap("vol/.btrbk-snapshots", "vol-toplevel.20260930T0323");
         let runner = rig.deleting(&[&small, &source]);
-        let out = expire_retired(&rig.config_path, false, "2027-12-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2027-12-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(small.exists() && source.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert!(!out.entries[0].removed_from_config);
@@ -2410,7 +3128,15 @@ mod tests {
         let runner = rig.deleting(&[&small]);
         let vol = rig.dir.path().join("vol");
         let not_vol = move |p: &Path| p != vol;
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &not_vol).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &not_vol,
+        )
+        .unwrap();
         assert!(small.exists());
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert!(out.deleted_paths().is_empty());
@@ -2433,7 +3159,15 @@ mod tests {
         let rig = rig();
         let small = rig.snap("small/ssd", "opt.20260930T0323");
         let runner = rig.deleting(&[&small]);
-        let out = expire_retired(&rig.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        let out = expire_retired(
+            &rig.config_path,
+            &rig.db(),
+            false,
+            "2030-01-01",
+            &runner,
+            &mounted,
+        )
+        .unwrap();
         assert!(!small.exists());
         assert_eq!(
             out.entries[0].locations[1].state,

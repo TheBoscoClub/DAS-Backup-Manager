@@ -1853,6 +1853,14 @@ pub fn boot_plan_line(item: &BootPlanItem) -> Result<String, String> {
 }
 
 /// Which `target_subdirs` a given boot subvolume's snapshots live under.
+///
+/// Deliberately NOT `btrbk_conf::source_subdir`, the directory btrbk writes
+/// (first entry, else the label): this searches every listed entry and has no
+/// label fallback, so a source with no `target_subdirs` leaves its boot
+/// subvolumes untouched (the `no-target-subdirs` case of the boot-step tests).
+/// Aligning it with btrbk would make the boot step replace `@` where it now
+/// refuses — a behaviour change to a destructive step, left to a decision of
+/// its own rather than made in passing (bd DAS-Backup-Manager-12k).
 fn subdirs_for_subvol(config: &Config, subvol: &str) -> Vec<String> {
     let mut dirs: Vec<String> = config
         .sources
