@@ -1010,3 +1010,199 @@ fn coverage_list_prints_the_dropped_pairs_and_the_accept_log_as_json() {
     ]);
     assert_eq!(out.status.code(), Some(2), "a directory is no database");
 }
+
+/// The hand-run `subvol sync` and `subvol expire` of `config`, both dry runs,
+/// with `db` as their index database (bd DAS-Backup-Manager-5237.9).
+fn sync_and_expire(config: &Path, db: &Path) -> [Vec<String>; 2] {
+    let (config, db) = (config.to_str().unwrap(), db.to_str().unwrap());
+    let args = |action: &str| {
+        [
+            "subvol",
+            action,
+            "--config",
+            config,
+            "--db",
+            db,
+            "--dry-run",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    [args("sync"), args("expire")]
+}
+
+/// While a backup or setup holds the singleton, a hand-run `subvol sync` or
+/// `subvol expire` refuses with 75 as the config editors do, reading and
+/// writing nothing; once it is let go they run (bd DAS-Backup-Manager-5237.9).
+#[test]
+fn hand_run_sync_and_expire_refuse_while_the_backup_singleton_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let db = dir.path().join("nonexistent").join("x.db");
+    let lock = dir.path().join("das-backup.lock");
+    let before = std::fs::read(&config).unwrap();
+    {
+        let _held = buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "backup-run.sh")
+            .unwrap()
+            .expect("the lock is free");
+        for args in sync_and_expire(&config, &db) {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = btrdasd_with_lock(&args, &lock);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(75), "{args:?}: {err}");
+            assert!(
+                err.contains("Not saved, nothing changed"),
+                "{args:?}: {err}"
+            );
+            assert!(out.stdout.is_empty(), "{args:?} ran");
+            assert_eq!(std::fs::read(&config).unwrap(), before, "{args:?} wrote");
+        }
+    }
+    for args in sync_and_expire(&config, &db) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = btrdasd_with_lock(&args, &lock);
+        assert_ne!(
+            out.status.code(),
+            Some(75),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(!db.exists(), "a dry run creates no database");
+}
+
+/// Open `path` and take an exclusive `flock` on it, as `backup-run.sh`'s
+/// `exec 9<>"$LOCKFILE"; flock -n 9` does, recording `record` in it.
+fn flock_as_a_parent(path: &Path, record: &str) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    // SAFETY: flock on a descriptor this function owns.
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    std::fs::write(path, record).unwrap();
+    file
+}
+
+/// `btrdasd args` with the backup singleton at `lock` and `DAS_BACKUP_LOCK_FD`
+/// set to `fd_env`; `fd`, if any, is handed to the child as its descriptor 9
+/// (sharing the open file description, as `backup-run.sh`'s own fd 9 is).
+fn btrdasd_handed(
+    args: &[&str],
+    lock: &Path,
+    fd: Option<std::os::fd::RawFd>,
+    fd_env: &str,
+) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_btrdasd"));
+    cmd.args(args)
+        .env("DAS_BACKUP_LOCK", lock)
+        .env("DAS_BACKUP_LOCK_FD", fd_env);
+    if let Some(fd) = fd {
+        // SAFETY: dup2 is async-signal-safe; the new descriptor 9 shares
+        // `fd`'s open file description and is not close-on-exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(fd, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd.output().expect("spawn btrdasd")
+}
+
+/// A child of `backup-run.sh` is handed the singleton its parent holds
+/// (`DAS_BACKUP_LOCK_FD`): checked, never believed. The holder's own
+/// descriptor proceeds and leaves the parent's hold and record as they were;
+/// garbage, a descriptor not open, one on another file, or one on the lock
+/// file that holds nothing is refused before anything runs — never taken as
+/// held, never a fall-back to taking the lock (bd DAS-Backup-Manager-5237.9).
+#[test]
+fn a_handed_down_singleton_is_proven_before_sync_or_expire_runs() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let db = dir.path().join("nonexistent").join("x.db");
+    let lock = dir.path().join("das-backup.lock");
+    let before = std::fs::read(&config).unwrap();
+    let record = "backup-run.sh pid 4242\n";
+
+    let parent = flock_as_a_parent(&lock, record);
+    for args in sync_and_expire(&config, &db) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = btrdasd_handed(&args, &lock, Some(parent.as_raw_fd()), "9");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(75), "{args:?}: {err}");
+        assert!(!err.contains("DAS_BACKUP_LOCK_FD"), "{args:?}: {err}");
+        if args[1] == "sync" {
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("SUBVOLUME SYNC"),
+                "{args:?} did not run: {err}"
+            );
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{args:?}: {err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            record,
+            "{args:?}: the parent's record must stand"
+        );
+        assert!(
+            buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "x")
+                .unwrap()
+                .is_none(),
+            "{args:?}: the child must not release its parent's hold"
+        );
+    }
+    drop(parent);
+
+    // The lock is free from here: a refusal that fell back to taking it would
+    // run, and these would pass for the wrong reason.
+    std::fs::write(&lock, "").unwrap();
+    let other = flock_as_a_parent(&dir.path().join("other.lock"), record);
+    let unlocked = std::fs::File::open(&lock).unwrap();
+    let cases: [(&str, Option<std::os::fd::RawFd>, &str); 4] = [
+        ("garbage", None, "nine"),
+        ("not open", None, "9"),
+        ("another file", Some(other.as_raw_fd()), "9"),
+        (
+            "the lock file, holding nothing",
+            Some(unlocked.as_raw_fd()),
+            "9",
+        ),
+    ];
+    for (what, fd, env) in cases {
+        for args in sync_and_expire(&config, &db) {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = btrdasd_handed(&args, &lock, fd, env);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && out.status.code() != Some(75),
+                "{what}: {args:?} exited {:?}: {err}",
+                out.status.code()
+            );
+            assert!(
+                err.contains("DAS_BACKUP_LOCK_FD"),
+                "{what}: {args:?}: {err}"
+            );
+            assert!(out.stdout.is_empty(), "{what}: {args:?} ran");
+            assert_eq!(std::fs::read(&config).unwrap(), before, "{what}: {args:?}");
+        }
+    }
+    assert!(
+        buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "x")
+            .unwrap()
+            .is_some(),
+        "no refused child may have taken the lock"
+    );
+    assert!(!db.exists());
+}

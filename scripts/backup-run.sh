@@ -1,9 +1,18 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.19.1
-# Date: 2026-11-10
+# Version: 4.19.2
+# Date: 2026-11-11
 #
 # Features:
+#   - The singleton is handed down to sync and expire (v4.19.2, bd
+#     DAS-Backup-Manager-5237.9): `btrdasd subvol sync` and `subvol expire`
+#     now hold /run/das-backup.lock while they read-modify-write config.toml
+#     (and expire deletes), so a hand run cannot lose a write to, or race, a
+#     backup or setup. This run holds that lock on fd 9 while it runs them, so
+#     it hands its hold down — DAS_BACKUP_LOCK_FD=9 on exactly those two
+#     calls, as DAS_MAINTENANCE_LOCK_FD=8 is for `btrdasd walk` — and the
+#     child proves it (fd 9 is the lock file and holds the lock) instead of
+#     meeting this run's own lock and refusing every night.
 #   - Target directories are the btrbk.conf `target` lines (v4.19.1, bd
 #     DAS-Backup-Manager-c0x): create_target_dirs makes, on each mounted
 #     target, exactly the directories this run's btrbk.conf and the state
@@ -724,6 +733,12 @@ clear_singleton_holder() {
 }
 
 acquire_singleton_lock() {
+    # fd 9 is not close-on-exec, so every child this run starts inherits it
+    # and shares the hold. sync_subvolumes and expire_retired_subvolumes rely
+    # on that and say so (DAS_BACKUP_LOCK_FD=9 for `btrdasd subvol sync` and
+    # `subvol expire`, which otherwise take this lock themselves; bd
+    # DAS-Backup-Manager-5237.9). Never `flock -u 9` while a child may hold
+    # the description — that releases it for the child as well.
     if ! exec 9<>"$LOCKFILE"; then
         echo "[ERROR] Cannot open the backup lock $LOCKFILE — could not start" >&2
         exit 1
@@ -1715,6 +1730,10 @@ record_subvol_coverage() {
 # the last recorded backup run. A real run records the check
 # (--record-coverage); a dry run never does. Its row is read from the sync's
 # own output by record_subvol_coverage.
+#
+# The sync rewrites config.toml and btrbk.conf holding the backup singleton:
+# this run's, handed down on fd 9 (DAS_BACKUP_LOCK_FD, bd
+# DAS-Backup-Manager-5237.9) — taking it afresh would meet this run's own hold.
 sync_subvolumes() {
     local mode="$1"
     local args=(subvol sync --config "$DAS_CONFIG" --db "$DAS_DB_PATH")
@@ -1735,7 +1754,7 @@ sync_subvolumes() {
 
     log_info "Syncing subvolumes with config..."
     local rc=0
-    SUBVOL_SYNC_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    SUBVOL_SYNC_REPORT="$(DAS_BACKUP_LOCK_FD=9 "$BTRDASD_BIN" "${args[@]}")" || rc=$?
     if [[ -n "${DRYRUN_BTRBK_CONF:-}" && ! -s "$DRYRUN_BTRBK_CONF" ]]; then
         log_warn "Sync rendered no btrbk.conf for the dry run — btrbk dryrun uses the current one"
         rm -f -- "${DRYRUN_BTRBK_CONF:?}"
@@ -1776,7 +1795,9 @@ sync_subvolumes() {
 }
 
 # Delete the backups of retired subvolumes that are past their window.
-# Runs after btrbk, while the targets are still mounted.
+# Runs after btrbk, while the targets are still mounted. Like the sync, it is
+# handed this run's singleton on fd 9 (DAS_BACKUP_LOCK_FD, bd
+# DAS-Backup-Manager-5237.9).
 #
 # When this run's sync failed it could not look at every volume, so a retired
 # subvolume may exist again and be waiting for sync to revive it. Expiry must
@@ -1795,7 +1816,7 @@ expire_retired_subvolumes() {
     fi
 
     local rc=0
-    SUBVOL_EXPIRE_REPORT="$("$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    SUBVOL_EXPIRE_REPORT="$(DAS_BACKUP_LOCK_FD=9 "$BTRDASD_BIN" "${args[@]}")" || rc=$?
     if [[ $rc -ne 0 ]]; then
         record_op "subvol_expire" "FAIL" "exit code $rc — see RETIRED SUBVOLUMES in the report"
         log_error "Expiry of retired subvolumes failed (exit $rc)"
@@ -3858,7 +3879,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.19.1
+  backup-run.sh v4.19.2
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

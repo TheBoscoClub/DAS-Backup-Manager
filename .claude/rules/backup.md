@@ -177,7 +177,8 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
 
 1. **Singleton lock**, non-blocking: `/run/das-{backup,scrub,reconcile,doctor}.lock`. Held ⇒ skip; a
    backup lock that cannot be opened or taken is "could not start", exit 1 (bd `ismb`).
-   - Every holder of `/run/das-backup.lock` writes `<who> pid <pid>` into it and empties it (never removes it) before release: `backup-run.sh`, `btrdasd backup …`, `btrdasd recovery-os record`, `btrdasd setup …`, `config edit` (`backup::SingletonHeld`, bd `al9`).
+   - Every holder of `/run/das-backup.lock` writes `<who> pid <pid>` into it and empties it (never removes it) before release: `backup-run.sh`, `btrdasd backup …`, `btrdasd recovery-os record`, `btrdasd setup …`, `config edit` (`subvol add`/`remove`, `schedule set`, a hand-run `subvol sync`/`expire`, the helper's edits) (`backup::SingletonHeld`, bd `al9`).
+   - `backup-run.sh` hands its hold to the `subvol sync` and `subvol expire` it runs (`DAS_BACKUP_LOCK_FD=9`, those two calls only); the child proves it (`SingletonHeld::delegated_at`) or fails, never takes the lock, never touches the record (bd `5237.9`).
    - Open the singleton `<>`, never `>` (a run that does not get the lock must not empty the holder's record).
    - `backup-run.sh` finds it held by setup or a config edit → waits, `SINGLETON_WAIT_SECS` (900 s), saying whom; still held → skip, exit 0, a WARN that this backup did NOT run.
    - Held by a backup → skip, exit 0, naming it. No record, no pid, or the pid gone → skip, exit 0, with the same WARN; never a silent skip.

@@ -48,8 +48,28 @@ pub fn config_edit_lock_path() -> PathBuf {
 /// through here; a holder that did not record itself reads as unknown.
 #[derive(Debug)]
 pub struct SingletonHeld {
-    lock: scrub::FileLock,
+    path: PathBuf,
+    how: SingletonHow,
 }
+
+#[derive(Debug)]
+enum SingletonHow {
+    /// This process took the lock. Its record is in the lock file; both go on
+    /// drop.
+    Owned(scrub::FileLock),
+    /// The process that started this one holds the lock and handed it down
+    /// ([`DELEGATED_SINGLETON_FD_ENV`]). Never unlocked here, and its record
+    /// never touched: the open file description and the record are that
+    /// process's, and it still relies on both.
+    Delegated,
+}
+
+/// A process that holds the backup singleton hands it to a command it runs by
+/// setting this to the number of its open descriptor on the lock file —
+/// `backup-run.sh` does, `DAS_BACKUP_LOCK_FD=9`, for the `btrdasd subvol sync`
+/// and `subvol expire` it runs (bd DAS-Backup-Manager-5237.9). Checked, never
+/// believed: see [`SingletonHeld::delegated_at`].
+pub const DELEGATED_SINGLETON_FD_ENV: &str = "DAS_BACKUP_LOCK_FD";
 
 impl SingletonHeld {
     /// Take the singleton at `path` without waiting and record `job` (and this
@@ -67,23 +87,69 @@ impl SingletonHeld {
                 path.display()
             );
         }
-        Ok(Some(Self { lock }))
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            how: SingletonHow::Owned(lock),
+        }))
+    }
+
+    /// The singleton as the process that started this one holds it: `fd` is
+    /// that process's open descriptor on the lock file at `path`, inherited
+    /// and named in [`DELEGATED_SINGLETON_FD_ENV`]. Proven exactly as the
+    /// maintenance lock's hand-down is
+    /// ([`MaintenanceHeld::delegated_at`](crate::maintenance::MaintenanceHeld::delegated_at),
+    /// with its caveat): `fd` is the lock file, the lock is held, and held
+    /// through `fd`. Anything else is an error — never a fall-back to taking
+    /// the lock, which would let a forged or stale number run unlocked.
+    pub fn delegated_at(path: &Path, fd: std::os::fd::RawFd) -> Result<Self, String> {
+        crate::maintenance::prove_handed_down(path, fd, DELEGATED_SINGLETON_FD_ENV)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            how: SingletonHow::Delegated,
+        })
+    }
+
+    /// The singleton for a command a backup may run as its child: the hold
+    /// handed down, when `delegated` (the value of
+    /// [`DELEGATED_SINGLETON_FD_ENV`]) is set, proven by
+    /// [`delegated_at`](Self::delegated_at); otherwise taken as
+    /// [`try_acquire_at`](Self::try_acquire_at) takes it, `Ok(None)` when
+    /// another holds it. A value that is not a descriptor number, or does not
+    /// prove the hold, is an error.
+    pub fn handed_down_or_taken(
+        path: &Path,
+        delegated: Option<&std::ffi::OsStr>,
+        job: &str,
+    ) -> Result<Option<Self>, String> {
+        let Some(raw) = delegated else {
+            return Self::try_acquire_at(path, job).map_err(|e| e.to_string());
+        };
+        let fd = raw
+            .to_str()
+            .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+            .ok_or_else(|| {
+                format!("{DELEGATED_SINGLETON_FD_ENV}={raw:?} is not a descriptor number")
+            })?;
+        Self::delegated_at(path, fd).map(Some)
     }
 
     /// The lock file.
     pub fn path(&self) -> &Path {
-        self.lock.path()
+        &self.path
     }
 }
 
 impl Drop for SingletonHeld {
     fn drop(&mut self) {
         // Emptied while still held: once released, the next holder may
-        // already have written its own. Display only.
-        if let Err(e) = self.lock.clear_note() {
+        // already have written its own. Display only. A delegated hold's
+        // record belongs to the process that holds it.
+        if let SingletonHow::Owned(lock) = &self.how
+            && let Err(e) = lock.clear_note()
+        {
             eprintln!(
                 "warning: could not empty the holder record in {}: {e}",
-                self.lock.path().display()
+                lock.path().display()
             );
         }
     }
