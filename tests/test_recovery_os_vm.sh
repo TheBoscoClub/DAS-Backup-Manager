@@ -1327,13 +1327,17 @@ run_interrupted() {
     # What happens in the guest in the instant before the signal.
     if [[ -n "${BEFORE_SIG:-}" ]]; then eval "$BEFORE_SIG"; fi
     kill -"${SIG:-INT}" -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIG${SIG:-INT})" >>"$T/driver.out"
-    for ((i = 0; i < 600; i++)); do
+    # A backstop against a driver that never ends, not a measure of how fast
+    # it winds down: 30 s was too short on a loaded host (CI on 63ab2a3b ran
+    # beside a backup, the whole suite three times slower, and the two-drive
+    # case was killed here at exit 137; bd DAS-Backup-Manager-uk3v.1).
+    for ((i = 0; i < 3600; i++)); do
         kill -0 "$dpid" 2>/dev/null || break
         sleep 0.05
     done
     if kill -0 "$dpid" 2>/dev/null; then
         kill -KILL -- "-$dpid" 2>/dev/null || :
-        echo "(the driver did not exit within 30s of SIGINT)" >>"$T/driver.out"
+        echo "(the driver did not exit within 180s of SIGINT)" >>"$T/driver.out"
     fi
     wait "$dpid" || RC=$?
     OUT="$(cat "$T/driver.out")"
