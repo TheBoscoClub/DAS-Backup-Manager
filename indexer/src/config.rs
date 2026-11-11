@@ -3264,6 +3264,15 @@ impl Config {
                 if sv.retired.is_some() {
                     continue;
                 }
+                // btrbk refuses a name holding '/' ("Invalid file name"), and
+                // with it every run (bd DAS-Backup-Manager-31q).
+                if snap.contains('/') {
+                    errors.push(format!(
+                        "Subvolume '{}' on volume '{}' resolves to snapshot name '{snap}', \
+                         which holds a '/' btrbk refuses — give it an explicit snapshot_name",
+                        sv.name, src.volume
+                    ));
+                }
                 let key = (src.volume.clone(), src.snapshot_dir.clone(), snap.clone());
                 if let Some(first) = seen.get(&key) {
                     errors.push(format!(
@@ -3461,6 +3470,48 @@ mod tests {
         assert_eq!(
             cfg.exclude_patterns(),
             ["@tmp", "@var-tmp", "scratch", "@cache", "coredumps"]
+        );
+    }
+
+    /// btrbk 0.32.7 refuses a snapshot name holding `/` ("Invalid file name"),
+    /// and then every backup fails. Two unnamed entries `a/b` and `a-b`
+    /// collide and the resolver separates the first as `root-a/b` (bd
+    /// DAS-Backup-Manager-31q); an explicit one can say it outright.
+    #[test]
+    fn validate_rejects_a_snapshot_name_holding_a_slash() {
+        for subvols in [
+            &[("a/b", None), ("a-b", None)][..],
+            &[("@data", Some("data/one"))],
+        ] {
+            let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", subvols));
+            let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+            let errors = cfg.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("'/'") && e.contains("snapshot name")),
+                "{subvols:?}: {errors:?}"
+            );
+        }
+        // A retired sibling still takes part in the resolving, and the
+        // renderer gives the live `a/b` that same `root-a/b`.
+        let extra = format!(
+            "{}[[source.subvolumes]]\nname = \"a-b\"\nretired = \"2026-01-01\"\n{ONE_TARGET}",
+            source_with("s", "/vol", &[("a/b", None)])
+        );
+        let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
+        let errors = cfg.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("'root-a/b'")),
+            "{errors:?}"
+        );
+        let rendered = crate::btrbk_conf::render_btrbk_conf(&cfg).unwrap();
+        assert!(rendered.contains("root-a/b"), "{rendered}");
+        // Flattened, as the resolver does for a lone nested subvolume.
+        let extra = format!("{}{ONE_TARGET}", source_with("s", "/vol", &[("a/b", None)]));
+        assert_eq!(
+            Config::from_toml(&minimal_toml(&extra)).unwrap().validate(),
+            Vec::<String>::new()
         );
     }
 
@@ -3715,9 +3766,13 @@ mod tests {
 
     #[test]
     fn validate_ignores_a_retired_entry_when_checking_snapshot_names() {
+        // `@x` and the retired `x` both resolve to `root-x`: no clash, since a
+        // retired entry is not rendered. (With `a/b` beside a retired `a-b`
+        // the live one resolves to `root-a/b`, which btrbk refuses: bd 31q,
+        // validate_rejects_a_snapshot_name_holding_a_slash.)
         let extra = format!(
-            "{}[[source.subvolumes]]\nname = \"a-b\"\nretired = \"2026-01-01\"\n{ONE_TARGET}",
-            source_with("s", "/vol", &[("a/b", None)])
+            "{}[[source.subvolumes]]\nname = \"x\"\nretired = \"2026-01-01\"\n{ONE_TARGET}",
+            source_with("s", "/vol", &[("@x", None)])
         );
         let cfg = Config::from_toml(&minimal_toml(&extra)).unwrap();
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());

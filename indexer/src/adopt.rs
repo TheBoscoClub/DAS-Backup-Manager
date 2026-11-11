@@ -979,9 +979,9 @@ fn bring_btrbk_conf_into_line(
     sync_failed: bool,
 ) -> (BtrbkConf, Option<String>) {
     let conf_path = Path::new(&config.general.btrbk_conf);
-    // Validated first: a file that matches an invalid config.toml (one that
-    // `setup --upgrade`, which never validates, may have written) is not
-    // "current" (bd xtnq D1).
+    // Validated first: a file that matches an invalid config.toml (one an
+    // older `setup --upgrade`, which did not validate, may have written) is
+    // not "current" (bd xtnq D1; upgrade validates since bd 31q).
     let errors = config.validate();
     if errors.is_empty() && crate::btrbk_conf::confs_are_current(config) {
         return (BtrbkConf::Current, None);

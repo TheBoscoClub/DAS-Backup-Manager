@@ -1513,9 +1513,17 @@ fn prepare_upgrade(
 
     let migrations = migrate_config(&mut config);
 
-    // A config the btrbk.conf renderer refuses (bd xtnq) is refused here,
-    // before the version stamp or a migration is saved: no file changes.
-    if let Err(why) = GeneratedFiles::generate(&config) {
+    // A config the btrbk.conf renderer refuses (bd xtnq), or one `validate`
+    // rejects — as the nightly sync does before it regenerates btrbk.conf
+    // (bd DAS-Backup-Manager-31q) — is refused here, before the version stamp
+    // or a migration is saved: no file changes.
+    let errors = config.validate();
+    let refused = if errors.is_empty() {
+        GeneratedFiles::generate(&config).err()
+    } else {
+        Some(format!("config.toml is not valid: {}", errors.join("; ")))
+    };
+    if let Some(why) = refused {
         for change in &migrations {
             say(format!(
                 "Migration pending, not saved (the upgrade is refused): {change}"
@@ -3190,7 +3198,9 @@ auth = "starttls""#,
     }
 
     fn relay_config(port: u16) -> Config {
-        let mut config = Config::default();
+        // Valid, as an upgrade now requires (bd 31q); nothing here opens the
+        // database the path names.
+        let mut config = valid_config(Path::new("/nonexistent/das-test"));
         config.email.enabled = true;
         config.email.smtp_host = "127.0.0.1".to_string();
         config.email.smtp_port = port;
@@ -3248,6 +3258,28 @@ auth = "starttls""#,
         assert_eq!(std::fs::read(&config_path).unwrap(), before);
     }
 
+    /// An upgrade validates before it writes, as the nightly sync does: a
+    /// config btrbk would refuse (a snapshot name holding '/') is refused,
+    /// config.toml left byte for byte (bd DAS-Backup-Manager-31q, c0x item 1).
+    #[test]
+    fn an_upgrade_of_a_config_validate_rejects_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = valid_config(dir.path());
+        assert_eq!(config.validate(), Vec::<String>::new());
+        config.sources[0].subvolumes[0].snapshot_name = Some("data/one".to_string());
+        config.general.version = "0.0.1".to_string();
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let (result, _) = run_prepare_upgrade(&config_path, false);
+
+        let why = result.unwrap_err();
+        assert!(why.contains("data/one"), "{why}");
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    }
+
     #[test]
     fn upgrade_refuses_to_run_without_an_existing_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -3270,7 +3302,7 @@ auth = "starttls""#,
     fn upgrade_stamps_an_older_config_with_this_version_and_saves_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        let mut config = Config::default();
+        let mut config = valid_config(dir.path());
         config.general.version = "0.0.1".to_string();
         config.email.enabled = false;
         config.save(&config_path).unwrap();
@@ -3309,7 +3341,7 @@ auth = "starttls""#,
     fn upgrade_stamps_the_version_and_keeps_unknown_keys_and_comments() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        let mut config = Config::default();
+        let mut config = valid_config(dir.path());
         config.general.version = "0.0.1".to_string();
         config.email.enabled = false;
         hand_edited(&config, &config_path);
@@ -3382,7 +3414,7 @@ auth = "starttls""#,
         // would re-serialize it and drop everything that is not a setting.
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        let mut config = Config::default();
+        let mut config = valid_config(dir.path());
         config.email.enabled = false;
         config.save(&config_path).unwrap();
         let mut on_disk = std::fs::read_to_string(&config_path).unwrap();
