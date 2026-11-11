@@ -408,6 +408,11 @@ if(BUILD_TESTING)
         NAME shell-suite-bounds
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_suite_bounds.sh
     )
+    # Alone under ctest -j: this suite sizes its cap from the user's live task
+    # count, which suites running beside it move (failed once under -j4, bd
+    # DAS-Backup-Manager-s5jv.9); the VM suite's stub mistakes another suite's
+    # shell naming recovery-os-vm.sh for the driver.
+    set_tests_properties(shell-suite-bounds shell-recovery-os-vm PROPERTIES RUN_SERIAL TRUE)
     # boot-archive-cleanup.sh itself, run for real in a sandbox of stub btrfs,
     # mountpoint and btrdasd: what it may delete (bd DAS-Backup-Manager-1bsx),
     # and what it prints, read back by backup-run.sh's run_archive_cleanup in

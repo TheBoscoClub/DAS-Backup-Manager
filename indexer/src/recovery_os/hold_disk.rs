@@ -690,10 +690,18 @@ mod tests {
 
     // ----- the signals ---------------------------------------------------------
 
+    /// A mask is per thread, a disposition per process. Setting one of these
+    /// signals to SIG_IGN discards an instance another test's thread has queued
+    /// but not yet waited for, and that test's `wait` then never returns
+    /// (bd s5jv.9). Every test that sets a disposition, or blocks and waits,
+    /// holds this.
+    static DISPOSITIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Each signal raised at a thread that blocked them is queued and returned
     /// by `wait`. In a thread of its own, so the mask goes with it.
     #[test]
     fn each_termination_signal_is_queued_until_waited_for() {
+        let _guard = DISPOSITIONS.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(|| {
             let signals = TerminationSignals::block().unwrap();
             for signal in TERMINATION_SIGNALS {
@@ -714,6 +722,7 @@ mod tests {
     /// also restores their default disposition, so they queue for `wait`.
     #[test]
     fn an_inherited_ignore_does_not_survive_blocking() {
+        let _guard = DISPOSITIONS.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(|| {
             let disposition = |signal| {
                 // SAFETY: a null new action only reads the current one.
@@ -724,8 +733,9 @@ mod tests {
                 );
                 old.sa_sigaction
             };
-            // SAFETY: SIGHUP's disposition is process-wide; nothing in the test
-            // binary relies on it, and the default is what it started with.
+            // SAFETY: SIGHUP's disposition is process-wide; the other tests that
+            // rely on it wait for DISPOSITIONS, and `block` puts back the default
+            // it started with.
             unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
             assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN);
             let signals = TerminationSignals::block().unwrap();
@@ -744,6 +754,8 @@ mod tests {
     /// The whole command on something that is not a disk: refused with 2.
     #[test]
     fn run_refuses_what_is_not_a_block_device() {
+        // `run` sets the dispositions to SIG_DFL, under the other tests' feet.
+        let _guard = DISPOSITIONS.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(|| {
             let dir = tempfile::tempdir().unwrap();
             let img = dir.path().join("disk.img");
