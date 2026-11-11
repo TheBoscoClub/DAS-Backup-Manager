@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`nodev,nosuid,noexec` are recommended for the backup targets' mounts** (bd `DAS-Backup-Manager-20q`): `docs/INSTALL.md` now says so for `[das].mount_opts`. A target holds copies of every device node and setuid binary of the backed-up system; with the options, `btrfs receive` and a restore still keep them intact, while opening a device node or running anything from the mounted target is refused. Proven on a loop device and on a full backup run, a restore and a walk
+
 - **The systemd units `btrdasd setup` generates live in a directory of their own, linked into systemd** (bd `DAS-Backup-Manager-5237.7`, operator decision 2026-11-09): the eight `das-*.{service,timer}` units sat loose in `/etc/systemd/system` among everything else there, so they could not be versioned as one directory
   - Each unit is a file in `<config dir>-units` (`/etc/das-backup-units`; derived, not a config key) and `/etc/systemd/system/<unit>` is the link to it; unit names, drop-ins and the runtime brake are unchanged, and the manifest lists file and link
   - `setup --upgrade` replaces a unit an older version wrote as a regular file with its link in one rename — an armed timer keeps its next elapse (observed on systemd 262, also across a reboot)
