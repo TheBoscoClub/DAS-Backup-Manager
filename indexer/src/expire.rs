@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::btrbk_conf::resolve_snapshot_names;
+use crate::btrbk_conf::{resolve_snapshot_names, source_subdir, source_targets};
 use crate::caldate::{date_of, day_number, untrusted_clock};
-use crate::config::{Config, Retention, Source, Target, TargetRole};
+use crate::config::{Config, Retention, Source};
 use crate::fsutil::CommandRunner;
 
 /// The longest of a target's retention tiers, in whole days: a daily tier
@@ -208,15 +208,6 @@ impl ExpireOutcome {
     }
 }
 
-fn targets_of<'a>(config: &'a Config, source: &Source) -> Vec<&'a Target> {
-    config
-        .targets
-        .iter()
-        .filter(|t| t.role == TargetRole::Primary || t.role == TargetRole::Mirror)
-        .filter(|t| source.target_labels.is_empty() || source.target_labels.contains(&t.label))
-        .collect()
-}
-
 /// The first LIVE entry, in any source accepted by `same_place`, that
 /// resolves to `snapshot_name`. Names are resolved within the entry's own
 /// source, as btrbk will see them.
@@ -238,10 +229,6 @@ fn live_user_of(
                 .find(|(e, n)| e.retired.is_none() && n == snapshot_name)
                 .map(|(e, _)| (other.label.clone(), e.name.clone()))
         })
-}
-
-fn target_subdir(source: &Source) -> &String {
-    source.target_subdirs.first().unwrap_or(&source.label)
 }
 
 /// Every entry name of a directory, or why the listing cannot be trusted. A
@@ -456,8 +443,8 @@ pub fn expire_retired(
                 });
                 continue;
             }
-            let targets = targets_of(&config, source);
-            let subdir = target_subdir(source);
+            let targets = source_targets(&config, source);
+            let subdir = source_subdir(source);
             let mut locations = Vec::new();
             for target in &targets {
                 let root = Path::new(&target.mount);
@@ -473,8 +460,8 @@ pub fn expire_retired(
                     runner,
                     is_mountpoint,
                     live_user_of(&config, &snapshot_name, |other| {
-                        target_subdir(other) == subdir
-                            && targets_of(&config, other)
+                        source_subdir(other) == subdir
+                            && source_targets(&config, other)
                                 .iter()
                                 .any(|t| t.label == target.label)
                     }),

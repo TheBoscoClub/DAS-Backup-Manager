@@ -527,8 +527,10 @@ pub fn config_busy_line(path: &Path) -> String {
     )
 }
 
-/// The targets a source's volume block sends to.
-pub(crate) fn source_targets<'a>(
+/// The targets a source's volume block sends to. The one derivation: expiry
+/// (`expire`) examines exactly these, so deletion cannot drift from what
+/// btrbk is told to write (bd DAS-Backup-Manager-12k).
+pub fn source_targets<'a>(
     config: &'a Config,
     source: &crate::config::Source,
 ) -> Vec<&'a Target> {
@@ -542,8 +544,10 @@ pub(crate) fn source_targets<'a>(
 
 /// The directory under each target a source's snapshots are sent to: the
 /// FIRST `target_subdirs` entry, else the source label. Further entries are
-/// not used by the renderer.
-fn source_subdir(source: &crate::config::Source) -> &str {
+/// not used by the renderer. The one derivation: expiry reads the directory
+/// it deletes from through this, so the two cannot drift (bd
+/// DAS-Backup-Manager-12k).
+pub fn source_subdir(source: &crate::config::Source) -> &str {
     source
         .target_subdirs
         .first()
@@ -721,6 +725,32 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `source_subdir` is what expiry deletes under, so it must be the
+    /// directory the renderer writes in every `target` line: the first
+    /// `target_subdirs` entry, else the label (bd DAS-Backup-Manager-12k).
+    #[test]
+    fn source_subdir_is_the_directory_the_renderer_writes() {
+        let mut cfg = test_config();
+        let cases: [(Vec<String>, &str); 3] = [
+            (vec!["first".into(), "second".into()], "first"),
+            (vec!["only".into()], "only"),
+            (Vec::new(), "nvme-root"),
+        ];
+        for (subdirs, want) in cases {
+            cfg.sources[0].target_subdirs = subdirs.clone();
+            assert_eq!(source_subdir(&cfg.sources[0]), want, "{subdirs:?}");
+            let text = render_btrbk_conf(&cfg).unwrap();
+            for target in source_targets(&cfg, &cfg.sources[0]) {
+                let line = format!("{}/{want}", target.mount);
+                assert!(text.contains(&line), "{subdirs:?}: no {line} in\n{text}");
+            }
+            assert!(
+                !text.contains("/second"),
+                "a later entry is never written:\n{text}"
+            );
+        }
+    }
 
     fn test_config() -> Config {
         let mut config = Config::default();
