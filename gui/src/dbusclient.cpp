@@ -638,7 +638,13 @@ void DBusClient::callAsync(const QString &method, const QList<QVariant> &args,
     // call. The single helperUnavailable signal emitted from the constructor
     // is the user's one notification; per-action errorOccurred firings here
     // would just rebuild the cascade we're trying to eliminate.
-    if (!m_available) return;
+    if (!m_available) {
+        // Still told, quietly: a caller waiting for jobStarted or
+        // errorOccurred would otherwise wait for ever (bd qxxv).
+        QMetaObject::invokeMethod(
+            this, [this, operation] { Q_EMIT callDropped(operation); }, Qt::QueuedConnection);
+        return;
+    }
     QDBusPendingCall pending = m_interface->asyncCallWithArgumentList(method, args);
     auto *watcher = new QDBusPendingCallWatcher(pending, this);
 

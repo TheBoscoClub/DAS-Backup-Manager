@@ -104,6 +104,10 @@ Q_SIGNALS:
     void jobFinished(const QString &jobId, bool success,
                      const QString &summary);
     void errorOccurred(const QString &operation, const QString &error);
+    // A job-starting call dropped because no helper is reachable: no job and
+    // no reply will follow. Not an error dialog — helperUnavailable said it
+    // once. Queued, so it arrives after the caller has marked its request.
+    void callDropped(const QString &operation);
 
     // Fired once, deferred to the next event-loop iteration, if the helper
     // could not be activated at startup. Collapses what would otherwise be

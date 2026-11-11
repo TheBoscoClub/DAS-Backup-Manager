@@ -61,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI's Run buttons come back when no D-Bus helper is reachable** (bd `DAS-Backup-Manager-qxxv`): the client dropped a job-starting call without a word when the helper was unavailable, so a panel that had marked its backup as requested kept Run and Dry Run disabled until the GUI was restarted; the client now sends a quiet, queued `callDropped(operation)` (no error dialog — `helperUnavailable` already said why) and the backup panel ends the request on it
+
 - **The D-Bus helper's save error names the config file once** (bd `DAS-Backup-Manager-v4y`): it prefixed `Failed to save config '<path>':` to errors that already name the file (`cannot write <path>: …`); it now says `Config not saved: …`, and each error names its own file
 
 - **A target whose every retention period is 0 is refused, not given an invented four weeks** (bd `DAS-Backup-Manager-iyq`): `btrbk.conf` rendered it as `target_preserve 4w` while expiry read the same target as keeping its retired series forever — one setting, two opposite meanings; `Config::validate` now names the target, and the renderer refuses it too

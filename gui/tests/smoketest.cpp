@@ -701,6 +701,23 @@ private Q_SLOTS:
         QVERIFY(!p.run->isEnabled()); // targets all unticked
     }
 
+    // With no helper, Run must not wait for a reply that cannot come: the
+    // client drops the call without a signal, so a panel that marked the job
+    // running stayed disabled until restart (bd DAS-Backup-Manager-qxxv).
+    void panelRunWithNoHelperLeavesRunEnabled()
+    {
+        DBusClient client;
+        QVERIFY(!client.isAvailable()); // CTest's dead system bus
+        BackupPanel panel(&client);
+        panel.applyConfig(liveShapedPanel());
+        const PanelParts p = partsOf(panel);
+        QVERIFY(p.ok());
+        QVERIFY(p.run->isEnabled());
+        p.run->click();
+        // The drop is announced queued, after the click marked the request.
+        QTRY_VERIFY2(p.run->isEnabled(), "Run disabled, waiting for a job that never starts");
+    }
+
     void panelBootTooltipFollowsTheMode()
     {
         DBusClient client;

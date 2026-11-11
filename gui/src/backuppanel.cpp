@@ -192,6 +192,12 @@ BackupPanel::BackupPanel(DBusClient *client, QWidget *parent)
                 if (m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun"))
                     jobEnded();
             });
+    // No helper: the call was never made, so no job will start (bd
+    // DAS-Backup-Manager-qxxv). Said once by helperUnavailable, not again here.
+    connect(m_client, &DBusClient::callDropped, this, [this](const QString &operation) {
+        if (m_jobRunning && m_jobId.isEmpty() && operation == QLatin1String("BackupRun"))
+            jobEnded();
+    });
 
     // Populate sources and targets from config
     loadConfig();
