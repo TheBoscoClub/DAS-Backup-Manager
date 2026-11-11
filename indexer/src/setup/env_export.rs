@@ -105,12 +105,6 @@ pub fn dump_env(config: &Config) -> String {
         let subvol_names: Vec<&str> = src.subvolumes.iter().map(|sv| sv.name.as_str()).collect();
         out.push_str(&kv(&format!("{p}_SUBVOLUMES"), &subvol_names.join(" ")));
         out.push_str(&kv(&format!("{p}_SNAPSHOT_DIR"), &src.snapshot_dir));
-        if !src.target_subdirs.is_empty() {
-            out.push_str(&kv(
-                &format!("{p}_TARGET_SUBDIRS"),
-                &src.target_subdirs.join(" "),
-            ));
-        }
     }
 
     // Targets (indexed)
@@ -298,7 +292,9 @@ mod tests {
         assert!(output.contains("DAS_SOURCE_0_DEVICE='/dev/nvme0n1p2'"));
         assert!(output.contains("DAS_SOURCE_0_SUBVOLUMES='@ @home'"));
         assert!(output.contains("DAS_SOURCE_0_SNAPSHOT_DIR='.btrbk-snapshots'"));
-        assert!(output.contains("DAS_SOURCE_0_TARGET_SUBDIRS='nvme'"));
+        // Target directories come from btrbk.conf's `target` lines now
+        // (bd DAS-Backup-Manager-c0x): nothing reads a subdir list.
+        assert!(!output.contains("_TARGET_SUBDIRS"));
     }
 
     #[test]

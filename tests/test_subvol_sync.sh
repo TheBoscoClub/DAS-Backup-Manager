@@ -13,11 +13,15 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk parse_btrbk_run_log cleanup monotonic_secs create_target_dirs make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk parse_btrbk_run_log cleanup monotonic_secs create_target_dirs make_target_dirs_named_in make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
 done
+# The extracted cleanup empties the singleton's holder record; the real one
+# writes $LOCKFILE (/run/das-backup.lock). Never reached from a test.
+# shellcheck disable=SC2329
+clear_singleton_holder() { :; }
 
 # shellcheck disable=SC2329  # called by the eval-extracted functions
 log_info() { :; }; log_warn() { echo "WARN: $*" >>"$WORK/log"; }; log_error() { echo "ERROR: $*" >>"$WORK/log"; }
@@ -265,8 +269,6 @@ mkdir -p "$WORK/mnt/t0" "$WORK/mnt/t1"
 # shellcheck disable=SC2034
 DAS_SOURCE_COUNT=1
 # shellcheck disable=SC2034
-DAS_SOURCE_0_TARGET_SUBDIRS="nvme"
-# shellcheck disable=SC2034
 DAS_TARGET_COUNT=2
 # shellcheck disable=SC2034
 DAS_TARGET_0_MOUNT="$WORK/mnt/t0"
@@ -274,6 +276,10 @@ DAS_TARGET_0_MOUNT="$WORK/mnt/t0"
 DAS_TARGET_1_MOUNT="$WORK/mnt/t1"
 printf 'volume /.btrfs-nvme\n  target                %s\n  target                %s\n  target                %s\n  target                %s\n' \
     "$WORK/mnt/t0/nvme" "$WORK/mnt/t0/nvme-adopted" "$WORK/mnt/t1/nvme-adopted" "$WORK/mnt/t0/../escape" >"$WORK/planned.conf"
+# The current btrbk.conf: what a real run's sync left (never the host's).
+DAS_BTRBK_CONF="$WORK/current.conf"
+DAS_BTRBK_STATE_CONF=""
+printf 'volume /.btrfs-nvme\n  target                %s\n' "$WORK/mnt/t0/nvme" >"$DAS_BTRBK_CONF"
 DRYRUN_BTRBK_CONF=""
 create_target_dirs
 check "no plan: only the configured subdir" "$(find "$WORK/mnt/t0" -mindepth 1 -printf '%f ')" "nvme "
@@ -293,6 +299,30 @@ check "main: target directories are made only after the targets are verified" \
 check "plan: nothing on an unmounted target" "$(find "$WORK/mnt/t1" -mindepth 1 | wc -l)" "0"
 check "plan: no path that climbs out of the target" "$([[ -e "$WORK/mnt/escape" ]] && echo yes || echo no)" "no"
 DRYRUN_BTRBK_CONF=""
+unset -f mountpoint
+
+# --- the directories made are the ones btrbk.conf sends to (bd c0x item 4) ---
+# Both targets mounted; the source sends only to t0 (target_labels), the state
+# pass to both. Nothing for a target btrbk never writes to, nothing missing.
+# shellcheck disable=SC2329  # called by the extracted create_target_dirs
+mountpoint() { [[ "${!#}" == "$WORK/mnt2/t0" || "${!#}" == "$WORK/mnt2/t1" ]]; }
+mkdir -p "$WORK/mnt2/t0" "$WORK/mnt2/t1"
+saved_conf="$DAS_BTRBK_CONF" saved_state="${DAS_BTRBK_STATE_CONF:-}"
+# shellcheck disable=SC2034
+DAS_TARGET_0_MOUNT="$WORK/mnt2/t0"
+# shellcheck disable=SC2034
+DAS_TARGET_1_MOUNT="$WORK/mnt2/t1"
+DAS_BTRBK_CONF="$WORK/scoped.conf"
+DAS_BTRBK_STATE_CONF="$WORK/scoped-state.conf"
+printf 'volume /.btrfs-nvme\n  subvolume @\n  target                %s\n' "$WORK/mnt2/t0/nvme" >"$DAS_BTRBK_CONF"
+printf 'volume /.btrfs-nvme\n  subvolume @das-state\n  target                %s\n  target                %s\n' \
+    "$WORK/mnt2/t0/das-state" "$WORK/mnt2/t1/das-state" >"$DAS_BTRBK_STATE_CONF"
+create_target_dirs
+check "scoped: the source's directory on the target it sends to" "$([[ -d "$WORK/mnt2/t0/nvme" ]] && echo yes || echo no)" "yes"
+check "scoped: no directory on a target it does not send to" "$([[ -e "$WORK/mnt2/t1/nvme" ]] && echo yes || echo no)" "no"
+check "scoped: the state pass's directories on both" "$(find "$WORK/mnt2" -name das-state -type d | wc -l)" "2"
+DAS_BTRBK_CONF="$saved_conf"
+DAS_BTRBK_STATE_CONF="$saved_state"
 unset -f mountpoint
 
 # --- expire -----------------------------------------------------------------
@@ -327,7 +357,7 @@ expire_retired_subvolumes run
 check "failed sync: expire runs as a dry run" "$(grep -c -- 'subvol expire .*--dry-run' "$WORK/calls")" "1"
 check "failed sync: expire is recorded as not performed" "${OP_STATUS[subvol_expire]}" "SKIP"
 check "failed sync: the detail says why" "${OP_STATUS[subvol_expire_detail]}" \
-    "not performed: subvolume sync failed this run (dry run shown)"
+    "not performed: subvolume sync failed this run; dry run shown"
 check "failed sync: the section says expiry was not performed" \
     "$(sed -n 2p <<<"$SUBVOL_EXPIRE_REPORT")" \
     "  EXPIRY NOT PERFORMED: subvolume sync failed this run; nothing was deleted (dry run shown)"

@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The nightly run makes only the target directories btrbk receives into** (bd `DAS-Backup-Manager-c0x`): `create_target_dirs` made every `target_subdirs` entry of every source on every mounted target, so a source scoped to the primary (`target_labels`) left empty directories on the recovery drives, and the state pass's directories were never named; it now makes, on each mounted target, exactly the `target` lines of this run's `btrbk.conf` and of the state pass's `btrbk-state.conf` (and of the dry run's planned file, as before) — the rule the Rust path's `btrbk_conf::target_dirs` already follows — and says when one of those files cannot be read (`backup-run.sh` 4.19.1)
+  - `btrdasd config dump-env` no longer exports `DAS_SOURCE_<n>_TARGET_SUBDIRS`, which only that loop read
+  - The expiry row a failed sync leaves reads `SKIP  (not performed: subvolume sync failed this run; dry run shown)`, no parentheses inside the parentheses, on both paths (`run_steps::SYNC_FAILED`)
+
 - **`btrdasd subvol add`, `subvol remove` and `schedule set` hold the backup singleton while they edit `config.toml`** (bd `DAS-Backup-Manager-olyo`): they read, changed and wrote the file with no lock, so a hand-run edit could lose a write to a backup's subvolume sync or to `btrdasd setup` — the race the D-Bus helper's edits closed in bd `lxw`
   - Each takes `/run/das-backup.lock` (recorded as `config edit pid <pid>`) before it reads the file and keeps it to the last write; while a backup or setup holds it, the command prints `Not saved, nothing changed: …` and exits 75, having read and written nothing — `edit_config_cli`, `btrbk_conf::edit_config_under_backup_lock`
   - A test build reads `DAS_BACKUP_LOCK` for the lock's path (`backup::config_edit_lock_path`), so the CLI's tests run unprivileged; a shipped binary never reads it. A hand-run `subvol sync` / `subvol expire`, which `backup-run.sh` also runs while it holds the singleton, needs the lock handed down instead (bd `DAS-Backup-Manager-5237.9`)

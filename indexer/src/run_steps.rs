@@ -272,7 +272,7 @@ pub enum ExpiryStep {
 pub const NARROW_SELECTION: &str = "not performed: a run of a selection (the nightly run or `btrdasd subvol expire` expires retired subvolumes)";
 
 /// Why a run whose sync failed only shows what it would expire.
-pub const SYNC_FAILED: &str = "not performed: subvolume sync failed this run (dry run shown)";
+pub const SYNC_FAILED: &str = "not performed: subvolume sync failed this run; dry run shown";
 
 impl ExpiryStep {
     pub fn failed(&self) -> bool {

@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.19.0
+# Version: 4.19.1
 # Date: 2026-11-10
 #
 # Features:
+#   - Target directories are the btrbk.conf `target` lines (v4.19.1, bd
+#     DAS-Backup-Manager-c0x): create_target_dirs makes, on each mounted
+#     target, exactly the directories this run's btrbk.conf and the state
+#     pass's name there — no longer every target_subdirs entry on every
+#     target, which left empty ones where a scoped source never sends.
 #   - The snapshot counts are what THIS run did (v4.19.0, bd
 #     DAS-Backup-Manager-17x): the live run is `btrbk --format=raw run`, its
 #     raw TRANSACTION LOG kept in the journal and in a run-scoped temp file,
@@ -1795,7 +1800,7 @@ expire_retired_subvolumes() {
         record_op "subvol_expire" "FAIL" "exit code $rc — see RETIRED SUBVOLUMES in the report"
         log_error "Expiry of retired subvolumes failed (exit $rc)"
     elif [[ "$held_back" == "true" ]]; then
-        record_op "subvol_expire" "SKIP" "not performed: subvolume sync failed this run (dry run shown)"
+        record_op "subvol_expire" "SKIP" "not performed: subvolume sync failed this run; dry run shown"
     else
         record_op "subvol_expire" "OK"
     fi
@@ -2113,23 +2118,45 @@ make_target_dir() {
     log_info "  Created target directory $dir"
 }
 
+# Make every directory `conf` names on a `target` line under mount `mnt` — the
+# directories btrbk will receive into there, and no others.
+make_target_dirs_named_in() {
+    local conf="$1" mnt="$2" kw path _rest
+    while read -r kw path _rest; do
+        [[ "$kw" == "target" && "$path" == "$mnt"/* && "$path" != *"/.."* ]] || continue
+        make_target_dir "$path"
+    done <"$conf"
+}
+
 # Runs after verify_targets_before_btrbk, so every directory is made inside a
-# target that is a real mount point holding the expected filesystem.
+# target that is a real mount point holding the expected filesystem. The
+# directories are the `target` lines of the btrbk.conf this run's btrbk reads
+# (sync has just rewritten it) and of the state pass's, so a source scoped to
+# some targets gets no empty directory on the others (bd DAS-Backup-Manager-c0x).
 create_target_dirs() {
     log_info "Creating target directory structure..."
 
-    # Collect all target subdirs from sources
-    local -a all_subdirs=()
-    for (( i=0; i<DAS_SOURCE_COUNT; i++ )); do
-        local subdirs_var="DAS_SOURCE_${i}_TARGET_SUBDIRS"
-        local subdirs="${!subdirs_var:-}"
-        if [[ -n "$subdirs" ]]; then
-            IFS=' ' read -ra parts <<< "$subdirs"
-            all_subdirs+=("${parts[@]}")
+    local -a confs=("$DAS_BTRBK_CONF")
+    if [[ -n "${DAS_BTRBK_STATE_CONF:-}" && "$DAS_BTRBK_STATE_CONF" != "$DAS_BTRBK_CONF" \
+        && -f "$DAS_BTRBK_STATE_CONF" ]]; then
+        confs+=("$DAS_BTRBK_STATE_CONF")
+    fi
+    # Dry run: the planned btrbk.conf may send a pending adoption to a target
+    # directory the current config does not name yet (a new <source>-adopted
+    # source). The real run creates it here, after its config reload; create
+    # it for the dry run too, or btrbk dryrun fails on a path the real run
+    # would have (bd DAS-Backup-Manager-g17).
+    if [[ -n "${DRYRUN_BTRBK_CONF:-}" && -f "$DRYRUN_BTRBK_CONF" ]]; then
+        confs+=("$DRYRUN_BTRBK_CONF")
+    fi
+    local conf
+    for conf in "${confs[@]}"; do
+        if [[ ! -r "$conf" ]]; then
+            # btrbk itself fails on it next; say which file, here.
+            log_warn "  Cannot read $conf: no target directories made from it"
         fi
     done
 
-    # Create subdirs on every mounted target
     for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
         local mount_var="DAS_TARGET_${i}_MOUNT"
         local mnt="${!mount_var}"
@@ -2137,24 +2164,13 @@ create_target_dirs() {
         if ! mountpoint -q "$mnt" 2>/dev/null; then
             continue
         fi
-
-        for subdir in "${all_subdirs[@]}"; do
-            make_target_dir "$mnt/$subdir"
+        for conf in "${confs[@]}"; do
+            # An `if`, never `&&`: an unreadable last file must not leave
+            # this loop's status 1 for `set -e` to abort on.
+            if [[ -r "$conf" ]]; then
+                make_target_dirs_named_in "$conf" "$mnt"
+            fi
         done
-
-        # Dry run: the planned btrbk.conf may send a pending adoption to a
-        # target directory the current config does not name yet (a new
-        # <source>-adopted source). The real run creates it here, after its
-        # config reload; create it for the dry run too, or btrbk dryrun fails
-        # on a path the real run would have (bd DAS-Backup-Manager-g17). Only
-        # `target` lines under this mounted target are used.
-        if [[ -n "${DRYRUN_BTRBK_CONF:-}" && -f "$DRYRUN_BTRBK_CONF" ]]; then
-            local kw path _rest
-            while read -r kw path _rest; do
-                [[ "$kw" == "target" && "$path" == "$mnt"/* && "$path" != *"/.."* ]] || continue
-                make_target_dir "$path"
-            done <"$DRYRUN_BTRBK_CONF"
-        fi
     done
 }
 
@@ -3842,7 +3858,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.19.0
+  backup-run.sh v4.19.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
