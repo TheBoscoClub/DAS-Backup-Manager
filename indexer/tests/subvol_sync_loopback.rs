@@ -219,6 +219,7 @@ impl Rig {
     fn expire(&self, today: &str) -> ExpireOutcome {
         expire_retired(
             &self.config_path,
+            &self.db_path(),
             false,
             today,
             &SystemRunner,

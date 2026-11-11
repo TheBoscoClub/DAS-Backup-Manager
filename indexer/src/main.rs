@@ -2954,6 +2954,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let outcome = match buttered_dasd::expire::expire_retired(
                     &config,
+                    &db,
                     dry_run,
                     &buttered_dasd::caldate::today(),
                     &buttered_dasd::fsutil::SystemRunner,

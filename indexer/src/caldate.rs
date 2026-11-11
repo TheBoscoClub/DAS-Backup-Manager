@@ -92,6 +92,32 @@ pub fn today() -> String {
 /// that was never set, or was reset — a dead RTC battery reads 1970.
 pub const EARLIEST_TRUSTED_DATE: &str = "2026-01-01";
 
+/// How many days past the newest recorded backup run `today` may be and still
+/// be trusted to judge an expiry. Runs are nightly, and expiry runs before the
+/// run's own row is written, so an ordinary gap is one day; this bound lets a
+/// week-long outage pass without a false alarm. Seven is the weekly tier's
+/// unit in `expire::longest_window_days`, the smallest one above a single
+/// day: a forward jump inside it brings an expiry forward by at most a week,
+/// and a refusal costs one night, since the run that refused then records a
+/// row of its own (bd DAS-Backup-Manager-12k).
+pub const MAX_DAYS_PAST_LAST_RUN: i64 = 7;
+
+/// Why `today` cannot be trusted because it is too far past the newest
+/// recorded backup run (`newest_run_epoch`, Unix seconds), or `None` if it
+/// can. A clock that jumped forward would bring every retired series' expiry
+/// forward by the jump. No run recorded (`None`): nothing to compare against,
+/// and only [`untrusted_clock`] applies. A `today` before the newest run is
+/// not refused here: a clock behind deletes later, never earlier.
+pub fn clock_far_past_last_run(today: &str, newest_run_epoch: Option<i64>) -> Option<String> {
+    let run_day = newest_run_epoch?.div_euclid(86_400);
+    (day_number(today)? > run_day + MAX_DAYS_PAST_LAST_RUN).then(|| {
+        format!(
+            "the system clock reads {today}, more than {MAX_DAYS_PAST_LAST_RUN} days after the newest recorded backup run ({}) — a clock that jumped forward would expire backups early",
+            date_of(run_day)
+        )
+    })
+}
+
 /// Why `today` cannot be trusted to date a retirement or an expiry, or
 /// `None` if it can. A wrong clock must cost a late deletion, never an early
 /// one: sync refuses to stamp a retirement with it and expiry refuses to

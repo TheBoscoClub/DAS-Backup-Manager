@@ -213,7 +213,8 @@ pub fn expire_at(
     is_mountpoint: &dyn Fn(&Path) -> bool,
 ) -> ExpireRun {
     let outcome =
-        match crate::expire::expire_retired(config_path, dry_run, today, runner, is_mountpoint) {
+        match crate::expire::expire_retired(config_path, db, dry_run, today, runner, is_mountpoint)
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 return ExpireRun::Performed {

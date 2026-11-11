@@ -1615,6 +1615,21 @@ pub fn open_read_only(path: &Path) -> Result<Option<Connection>, String> {
     Ok(Some(conn))
 }
 
+/// The timestamp (Unix seconds) of the newest recorded backup run at `path`,
+/// read as [`open_read_only`] reads: `None` when no file is there or no run
+/// is recorded; `Err` when it cannot be opened or read — never `None` for a
+/// database that could not be asked (bd DAS-Backup-Manager-12k).
+pub fn newest_backup_run_read_only(path: &Path) -> Result<Option<i64>, String> {
+    match open_read_only(path)? {
+        None => Ok(None),
+        Some(conn) => conn
+            .query_row("SELECT MAX(timestamp) FROM backup_runs", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
 /// The coverage baseline at `path`, read without creating or migrating
 /// anything: `None` when the file is absent, older than schema 5, or holds
 /// no recorded check; `Err` when it cannot be opened or read.
