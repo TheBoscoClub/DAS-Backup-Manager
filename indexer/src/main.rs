@@ -2465,6 +2465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ConfigAction::DumpEnv { config } => {
                 let cfg = Config::load(&config)?;
                 print!("{}", setup::env_export::dump_env(&cfg));
+                print!("{}", setup::env_export::local_docs_env(&cfg, &config));
             }
             ConfigAction::Show { config } => {
                 let cfg = Config::load(&config)?;

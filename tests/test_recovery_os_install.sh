@@ -393,9 +393,10 @@ check "package: the boot notice autostart" has "$R/mnt/target/etc/xdg/autostart/
 check "package: Quick Reference on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /usr/share/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md
 check "package: Recovery Guide on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
 check "package: Storage architecture on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
-check "package, no local documents: nothing at /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
+check "package, no local documents: nothing at /etc/das-backup-docs" test ! -e "$R/mnt/target/etc/das-backup-docs"
+check "package, no local documents: nothing at the old /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
 
-echo "== package: the installation's own documents (DAS_INSTALL_LOCAL_DOCS)"
+echo "== package: the installation's own documents (DAS_INSTALL_LOCAL_DOCS, installed at DAS_INSTALL_LOCAL_DOCS_DEST)"
 package_fixture() {
     fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup" "$R/payload/docs"
     printf '[Unit]\nDescription=x\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
@@ -404,40 +405,57 @@ package_fixture
 printf 'filled-in quick reference\n' >"$R/payload/docs/EMERGENCY-QUICK-REFERENCE.md"
 printf 'filled-in guide\n' >"$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
 printf 'not a document\n' >"$R/payload/docs/notes.txt"
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs: exit 0" test "$RC" -eq 0
-check "local docs: the quick reference installed" has "$R/mnt/target/etc/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md" "filled-in quick reference"
-check "local docs: the guide installed" has "$R/mnt/target/etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md" "filled-in guide"
-check "local docs: mode 0644" test "$(stat -c %a "$R/mnt/target/etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md")" = 644
-check "local docs: owned by root in the chroot" has "$LOG" "arch-chroot $R/mnt/target chown -R root:root /etc/das-backup/docs"
-check "local docs: only *.md installed" test ! -e "$R/mnt/target/etc/das-backup/docs/notes.txt"
-check "local docs: Quick Reference link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /etc/das-backup/docs/EMERGENCY-QUICK-REFERENCE.md
-check "local docs: Recovery Guide link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /etc/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
+check "local docs: the quick reference installed" has "$R/mnt/target/etc/das-backup-docs/EMERGENCY-QUICK-REFERENCE.md" "filled-in quick reference"
+check "local docs: the guide installed" has "$R/mnt/target/etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md" "filled-in guide"
+check "local docs: mode 0644" test "$(stat -c %a "$R/mnt/target/etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md")" = 644
+check "local docs: owned by root in the chroot" has "$LOG" "arch-chroot $R/mnt/target chown -R root:root /etc/das-backup-docs"
+check "local docs: nothing at the old /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
+check "local docs: only *.md installed" test ! -e "$R/mnt/target/etc/das-backup-docs/notes.txt"
+check "local docs: Quick Reference link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /etc/das-backup-docs/EMERGENCY-QUICK-REFERENCE.md
+check "local docs: Recovery Guide link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md
 check "local docs: a document with no local copy keeps the package's" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
 package_fixture
 printf 'x\n' >"$WORK/elsewhere.md"
 ln -s "$WORK/elsewhere.md" "$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs, a symlink: refused (exit 3)" test "$RC" -eq 3
 check "local docs, a symlink: said" out_has "is not a regular file"
 check "local docs, a symlink: refused before pacman" test "$(calls 'pacman -U')" -eq 0
-check "local docs, a symlink: nothing installed" test ! -e "$R/mnt/target/etc/das-backup/docs"
+check "local docs, a symlink: nothing installed" test ! -e "$R/mnt/target/etc/das-backup-docs"
 package_fixture
 mkdir "$R/payload/docs/sub.md"
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs, a directory named *.md: refused (exit 3)" test "$RC" -eq 3
 package_fixture
 printf 'x\n' >"$R/payload/docs/bad name.md"
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs, a name with a space: refused (exit 3)" test "$RC" -eq 3
 check "local docs, a name with a space: before pacman" test "$(calls 'pacman -U')" -eq 0
 package_fixture
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/missing"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/missing" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs, not a directory: refused (exit 3)" test "$RC" -eq 3
 package_fixture
-run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc/das-backup-docs
 check "local docs, an empty directory: exit 0" test "$RC" -eq 0
 check "local docs, an empty directory: links stay on the package's" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /usr/share/das-backup/docs/DISASTER-RECOVERY-GUIDE.md
+# The destination is the host's resolved [recovery_os].local_docs_dir (bd
+# 5237.6): documents with no destination, or one that is not a plain absolute
+# path, are refused before anything is installed.
+package_fixture
+printf 'filled-in guide\n' >"$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs"
+check "local docs, no destination: refused (exit 3)" test "$RC" -eq 3
+check "local docs, no destination: said" out_has "DAS_INSTALL_LOCAL_DOCS_DEST"
+check "local docs, no destination: before pacman" test "$(calls 'pacman -U')" -eq 0
+for dest in relative/docs /etc/../x "/a b" /etc/./x; do
+    package_fixture
+    printf 'filled-in guide\n' >"$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
+    run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST="$dest"
+    check "local docs, destination '$dest': refused (exit 3)" test "$RC" -eq 3
+    check "local docs, destination '$dest': before pacman" test "$(calls 'pacman -U')" -eq 0
+done
 fixture; run package DAS_INSTALL_PAYLOAD_SHA256=0000
 check "package, wrong sha256: exit 3" test "$RC" -eq 3
 check "package, wrong sha256: pacman never ran" test "$(calls 'pacman -U')" -eq 0

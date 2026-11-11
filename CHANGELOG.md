@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The installation's own recovery documents live beside the config's directory, not inside it** (bd `DAS-Backup-Manager-5237.6`, operator decision): `/etc/das-backup` held `docs/`, so it could not be versioned as flat files
+  - New key `[recovery_os].local_docs_dir`; unset, `<config dir>-docs` (`/etc/das-backup-docs`); one inside the config's directory, or not a plain absolute path, is refused
+  - Resolved once, by `config::local_docs_dir`; `btrdasd config dump-env` prints it as `DAS_RECOVERY_OS_LOCAL_DOCS_DIR` (or `DAS_RECOVERY_OS_LOCAL_DOCS_ERROR`, why not) and `recovery-os-vm.sh` never derives it
+  - `setup --upgrade` moves an older install's `<config dir>/docs` there once, by one rename, judged with the other refusals before anything is written: both present, a link, a file, or a rename across filesystems is an error with nothing changed
+  - `provision` refuses while `<config dir>/docs` is still there (pointing at `setup --upgrade`), or when `dump-env` names no directory; the installer puts the documents at the same path on the drive (`DAS_INSTALL_LOCAL_DOCS_DEST`) — the drive's `config.toml` is derived from the host's at boot
+
 - **Boot archival looks for `@` / `@home` in the directory btrbk writes, and only there** (bd `DAS-Backup-Manager-5237.11`, operator decision): `subdirs_for_subvol` searched every `target_subdirs` entry with no fallback, so it disagreed with btrbk's rule (first entry, else the source label, `btrbk_conf::source_subdir`) both ways — now it calls `source_subdir`, and the script's `boot-plan` gets the same answer
   - A source with no `target_subdirs` has its boot subvolumes archived and replaced from the label's directory, instead of a WARN
   - A later `target_subdirs` entry is no longer searched: btrbk does not write there, so a snapshot found there is an old series, and a full run used to rebuild `@` from it

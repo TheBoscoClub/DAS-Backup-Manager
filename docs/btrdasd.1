@@ -417,6 +417,14 @@ ExecStart= line names; anything else at those paths (an edited file, a link, a
 directory, a copy reached through a linked directory, a file replaced while it
 was being checked) is kept and named. A file it cannot remove, or a path it
 cannot read, is an error (exit 1), once the rest is done.
+An older install's local recovery documents,
+.IR docs/ " in the config's directory,"
+are moved once, by one rename, to the directory
+.B [recovery_os].local_docs_dir
+names (default: the one beside the config's,
+.IR /etc/das\-backup\-docs );
+a destination already there, an old path that is a link or a file, or a
+rename across filesystems is an error (exit 1), with nothing written.
 On an init system other than systemd the helper is restarted by hand: the files
 are upgraded and the upgrade exits 3. Refused while a job holds a lock: exit 75,
 nothing written. Done: exit 0.

@@ -638,7 +638,9 @@ GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
 P_ALSO=()             # provision: the @.archive.* names also set aside
 INSTALL_USER=""       # provision: the new OS's account, [recovery_os].install_user (load_targets)
-P_DOCS=()             # provision: the installation's own documents, <config dir>/docs/*.md
+P_DOCS=()             # provision: the installation's own documents, $LOCAL_DOCS_DIR/*.md
+LOCAL_DOCS_DIR=""     # provision: where they are, [recovery_os].local_docs_dir as dump-env resolved it (load_targets)
+LOCAL_DOCS_ERROR=""   # ...or why dump-env could not resolve it
 PROVISION_STAMP=""    # provision: the stamp of every *.replaced.<stamp> name
 PAYLOAD_ISO=""        # provision: the payload cdrom image, removed at the end
 CAPTURE_FILE=""       # provision: where the capture step's lines are kept
@@ -1040,7 +1042,7 @@ load_targets() {
     fi
     # dump-env leaves a key out when it is unset: clear the names first, so an inherited
     # variable of the same name can never stand in for config.toml (review L2).
-    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER
+    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER DAS_RECOVERY_OS_LOCAL_DOCS_DIR DAS_RECOVERY_OS_LOCAL_DOCS_ERROR
     eval "$env_text"
     # The egress org from config.toml, when the environment gave none. Config::load
     # does not validate, so the characters are checked here as for the variable.
@@ -1058,6 +1060,10 @@ load_targets() {
         { [[ ! "$INSTALL_USER" =~ ^[abcdefghijklmnopqrstuvwxyz_][abcdefghijklmnopqrstuvwxyz0123456789_-]{0,31}$ ]] || [[ "$INSTALL_USER" == root ]]; }; then
         refuse "[recovery_os].install_user in $DAS_CONFIG is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -; not root)"
     fi
+    # The local documents' directory, resolved once by btrdasd (bd
+    # DAS-Backup-Manager-5237.6) and never derived here; only provision reads it.
+    LOCAL_DOCS_DIR="${DAS_RECOVERY_OS_LOCAL_DOCS_DIR:-}"
+    LOCAL_DOCS_ERROR="${DAS_RECOVERY_OS_LOCAL_DOCS_ERROR:-}"
     TARGET_LABELS=()
     declare -gA T_ROLE=()
     declare -gA T_SERIALS=()
@@ -6187,15 +6193,28 @@ provision_preflight() {
     make_state_dir || refuse "cannot create $STATE_DIR"
 }
 
-# The installation's own filled-in recovery documents: every *.md in the
-# directory docs/ beside config.toml (/etc/das-backup/docs), carried on the
-# payload for the installer to put on the drive. No directory, none -- not an
-# error. A *.md that is not a regular file (a symlink, a directory) or whose
-# name is not plain refuses provision here, before any drive is touched.
+# The installation's own filled-in recovery documents: every *.md in
+# [recovery_os].local_docs_dir, as `btrdasd config dump-env` resolved it
+# (default: the directory beside config.toml's, /etc/das-backup-docs; bd
+# DAS-Backup-Manager-5237.6), carried on the payload for the installer to put
+# at the same path on the drive. No directory, none -- not an error. A *.md
+# that is not a regular file (a symlink, a directory) or whose name is not
+# plain refuses provision here, before any drive is touched; so does a
+# directory dump-env could not name, and documents still in docs/ beside
+# config.toml, where versions before it kept them (setup --upgrade moves them).
 provision_local_docs() {
-    local dir f n
-    dir="$(dirname -- "$DAS_CONFIG")/docs"
+    local dir f n legacy
     P_DOCS=()
+    [[ -z "$LOCAL_DOCS_ERROR" ]] || refuse "the local recovery documents' directory: $LOCAL_DOCS_ERROR"
+    dir=$LOCAL_DOCS_DIR
+    [[ -n "$dir" ]] || refuse "btrdasd config dump-env named no DAS_RECOVERY_OS_LOCAL_DOCS_DIR: the installed btrdasd is older than this script -- install both from one build"
+    # As config.rs local_docs_dir_is_valid: it reaches the installer's shell.
+    [[ "$dir" =~ ^(/[${ASCII_LETTERS}[:digit:]._-]+)+$ && ! "$dir" =~ (^|/)\.\.?(/|$) ]] ||
+        refuse "the local recovery documents' directory '$dir' is not an absolute path of letters, digits, . _ - and / with no . or .. component"
+    legacy="$(dirname -- "$DAS_CONFIG")/docs"
+    if [[ -e "$legacy" || -L "$legacy" ]]; then
+        refuse "$legacy is where the local recovery documents were kept before; they now live in $dir -- run 'sudo btrdasd setup --upgrade', which moves them, then provision again"
+    fi
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" && ! -L "$dir" ]] || refuse "$dir is not a directory: put the installation's recovery documents there, or nothing"
     for f in "$dir"/*.md; do
@@ -6383,6 +6402,8 @@ prov_env_lines() {
         printf 'export DAS_INSTALL_USER=%s\n' "$INSTALL_USER"
         if ((${#P_DOCS[@]} > 0)); then
             printf 'export DAS_INSTALL_LOCAL_DOCS=%s/docs\n' "$PAYLOAD_MNT"
+            # A plain absolute path (provision_local_docs checked it), so one word.
+            printf 'export DAS_INSTALL_LOCAL_DOCS_DEST=%s\n' "$LOCAL_DOCS_DIR"
         fi
     fi
     printf 'payload=%s\n' "$PAYLOAD_MNT"

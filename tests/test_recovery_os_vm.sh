@@ -291,6 +291,8 @@ write_state() {
 # serials of the two mirror targets, $3 the second one's label if not B's, $4
 # the first one's mount_uuid if not its real one ('' for none).
 dump_env() {
+    # The quotes are output: in this unquoted heredoc they are literal and $T expands.
+    # shellcheck disable=SC2016
     cat >"$S/dump-env" <<EOF
 DAS_VERSION='0.7.22.3'
 DAS_TARGET_COUNT=3
@@ -316,6 +318,7 @@ DAS_TARGET_2_ROLE='mirror'
 DAS_TARGET_2_DISPLAY_NAME='2TB Recovery B (Bay 4, SERIAL02)'
 DAS_RECOVERY_OS_EGRESS_ORG='${EGRESS_CFG-AS64500}'
 DAS_RECOVERY_OS_INSTALL_USER='${INSTALL_USER_CFG-recovery}'
+${LOCAL_DOCS_ENV-DAS_RECOVERY_OS_LOCAL_DOCS_DIR='$T/local-docs'}
 EOF
 }
 
@@ -5985,24 +5988,52 @@ run_driver_env "${PROV[@]}" --dry-run
 check "provision, the other drive's last session failed: exit 1" "$RC" "1"
 has "provision, the other drive failed: never two drives down" "$OUT" "system-recovery-B-2tb's last session was failed (stopped at upgrade): never two recovery drives down at once"
 
-echo "--- provision: the installation's own documents, docs/ beside config.toml"
+echo "--- provision: the installation's own documents, in dump-env's DAS_RECOVERY_OS_LOCAL_DOCS_DIR (bd 5237.6)"
 provision_fixture
-mkdir -p "$T/docs"
-printf 'filled in\n' >"$T/docs/DISASTER-RECOVERY-GUIDE.md"
-ln -s "$T/config.toml" "$T/docs/EMERGENCY-QUICK-REFERENCE.md"
+mkdir -p "$T/local-docs"
+printf 'filled in\n' >"$T/local-docs/DISASTER-RECOVERY-GUIDE.md"
+ln -s "$T/config.toml" "$T/local-docs/EMERGENCY-QUICK-REFERENCE.md"
 run_driver_env "${PROV[@]}" --dry-run
 check "provision, a symlink among the local documents: exit 1" "$RC" "1"
 has "provision, a symlink among the local documents: named" "$OUT" "EMERGENCY-QUICK-REFERENCE.md' is not a readable regular file"
 lacks "provision, a symlink among the local documents: nothing booted" "$(file "$S/virsh.calls")" "start"
 check "provision, a symlink among the local documents: no lock taken" "$(file "$S/flock.calls")" ""
 provision_fixture # a new $T: the documents are made again, without the symlink
-mkdir -p "$T/docs"
-printf 'filled in\n' >"$T/docs/DISASTER-RECOVERY-GUIDE.md"
+mkdir -p "$T/local-docs"
+printf 'filled in\n' >"$T/local-docs/DISASTER-RECOVERY-GUIDE.md"
 printf 'top: @\ntop: @home\npackage: linux-cachyos 7.2.9-1\n' >"$S/stage.capture.out"
 run_driver_env "${PROV[@]}"
 check "provision with local documents: exit 0" "$RC" "0"
 has "provision with local documents: package is told where they are" "$(file "$S/stage.package.sh")" "export DAS_INSTALL_LOCAL_DOCS=/run/das-provision/payload/docs"
-rm -rf "${T:?}/docs"
+has "provision with local documents: and where they go on the drive" "$(file "$S/stage.package.sh")" "DAS_INSTALL_LOCAL_DOCS_DEST=$T/local-docs"
+# The old place, docs/ beside config.toml, is setup --upgrade's to move: left
+# there, provision refuses rather than carry nothing.
+provision_fixture
+mkdir -p "$T/docs"
+printf 'filled in\n' >"$T/docs/DISASTER-RECOVERY-GUIDE.md"
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, documents left in docs/ beside config.toml: exit 1" "$RC" "1"
+has "provision, documents left in docs/: says setup --upgrade moves them" "$OUT" "btrdasd setup --upgrade"
+has "provision, documents left in docs/: names where to" "$OUT" "$T/local-docs"
+lacks "provision, documents left in docs/: nothing booted" "$(file "$S/virsh.calls")" "start"
+# btrdasd could not resolve the directory: its reason, and nothing touched.
+LOCAL_DOCS_ENV="DAS_RECOVERY_OS_LOCAL_DOCS_ERROR='recovery_os.local_docs_dir /x is inside /x'"
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, the documents' directory unresolved: exit 1" "$RC" "1"
+has "provision, the documents' directory unresolved: btrdasd's reason" "$OUT" "is inside /x"
+# A btrdasd older than this script prints neither line.
+LOCAL_DOCS_ENV=""
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, dump-env names no documents' directory: exit 1" "$RC" "1"
+has "provision, dump-env names no documents' directory: said" "$OUT" "DAS_RECOVERY_OS_LOCAL_DOCS_DIR"
+# Re-checked as config.rs checks it: it reaches the installer's shell.
+LOCAL_DOCS_ENV="DAS_RECOVERY_OS_LOCAL_DOCS_DIR='/a b'"
+provision_fixture
+run_driver_env "${PROV[@]}" --dry-run
+check "provision, a documents' directory that is not a plain path: exit 1" "$RC" "1"
+unset LOCAL_DOCS_ENV
 
 echo "--- provision: the new OS's account comes from config.toml, no built-in name"
 for bad_user in "" Root "a;reboot" root; do
@@ -6130,7 +6161,7 @@ has "provision: delete-replaced gets the same stamp" "$(file "$S/stage.delete-re
 has "provision: verify gets the config from the payload" "$(file "$S/stage.verify.sh")" "DAS_INSTALL_CONFIG=/run/das-provision/payload/config.toml"
 has "provision: configure gets the account from config.toml" "$(file "$S/stage.configure.sh")" "export DAS_INSTALL_USER=recovery"
 has "provision: replace-os gets the account too (it refuses without one)" "$(file "$S/stage.replace-os.sh")" "export DAS_INSTALL_USER=recovery"
-lacks "provision: no docs/ beside config.toml, no local documents passed" "$(file "$S/stage.package.sh")" "DAS_INSTALL_LOCAL_DOCS"
+lacks "provision: no local documents, none passed" "$(file "$S/stage.package.sh")" "DAS_INSTALL_LOCAL_DOCS"
 has "provision: each step runs the installer from the payload" "$(file "$S/stage.pacstrap.sh")" "/run/das-provision/payload/recovery-os-install.sh pacstrap"
 has "provision: the payload step checks its sums" "$(file "$S/stage.payload.sh")" "sha256sum -c"
 has "provision: repos runs the pipeline's own check against the new root" "$(file "$S/stage.repos.sh")" "PACMAN_CONF=/mnt/target/etc/pacman.conf"

@@ -1,5 +1,17 @@
 use super::config::*;
 
+/// The local recovery documents' directory for the config at `config_path`,
+/// as one `dump-env` line: `DAS_RECOVERY_OS_LOCAL_DOCS_DIR`, resolved by
+/// [`local_docs_dir`] (bd DAS-Backup-Manager-5237.6), or, when it cannot be
+/// resolved, `DAS_RECOVERY_OS_LOCAL_DOCS_ERROR` saying why. Only provision
+/// reads either; the scripts never derive the directory themselves.
+pub fn local_docs_env(config: &Config, config_path: &std::path::Path) -> String {
+    match local_docs_dir(config, config_path) {
+        Ok(dir) => kv("DAS_RECOVERY_OS_LOCAL_DOCS_DIR", &dir.to_string_lossy()),
+        Err(why) => kv("DAS_RECOVERY_OS_LOCAL_DOCS_ERROR", &why),
+    }
+}
+
 /// Export config as shell-sourceable KEY=VALUE pairs with DAS_ prefix.
 /// Output format uses indexed arrays for sources/targets.
 pub fn dump_env(config: &Config) -> String {
@@ -398,6 +410,28 @@ mod tests {
         assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER"));
         config.recovery_os.install_user = Some("recovery".into());
         assert!(dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER='recovery'\n"));
+    }
+
+    /// The local recovery documents' directory, resolved once here for the
+    /// config at its path (bd DAS-Backup-Manager-5237.6): the scripts never
+    /// derive it. A config it cannot be resolved for exports the reason under
+    /// another name instead, so provision can refuse saying why while every
+    /// other reader of `dump-env` (the nightly backup) is unaffected.
+    #[test]
+    fn local_docs_env_exports_the_resolved_directory_or_why_not() {
+        let mut config = test_config();
+        let conf = std::path::Path::new("/etc/das-backup/config.toml");
+        assert_eq!(
+            local_docs_env(&config, conf),
+            "DAS_RECOVERY_OS_LOCAL_DOCS_DIR='/etc/das-backup-docs'\n"
+        );
+        config.recovery_os.local_docs_dir = Some("/etc/das-backup/docs".into());
+        let out = local_docs_env(&config, conf);
+        assert!(!out.contains("DAS_RECOVERY_OS_LOCAL_DOCS_DIR="), "{out}");
+        assert!(
+            out.starts_with("DAS_RECOVERY_OS_LOCAL_DOCS_ERROR='") && out.contains("inside"),
+            "{out}"
+        );
     }
 
     /// Retention reaches btrbk through the rendered btrbk.conf; no script reads

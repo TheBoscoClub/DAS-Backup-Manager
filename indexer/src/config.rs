@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Top-level config
@@ -90,6 +90,15 @@ pub struct RecoveryOs {
     /// built-in account name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_user: Option<String>,
+    /// The directory of this installation's own filled-in recovery documents
+    /// (`*.md`), which `recovery-os-vm.sh provision` carries to a rebuilt
+    /// drive. Unset, the directory beside the config's own:
+    /// `<config dir>-docs` (`/etc/das-backup-docs`). Never inside the
+    /// config's directory, which is kept free of subdirectories so it can be
+    /// versioned as flat files ([`local_docs_dir`]; bd
+    /// DAS-Backup-Manager-5237.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_docs_dir: Option<String>,
 }
 
 fn default_recovery_os_max_age_days() -> u32 {
@@ -125,8 +134,59 @@ impl Default for RecoveryOs {
             max_age_days: default_recovery_os_max_age_days(),
             egress_org: None,
             install_user: None,
+            local_docs_dir: None,
         }
     }
+}
+
+/// `recovery_os.local_docs_dir` is printed for a shell's `eval` and becomes
+/// the installer's paths, so it is an absolute path of ASCII letters, digits,
+/// `.`, `_`, `-` and `/`, with at least one component and none `.` or `..`.
+pub fn local_docs_dir_is_valid(dir: &str) -> bool {
+    let mut parts = dir.split('/').filter(|p| !p.is_empty()).peekable();
+    dir.starts_with('/')
+        && parts.peek().is_some()
+        && dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        && parts.all(|p| p != "." && p != "..")
+}
+
+/// Where the installation's own recovery documents live for the config at
+/// `config_path`: `recovery_os.local_docs_dir`, else the directory beside the
+/// config's own, named `<that directory>-docs`. The one place the default is
+/// derived: `dump-env` prints it for the scripts, `setup --upgrade` moves
+/// [`legacy_local_docs_dir`] to it. A directory inside the config's own is
+/// refused, as is a config with no directory to put one beside.
+pub fn local_docs_dir(config: &Config, config_path: &Path) -> Result<PathBuf, String> {
+    let conf_dir = config_path.parent().filter(|d| d.file_name().is_some()).ok_or_else(|| {
+        format!(
+            "{} has no directory beside which to keep the local recovery documents: set recovery_os.local_docs_dir",
+            config_path.display()
+        )
+    })?;
+    let dir = match &config.recovery_os.local_docs_dir {
+        Some(d) => PathBuf::from(d),
+        None => {
+            let mut name = conf_dir.file_name().unwrap_or_default().to_os_string();
+            name.push("-docs");
+            conf_dir.with_file_name(name)
+        }
+    };
+    if dir.starts_with(conf_dir) {
+        return Err(format!(
+            "recovery_os.local_docs_dir {} is inside {}, the config's directory, which must hold no subdirectory: choose a directory beside it",
+            dir.display(),
+            conf_dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
+/// Where versions before bd DAS-Backup-Manager-5237.6 kept the local
+/// recovery documents: `docs/` in the config's own directory.
+pub fn legacy_local_docs_dir(config_path: &Path) -> PathBuf {
+    config_path.parent().unwrap_or(Path::new("/")).join("docs")
 }
 
 /// Roots a restore may NEVER write beneath, regardless of `allowed_roots`.
@@ -3133,6 +3193,13 @@ impl Config {
                 "recovery_os.egress_org {org:?} must be letters, digits and spaces, starting with a letter or digit (an AS number: AS64500)"
             ));
         }
+        if let Some(dir) = &self.recovery_os.local_docs_dir
+            && !local_docs_dir_is_valid(dir)
+        {
+            errors.push(format!(
+                "recovery_os.local_docs_dir {dir:?} must be an absolute path of letters, digits, . _ - and /, with no . or .. component"
+            ));
+        }
         // A listed scrub target no [[target]] defines is deliberately NOT a
         // validation error: configs saved by older versions carry the old
         // built-in label list, and validate() gates `subvol sync` (every
@@ -4113,6 +4180,93 @@ mod tests {
         assert_eq!(parsed.scrub.fail_age_days, 75);
         // [doctor] is optional — default config has no exclude patterns
         assert!(parsed.doctor.exclude.is_empty());
+    }
+
+    /// `[recovery_os].local_docs_dir` (bd DAS-Backup-Manager-5237.6): absent,
+    /// the directory beside the config's own, `<config dir>-docs`; set, an
+    /// absolute plain path outside the config's directory. live-sync versions
+    /// the config's directory, and refuses one that holds a subdirectory.
+    #[test]
+    fn local_docs_dir_defaults_beside_the_config_directory_and_never_inside_it() {
+        let conf = Path::new("/etc/das-backup/config.toml");
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(
+            local_docs_dir(&cfg, conf),
+            Ok(PathBuf::from("/etc/das-backup-docs"))
+        );
+        assert_eq!(
+            legacy_local_docs_dir(conf),
+            PathBuf::from("/etc/das-backup/docs")
+        );
+        cfg.recovery_os.local_docs_dir = Some("/srv/recovery-docs".into());
+        assert_eq!(
+            local_docs_dir(&cfg, conf),
+            Ok(PathBuf::from("/srv/recovery-docs"))
+        );
+        for inside in [
+            "/etc/das-backup",
+            "/etc/das-backup/docs",
+            "/etc/das-backup/x/y",
+        ] {
+            cfg.recovery_os.local_docs_dir = Some(inside.into());
+            let err = local_docs_dir(&cfg, conf).unwrap_err();
+            assert!(
+                err.contains("inside") && err.contains(inside),
+                "{inside}: {err}"
+            );
+        }
+        // A config at the root has no directory to put one beside.
+        cfg.recovery_os.local_docs_dir = None;
+        assert!(local_docs_dir(&cfg, Path::new("/config.toml")).is_err());
+        let text = minimal_toml("[recovery_os]\nlocal_docs_dir = \"/srv/d\"\n");
+        let cfg = Config::from_toml(&text).unwrap();
+        assert_eq!(cfg.recovery_os.local_docs_dir.as_deref(), Some("/srv/d"));
+        assert!(
+            cfg.to_toml()
+                .unwrap()
+                .contains("local_docs_dir = \"/srv/d\"\n")
+        );
+        // Unset is never written out: the default stays the resolver's.
+        assert!(
+            !Config::from_toml(&minimal_toml(""))
+                .unwrap()
+                .to_toml()
+                .unwrap()
+                .contains("local_docs_dir")
+        );
+    }
+
+    /// The value reaches a shell (`eval` of `dump-env`) and the installer's
+    /// paths: an absolute path of letters, digits, `.`, `_`, `-` and `/` only,
+    /// with no `.` or `..` component.
+    #[test]
+    fn local_docs_dir_must_be_a_plain_absolute_path() {
+        for good in ["/etc/das-backup-docs", "/srv/a_b/c-d.e"] {
+            assert!(local_docs_dir_is_valid(good), "{good}");
+        }
+        for bad in [
+            "",
+            "relative/docs",
+            "/",
+            "/etc/../x",
+            "/etc/./x",
+            "/a b",
+            "/a'b",
+            "/a$b",
+            "/a\nb",
+            "/é",
+        ] {
+            assert!(!local_docs_dir_is_valid(bad), "{bad:?}");
+            let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+            cfg.recovery_os.local_docs_dir = Some(bad.into());
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("recovery_os.local_docs_dir")),
+                "{bad:?}: {:?}",
+                cfg.validate()
+            );
+        }
     }
 
     #[test]

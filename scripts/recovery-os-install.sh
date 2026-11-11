@@ -40,9 +40,12 @@
 # package refuse without a valid one before they change anything) and
 # DAS_INSTALL_UID (its uid, 1000 unless set; 1000-60000) and
 # DAS_INSTALL_LOCAL_DOCS (optional: a directory of the installation's own
-# filled-in recovery documents, *.md, from /etc/das-backup/docs on the host;
-# package installs them at /etc/das-backup/docs and points the Desktop links
-# at them).
+# filled-in recovery documents, *.md, carried from the host's
+# [recovery_os].local_docs_dir) with DAS_INSTALL_LOCAL_DOCS_DEST (required
+# with it: that directory's path, resolved on the host, /etc/das-backup-docs
+# by default; package installs the documents at the same path on the drive,
+# whose config.toml is derived from the host's at boot, and points the Desktop
+# links at them; bd DAS-Backup-Manager-5237.6).
 #
 # Deletion and undo act ONLY on names a manifest lists, never on a pattern
 # match: the manifest is written atomically before the first rename.
@@ -82,6 +85,7 @@ SYNC="${DAS_INSTALL_SYNC:-sync}"
 ACCOUNT="${DAS_INSTALL_USER:-}"
 ACCOUNT_UID="${DAS_INSTALL_UID:-1000}"
 LOCAL_DOCS="${DAS_INSTALL_LOCAL_DOCS:-}"
+LOCAL_DOCS_DEST="${DAS_INSTALL_LOCAL_DOCS_DEST:-}"
 
 say() { printf '%s\n' "$*"; }
 refuse() {
@@ -432,6 +436,10 @@ check_local_docs() {
     local f n
     LOCAL_DOC_FILES=()
     [[ -n "$LOCAL_DOCS" ]] || return 0
+    [[ -n "$LOCAL_DOCS_DEST" ]] || refuse "DAS_INSTALL_LOCAL_DOCS is set without DAS_INSTALL_LOCAL_DOCS_DEST: no path to install the documents at"
+    # As config.rs local_docs_dir_is_valid: absolute, plain, no . or .. component.
+    [[ "$LOCAL_DOCS_DEST" =~ ^(/[${ASCII_ALNUM}._-]+)+$ && ! "$LOCAL_DOCS_DEST" =~ (^|/)\.\.?(/|$) ]] ||
+        refuse "DAS_INSTALL_LOCAL_DOCS_DEST '$LOCAL_DOCS_DEST' is not an absolute path of letters, digits, . _ - and / with no . or .. component"
     [[ -d "$LOCAL_DOCS" && ! -L "$LOCAL_DOCS" ]] || refuse "DAS_INSTALL_LOCAL_DOCS '$LOCAL_DOCS' is not a directory"
     for f in "$LOCAL_DOCS"/*.md; do
         [[ -e "$f" || -L "$f" ]] || continue
@@ -444,8 +452,8 @@ check_local_docs() {
 # A Desktop link's target: the installation's own copy when one was installed,
 # else the package's generic one.
 doc_path() {
-    if [[ -f "$TARGET/etc/das-backup/docs/$1" ]]; then
-        printf '/etc/das-backup/docs/%s\n' "$1"
+    if [[ -n "$LOCAL_DOCS_DEST" && -f "$TARGET$LOCAL_DOCS_DEST/$1" ]]; then
+        printf '%s/%s\n' "$LOCAL_DOCS_DEST" "$1"
     else
         printf '/usr/share/das-backup/docs/%s\n' "$1"
     fi
@@ -478,13 +486,13 @@ Exec=sh -c 'notify-send -t 0 "DAS recovery disk" "$(cat /run/das-recovery-state/
 OnlyShowIn=KDE;
 EOF
     if ((${#LOCAL_DOC_FILES[@]} > 0)); then
-        mkdir -p "$etc/das-backup/docs"
+        mkdir -p "$TARGET$LOCAL_DOCS_DEST"
         for f in "${LOCAL_DOC_FILES[@]}"; do
-            cp -- "$f" "$etc/das-backup/docs/${f##*/}" || cannot "cannot install the local document ${f##*/}"
-            chmod 0644 "$etc/das-backup/docs/${f##*/}"
+            cp -- "$f" "$TARGET$LOCAL_DOCS_DEST/${f##*/}" || cannot "cannot install the local document ${f##*/}"
+            chmod 0644 "$TARGET$LOCAL_DOCS_DEST/${f##*/}"
         done
-        "$CHROOT" "$TARGET" chown -R root:root /etc/das-backup/docs || cannot "chown of /etc/das-backup/docs failed"
-        say "package: ${#LOCAL_DOC_FILES[@]} local document(s) installed at /etc/das-backup/docs"
+        "$CHROOT" "$TARGET" chown -R root:root "$LOCAL_DOCS_DEST" || cannot "chown of $LOCAL_DOCS_DEST failed"
+        say "package: ${#LOCAL_DOC_FILES[@]} local document(s) installed at $LOCAL_DOCS_DEST"
     fi
     ln -sfn "$(doc_path EMERGENCY-QUICK-REFERENCE.md)" "$TARGET$desk/Quick Reference — PRINT THIS.md"
     ln -sfn "$(doc_path DISASTER-RECOVERY-GUIDE.md)" "$TARGET$desk/Recovery Guide.md"

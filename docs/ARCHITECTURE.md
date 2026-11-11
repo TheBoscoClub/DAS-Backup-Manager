@@ -473,6 +473,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `subvolumes` | exclude[] | Glob patterns the backup run must not adopt (`btrdasd subvol sync`); a pattern also covers everything nested under it; only the exact pattern `/` excludes a volume's top level (entry `.`, adopted primary-only) |
 | `restore` | allowed_roots[] | Where a restore may write (an unoverridable denylist is checked first) |
 | `recovery_os` | max_age_days | Age past which a mirror target's own OS is reported STALE (`btrdasd recovery-os`) |
+| `recovery_os` | local_docs_dir | The installation's own recovery documents, carried to a rebuilt drive by `provision`; unset, `<config dir>-docs`, resolved once by `config::local_docs_dir` and printed by `dump-env` for the scripts; never inside the config's directory |
 | `source[]` | label, volume, device, snapshot_dir, target_subdirs[], target_labels[], subvolumes[] (name, snapshot_name, adopted, retired, after_index) | BTRFS sources; `adopted` / `retired` dates are written by the backup run; empty `target_labels` = every target |
 | `target[]` | label, serials[], mount_uuid, mount, role (primary/mirror), display_name, esp_partuuid (mirror only), retention (daily, weekly, monthly, yearly) | Backup targets; mounted by `mount_uuid` when set, else by serial; a mirror's `esp_partuuid` names its own ESP for the recovery-OS reading's read-only loader check |
 | `email` | enabled, smtp_host, smtp_port, from, to | Email reports |

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use buttered_dasd::maintenance::MaintenanceHeld;
 
-use crate::setup::config::Config;
+use crate::setup::config::{Config, legacy_local_docs_dir, local_docs_dir};
 use crate::setup::templates::{GeneratedFiles, SCRUB_IO_CLASS, SCRUB_IO_LEVEL, SCRUB_NICE};
 
 const CONFIG_FILE: &str = "/etc/das-backup/config.toml";
@@ -1525,6 +1525,16 @@ fn prepare_upgrade(
     } else {
         Some(format!("config.toml is not valid: {}", errors.join("; ")))
     };
+    // The documents move out of the config's directory (bd
+    // DAS-Backup-Manager-5237.6) is judged with the other refusals, before
+    // anything is written; made only when none applies.
+    let (refused, docs_move) = match refused {
+        Some(why) => (Some(why), None),
+        None => match plan_docs_move(&config, config_path) {
+            Ok(m) => (None, m),
+            Err(why) => (Some(why), None),
+        },
+    };
     if let Some(why) = refused {
         for change in &migrations {
             say(format!(
@@ -1538,6 +1548,20 @@ fn prepare_upgrade(
     }
     for change in &migrations {
         say(format!("Migrating config: {change}"));
+    }
+    if let Some((from, to)) = docs_move {
+        std::fs::rename(&from, &to).map_err(|e| {
+            format!(
+                "cannot move {} to {} ({e}) — nothing was changed; move it by hand (a different filesystem needs a copy) and run the upgrade again",
+                from.display(),
+                to.display()
+            )
+        })?;
+        say(format!(
+            "Moved the local recovery documents {} -> {}",
+            from.display(),
+            to.display()
+        ));
     }
 
     if old_version != config.general.version || !migrations.is_empty() {
@@ -1565,6 +1589,41 @@ fn prepare_upgrade(
         config,
         refused: None,
     })
+}
+
+/// The move of the local recovery documents out of the config's directory,
+/// `(from, to)`, or `None` when there is nothing to move: the legacy
+/// `<config dir>/docs` ([`legacy_local_docs_dir`]) to the directory
+/// [`local_docs_dir`] names. Refused, naming the legacy path, when that path
+/// is a link or not a directory, when the destination cannot be resolved,
+/// or when anything is already there — never merged, never followed.
+fn plan_docs_move(
+    config: &Config,
+    config_path: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let from = legacy_local_docs_dir(config_path);
+    let meta = match std::fs::symlink_metadata(&from) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot look at {} ({e})", from.display())),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link or a file): the local recovery documents now live outside the config's directory — move what it holds there by hand and remove it",
+            from.display()
+        ));
+    }
+    let to = local_docs_dir(config, config_path)
+        .map_err(|e| format!("cannot move {}: {e}", from.display()))?;
+    match std::fs::symlink_metadata(&to) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some((from, to))),
+        Ok(_) => Err(format!(
+            "{} and {} both exist: the local recovery documents belong in the second only — merge them by hand, remove the first, and run the upgrade again",
+            from.display(),
+            to.display()
+        )),
+        Err(e) => Err(format!("cannot look at {} ({e})", to.display())),
+    }
 }
 
 /// Check: validate config, verify manifest files, report dependency status.
@@ -3239,6 +3298,85 @@ auth = "starttls""#,
                 Some(why) => Err(why),
             });
         (result, lines)
+    }
+
+    /// A config at `<root>/etc/das-backup/config.toml`, valid and saved, and
+    /// its legacy documents directory `<root>/etc/das-backup/docs` holding
+    /// `quick.md` — the layout before bd DAS-Backup-Manager-5237.6.
+    fn legacy_docs_site(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let etc = root.join("etc/das-backup");
+        std::fs::create_dir_all(etc.join("docs")).unwrap();
+        std::fs::write(etc.join("docs/quick.md"), b"filled in").unwrap();
+        let config_path = etc.join("config.toml");
+        let mut config = valid_config(root);
+        config.email.enabled = false;
+        config.save(&config_path).unwrap();
+        (
+            config_path,
+            etc.join("docs"),
+            root.join("etc/das-backup-docs"),
+        )
+    }
+
+    /// `setup --upgrade` moves the documents out of the config's directory to
+    /// the directory beside it, once, by one rename (bd 5237.6).
+    #[test]
+    fn an_upgrade_moves_the_local_documents_beside_the_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, legacy, dest) = legacy_docs_site(dir.path());
+        let (result, lines) = run_prepare_upgrade(&config_path, false);
+        result.unwrap();
+        assert_eq!(std::fs::read(dest.join("quick.md")).unwrap(), b"filled in");
+        assert!(!legacy.exists());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Moved") && l.contains(&dest.display().to_string())),
+            "{lines:?}"
+        );
+        // Once: a second upgrade finds nothing to move and says nothing of it.
+        let (result, lines) = run_prepare_upgrade(&config_path, false);
+        result.unwrap();
+        assert!(!lines.iter().any(|l| l.contains("Moved")), "{lines:?}");
+    }
+
+    /// A destination already there, or a legacy path that is a link or not a
+    /// directory, refuses the upgrade before anything is written: both paths
+    /// and config.toml are left as they were.
+    #[test]
+    fn an_upgrade_refuses_a_documents_move_it_cannot_make_cleanly_and_changes_nothing() {
+        for case in ["dest-exists", "legacy-is-a-link", "legacy-is-a-file"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (config_path, legacy, dest) = legacy_docs_site(dir.path());
+            let mut config = Config::load(&config_path).unwrap();
+            config.general.version = "0.0.1".to_string();
+            config.save(&config_path).unwrap();
+            match case {
+                "dest-exists" => std::fs::create_dir(&dest).unwrap(),
+                "legacy-is-a-link" => {
+                    std::fs::rename(&legacy, dir.path().join("elsewhere")).unwrap();
+                    std::os::unix::fs::symlink(dir.path().join("elsewhere"), &legacy).unwrap();
+                }
+                "legacy-is-a-file" => {
+                    std::fs::remove_dir_all(&legacy).unwrap();
+                    std::fs::write(&legacy, b"x").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&config_path).unwrap();
+            let (result, _) = run_prepare_upgrade(&config_path, false);
+            let why = result.unwrap_err();
+            assert!(why.contains(&legacy.display().to_string()), "{case}: {why}");
+            assert_eq!(std::fs::read(&config_path).unwrap(), before, "{case}");
+            assert!(std::fs::symlink_metadata(&legacy).is_ok(), "{case}");
+            match case {
+                "dest-exists" => {
+                    assert!(legacy.join("quick.md").exists());
+                    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+                }
+                _ => assert!(!dest.exists(), "{case}"),
+            }
+        }
     }
 
     /// Re-review of b62ddbc: a config the renderer refuses must leave
