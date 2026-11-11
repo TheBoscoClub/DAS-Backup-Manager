@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::btrbk_conf::{resolve_snapshot_names, source_subdir, source_targets};
+use crate::btrbk_conf::{normalise_dir, resolve_snapshot_names, source_subdir, source_targets};
 use crate::caldate::{date_of, day_number, untrusted_clock};
 use crate::config::{Config, Retention, Source};
 use crate::fsutil::CommandRunner;
@@ -229,6 +229,17 @@ fn live_user_of(
                 .find(|(e, n)| e.retired.is_none() && n == snapshot_name)
                 .map(|(e, _)| (other.label.clone(), e.name.clone()))
         })
+}
+
+/// The directory a source keeps its snapshots in, in its one spelling
+/// (`btrbk_conf::normalise_dir`): `<vol>/` + `./snaps` and `<vol>` + `snaps`
+/// are one place, and so is `<vol>` + `a/snaps` beside `<vol>/a` + `snaps`.
+fn source_snapshot_dir(source: &Source) -> String {
+    normalise_dir(
+        &Path::new(&source.volume)
+            .join(&source.snapshot_dir)
+            .to_string_lossy(),
+    )
 }
 
 /// Every entry name of a directory, or why the listing cannot be trusted. A
@@ -460,7 +471,7 @@ pub fn expire_retired(
                     runner,
                     is_mountpoint,
                     live_user_of(&config, &snapshot_name, |other| {
-                        source_subdir(other) == subdir
+                        normalise_dir(source_subdir(other)) == normalise_dir(subdir)
                             && source_targets(&config, other)
                                 .iter()
                                 .any(|t| t.label == target.label)
@@ -486,7 +497,7 @@ pub fn expire_retired(
                 runner,
                 is_mountpoint,
                 live_user_of(&config, &snapshot_name, |other| {
-                    other.volume == source.volume && other.snapshot_dir == source.snapshot_dir
+                    source_snapshot_dir(other) == source_snapshot_dir(source)
                 }),
             ));
             entries.push(RetiredReport {
@@ -1869,6 +1880,55 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
         assert_eq!(states(&out)[2], shared("other", "@opt"));
         assert!(!out.failed());
+    }
+
+    /// One directory spelled two ways is still one directory: a live series
+    /// there is never deleted as the retired one's (bd DAS-Backup-Manager-12k).
+    #[test]
+    fn a_live_series_in_the_same_directory_spelled_differently_is_never_deleted() {
+        // Source side: `<vol>/` + `./.btrbk-snapshots/` is `<vol>` + `.btrbk-snapshots`.
+        let rig1 = rig();
+        rig1.edit(|c| {
+            let volume = format!("{}/", c.sources[0].volume);
+            c.sources.push(other_source(
+                "other",
+                volume,
+                "./.btrbk-snapshots/",
+                "other",
+                live("@opt"),
+            ));
+        });
+        let src = rig1.snap("vol/.btrbk-snapshots", "opt.20260930T0323");
+        let runner = rig1.deleting(&[&src]);
+        let out =
+            expire_retired(&rig1.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(src.exists(), "the live series' send parent");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(states(&out)[2], shared("other", "@opt"));
+
+        // Target side: `./ssd/` is `ssd`.
+        let rig2 = rig();
+        let vol2 = rig2.dir.path().join("vol2").to_string_lossy().into_owned();
+        rig2.edit(|c| {
+            c.sources.push(other_source(
+                "other",
+                vol2,
+                ".btrbk-snapshots",
+                "./ssd/",
+                live("@opt"),
+            ));
+        });
+        let small = rig2.snap("small/ssd", "opt.20260930T0323");
+        let big = rig2.snap("big/ssd", "opt.20260930T0323");
+        let runner = rig2.deleting(&[&small, &big]);
+        let out =
+            expire_retired(&rig2.config_path, false, "2030-01-01", &runner, &mounted).unwrap();
+        assert!(small.exists() && big.exists());
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert_eq!(
+            states(&out)[..2],
+            [shared("other", "@opt"), shared("other", "@opt")]
+        );
     }
 
     #[test]

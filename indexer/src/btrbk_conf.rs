@@ -530,10 +530,7 @@ pub fn config_busy_line(path: &Path) -> String {
 /// The targets a source's volume block sends to. The one derivation: expiry
 /// (`expire`) examines exactly these, so deletion cannot drift from what
 /// btrbk is told to write (bd DAS-Backup-Manager-12k).
-pub fn source_targets<'a>(
-    config: &'a Config,
-    source: &crate::config::Source,
-) -> Vec<&'a Target> {
+pub fn source_targets<'a>(config: &'a Config, source: &crate::config::Source) -> Vec<&'a Target> {
     config
         .targets
         .iter()
@@ -552,6 +549,27 @@ pub fn source_subdir(source: &crate::config::Source) -> &str {
         .target_subdirs
         .first()
         .map_or(source.label.as_str(), String::as_str)
+}
+
+/// A directory as written in `config.toml`, in one spelling: repeated `/`
+/// collapsed, `.` components and a trailing `/` dropped (`/vol/` and `/vol`,
+/// `./ssd/` and `ssd` are each one directory). Text only — the filesystem is
+/// never asked, so `..` and symlinks are left as written. An empty or
+/// all-`.` relative path is `.`. Two directories are the same place when their
+/// normal forms are equal; expiry's Shared guard compares through this (bd
+/// DAS-Backup-Manager-12k). `Config::validate`'s same-volume check is meant
+/// to call it too.
+pub fn normalise_dir(dir: &str) -> String {
+    let parts: Vec<&str> = dir
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let joined = parts.join("/");
+    match (dir.starts_with('/'), joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_string(),
+        (false, false) => joined,
+    }
 }
 
 /// Every `(target, subdirectory)` that `render_btrbk_conf` names in a
@@ -750,6 +768,33 @@ mod tests {
                 "a later entry is never written:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn normalise_dir_gives_one_spelling_per_directory() {
+        for (a, b) in [
+            ("/vol", "/vol/"),
+            ("/vol", "//vol//"),
+            ("/vol/x", "/vol/./x/"),
+            ("ssd", "./ssd"),
+            ("ssd", "ssd/"),
+            (".btrbk-snapshots", "./.btrbk-snapshots/"),
+            (".", "./"),
+            (".", ""),
+            ("/", "//"),
+        ] {
+            assert_eq!(normalise_dir(a), normalise_dir(b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("/vol", "vol"),
+            ("/vol", "/vol2"),
+            ("a/../b", "b"),
+            ("ssd", "SSD"),
+        ] {
+            assert_ne!(normalise_dir(a), normalise_dir(b), "{a} vs {b}");
+        }
+        assert_eq!(normalise_dir("/vol/./x//"), "/vol/x");
+        assert_eq!(normalise_dir("./ssd/"), "ssd");
     }
 
     fn test_config() -> Config {
