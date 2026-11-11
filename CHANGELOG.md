@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`backup-run.sh` says when a target's mount options cannot take effect** (bd `DAS-Backup-Manager-804`): btrfs keeps the filesystem-wide options of the first mount, so when another program already held a target's filesystem mounted somewhere else, the run's own `mount -o` succeeded and applied none of `compress`, `autodefrag` or `commit` — measured on a loop device, a file written through the second mount had no compressed extent
+  - The run now warns before mounting, naming the other mount point and the options not applied, and goes on; the `btrdasd` path already warned (script v4.19.4)
+
 - **`btrdasd setup --modify` no longer discards the GUI choice or hides the retention that governs a target** (bd `DAS-Backup-Manager-pz6`): the wizard offered "no" for the GUI whatever the configuration said, so Enter on a GUI-enabled installation switched the GUI off, and it showed and edited weeks and months only, so a target kept by days alone read `0 weeks, 0 months`
   - The GUI question offers the current choice; the retention step and the review show days, weeks, months and years, and customising asks for all four
   - An `audiobook` source that cannot be restricted to a primary target, because none is configured, is now said (`not restricted to a primary target … goes to every target`) instead of passed over without a word

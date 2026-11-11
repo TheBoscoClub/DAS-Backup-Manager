@@ -410,15 +410,23 @@ exit 32
 EOF
 
 stub findmnt <<'EOF'
-cols="" target="" fstab=""
+cols="" target="" fstab="" src=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
     -o) cols="$2"; shift ;;
+    -S | --source) src="$2"; shift ;;
     --target | --mountpoint) target="$2"; shift ;;
     --fstab) fstab=1 ;;
     esac
     shift
 done
+# -S UUID=<uuid>: every mount point of that filesystem, or none (1), as the
+# real findmnt answers.
+if [[ -n "$src" ]]; then
+    [[ "$cols" == TARGET ]] || { echo "findmnt stub: unexpected -S with -o $cols" >&2; exit 2; }
+    awk -F'\t' -v u="${src#UUID=}" '$2 == u { print $1; n++ } END { exit n ? 0 : 1 }' "$S/mounted"
+    exit $?
+fi
 # fstab, as the knob declares it: the entry for <target>, or none (1).
 if [[ -n "$fstab" ]]; then
     listed fstab_declares "$target" || exit 1
@@ -1854,6 +1862,31 @@ check "leftover, will not unmount even forced: btrbk never ran" "$(ran_btrbk)" "
 check "leftover, will not unmount even forced: ABORTED" "$(mail_status 1)" "ABORTED"
 check "leftover, will not unmount even forced: what aborted" "$(body_field 1 'What aborted')" "a leftover mount"
 check "leftover, will not unmount even forced: recorded as failed" "$(recorded_as)" "failure"
+
+# ---------------------------------------------------------------------------
+echo "== a target's filesystem already mounted somewhere else (bd DAS-Backup-Manager-804)"
+# ---------------------------------------------------------------------------
+# btrfs keeps the first mount's filesystem-wide options: a second mount -o
+# returns 0 and applies none of compress, autodefrag, commit (measured on a
+# loop device, 2026-11-11). The run goes on, and says so.
+elsewhere_line() { grep -c "primary-22tb: its filesystem is already mounted at $WORK/media/das-backup by another program" "$STATE/out"; }
+fresh
+premount "$WORK/media/das-backup" primary-uuid
+run_backup
+check "mounted elsewhere: exit status" "$RC" "0"
+show_tail 0
+check "mounted elsewhere: says the mount options will not apply" "$(elsewhere_line)" "1"
+check "mounted elsewhere: names the options" \
+    "$(grep -c "\[das\].mount_opts (.*) will not be applied" "$STATE/out")" "1"
+check "mounted elsewhere: still mounted at its own path once" "$(calls_for mount "$PRIMARY_MNT")" "1"
+check "mounted elsewhere: btrbk ran" "$(ran_btrbk)" "yes"
+check "mounted elsewhere: the other mount is not this run's to unmount" \
+    "$(calls_for umount "$WORK/media/das-backup")" "0"
+
+fresh
+run_backup
+check "not mounted elsewhere: nothing said about mount options" \
+    "$(grep -c "will not be applied" "$STATE/out")" "0"
 
 fresh
 leftover_primary a-different-filesystem

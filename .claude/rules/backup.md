@@ -76,6 +76,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 ## Mount Options for a RAID-1 Primary Target
 
 - `[das].mount_opts` includes `degraded`, so one failed leg does not block backup or restore.
+- A target filesystem already mounted somewhere else keeps that mount's filesystem-wide options: a second `mount -o` returns 0 and applies none of them. Both paths WARN and go on (bd `804`).
 - Data written degraded lands as `single` chunks. After replacing the leg: `btrfs scrub`, then
   `btrfs balance start -dconvert=raid1 -mconvert=raid1`.
 - A backup target is never in `/etc/fstab`; boot is unaffected by a leg failure.

@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.19.3
+# Version: 4.19.4
 # Date: 2026-11-11
 #
 # Features:
+#   - A target whose filesystem is already mounted somewhere else is said
+#     (v4.19.4, bd DAS-Backup-Manager-804): btrfs keeps the first mount's
+#     filesystem-wide options, so this run's `mount -o` returns 0 and applies
+#     none of compress, autodefrag or commit. warn_mounted_elsewhere() names
+#     the other mount point and the options not applied; the run goes on.
 #   - The boot step looks only where btrbk writes (v4.19.3, bd
 #     DAS-Backup-Manager-5237.11): `backup boot-plan` names, per source, the
 #     first target_subdirs entry, else the source label; the one absence left
@@ -2044,6 +2049,36 @@ take_down_leftover() {
     exit 3
 }
 
+# warn_mounted_elsewhere <label> <findmnt source: UUID=… or a device> <mnt>:
+# btrfs keeps one set of filesystem-wide options per mounted filesystem, the
+# first mount's. A second `mount -o` returns 0 and applies only the per-mount
+# ones (noatime): compress, autodefrag, commit, nossd and degraded are dropped
+# without a word (measured on a loop device, kernel 7.3, 2026-11-11: a file
+# written through the second mount had no compressed extent). So a target
+# whose filesystem another program holds somewhere else is said, before this
+# run mounts it (bd DAS-Backup-Manager-804; the Rust path:
+# mount::ensure_targets_mounted_with). The run goes on: the mount guard still
+# verifies what is at the target's own path.
+warn_mounted_elsewhere() {
+    local label="$1" spec="$2" mnt="$3" others rc=0
+    others="$(findmnt -rn -o TARGET -S "$spec")" || rc=$?
+    case "$rc" in
+    0) ;;
+    1) return 0 ;; # mounted nowhere
+    *)
+        log_warn "  $label: cannot tell whether its filesystem is mounted somewhere else (findmnt exit $rc) — [das].mount_opts may not be applied"
+        return 0
+        ;;
+    esac
+    local line list=""
+    while IFS= read -r line; do
+        [[ -n "$line" && "$line" != "$mnt" ]] || continue
+        list+="${list:+, }$line"
+    done <<<"$others"
+    [[ -n "$list" ]] || return 0
+    log_warn "  $label: its filesystem is already mounted at $list by another program: [das].mount_opts ($DAS_MOUNT_OPTS) will not be applied — that mount's own options stay in force"
+}
+
 mount_targets() {
     log_info "Mounting backup targets..."
 
@@ -2066,6 +2101,7 @@ mount_targets() {
         # RAID-1 (one leg missing) still mounts cleanly. The DAS_MOUNT_OPTS
         # config value is expected to include `degraded` for RAID-1 targets.
         if [[ -n "$uuid" ]]; then
+            warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
             if mount -t btrfs -o "$DAS_MOUNT_OPTS" "UUID=$uuid" "$mnt"; then
                 log_info "  Mounted $label at $mnt (UUID=$uuid)"
                 continue
@@ -2093,6 +2129,7 @@ mount_targets() {
             continue
         fi
 
+        warn_mounted_elsewhere "$label" "$part_dev" "$mnt"
         if mount -o "$DAS_MOUNT_OPTS" "$part_dev" "$mnt"; then
             log_info "  Mounted $label at $mnt ($part_dev)"
         else
@@ -3883,7 +3920,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.19.3
+  backup-run.sh v4.19.4
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
