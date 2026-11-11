@@ -393,6 +393,13 @@ fn step_subvolumes(
 
         let selected = p.multi_select("Select subvolumes to back up", &items, &defaults)?;
 
+        if selected.contains(&0) && selected.contains(&1) {
+            say!(
+                p,
+                "  {} both 'Select All' and 'Deselect All' are ticked: taken as Select All",
+                style("Note:").yellow()
+            );
+        }
         let chosen_subvols = resolve_selection(&selected, &subvol_names);
 
         if chosen_subvols.is_empty() {
@@ -626,10 +633,17 @@ fn step_targets(
         .filter(|t| t.role == TargetRole::Primary)
         .map(|t| t.label.clone())
         .collect();
-    if !primary_labels.is_empty() {
-        for source in config.sources.iter_mut() {
-            if source.target_labels.is_empty() && source.label.to_lowercase().contains("audiobook")
-            {
+    for source in config.sources.iter_mut() {
+        if source.target_labels.is_empty() && source.label.to_lowercase().contains("audiobook") {
+            if primary_labels.is_empty() {
+                say!(
+                    p,
+                    "  {} Source '{}' is not restricted to a primary target: none is \
+                     configured, so it goes to every target",
+                    style("Note:").yellow(),
+                    source.label
+                );
+            } else {
                 source.target_labels = primary_labels.clone();
                 say!(
                     p,
@@ -675,11 +689,13 @@ fn step_retention(
     for target in &config.targets {
         say!(
             p,
-            "    {} {}: {} weeks, {} months",
+            "    {} {}: {} days, {} weeks, {} months, {} years",
             style("•").dim(),
             target.label,
+            target.retention.daily,
             target.retention.weekly,
             target.retention.monthly,
+            target.retention.yearly,
         );
     }
 
@@ -688,9 +704,13 @@ fn step_retention(
     if customize {
         for target in &mut config.targets {
             say!(p, "\n  Target: {}", style(&target.label).bold());
+            // All four periods: a target kept by days alone (a recovery drive)
+            // would otherwise show as "0 weeks, 0 months" (bd pz6).
+            target.retention.daily = p.input("  Days to keep", Some(target.retention.daily))?;
             target.retention.weekly = p.input("  Weeks to keep", Some(target.retention.weekly))?;
             target.retention.monthly =
                 p.input("  Months to keep", Some(target.retention.monthly))?;
+            target.retention.yearly = p.input("  Years to keep", Some(target.retention.yearly))?;
         }
     }
 
@@ -902,7 +922,11 @@ fn step_gui(p: &mut impl Prompter, config: &mut Config) -> Result<(), Box<dyn st
         style("KDE Plasma GUI").bold()
     );
 
-    config.gui.enabled = p.confirm("Install KDE Plasma GUI? (requires Qt6/KF6)", false)?;
+    // The existing choice is the default: Enter on --modify keeps it (bd pz6).
+    config.gui.enabled = p.confirm(
+        "Install KDE Plasma GUI? (requires Qt6/KF6)",
+        config.gui.enabled,
+    )?;
 
     say!(
         p,
@@ -973,10 +997,12 @@ fn step_review(p: &mut impl Prompter, config: &Config) -> Result<(), Box<dyn std
         );
         say!(
             p,
-            "      mount: {}, retention: {}w {}m",
+            "      mount: {}, retention: {}d {}w {}m {}y",
             tgt.mount,
+            tgt.retention.daily,
             tgt.retention.weekly,
-            tgt.retention.monthly
+            tgt.retention.monthly,
+            tgt.retention.yearly
         );
     }
 
@@ -1679,6 +1705,32 @@ mod tests {
     }
 
     #[test]
+    fn sources_with_both_meta_rows_ticked_select_all_and_say_so() {
+        let mut sys = bare_system();
+        sys.subvolumes = vec![subvol("@", 5), subvol("@home", 5)];
+        let mut config = Config::default();
+        let mut p = Script::new(vec![
+            Reply::Multi(vec![0, 1]),
+            Reply::Accept,
+            Reply::Text("/dev/nvme0n1p2"),
+            Reply::Accept,
+            Reply::Accept,
+        ]);
+
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+
+        p.assert_finished();
+        assert_eq!(names(&config.sources[0].subvolumes), ["@", "@home"]);
+        p.assert_said("Note: both 'Select All' and 'Deselect All' are ticked: taken as Select All");
+
+        // One meta row alone says nothing about it.
+        let mut config = Config::default();
+        let mut p = Script::new(vec![Reply::Multi(vec![1, 2]), Reply::Accept]);
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+        p.assert_not_said("are ticked");
+    }
+
+    #[test]
     fn sources_deselect_all_configures_no_source_but_still_offers_another_volume() {
         let mut sys = bare_system();
         sys.subvolumes = vec![subvol("@", 5), subvol("@home", 5)];
@@ -1940,6 +1992,10 @@ mod tests {
 
         assert!(config.sources[0].target_labels.is_empty());
         p.assert_not_said("restricted to primary");
+        // Said, not skipped without a word (bd pz6 item 4).
+        p.assert_said(
+            "Note: Source 'audiobooks' is not restricted to a primary target: none is configured, so it goes to every target",
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1973,7 +2029,7 @@ mod tests {
         );
         assert_eq!(config.targets[0].retention.weekly, 4);
         assert_eq!(config.targets[0].retention.monthly, 2);
-        p.assert_said("• primary-22tb: 4 weeks, 2 months");
+        p.assert_said("• primary-22tb: 0 days, 4 weeks, 2 months, 0 years");
         p.assert_said("✓ Retention configured.");
         p.assert_not_said("Target: primary-22tb");
     }
@@ -1987,14 +2043,19 @@ mod tests {
                 target("recovery-A", TargetRole::Mirror),
             ],
         );
+        config.targets[1].retention.daily = 7;
         config.targets[1].retention.weekly = 1;
         config.targets[1].retention.monthly = 0;
         let mut p = Script::new(vec![
             Reply::Confirm(true),
+            Reply::Accept,
             Reply::Text("12"),
             Reply::Accept,
+            Reply::Text("1"),
+            Reply::Text("14"),
             Reply::Accept,
             Reply::Text("3"),
+            Reply::Accept,
         ]);
 
         step_retention(&mut p, &mut config).unwrap();
@@ -2004,16 +2065,25 @@ mod tests {
             p.asked,
             [
                 "confirm: Customize retention per target? [false]",
+                "input:   Days to keep [0]",
                 "input:   Weeks to keep [4]",
                 "input:   Months to keep [2]",
+                "input:   Years to keep [0]",
+                "input:   Days to keep [7]",
                 "input:   Weeks to keep [1]",
                 "input:   Months to keep [0]",
+                "input:   Years to keep [0]",
             ]
         );
-        assert_eq!(config.targets[0].retention.weekly, 12);
-        assert_eq!(config.targets[0].retention.monthly, 2);
-        assert_eq!(config.targets[1].retention.weekly, 1);
-        assert_eq!(config.targets[1].retention.monthly, 3);
+        // Every period is shown and can be edited, the daily one that governs
+        // a recovery drive included (bd pz6 item 3).
+        p.assert_said("• recovery-A: 7 days, 1 weeks, 0 months, 0 years");
+        let kept = |t: &Target| {
+            let r = &t.retention;
+            (r.daily, r.weekly, r.monthly, r.yearly)
+        };
+        assert_eq!(kept(&config.targets[0]), (0, 12, 2, 1));
+        assert_eq!(kept(&config.targets[1]), (14, 1, 3, 0));
         p.assert_said("Target: primary-22tb");
         p.assert_said("Target: recovery-A");
     }
@@ -2249,9 +2319,22 @@ mod tests {
     }
 
     #[test]
-    fn gui_is_opt_in() {
+    fn gui_offers_the_current_choice() {
+        // --modify on a GUI-enabled config: Enter keeps the GUI (bd pz6 item 2).
         let mut config = Config::default();
         config.gui.enabled = true;
+        let mut p = Script::new(vec![Reply::Accept]);
+        step_gui(&mut p, &mut config).unwrap();
+        assert_eq!(
+            p.asked,
+            ["confirm: Install KDE Plasma GUI? (requires Qt6/KF6) [true]"]
+        );
+        assert!(config.gui.enabled);
+        p.assert_said("[8/9] KDE Plasma GUI");
+        p.assert_said("✓ GUI: will be installed");
+
+        // A new configuration is still opt-in.
+        let mut config = Config::default();
         let mut p = Script::new(vec![Reply::Accept]);
         step_gui(&mut p, &mut config).unwrap();
         assert_eq!(
@@ -2259,13 +2342,11 @@ mod tests {
             ["confirm: Install KDE Plasma GUI? (requires Qt6/KF6) [false]"]
         );
         assert!(!config.gui.enabled);
-        p.assert_said("[8/9] KDE Plasma GUI");
         p.assert_said("✓ GUI: skipped");
 
         let mut p = Script::new(vec![Reply::Confirm(true)]);
         step_gui(&mut p, &mut config).unwrap();
         assert!(config.gui.enabled);
-        p.assert_said("✓ GUI: will be installed");
     }
 
     // -----------------------------------------------------------------------
@@ -2298,7 +2379,7 @@ mod tests {
         p.assert_said("volume: /.btrfs-root, subvols: @, @home");
         p.assert_said("Targets (2):");
         p.assert_said("• primary-22tb [SER-primary-22tb] role=primary");
-        p.assert_said("mount: /mnt/primary-22tb, retention: 4w 2m");
+        p.assert_said("mount: /mnt/primary-22tb, retention: 0d 4w 2m 0y");
         p.assert_said("• recovery-A [SER-recovery-A] role=mirror");
         p.assert_said("init: systemd");
         p.assert_said("incremental: 03:00");

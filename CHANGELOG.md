@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd setup --modify` no longer discards the GUI choice or hides the retention that governs a target** (bd `DAS-Backup-Manager-pz6`): the wizard offered "no" for the GUI whatever the configuration said, so Enter on a GUI-enabled installation switched the GUI off, and it showed and edited weeks and months only, so a target kept by days alone read `0 weeks, 0 months`
+  - The GUI question offers the current choice; the retention step and the review show days, weeks, months and years, and customising asks for all four
+  - An `audiobook` source that cannot be restricted to a primary target, because none is configured, is now said (`not restricted to a primary target … goes to every target`) instead of passed over without a word
+  - Ticking both `Select All` and `Deselect All` still selects everything, and the wizard now says which one it took
+
 - **A boot subvolume that two sources list is refused, never rebuilt from the newer of the two series** (bd `DAS-Backup-Manager-5237.12`): with `@` listed by a source `nvme-root` and again by a source `sata-os`, the boot step searched both sources' directories on the target and took the newest snapshot across them, so a full run could rebuild the target's `@` from the other volume's OS
   - `[boot].subvolumes` entries are now each listed by one source — a second source listing one (a retired entry counts, its series is still on the targets) fails `config validate`, `backup boot-plan` (exit 2) and the boot step of a run, before any btrfs call, naming the sources
 
