@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - One pass per target gives both numbers (`health::read_snapshots`), and calls that arrive while a reply is being made share it instead of each taking a reading (`SharedReply`)
   - A snapshot count that was not taken is `null` in `btrdasd health --json` and in the helper's reply (`snapshot_count`), no longer `0`: an unmounted target, one that could not be listed, and one a job holds with no kept reading; the reply gains `snapshot_reading_age_secs` per target and `last_backup_reading_age_secs` and `targets_busy` under `services`. `btrdasd health` and a run's own report still read live
 
+- **`btrdasd setup --modify` no longer proposes a second copy of the configured sources** (bd `DAS-Backup-Manager-5237.17`): the wizard's source step offered every detected subvolume again, all ticked, and pushed them as a new source beside the configured ones — Enter through the step on a one-source installation ended with two sources listing `@` and `@home` twice — and with no subvolume detected it required a new source to be typed before it would go on
+  - With sources configured the step now shows them (label, volume, subvolumes), points to `btrdasd subvol add` / `subvol remove` for changing one, and asks `Add another source?`, defaulting to no
+  - Asked for one, it offers only detected subvolumes no source lists yet; when every detected one is listed the new source is entered by hand
+  - A subvolume the excludes skip (`@tmp`, `@var-tmp`, `[subvolumes].exclude`) is no longer offered, on a first install either: the run would never have adopted it
+
 - **`backup-run.sh` says when a target's mount options cannot take effect** (bd `DAS-Backup-Manager-804`): btrfs keeps the filesystem-wide options of the first mount, so when another program already held a target's filesystem mounted somewhere else, the run's own `mount -o` succeeded and applied none of `compress`, `autodefrag` or `commit` — measured on a loop device, a file written through the second mount had no compressed extent
   - The run now warns before mounting, naming the other mount point and the options not applied, and goes on; the `btrdasd` path already warned (script v4.19.4)
 

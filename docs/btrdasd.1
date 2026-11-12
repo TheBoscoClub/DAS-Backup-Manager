@@ -389,7 +389,12 @@ Requires root privileges.
 .RB [ \-\-force ]
 .TP
 .B \-\-modify
-Re-open the wizard with the current configuration pre-filled.
+Re-open the wizard with the current configuration pre-filled. The source
+step shows the configured sources and adds one only when asked, offering
+the detected subvolumes no source lists yet; change a source's subvolumes with
+.B "subvol add"
+and
+.BR "subvol remove" .
 .TP
 .B \-\-upgrade
 Regenerate all managed files from the existing configuration

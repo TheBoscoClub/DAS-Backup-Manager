@@ -119,7 +119,7 @@ Runs the full 9-step wizard, generates all configuration files, and enables back
 sudo btrdasd setup --modify
 ```
 
-Re-opens the wizard with your current configuration pre-filled from `/etc/das-backup/config.toml`. Change any settings, then regenerate files.
+Re-opens the wizard with your current configuration pre-filled from `/etc/das-backup/config.toml`. Change any settings, then regenerate files. The source step lists the sources already configured and asks whether to add another (default: no); asked for one, it offers only the detected subvolumes no source lists yet. To change which subvolumes a configured source lists, use `btrdasd subvol add` and `btrdasd subvol remove`.
 
 ### Upgrade After Binary Update
 

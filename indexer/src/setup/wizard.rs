@@ -330,12 +330,72 @@ fn step_subvolumes(
         style("Backup Sources (BTRFS Subvolumes)").bold()
     );
 
-    if sys.subvolumes.is_empty() {
+    // A --modify session starts from the sources already configured: it
+    // shows them and adds one only when asked. It used to offer every
+    // detected subvolume again, ticked, and push the lot as a second source
+    // beside the first (bd DAS-Backup-Manager-5237.17).
+    let modifying = !config.sources.is_empty();
+    if modifying {
+        say!(p, "\n  Configured sources:\n");
+        for source in &config.sources {
+            let names: Vec<&str> = source
+                .subvolumes
+                .iter()
+                .map(|sv| sv.name.as_str())
+                .collect();
+            say!(
+                p,
+                "    {}  {}  {}",
+                source.label,
+                source.volume,
+                names.join(", ")
+            );
+        }
         say!(
             p,
-            "\n  {} No BTRFS subvolumes detected. Enter manually.",
+            "\n  {} Change a source's subvolumes with `btrdasd subvol add` / `btrdasd subvol remove`.",
             style("Note:").yellow()
         );
+        if !p.confirm("Add another source?", false)? {
+            say!(
+                p,
+                "\n  {} {} source(s) configured.",
+                style("✓").green().bold(),
+                config.sources.len()
+            );
+            return Ok(());
+        }
+    }
+
+    // What is worth offering: not what the excludes skip (the run would
+    // never adopt it), and not what a source already lists.
+    let excludes = config.exclude_patterns();
+    let subvol_names: Vec<String> = backup_candidates(&sys.subvolumes)
+        .into_iter()
+        .filter(|name| buttered_dasd::adopt::excluding_pattern(name, &excludes).is_none())
+        .filter(|name| {
+            !config
+                .sources
+                .iter()
+                .any(|source| source.subvolumes.iter().any(|sv| &sv.name == name))
+        })
+        .collect();
+    let all_listed = modifying && !sys.subvolumes.is_empty() && subvol_names.is_empty();
+
+    if sys.subvolumes.is_empty() || all_listed {
+        if all_listed {
+            say!(
+                p,
+                "\n  {} Every detected subvolume is already listed by a source or excluded. Enter the new source manually.",
+                style("Note:").yellow()
+            );
+        } else {
+            say!(
+                p,
+                "\n  {} No BTRFS subvolumes detected. Enter manually.",
+                style("Note:").yellow()
+            );
+        }
 
         loop {
             let label: String = p.input("Source label (e.g. root)", None)?;
@@ -364,8 +424,6 @@ fn step_subvolumes(
             }
         }
     } else {
-        let subvol_names = backup_candidates(&sys.subvolumes);
-
         if subvol_names.is_empty() {
             say!(
                 p,
@@ -1748,6 +1806,132 @@ mod tests {
         p.assert_said("✓ 0 source(s) configured.");
     }
 
+    // --- bd DAS-Backup-Manager-5237.17: --modify starts from configured sources
+
+    fn configured_source(label: &str, subvolumes: &[&str]) -> Source {
+        Source {
+            label: label.to_string(),
+            volume: "/.btrfs-nvme".into(),
+            subvolumes: subvolumes
+                .iter()
+                .map(|name| SubvolConfig {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            device: "/dev/nvme0n1p2".into(),
+            snapshot_dir: ".btrbk-snapshots".into(),
+            target_subdirs: vec![],
+            target_labels: vec![],
+        }
+    }
+
+    #[test]
+    fn modify_shows_the_configured_sources_and_adds_none_by_default() {
+        let mut sys = bare_system();
+        sys.subvolumes = vec![subvol("@", 5), subvol("@home", 5), subvol("@log", 5)];
+        let mut config = config_with(
+            vec![configured_source("nvme-root", &["@", "@home"])],
+            vec![],
+        );
+        let mut p = Script::new(vec![Reply::Accept]);
+
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+
+        p.assert_finished();
+        assert_eq!(p.asked, ["confirm: Add another source? [false]"]);
+        assert_eq!(config.sources.len(), 1);
+        assert_eq!(names(&config.sources[0].subvolumes), ["@", "@home"]);
+        p.assert_said("nvme-root  /.btrfs-nvme  @, @home");
+        p.assert_said("btrdasd subvol add");
+        p.assert_said("✓ 1 source(s) configured.");
+    }
+
+    #[test]
+    fn modify_offers_only_detected_subvolumes_no_source_lists() {
+        let mut sys = bare_system();
+        sys.subvolumes = vec![
+            subvol("@", 5),
+            subvol("@home", 5),
+            subvol("@log", 5),
+            subvol("@tmp", 5),
+        ];
+        let mut config = config_with(
+            vec![configured_source("nvme-root", &["@", "@home"])],
+            vec![],
+        );
+        let mut p = Script::new(vec![
+            Reply::Confirm(true),
+            Reply::Accept,
+            Reply::Accept,
+            Reply::Text("/dev/nvme0n1p2"),
+            Reply::Text("nvme-more"),
+            Reply::Accept,
+        ]);
+
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+
+        p.assert_finished();
+        assert_eq!(
+            p.asked[..2],
+            [
+                "confirm: Add another source? [false]",
+                "multi: Select subvolumes to back up \
+                 {── Select All ──|── Deselect All ──|@log} [2]",
+            ]
+        );
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(names(&config.sources[0].subvolumes), ["@", "@home"]);
+        assert_eq!(config.sources[1].label, "nvme-more");
+        assert_eq!(names(&config.sources[1].subvolumes), ["@log"]);
+    }
+
+    #[test]
+    fn modify_with_every_detected_subvolume_listed_takes_a_new_source_by_hand() {
+        let mut sys = bare_system();
+        sys.subvolumes = vec![subvol("@", 5), subvol("@home", 5)];
+        let mut config = config_with(
+            vec![configured_source("nvme-root", &["@", "@home"])],
+            vec![],
+        );
+        let mut p = Script::new(vec![
+            Reply::Confirm(true),
+            Reply::Text("hdd"),
+            Reply::Text("/srv/data"),
+            Reply::Text("Projects"),
+            Reply::Text("/dev/sda"),
+            Reply::Accept,
+        ]);
+
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+
+        p.assert_finished();
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(names(&config.sources[1].subvolumes), ["Projects"]);
+        p.assert_said("Every detected subvolume is already listed by a source");
+    }
+
+    #[test]
+    fn a_subvolume_the_excludes_skip_is_not_offered() {
+        let mut sys = bare_system();
+        sys.subvolumes = vec![
+            subvol("@", 5),
+            subvol("@tmp", 5),
+            subvol("@var-tmp", 5),
+            subvol("scratch", 5),
+        ];
+        let mut config = Config::default();
+        config.subvolumes.exclude = vec!["scratch".into()];
+        let mut p = Script::new(vec![Reply::Multi(vec![1]), Reply::Accept]);
+
+        step_subvolumes(&mut p, &sys, &mut config).unwrap();
+
+        assert_eq!(
+            p.asked[0],
+            "multi: Select subvolumes to back up {── Select All ──|── Deselect All ──|@} [2]"
+        );
+    }
+
     #[test]
     fn sources_with_only_snapshot_subvolumes_detected_asks_nothing() {
         let mut sys = bare_system();
@@ -2526,8 +2710,9 @@ mod tests {
         let mut existing = complete_config();
         existing.schedule.incremental = "01:15".to_string();
         existing.general.install_prefix = "/usr".to_string();
-        // No subvolumes detected, so step 2 asks for a source by hand.
+        // Asked to add a source; no subvolumes detected, so it is entered by hand.
         let mut p = Script::new(vec![
+            Reply::Confirm(true),
             Reply::Text("hdd"),
             Reply::Text("/srv/data"),
             Reply::Text("Projects"),
@@ -2557,11 +2742,7 @@ mod tests {
     fn cancelling_at_review_yields_no_config() {
         let sys = bare_system();
         let mut p = Script::new(vec![
-            Reply::Text("hdd"),
-            Reply::Text("/srv/data"),
-            Reply::Text("Projects"),
-            Reply::Text("/dev/sda"),
-            Reply::Accept,
+            Reply::Accept, // sources exist: add none
             Reply::Accept,
             Reply::Accept,
             Reply::Accept,
