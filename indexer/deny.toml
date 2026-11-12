@@ -11,7 +11,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # zbus 5's helper crates were folded into zbus 6 and marked unmaintained;
+    # no 5.x release replaces them. Not a vulnerability. They leave the tree
+    # with the zbus 6 migration (bd DAS-Backup-Manager-o3zk); remove these
+    # three entries in that change.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5 unmaintained: merged into zbus 6 (bd DAS-Backup-Manager-o3zk)" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4 unmaintained: merged into zbus 6 (bd DAS-Backup-Manager-o3zk)" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5 unmaintained: merged into zbus 6 (bd DAS-Backup-Manager-o3zk)" },
+]
 
 [licenses]
 version = 2
