@@ -311,6 +311,44 @@ pub trait CommandRunner {
     /// output as it goes. The `Output` carries the exit status and all of
     /// stderr; its `stdout` is empty, the lines having gone to `on_line`.
     fn stream(&self, cmd: &mut Command, on_line: &mut dyn FnMut(&str)) -> io::Result<Output>;
+    /// Run `producer` and `consumer` to completion with the producer's stdout
+    /// as the consumer's stdin (`btrfs send | btrfs receive`). Both stderrs
+    /// are drained while they run, so neither command can block on a full
+    /// pipe, and BOTH exit statuses are returned: a failed producer beside a
+    /// consumer that succeeded is the caller's to tell apart. A consumer that
+    /// cannot be started is an error, and the producer is stopped. A runner
+    /// that cannot do this says so rather than answer for a transfer that
+    /// never ran, so every other implementation is spared it.
+    fn pipe(&self, producer: &mut Command, consumer: &mut Command) -> io::Result<PipeOutput> {
+        let _ = (producer, consumer);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this command runner cannot pipe one command into another",
+        ))
+    }
+}
+
+/// What [`CommandRunner::pipe`] read from the two commands. Each `Output`
+/// carries the exit status and all of that command's stderr; the producer's
+/// stdout went to the consumer, and the consumer's stdout is kept.
+#[derive(Debug)]
+pub struct PipeOutput {
+    pub producer: Output,
+    pub consumer: Output,
+}
+
+/// Read `source` to its end on its own thread.
+fn drain<R: Read + Send + 'static>(mut source: R) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map(|_| bytes)
+    })
+}
+
+fn joined(handle: std::thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("an output reader panicked"))?
 }
 
 /// The real thing.
@@ -351,6 +389,60 @@ impl CommandRunner for SystemRunner {
             status,
             stdout: Vec::new(),
             stderr,
+        })
+    }
+
+    fn pipe(&self, producer: &mut Command, consumer: &mut Command) -> io::Result<PipeOutput> {
+        Self::pipe_for_real(producer, consumer)
+    }
+}
+
+impl SystemRunner {
+    /// [`CommandRunner::pipe`] for real.
+    fn pipe_for_real(producer: &mut Command, consumer: &mut Command) -> io::Result<PipeOutput> {
+        let mut first = producer
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let feed = first.stdout.take().expect("stdout is piped above");
+        let started = consumer
+            .stdin(Stdio::from(feed))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        // The `Command` still owns the read end of the pipe. While it does,
+        // a consumer that exits early leaves a producer blocked forever on a
+        // full pipe instead of dying of SIGPIPE; dropping it here leaves the
+        // consumer's own copy as the only one.
+        consumer.stdin(Stdio::null());
+        let mut second = match started {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = first.kill();
+                let _ = first.wait();
+                return Err(e);
+            }
+        };
+        let first_err = drain(first.stderr.take().expect("stderr is piped above"));
+        let second_out = drain(second.stdout.take().expect("stdout is piped above"));
+        let second_err = drain(second.stderr.take().expect("stderr is piped above"));
+        // Both are waited for whatever the first wait says: no child outlives
+        // the call writing to a target.
+        let second_status = second.wait();
+        let first_status = first.wait();
+        let (second_status, first_status) = (second_status?, first_status?);
+        Ok(PipeOutput {
+            producer: Output {
+                status: first_status,
+                stdout: Vec::new(),
+                stderr: joined(first_err)?,
+            },
+            consumer: Output {
+                status: second_status,
+                stdout: joined(second_out)?,
+                stderr: joined(second_err)?,
+            },
         })
     }
 }
@@ -413,7 +505,19 @@ pub(crate) mod testing {
         snapshotting: bool,
         /// Command-line fragments of the snapshots that fail.
         failing: Vec<String>,
+        /// Piped pairs by `<producer argv> | <consumer argv>`: the two exit
+        /// codes, and a directory the consumer makes when it exits 0 (what
+        /// `btrfs receive` leaves behind).
+        pipes: Vec<(String, i32, i32, Option<String>)>,
         calls: Mutex<Vec<String>>,
+    }
+
+    fn argv_of(cmd: &Command) -> String {
+        std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     impl Scripted {
@@ -433,6 +537,7 @@ pub(crate) mod testing {
                 deletable: Vec::new(),
                 snapshotting: false,
                 failing: Vec::new(),
+                pipes: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -449,6 +554,26 @@ pub(crate) mod testing {
         /// `fragment` fails (exit 1) even when snapshots are being made.
         pub(crate) fn failing_snapshots_of(mut self, fragment: &str) -> Self {
             self.failing.push(fragment.to_string());
+            self
+        }
+
+        /// The same runner, where piping `producer` into `consumer` (each an
+        /// argv, joined with single spaces) exits with the two codes and, when
+        /// the consumer exits 0, makes the directory `creates`. An unscripted
+        /// pipe exits 1 on both sides. The call is recorded as
+        /// `<producer> | <consumer>`.
+        pub(crate) fn piping(
+            mut self,
+            (producer, consumer): (&str, &str),
+            (producer_code, consumer_code): (i32, i32),
+            creates: Option<&str>,
+        ) -> Self {
+            self.pipes.push((
+                format!("{producer} | {consumer}"),
+                producer_code,
+                consumer_code,
+                creates.map(str::to_string),
+            ));
             self
         }
 
@@ -527,6 +652,35 @@ pub(crate) mod testing {
                 status: ExitStatus::from_raw(code << 8),
                 stdout: stdout.into_bytes(),
                 stderr,
+            })
+        }
+
+        fn pipe(
+            &self,
+            producer: &mut Command,
+            consumer: &mut Command,
+        ) -> io::Result<super::PipeOutput> {
+            let key = format!("{} | {}", argv_of(producer), argv_of(consumer));
+            self.calls.lock().unwrap().push(key.clone());
+            let (pc, cc, creates) = self
+                .pipes
+                .iter()
+                .find(|(k, ..)| *k == key)
+                .map(|(_, p, c, d)| (*p, *c, d.clone()))
+                .unwrap_or((1, 1, None));
+            if cc == 0
+                && let Some(dir) = creates
+            {
+                std::fs::create_dir(dir)?;
+            }
+            let done = |code: i32| Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            Ok(super::PipeOutput {
+                producer: done(pc),
+                consumer: done(cc),
             })
         }
 
@@ -610,6 +764,110 @@ mod tests {
             .unwrap();
         assert_eq!(lines, ["ready", "done"]);
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn system_runner_pipes_one_command_into_another_and_returns_both_statuses() {
+        let out = SystemRunner
+            .pipe(
+                Command::new("sh").args(["-c", "printf hello; echo p >&2; exit 5"]),
+                Command::new("sh").args(["-c", "cat >&2; echo c >&2; exit 0"]),
+            )
+            .unwrap();
+        // A failed producer beside a consumer that succeeded stays visible.
+        assert_eq!(out.producer.status.code(), Some(5));
+        assert_eq!(out.consumer.status.code(), Some(0));
+        assert_eq!(out.producer.stderr, b"p\n");
+        // What the producer wrote reached the consumer's stdin.
+        assert_eq!(out.consumer.stderr, b"helloc\n");
+        let out = SystemRunner
+            .pipe(
+                Command::new("sh").args(["-c", "printf x"]),
+                Command::new("sh").args(["-c", "cat >/dev/null; exit 3"]),
+            )
+            .unwrap();
+        assert!(out.producer.status.success());
+        assert_eq!(out.consumer.status.code(), Some(3));
+    }
+
+    /// A consumer that exits without reading (a `btrfs receive` that refuses
+    /// at once) must end the producer: the parent must not keep the pipe's
+    /// read end open, or a producer with more than a pipe buffer to write
+    /// blocks forever with the run's locks held. Bounded so a regression
+    /// fails, not hangs.
+    #[test]
+    fn a_consumer_that_exits_unread_ends_the_producer_instead_of_hanging() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = SystemRunner.pipe(
+                Command::new("sh").args(["-c", "head -c 4194304 /dev/zero"]),
+                Command::new("sh").args(["-c", "exit 1"]),
+            );
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok(out)) => {
+                assert_eq!(out.consumer.status.code(), Some(1));
+                assert!(
+                    !out.producer.status.success(),
+                    "the producer died of SIGPIPE, which is not a success"
+                );
+            }
+            Ok(Err(e)) => panic!("pipe failed: {e}"),
+            Err(_) => panic!("the producer hung on a consumer that never read"),
+        }
+    }
+
+    #[test]
+    fn pipe_drains_both_stderrs_past_a_pipe_buffer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let big = "head -c 204800 /dev/zero | tr '\\0' 'x' >&2";
+            let out = SystemRunner.pipe(
+                Command::new("sh").args(["-c", &format!("{big}; echo data")]),
+                Command::new("sh").args(["-c", &format!("{big}; cat >/dev/null")]),
+            );
+            let _ = tx.send(out.map(|o| (o.producer.stderr.len(), o.consumer.stderr.len())));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok((p, c))) => assert_eq!((p, c), (204_800, 204_800)),
+            Ok(Err(e)) => panic!("pipe failed: {e}"),
+            Err(_) => panic!("pipe deadlocked on a large stderr write"),
+        }
+    }
+
+    #[test]
+    fn a_consumer_that_cannot_start_stops_the_producer_and_is_an_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = SystemRunner.pipe(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                &mut Command::new("/nonexistent/das-no-such-binary"),
+            );
+            let _ = tx.send(out.is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(20)),
+            Ok(true),
+            "an unstartable consumer is an error, and the producer is not left running"
+        );
+    }
+
+    #[test]
+    fn a_runner_that_cannot_pipe_refuses_instead_of_answering() {
+        struct NoPipe;
+        impl CommandRunner for NoPipe {
+            fn output(&self, cmd: &mut Command) -> io::Result<Output> {
+                cmd.output()
+            }
+            fn stream(&self, _: &mut Command, _: &mut dyn FnMut(&str)) -> io::Result<Output> {
+                Err(io::Error::other("unused"))
+            }
+        }
+        let err = NoPipe
+            .pipe(&mut Command::new("true"), &mut Command::new("true"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     /// More stderr than a pipe holds (~64 KiB) used to deadlock the reader:

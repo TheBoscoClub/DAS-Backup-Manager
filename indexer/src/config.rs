@@ -566,11 +566,15 @@ pub struct Source {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticSubvolumes {
     /// Directory on the source's volume, relative to it. Exactly one level of
-    /// it is read, never recursed.
+    /// it is read, never recursed: the subvolumes directly in it are the
+    /// candidates.
     pub dir: String,
     /// Glob on the subvolume's name; only `*` and `?` are special.
     pub pattern: String,
-    /// Directory on the target, relative to its mount: one path component.
+    /// Directory on the target, relative to its mount, where the copies land.
+    /// Distinct from, and not nested with, every directory a source's
+    /// snapshots go to and every other table's (`Config::validate`): the
+    /// expiry of retired subvolumes deletes in those.
     pub target_subdir: String,
 }
 
@@ -3045,6 +3049,7 @@ impl Config {
             }
         }
         errors.extend(self.top_level_scope_errors());
+        errors.extend(self.static_errors());
         for src in &self.sources {
             // `snapshot_dir` is a directory inside the volume: empty, absolute,
             // `.`, or with an empty or `..` component, it yields
@@ -3072,6 +3077,120 @@ impl Config {
                     "Exclude pattern '{pattern}' matches no subvolume — write '{TOP_LEVEL_EXCLUDE}' \
                      to exclude each volume's top level"
                 ));
+            }
+        }
+        errors
+    }
+
+    /// What is wrong with the `[[source.static]]` tables (bd
+    /// DAS-Backup-Manager-5237.8). A static copy is judged and, once its
+    /// pristine is replaced, deleted by [`crate::static_send`] in its own
+    /// `target_subdir`; every other deleter works in the directories a
+    /// source's snapshots go to. So a table's `target_subdir` is refused when
+    /// it is, is inside, or holds any of those, and the same against every
+    /// other table, so no deleter can reach another's copies. Compared as
+    /// text through `normalise_dir`, the filesystem never asked.
+    pub fn static_errors(&self) -> Vec<String> {
+        use crate::btrbk_conf::normalise_dir;
+        let mut errors = Vec::new();
+        let clean = |path: &str| {
+            let inner = path.strip_suffix('/').unwrap_or(path);
+            !path.starts_with('/')
+                && !path.chars().any(char::is_control)
+                && inner
+                    .split('/')
+                    .all(|c| !c.is_empty() && c != "." && c != "..")
+        };
+        // Whether one directory is the other or inside it, either way round.
+        let overlap = |a: &str, b: &str| {
+            let (a, b) = (normalise_dir(a), normalise_dir(b));
+            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+        };
+        // Every directory a source's snapshots go to on a target: each
+        // `target_subdirs` entry (the renderer uses the first, a later one is
+        // not trusted to stay unused), else the label.
+        let btrbk_dirs: Vec<(&str, &str)> = self
+            .sources
+            .iter()
+            .flat_map(|src| {
+                let dirs: Vec<&str> = if src.target_subdirs.is_empty() {
+                    vec![src.label.as_str()]
+                } else {
+                    src.target_subdirs.iter().map(String::as_str).collect()
+                };
+                dirs.into_iter().map(move |d| (src.label.as_str(), d))
+            })
+            .collect();
+        let mut tables: Vec<(&str, usize, &str)> = Vec::new();
+        for src in &self.sources {
+            for (i, table) in src.static_subvolumes.iter().enumerate() {
+                let who = format!("[[source.static]] #{} of source '{}'", i + 1, src.label);
+                if !clean(&table.dir) {
+                    errors.push(format!(
+                        "{who} has dir {:?} — it must be a path inside the source's volume, \
+                         relative, with no empty, '.' or '..' component",
+                        table.dir
+                    ));
+                } else {
+                    let same_volume = |o: &&Source| {
+                        normalise_dir(&o.volume) == normalise_dir(&src.volume)
+                    };
+                    if let Some(own) = self
+                        .sources
+                        .iter()
+                        .filter(same_volume)
+                        .find(|o| overlap(&o.snapshot_dir, &table.dir))
+                    {
+                        errors.push(format!(
+                            "{who} has dir {:?}, which is or holds the snapshot_dir {:?} of \
+                             source '{}': btrbk's own snapshots are never static copies",
+                            table.dir, own.snapshot_dir, own.label
+                        ));
+                    }
+                }
+                if table.pattern.is_empty()
+                    || table.pattern.contains('/')
+                    || table.pattern.chars().any(char::is_control)
+                    || table.pattern.chars().all(|c| c == '*' || c == '?')
+                {
+                    errors.push(format!(
+                        "{who} has pattern {:?} — it must be a glob on one subvolume name: no '/', \
+                         and at least one character that is not '*' or '?'",
+                        table.pattern
+                    ));
+                }
+                if !clean(&table.target_subdir)
+                    || table.target_subdir.split('/').any(|c| c == ".incoming")
+                {
+                    errors.push(format!(
+                        "{who} has target_subdir {:?} — it must be a path under the target's \
+                         mount, relative, with no empty, '.', '..' or '.incoming' component",
+                        table.target_subdir
+                    ));
+                    continue;
+                }
+                for (label, dir) in &btrbk_dirs {
+                    if overlap(dir, &table.target_subdir) {
+                        errors.push(format!(
+                            "{who} has target_subdir {:?}, which is or is inside or holds \
+                             {dir:?}, where source '{label}' sends its snapshots and expiry \
+                             deletes them",
+                            table.target_subdir
+                        ));
+                    }
+                }
+                for (other_label, j, other_dir) in &tables {
+                    if overlap(other_dir, &table.target_subdir) {
+                        errors.push(format!(
+                            "{who} has target_subdir {:?}, which is or is inside or holds the \
+                             target_subdir {other_dir:?} of [[source.static]] #{} of source \
+                             '{other_label}' — two tables must never judge one directory",
+                            table.target_subdir,
+                            j + 1
+                        ));
+                    }
+                }
+                tables.push((src.label.as_str(), i, table.target_subdir.as_str()));
             }
         }
         errors
@@ -3910,6 +4029,112 @@ mod tests {
             cfg.sources[0].snapshot_dir = ok.into();
             assert!(cfg.validate().is_empty(), "{ok}: {:?}", cfg.validate());
         }
+    }
+
+    // -- [[source.static]] (bd DAS-Backup-Manager-5237.8) ------------------------
+
+    fn static_table(dir: &str, pattern: &str, target_subdir: &str) -> StaticSubvolumes {
+        StaticSubvolumes {
+            dir: dir.into(),
+            pattern: pattern.into(),
+            target_subdir: target_subdir.into(),
+        }
+    }
+
+    fn static_config(table: StaticSubvolumes) -> Config {
+        let mut cfg = top_level_config("");
+        cfg.sources[0].static_subvolumes = vec![table];
+        cfg
+    }
+
+    #[test]
+    fn validate_accepts_static_tables_with_generic_names() {
+        let mut cfg = static_config(static_table(
+            ".snapshots",
+            "*.pristine-*",
+            "static/vm-pristines",
+        ));
+        cfg.sources[0]
+            .static_subvolumes
+            .push(static_table("a/b/", "gold-?", "static/gold"));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        // A table round-trips through a saved file.
+        let again = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(again.sources[0].static_subvolumes.len(), 2);
+    }
+
+    #[test]
+    fn validate_refuses_a_static_dir_that_leaves_the_volume_or_is_not_one_level_clean() {
+        for bad in ["", "/x", ".", "..", "a/..", "a//b", "./x", "a\nb", "../x"] {
+            let errors = static_config(static_table(bad, "x*", "static/x")).validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(errors[0].contains("[[source.static]]") && errors[0].contains("dir"));
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_static_pattern_that_is_not_a_name_glob() {
+        for bad in ["", "a/b", "*", "?*", "**", "a\nb"] {
+            let errors = static_config(static_table(".snapshots", bad, "static/x")).validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(errors[0].contains("pattern"), "{bad:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_static_target_subdir_that_is_not_a_clean_relative_path() {
+        for bad in [
+            "", "/x", ".", "..", "a/../b", "a//b", ".incoming", "x/.incoming", "x/.incoming/y",
+        ] {
+            let errors = static_config(static_table(".snapshots", "x*", bad)).validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(errors[0].contains("target_subdir"), "{bad:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_static_target_subdir_inside_or_holding_any_btrbk_directory() {
+        // Source "s" has no target_subdirs, so it sends to `s`.
+        for bad in ["s", "s/", "s/vm", "s/a/b"] {
+            let errors = static_config(static_table(".snapshots", "x*", bad)).validate();
+            assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
+            assert!(errors[0].contains("expiry deletes"), "{bad:?}: {errors:?}");
+        }
+        // With target_subdirs, every entry counts, not only the first; and a
+        // directory that holds one is as bad as one inside it.
+        let mut cfg = static_config(static_table(".snapshots", "x*", "nvme/deep"));
+        cfg.sources[0].target_subdirs = vec!["first".into(), "nvme".into()];
+        assert_eq!(cfg.validate().len(), 1, "{:?}", cfg.validate());
+        cfg.sources[0].static_subvolumes[0].target_subdir = "nv".into();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        cfg.sources[0].target_subdirs = vec!["static/deep".into()];
+        cfg.sources[0].static_subvolumes[0].target_subdir = "static".into();
+        assert_eq!(cfg.validate().len(), 1, "{:?}", cfg.validate());
+        // Another source's directory counts too, whichever targets either has.
+        let mut cfg = top_level_config(&primary_only("o", "/other", &[("data", None)]));
+        cfg.sources[0].static_subvolumes = vec![static_table(".snapshots", "x*", "o")];
+        assert_eq!(cfg.validate().len(), 1, "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_refuses_two_static_tables_sharing_or_nesting_a_target_subdir() {
+        for second in ["static/a", "static/a/b", "static", "static/a/"] {
+            let mut cfg = static_config(static_table(".snapshots", "x*", "static/a"));
+            cfg.sources[0]
+                .static_subvolumes
+                .push(static_table(".snapshots", "y*", second));
+            let errors = cfg.validate();
+            assert_eq!(errors.len(), 1, "{second:?}: {errors:?}");
+            assert!(errors[0].contains("judge one directory"), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_static_dir_that_is_btrbks_own_snapshot_dir() {
+        let mut cfg = static_config(static_table(".btrbk-snapshots", "x*", "static/x"));
+        assert_eq!(cfg.validate().len(), 1, "{:?}", cfg.validate());
+        cfg.sources[0].snapshot_dir = "snaps".into();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
     #[test]
