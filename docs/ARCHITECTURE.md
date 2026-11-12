@@ -297,6 +297,11 @@ lock held by reading, never by trying it: the holder's record in the lock file n
 process, or `/proc/locks` lists a flock on the file. Calls that arrive while a `HealthQuery()`
 reply is being made share that reply.
 
+**Recovery OS reading** (bd `DAS-Backup-Manager-5237.21`): the same rule. A mirror target is read
+live only when it is mounted and no job holds the targets; while one does, the helper answers from
+the record the last run kept (`recovery_os::health_reading`), and a drive with no record is said to
+be held, not unmounted.
+
 ### Indexing Pipeline
 
 ```text

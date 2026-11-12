@@ -1306,16 +1306,18 @@ pub fn get_health_with(
         .unwrap_or_default();
     times.record("growth log", growth_start.elapsed());
 
-    // 6b. Recovery OSes: read live while a drive is mounted, otherwise the
-    // record the last backup run kept. The host (uname, pacman) is probed only
-    // when there is a reading to compare it with.
+    // 6b. Recovery OSes: read live while a drive is mounted and no job holds
+    // the targets, otherwise the record the last backup run kept (a live read
+    // of a drive btrbk is receiving into took 10-11 s). The host (uname,
+    // pacman) is probed only when there is a reading to compare it with.
     let recovery = times.time("recovery OS", || {
-        crate::recovery_os::health_with(
+        crate::recovery_os::health_reading(
             config,
             &crate::recovery_os::load_state(&crate::recovery_os::state_path()),
             &crate::recovery_os::host_versions,
             &crate::caldate::today(),
             &is_mountpoint,
+            targets_busy,
         )
     });
     warnings.extend(recovery.warnings);

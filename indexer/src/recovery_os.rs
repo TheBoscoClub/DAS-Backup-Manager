@@ -1973,14 +1973,34 @@ pub fn health_with(
     today: &str,
     is_mounted: &dyn Fn(&Path) -> bool,
 ) -> RecoveryHealth {
+    health_reading(cfg, state, probe_host, today, is_mounted, false)
+}
+
+/// [`health_with`], told whether a running job holds the targets. While one
+/// does, no drive is read, mounted or not: every mirror target is answered
+/// from the stored record, and a line that has none says the drive is held
+/// rather than "not mounted".
+pub fn health_reading(
+    cfg: &Config,
+    state: &Result<Option<StoredState>, String>,
+    probe_host: &dyn Fn() -> HostVersions,
+    today: &str,
+    is_mounted: &dyn Fn(&Path) -> bool,
+    held: bool,
+) -> RecoveryHealth {
     let mut h = RecoveryHealth::default();
+    let absent = if held {
+        "held by a running job"
+    } else {
+        "not mounted"
+    };
     let max = cfg.recovery_os.max_age_days;
     let mut state_reported = false;
     let host_cell = std::cell::OnceCell::new();
     let host = || host_cell.get_or_init(probe_host);
     for t in cfg.targets.iter().filter(|t| t.role == TargetRole::Mirror) {
         let label = &t.label;
-        if is_mounted(Path::new(&t.mount)) {
+        if !held && is_mounted(Path::new(&t.mount)) {
             match read_drive(&os_root(&t.mount), host(), today, max) {
                 Ok((os, assessment)) => {
                     h.lines.push(summary(label, "live", &os, &assessment));
@@ -1998,7 +2018,7 @@ pub fn health_with(
         let stored = match state {
             Err(err) => {
                 h.lines.push(format!(
-                    "{label}: not mounted; stored record unreadable: {err}"
+                    "{label}: {absent}; stored record unreadable: {err}"
                 ));
                 if !state_reported {
                     h.warnings
@@ -2011,8 +2031,7 @@ pub fn health_with(
         };
         match stored {
             None => {
-                h.lines
-                    .push(format!("{label}: not mounted and never checked"));
+                h.lines.push(format!("{label}: {absent} and never checked"));
                 h.warnings
                     .push(format!("Recovery OS on '{label}' has never been checked"));
             }
@@ -5255,6 +5274,55 @@ mod tests {
                  btrfs-progs 6.10-1 is older than the host's 6.17-1",
                 "Recovery OS on 'C' could not be read: not a directory",
                 "Recovery OS on 'D' has never been checked",
+            ]
+        );
+    }
+
+    #[test]
+    fn health_reads_no_drive_while_a_job_holds_the_targets() {
+        // The mount point exists and holds nothing readable as an OS: a live
+        // read of it would answer "OS root unreadable".
+        let a = tempfile::tempdir().unwrap();
+        let cfg = mirror_config(&[("A", a.path().to_str().unwrap()), ("D", "/nonexistent/d")]);
+        let mut drives = BTreeMap::new();
+        drives.insert(
+            "A".into(),
+            StoredDrive {
+                checked_epoch: 0,
+                mount_uuid: None,
+                os: Some(os_with(Some(&days_before(TODAY, 2)), &["7.2.1"])),
+                error: None,
+            },
+        );
+        let state = Ok(Some(StoredState {
+            schema_version: STATE_SCHEMA_VERSION,
+            drives,
+        }));
+        let h = health_reading(&cfg, &state, &|| host("7.2.8"), TODAY, &|_| true, true);
+        assert_eq!(
+            h.lines,
+            [
+                "A (as of 1970-01-01 00:00 UTC): installed unknown, last full upgrade \
+                 2026-09-30, age 2 days since last applied upgrade, kernel 7.2.1, enabled \
+                 timers none, btrbk at boot no — current",
+                "D: held by a running job and never checked",
+            ]
+        );
+        assert_eq!(h.warnings, ["Recovery OS on 'D' has never been checked"]);
+
+        let h = health_reading(
+            &cfg,
+            &Err("bad json".into()),
+            &|| host("7.2.8"),
+            TODAY,
+            &|_| true,
+            true,
+        );
+        assert_eq!(
+            h.lines,
+            [
+                "A: held by a running job; stored record unreadable: bad json",
+                "D: held by a running job; stored record unreadable: bad json",
             ]
         );
     }
