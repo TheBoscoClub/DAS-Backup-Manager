@@ -649,10 +649,7 @@ void HealthDashboard::updateStatus(const QString &json)
 
     // Last backup age
     const qint64 ageSecs = services.value(QLatin1String("last_backup_age_secs")).toInteger(-1);
-    const QString ageStr = StatusText::lastBackupLine(
-        ageSecs,
-        services.value(QLatin1String("last_backup_reading_age_secs")).toInteger(-1),
-        services.value(QLatin1String("targets_busy")).toBool());
+    const QString ageStr = StatusText::lastBackupLine(ageSecs);
     if (ageSecs > qint64{48} * 3600) {
         m_lastBackupLabel->setText(
             QStringLiteral("<span style=\"color:#CC0000;\">%1</span>").arg(ageStr.toHtmlEscaped()));

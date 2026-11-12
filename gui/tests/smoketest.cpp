@@ -1805,19 +1805,14 @@ private Q_SLOTS:
                  QStringLiteral("DB: 2.0 KiB | 7 snapshots"));
     }
 
-    // The dashboard's Last Backup line says when its figure is a kept reading
-    // or missing because a job holds the targets (bd DAS-Backup-Manager-5237.16)
-    void lastBackupLineNamesAKeptOrWithheldReading()
+    // The dashboard's Last Backup line is the age of the newest successful
+    // run in the history, whatever the targets are doing
+    // (bd DAS-Backup-Manager-5237.18)
+    void lastBackupLineIsTheAgeOfTheLastSuccessfulRun()
     {
-        QCOMPARE(StatusText::lastBackupLine(7200, -1, false), QStringLiteral("2 hours ago"));
-        QCOMPARE(StatusText::lastBackupLine(300, -1, false), QStringLiteral("5 minutes ago"));
-        QCOMPARE(StatusText::lastBackupLine(-1, -1, false), QStringLiteral("Unknown"));
-        // Read live although a job is running elsewhere: nothing to add
-        QCOMPARE(StatusText::lastBackupLine(7200, -1, true), QStringLiteral("2 hours ago"));
-        QCOMPARE(StatusText::lastBackupLine(7200, 900, true),
-                 QStringLiteral("2 hours ago (read 15 minutes ago; a job is using the targets)"));
-        QCOMPARE(StatusText::lastBackupLine(-1, -1, true),
-                 QStringLiteral("Unknown (a job is using the targets)"));
+        QCOMPARE(StatusText::lastBackupLine(7200), QStringLiteral("2 hours ago"));
+        QCOMPARE(StatusText::lastBackupLine(300), QStringLiteral("5 minutes ago"));
+        QCOMPARE(StatusText::lastBackupLine(-1), QStringLiteral("Unknown"));
     }
 
     // --- Live-panel findings (Task 8, 2026-10-09) ----------------------------

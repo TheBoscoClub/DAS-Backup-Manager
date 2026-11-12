@@ -2101,7 +2101,6 @@ impl HelperInterface {
                         "timer_next": timer_next,
                         "last_backup": report.last_backup,
                         "last_backup_age_secs": last_backup_age_secs,
-                        "last_backup_reading_age_secs": report.last_backup_reading_age_secs,
                         "targets_busy": report.targets_busy,
                         "drives_mounted": drives_mounted,
                     },

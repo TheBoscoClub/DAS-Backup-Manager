@@ -49,19 +49,11 @@ StatusText StatusText::assemble(const QString &statsJson, const QString &schedul
     };
 }
 
-QString StatusText::lastBackupLine(qint64 ageSecs, qint64 readingAgeSecs, bool targetsBusy)
+QString StatusText::lastBackupLine(qint64 ageSecs)
 {
-    if (ageSecs < 0) {
-        return targetsBusy ? i18n("Unknown (a job is using the targets)") : i18n("Unknown");
-    }
+    if (ageSecs < 0)
+        return i18n("Unknown");
     const qint64 hours = ageSecs / 3600;
-    const QString age = hours > 0 ? i18n("%1 hours ago", hours)
-                                  : i18n("%1 minutes ago", (ageSecs % 3600) / 60);
-    if (readingAgeSecs < 0)
-        return age;
-    // A kept reading: the helper did not walk the targets for this reply.
-    const qint64 readHours = readingAgeSecs / 3600;
-    const QString read = readHours > 0 ? i18n("%1 hours ago", readHours)
-                                       : i18n("%1 minutes ago", (readingAgeSecs % 3600) / 60);
-    return i18n("%1 (read %2; a job is using the targets)", age, read);
+    return hours > 0 ? i18n("%1 hours ago", hours)
+                     : i18n("%1 minutes ago", (ageSecs % 3600) / 60);
 }

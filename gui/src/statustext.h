@@ -16,9 +16,7 @@ struct StatusText {
                                const QString &healthJson, const QStringList &failed);
 
     // The dashboard's "Last Backup" line from a HealthQuery reply's
-    // `services`: the age of the newest snapshot (ageSecs, -1 unknown), and,
-    // when the helper did not walk the targets because a job holds them, that
-    // the figure is a kept reading and how old (readingAgeSecs, -1 when read
-    // for this reply), or why there is none (bd DAS-Backup-Manager-5237.16).
-    static QString lastBackupLine(qint64 ageSecs, qint64 readingAgeSecs, bool targetsBusy);
+    // `services.last_backup_age_secs`: how long ago the newest successful run
+    // ended (-1: none recorded, or the history could not be read).
+    static QString lastBackupLine(qint64 ageSecs);
 };

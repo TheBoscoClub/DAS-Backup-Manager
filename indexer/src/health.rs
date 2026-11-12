@@ -351,10 +351,11 @@ pub struct GrowthPoint {
 pub struct HealthReport {
     pub status: HealthStatus,
     pub targets: Vec<TargetHealth>,
+    /// When the newest successful backup run ended (`YYYY-MM-DD HH:MM`,
+    /// UTC), from the run history: known with every target unmounted. `None`
+    /// when no run has succeeded yet or the history could not be read (then
+    /// a warning says so) (bd DAS-Backup-Manager-5237.18).
     pub last_backup: Option<String>,
-    /// Age of the oldest kept reading `last_backup` rests on; `None` when
-    /// every target that answered was read for this report.
-    pub last_backup_reading_age_secs: Option<u64>,
     /// A backup, scrub or other job held the targets, so their snapshot
     /// directories were not walked (bd DAS-Backup-Manager-5237.16).
     pub targets_busy: bool,
@@ -757,19 +758,13 @@ pub struct SnapshotReading {
     /// Directories named as btrbk names a snapshot, one level below the
     /// target's top level.
     pub count: usize,
-    /// The newest modification time among them, seconds since the epoch.
-    pub newest_epoch: Option<u64>,
 }
 
-/// Walk `mount` once for both numbers: the snapshot count and the newest
-/// snapshot's time (two walks before bd DAS-Backup-Manager-5237.16). `None`
-/// when the target's top level cannot be listed — not a count of 0.
+/// Walk `mount` once for its snapshot count. `None` when the target's top
+/// level cannot be listed — not a count of 0.
 pub fn read_snapshots(mount: &str) -> Option<SnapshotReading> {
     let source_entries = fs::read_dir(Path::new(mount)).ok()?;
-    let mut reading = SnapshotReading {
-        count: 0,
-        newest_epoch: None,
-    };
+    let mut reading = SnapshotReading { count: 0 };
     // One level of subdirectories (source dirs like "nvme", "ssd").
     for source_entry in source_entries.flatten() {
         if !source_entry
@@ -787,17 +782,6 @@ pub fn read_snapshots(mount: &str) -> Option<SnapshotReading> {
                 continue;
             }
             reading.count += 1;
-            let modified = snap_entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            if let Some(secs) = modified
-                && reading.newest_epoch.is_none_or(|prev| secs > prev)
-            {
-                reading.newest_epoch = Some(secs);
-            }
         }
     }
     Some(reading)
@@ -1111,8 +1095,6 @@ pub fn get_health_with(
     targets_busy: bool,
     snapshots: &dyn Fn(&str, &str) -> SnapshotAnswer,
 ) -> Result<HealthReport, Box<dyn std::error::Error>> {
-    let mut newest_epoch: Option<u64> = None;
-    let mut last_backup_reading_age_secs: Option<u64> = None;
     let mut target_healths: Vec<TargetHealth> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_mounts: Vec<String> = Vec::new();
@@ -1180,7 +1162,7 @@ pub fn get_health_with(
         let (total_bytes, used_bytes) = usage.unwrap_or((0, 0));
 
         // 3. Get snapshot count (using effective mount path)
-        // One pass gives the count and the newest snapshot's time.
+        // One pass gives the count.
         let answer = if mounted {
             times.time(format!("{label} snapshots"), || {
                 snapshots(label, &effective_path)
@@ -1192,10 +1174,6 @@ pub fn get_health_with(
             }
         };
         let snapshot_count = answer.reading.map(|r| r.count);
-        if let Some(secs) = answer.reading.and_then(|r| r.newest_epoch) {
-            newest_epoch = newest_epoch.max(Some(secs));
-            last_backup_reading_age_secs = last_backup_reading_age_secs.max(answer.kept_age_secs);
-        }
 
         // 4. Get SMART details of every configured drive (use -d sat for
         // USB-attached SATA drives); a RAID-1 pair is two (bd uhi).
@@ -1359,17 +1337,27 @@ pub fn get_health_with(
     });
     warnings.extend(recovery.warnings);
 
+    // 6c. Last backup: when the newest successful run ended, from the run
+    // history. A history that cannot be read is a warning, never "no backup".
+    let last_backup = match times.time("run history", || {
+        crate::db::newest_successful_run_read_only(Path::new(&config.general.db_path))
+    }) {
+        Ok(ended) => ended
+            .and_then(|secs| u64::try_from(secs).ok())
+            .map(format_epoch_minutes),
+        Err(why) => {
+            warnings.push(format!("Backup history could not be read: {why}"));
+            None
+        }
+    };
+
     // 7. Determine overall status
     let status = determine_status(&target_healths, &warnings);
-
-    // 8. Last backup time: the newest snapshot the targets' passes found.
-    let last_backup = newest_epoch.map(format_epoch_minutes);
 
     Ok(HealthReport {
         status,
         targets: target_healths,
         last_backup,
-        last_backup_reading_age_secs,
         targets_busy,
         growth_points,
         warnings,
@@ -1443,36 +1431,31 @@ mod tests {
 
     // --- bd DAS-Backup-Manager-5237.16: kept snapshot readings ---
 
-    fn reading(count: usize, newest: u64) -> SnapshotReading {
-        SnapshotReading {
-            count,
-            newest_epoch: Some(newest),
-        }
+    fn reading(count: usize) -> SnapshotReading {
+        SnapshotReading { count }
     }
 
     #[test]
     fn a_busy_target_is_served_its_kept_reading_with_its_age_and_is_not_walked() {
         let kept = KeptSnapshots::default();
-        let free = kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
-            Some(reading(12, 900))
-        });
+        let free = kept.answer("primary", "/mnt/p", false, 1_000, &|_| Some(reading(12)));
         assert_eq!(
             free,
             SnapshotAnswer {
-                reading: Some(reading(12, 900)),
+                reading: Some(reading(12)),
                 kept_age_secs: None
             }
         );
         let walked = std::cell::Cell::new(false);
         let busy = kept.answer("primary", "/mnt/p", true, 1_240, &|_| {
             walked.set(true);
-            Some(reading(99, 1_200))
+            Some(reading(99))
         });
         assert!(!walked.get(), "a target a job holds must not be walked");
         assert_eq!(
             busy,
             SnapshotAnswer {
-                reading: Some(reading(12, 900)),
+                reading: Some(reading(12)),
                 kept_age_secs: Some(240)
             }
         );
@@ -1481,7 +1464,7 @@ mod tests {
     #[test]
     fn a_busy_target_with_no_kept_reading_is_unknown_and_another_targets_is_not_lent() {
         let kept = KeptSnapshots::default();
-        kept.answer("other", "/mnt/o", false, 1_000, &|_| Some(reading(3, 800)));
+        kept.answer("other", "/mnt/o", false, 1_000, &|_| Some(reading(3)));
         let busy = kept.answer("primary", "/mnt/p", true, 1_240, &|_| {
             panic!("walked a target a job holds")
         });
@@ -1497,46 +1480,33 @@ mod tests {
     #[test]
     fn a_walk_that_cannot_read_keeps_the_earlier_reading() {
         let kept = KeptSnapshots::default();
-        kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
-            Some(reading(12, 900))
-        });
+        kept.answer("primary", "/mnt/p", false, 1_000, &|_| Some(reading(12)));
         let failed = kept.answer("primary", "/mnt/p", false, 1_100, &|_| None);
         assert_eq!(
             failed.reading, None,
             "this answer is unknown, not the old one"
         );
         let busy = kept.answer("primary", "/mnt/p", true, 1_300, &|_| None);
-        assert_eq!(busy.reading, Some(reading(12, 900)));
+        assert_eq!(busy.reading, Some(reading(12)));
         assert_eq!(busy.kept_age_secs, Some(300));
     }
 
-    fn set_mtime(path: &Path, epoch: u64) {
-        let dir = fs::File::open(path).unwrap();
-        dir.set_modified(UNIX_EPOCH + Duration::from_secs(epoch))
-            .unwrap();
-    }
-
     #[test]
-    fn one_pass_counts_the_snapshots_and_finds_the_newest() {
+    fn one_pass_counts_the_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        for (name, mtime) in [
-            ("nvme/root.20261101T0300", 1_000_000),
-            ("nvme/root.20261102T030001", 3_000_000),
-            ("ssd/vm.20261101T0300", 2_000_000),
-            ("ssd/not-a-snapshot", 9_000_000),
+        for name in [
+            "nvme/root.20261101T0300",
+            "nvme/root.20261102T030001",
+            "ssd/vm.20261101T0300",
+            "ssd/not-a-snapshot",
         ] {
-            let path = dir.path().join(name);
-            fs::create_dir_all(&path).unwrap();
-            set_mtime(&path, mtime);
+            fs::create_dir_all(dir.path().join(name)).unwrap();
         }
         // A plain file at the top level is no source directory.
         fs::write(dir.path().join("stray.20261101T0300"), "").unwrap();
         assert_eq!(
             read_snapshots(&dir.path().to_string_lossy()),
-            Some(SnapshotReading {
-                count: 3,
-                newest_epoch: Some(3_000_000)
-            })
+            Some(SnapshotReading { count: 3 })
         );
     }
 
@@ -1545,10 +1515,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             read_snapshots(&dir.path().to_string_lossy()),
-            Some(SnapshotReading {
-                count: 0,
-                newest_epoch: None
-            })
+            Some(SnapshotReading { count: 0 })
         );
         assert_eq!(
             read_snapshots(&dir.path().join("gone").to_string_lossy()),
@@ -1631,15 +1598,13 @@ mod tests {
     #[test]
     fn a_kept_reading_of_a_target_gone_from_the_config_is_dropped() {
         let kept = KeptSnapshots::default();
-        kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
-            Some(reading(3, 800))
-        });
-        kept.answer("gone", "/mnt/g", false, 1_000, &|_| Some(reading(5, 900)));
+        kept.answer("primary", "/mnt/p", false, 1_000, &|_| Some(reading(3)));
+        kept.answer("gone", "/mnt/g", false, 1_000, &|_| Some(reading(5)));
         kept.keep_only(&["primary"]);
         let gone = kept.answer("gone", "/mnt/g", true, 1_100, &|_| None);
         assert_eq!(gone.reading, None);
         let primary = kept.answer("primary", "/mnt/p", true, 1_100, &|_| None);
-        assert_eq!(primary.reading, Some(reading(3, 800)));
+        assert_eq!(primary.reading, Some(reading(3)));
     }
 
     #[test]
@@ -1722,7 +1687,7 @@ mod tests {
 [general]
 version = "0.4.0"
 install_prefix = "/usr/local"
-db_path = "/var/lib/das-backup/backup-index.db"
+db_path = "{d}/index.db"
 growth_log = "{d}/growth.log"
 [init]
 system = "systemd"
@@ -1763,11 +1728,49 @@ daily = 7
             names.contains(&"noserial mount") && names.contains(&"recovery OS"),
             "{names:?}"
         );
-        // The newest snapshot comes from each target's one pass, not from a
-        // second walk of every target (bd DAS-Backup-Manager-5237.16).
-        assert!(!names.contains(&"last backup"), "{names:?}");
         assert!(report.targets.iter().all(|t| t.snapshot_count.is_none()));
+        // No history file yet: no backup, and nothing to warn about.
+        assert!(names.contains(&"run history"), "{names:?}");
         assert_eq!(report.last_backup, None);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("history")),
+            "{:?}",
+            report.warnings
+        );
+
+        // With every target unmounted the figure still comes: the newest
+        // successful run's end, passing over a later failed run
+        // (bd DAS-Backup-Manager-5237.18).
+        let db = crate::db::Database::open(dir.path().join("index.db")).unwrap();
+        for (timestamp, success) in [(3_000_000, true), (3_100_000, false)] {
+            db.insert_backup_run(&crate::db::NewBackupRun {
+                timestamp,
+                success,
+                mode: "incremental",
+                snaps_created: Some(1),
+                snaps_sent: Some(1),
+                bytes_sent: Some(1),
+                duration_secs: 1,
+                errors: &[],
+            })
+            .unwrap();
+        }
+        drop(db);
+        let report = get_health_timed(&config, &mut StepTimes::default()).unwrap();
+        assert_eq!(report.last_backup.as_deref(), Some("1970-02-04 17:20"));
+
+        // A history that cannot be read is said, not shown as "no backup".
+        fs::write(dir.path().join("index.db"), "not a database").unwrap();
+        let report = get_health_timed(&config, &mut StepTimes::default()).unwrap();
+        assert_eq!(report.last_backup, None);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("Backup history could not be read: ")),
+            "{:?}",
+            report.warnings
+        );
         assert!(
             report
                 .targets

@@ -619,8 +619,9 @@ mod tests {
 
     #[test]
     fn a_one_step_stage_starts_uncounted_and_a_counted_one_at_zero() {
-        assert_eq!(ProgressEvent::stage_percent(1), ProgressEvent::UNCOUNTED);
-        assert_eq!(ProgressEvent::stage_percent(0), ProgressEvent::UNCOUNTED);
+        // -1 on the wire: the GUI shows any negative percentage as busy.
+        assert_eq!(ProgressEvent::stage_percent(1), -1);
+        assert_eq!(ProgressEvent::stage_percent(0), -1);
         assert_eq!(ProgressEvent::stage_percent(2), 0);
         assert_eq!(ProgressEvent::stage_percent(469), 0);
     }

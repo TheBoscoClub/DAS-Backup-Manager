@@ -1630,6 +1630,21 @@ pub fn newest_backup_run_read_only(path: &Path) -> Result<Option<i64>, String> {
     }
 }
 
+/// The time (Unix seconds) the newest SUCCESSFUL backup run ended, read as
+/// [`newest_backup_run_read_only`] reads: a failed run is not a backup.
+pub fn newest_successful_run_read_only(path: &Path) -> Result<Option<i64>, String> {
+    match open_read_only(path)? {
+        None => Ok(None),
+        Some(conn) => conn
+            .query_row(
+                "SELECT MAX(timestamp) FROM backup_runs WHERE success != 0",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
 /// The coverage baseline at `path`, read without creating or migrating
 /// anything: `None` when the file is absent, older than schema 5, or holds
 /// no recorded check; `Err` when it cannot be opened or read.
@@ -3241,6 +3256,34 @@ mod tests {
         assert_eq!(history[0].errors[0], "btrbk failed");
         assert_eq!(history[0].errors[1], "target offline");
         assert_eq!(history[0].id, id);
+    }
+
+    #[test]
+    fn the_newest_successful_run_passes_over_a_later_failed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        assert_eq!(newest_successful_run_read_only(&path), Ok(None), "no file");
+        let db = Database::open(&path).unwrap();
+        assert_eq!(newest_successful_run_read_only(&path), Ok(None), "no run");
+        for (timestamp, success) in [(100, true), (200, false)] {
+            db.insert_backup_run(&NewBackupRun {
+                timestamp,
+                success,
+                mode: "incremental",
+                snaps_created: Some(1),
+                snaps_sent: Some(1),
+                bytes_sent: Some(1),
+                duration_secs: 1,
+                errors: &[],
+            })
+            .unwrap();
+        }
+        assert_eq!(newest_successful_run_read_only(&path), Ok(Some(100)));
+        assert_eq!(newest_backup_run_read_only(&path), Ok(Some(200)));
+        // A file that is no database is an error, never "no backup yet".
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, "not a database").unwrap();
+        assert!(newest_successful_run_read_only(&junk).is_err());
     }
 
     #[test]
