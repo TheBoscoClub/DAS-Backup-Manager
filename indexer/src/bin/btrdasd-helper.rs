@@ -1916,7 +1916,23 @@ impl HelperInterface {
                 // While a job holds the targets their snapshot directories are
                 // not walked: each target's kept reading is served, with its age
                 // (bd DAS-Backup-Manager-5237.16).
-                let busy = times.time("lock table", health::targets_held_by_a_job);
+                // A lock whose state cannot be read counts as held; said once,
+                // or the dashboard reads "a job is using the targets" with no
+                // job and nothing in the journal (bd DAS-Backup-Manager-5237.19).
+                let busy = times
+                    .time("lock table", health::targets_hold_state)
+                    .unwrap_or_else(|why| {
+                        static SAID: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "btrdasd-helper: treating the targets as held by a job: {why}"
+                            );
+                        }
+                        true
+                    });
+                let labels: Vec<&str> = config.targets.iter().map(|t| t.label.as_str()).collect();
+                kept.keep_only(&labels);
                 let now_epoch = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())

@@ -93,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - While the backup singleton or the maintenance lock is held the helper answers every `role = "mirror"` target from the record the last run kept, dated as that record is (`as of <time>`); a drive with no record reads `held by a running job and never checked` instead of `not mounted and never checked` — `recovery_os::health_reading`
   - `btrdasd health` and a run's own report read the drives live, as before
 
+- **The helper says why it treats the targets as held when it cannot read a lock** (bd `DAS-Backup-Manager-5237.19`): a lock file that could not be looked at, a holder's record that could not be read, or an unreadable `/proc/locks` counts as held — the cautious answer — but left the dashboard reading `a job is using the targets` with no job running and nothing in the journal
+  - The first such reply writes one line to the helper's journal, `treating the targets as held by a job: <reason>` — `health::lock_file_state`, `health::targets_hold_state`
+  - A kept snapshot reading of a target no longer in `config.toml` is dropped at the next reply, no longer kept until the helper exits
+
 - **`btrdasd setup --modify` no longer proposes a second copy of the configured sources** (bd `DAS-Backup-Manager-5237.17`): the wizard's source step offered every detected subvolume again, all ticked, and pushed them as a new source beside the configured ones — Enter through the step on a one-source installation ended with two sources listing `@` and `@home` twice — and with no subvolume detected it required a new source to be typed before it would go on
   - With sources configured the step now shows them (label, volume, subvolumes), points to `btrdasd subvol add` / `subvol remove` for changing one, and asks `Add another source?`, defaulting to no
   - Asked for one, it offers only detected subvolumes no source lists yet; when every detected one is listed the new source is entered by hand

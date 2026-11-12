@@ -863,6 +863,15 @@ impl KeptSnapshots {
             kept_age_secs: None,
         }
     }
+
+    /// Drops every kept reading whose target label is not in `labels`: a
+    /// target removed from the configuration.
+    pub fn keep_only(&self, labels: &[&str]) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|label, _| labels.contains(&label.as_str()));
+    }
 }
 
 /// Whether some process holds a `flock` on the file with this device and
@@ -905,34 +914,62 @@ const LOCK_TABLE_READS: usize = 3;
 /// file that does not exist is not held; anything that cannot be read counts
 /// as held, so the caller does not walk a target it could not show to be free.
 pub fn lock_file_held(path: &Path) -> bool {
+    lock_file_state(path).unwrap_or(true)
+}
+
+/// [`lock_file_held`], with the reason when the lock's state could not be
+/// read and so counts as held.
+pub fn lock_file_state(path: &Path) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot look at {}: {e}", path.display())),
     };
-    match crate::maintenance::recorded_holder_runs(path) {
-        Ok(false) => {}
-        Ok(true) | Err(_) => return true,
+    if crate::maintenance::recorded_holder_runs(path)
+        .map_err(|e| format!("cannot read the holder's record in {}: {e}", path.display()))?
+    {
+        return Ok(true);
     }
-    (0..LOCK_TABLE_READS).any(|_| match fs::read_to_string("/proc/locks") {
-        Ok(table) => flock_listed(&table, meta.dev(), meta.ino()),
-        Err(_) => true,
-    })
+    for _ in 0..LOCK_TABLE_READS {
+        let table = fs::read_to_string("/proc/locks")
+            .map_err(|e| format!("cannot read /proc/locks: {e}"))?;
+        if flock_listed(&table, meta.dev(), meta.ino()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a job holds the backup targets: the backup singleton or the
 /// maintenance lock is held (backup, scrub, doctor, reconcile, walk, restore).
-pub fn targets_held_by_a_job() -> bool {
-    any_lock_held(&[
+/// `Err` when neither is known to be held and one could not be read: the
+/// caller treats that as held, and has the reason to log.
+pub fn targets_hold_state() -> Result<bool, String> {
+    any_lock_state(&[
         Path::new(crate::backup::BACKUP_LOCK_PATH),
         Path::new(scrub::MAINTENANCE_LOCK_PATH),
     ])
 }
 
+/// Whether any of the lock files at `paths` is held; `Err` with the first
+/// reason when none is known held and one could not be read.
+fn any_lock_state(paths: &[&Path]) -> Result<bool, String> {
+    let mut unreadable = None;
+    for path in paths {
+        match lock_file_state(path) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(why) => unreadable = unreadable.or(Some(why)),
+        }
+    }
+    unreadable.map_or(Ok(false), Err)
+}
+
 /// Whether any of the lock files at `paths` is held.
+#[cfg(test)]
 fn any_lock_held(paths: &[&Path]) -> bool {
-    paths.iter().any(|path| lock_file_held(path))
+    any_lock_state(paths).unwrap_or(true)
 }
 
 /// `secs` since the epoch as `YYYY-MM-DD HH:MM` (UTC), without chrono.
@@ -1564,6 +1601,45 @@ mod tests {
         // A record that cannot be read counts as held.
         fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(lock_file_held(&path));
+    }
+
+    #[test]
+    fn a_lock_whose_state_cannot_be_read_is_held_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("das.lock");
+        assert_eq!(lock_file_state(&path), Ok(false), "no file, no holder");
+        fs::write(&path, format!("backup-run.sh pid {}\n", std::process::id())).unwrap();
+        assert_eq!(lock_file_state(&path), Ok(true));
+        // A record that is not text.
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        let why = lock_file_state(&path).unwrap_err();
+        assert!(why.contains("das.lock") && why.contains("record"), "{why}");
+        assert!(lock_file_held(&path));
+        // A path under a regular file: the stat fails, and not as "no such file".
+        let under = path.join("das.lock");
+        let why = lock_file_state(&under).unwrap_err();
+        assert!(why.contains("cannot look at"), "{why}");
+        assert!(lock_file_held(&under));
+        // Among several locks: one known held outranks one that cannot be
+        // read; otherwise the unreadable one is the answer, with its reason.
+        let free = dir.path().join("free.lock");
+        assert!(any_lock_state(&[&free, &under]).is_err());
+        fs::write(&free, format!("btrdasd pid {}\n", std::process::id())).unwrap();
+        assert_eq!(any_lock_state(&[&under, &free]), Ok(true));
+    }
+
+    #[test]
+    fn a_kept_reading_of_a_target_gone_from_the_config_is_dropped() {
+        let kept = KeptSnapshots::default();
+        kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
+            Some(reading(3, 800))
+        });
+        kept.answer("gone", "/mnt/g", false, 1_000, &|_| Some(reading(5, 900)));
+        kept.keep_only(&["primary"]);
+        let gone = kept.answer("gone", "/mnt/g", true, 1_100, &|_| None);
+        assert_eq!(gone.reading, None);
+        let primary = kept.answer("primary", "/mnt/p", true, 1_100, &|_| None);
+        assert_eq!(primary.reading, Some(reading(3, 800)));
     }
 
     #[test]
