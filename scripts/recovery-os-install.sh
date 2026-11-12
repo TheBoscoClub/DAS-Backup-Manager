@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.1
+# Version: 1.5.2
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -486,12 +486,21 @@ Exec=sh -c 'notify-send -t 0 "DAS recovery disk" "$(cat /run/das-recovery-state/
 OnlyShowIn=KDE;
 EOF
     if ((${#LOCAL_DOC_FILES[@]} > 0)); then
-        mkdir -p "$TARGET$LOCAL_DOCS_DEST"
+        # Ownership goes to root by name, never recursively: the destination
+        # is a configured path, and one that names a directory already there
+        # (/etc, a home) must keep its owner and every other file in it
+        # (bd DAS-Backup-Manager-5237.13).
+        local -a owned=()
+        if [[ ! -d "$TARGET$LOCAL_DOCS_DEST" ]]; then
+            mkdir -p "$TARGET$LOCAL_DOCS_DEST" || cannot "cannot create $LOCAL_DOCS_DEST"
+            owned+=("$LOCAL_DOCS_DEST")
+        fi
         for f in "${LOCAL_DOC_FILES[@]}"; do
             cp -- "$f" "$TARGET$LOCAL_DOCS_DEST/${f##*/}" || cannot "cannot install the local document ${f##*/}"
             chmod 0644 "$TARGET$LOCAL_DOCS_DEST/${f##*/}"
+            owned+=("$LOCAL_DOCS_DEST/${f##*/}")
         done
-        "$CHROOT" "$TARGET" chown -R root:root "$LOCAL_DOCS_DEST" || cannot "chown of $LOCAL_DOCS_DEST failed"
+        "$CHROOT" "$TARGET" chown root:root -- "${owned[@]}" || cannot "chown of the local documents in $LOCAL_DOCS_DEST failed"
         say "package: ${#LOCAL_DOC_FILES[@]} local document(s) installed at $LOCAL_DOCS_DEST"
     fi
     ln -sfn "$(doc_path EMERGENCY-QUICK-REFERENCE.md)" "$TARGET$desk/Quick Reference — PRINT THIS.md"

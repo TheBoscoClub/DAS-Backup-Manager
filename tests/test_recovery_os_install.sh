@@ -410,11 +410,22 @@ check "local docs: exit 0" test "$RC" -eq 0
 check "local docs: the quick reference installed" has "$R/mnt/target/etc/das-backup-docs/EMERGENCY-QUICK-REFERENCE.md" "filled-in quick reference"
 check "local docs: the guide installed" has "$R/mnt/target/etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md" "filled-in guide"
 check "local docs: mode 0644" test "$(stat -c %a "$R/mnt/target/etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md")" = 644
-check "local docs: owned by root in the chroot" has "$LOG" "arch-chroot $R/mnt/target chown -R root:root /etc/das-backup-docs"
+check "local docs: the directory it made and the files it copied are given to root, by name" has "$LOG" "arch-chroot $R/mnt/target chown root:root -- /etc/das-backup-docs /etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md /etc/das-backup-docs/EMERGENCY-QUICK-REFERENCE.md"
+check "local docs: no recursive chown" test "$(calls 'chown -R')" = 0
 check "local docs: nothing at the old /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
 check "local docs: only *.md installed" test ! -e "$R/mnt/target/etc/das-backup-docs/notes.txt"
 check "local docs: Quick Reference link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Quick Reference — PRINT THIS.md")" = /etc/das-backup-docs/EMERGENCY-QUICK-REFERENCE.md
 check "local docs: Recovery Guide link to the local copy" test "$(readlink "$R/mnt/target/home/recovery/Desktop/Recovery Guide.md")" = /etc/das-backup-docs/DISASTER-RECOVERY-GUIDE.md
+
+echo "== package: a destination that already exists keeps its owner and its other files (bd 5237.13)"
+package_fixture
+mkdir -p "$R/mnt/target/etc"
+printf 'filled-in guide\n' >"$R/payload/docs/DISASTER-RECOVERY-GUIDE.md"
+run package DAS_INSTALL_LOCAL_DOCS="$R/payload/docs" DAS_INSTALL_LOCAL_DOCS_DEST=/etc
+check "existing destination: exit 0" test "$RC" -eq 0
+check "existing destination: only the copied file is given to root" has "$LOG" "arch-chroot $R/mnt/target chown root:root -- /etc/DISASTER-RECOVERY-GUIDE.md"
+check "existing destination: the directory itself is not named" test "$(calls 'chown root:root -- /etc ')" = 0
+check "existing destination: no recursive chown" test "$(calls 'chown -R')" = 0
 check "local docs: a document with no local copy keeps the package's" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
 package_fixture
 printf 'x\n' >"$WORK/elsewhere.md"

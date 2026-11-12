@@ -106,6 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The helper's `JobProgress` signal carries `-1` as the percentage at the start of a one-step stage (`ProgressEvent::stage_percent`); the panel shows the bar busy until a counted event or the job's end; a stage with steps to count starts at 0 as before
   - The signal's signature is unchanged, and an older GUI shows `-1` as 0%, as it did
 
+- **Installing the local recovery documents on a recovery drive changes the owner of those documents only** (bd `DAS-Backup-Manager-5237.13`): `recovery-os-install.sh` (1.5.2) ran `chown -R root:root` on the configured destination, so a `[recovery_os].local_docs_dir` naming a directory already on the drive (`/etc`, a home directory) had everything in it given to root
+  - The files it copied are given to root by name, and the directory only when the script created it; nothing is changed recursively
+  - A documents move that fails during `setup --upgrade` (a destination on another filesystem, a missing parent directory) is a refusal like the others: the upgrade still retires old units and restarts the helper before it exits non-zero, and no `Migrating config:` line is printed for a change that was not saved
+
 - **`btrdasd setup --modify` no longer proposes a second copy of the configured sources** (bd `DAS-Backup-Manager-5237.17`): the wizard's source step offered every detected subvolume again, all ticked, and pushed them as a new source beside the configured ones — Enter through the step on a one-source installation ended with two sources listing `@` and `@home` twice — and with no subvolume detected it required a new source to be typed before it would go on
   - With sources configured the step now shows them (label, volume, subvolumes), points to `btrdasd subvol add` / `subvol remove` for changing one, and asks `Add another source?`, defaulting to no
   - Asked for one, it offers only detected subvolumes no source lists yet; when every detected one is listed the new source is entered by hand

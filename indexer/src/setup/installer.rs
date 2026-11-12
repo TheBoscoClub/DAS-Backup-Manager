@@ -1670,6 +1670,24 @@ fn prepare_upgrade(
             Err(why) => (Some(why), None),
         },
     };
+    // The move is made first of all the changes, and one that fails is a
+    // refusal like the others: nothing is said as migrated, and the upgrade
+    // still retires old units and restarts the helper (bd
+    // DAS-Backup-Manager-5237.13).
+    let (refused, moved) = match (refused, docs_move) {
+        (None, Some((from, to))) => match std::fs::rename(&from, &to) {
+            Ok(()) => (None, Some((from, to))),
+            Err(e) => (
+                Some(format!(
+                    "cannot move {} to {} ({e}) — nothing was changed; move it by hand (a different filesystem needs a copy) and run the upgrade again",
+                    from.display(),
+                    to.display()
+                )),
+                None,
+            ),
+        },
+        (refused, _) => (refused, None),
+    };
     if let Some(why) = refused {
         for change in &migrations {
             say(format!(
@@ -1684,14 +1702,7 @@ fn prepare_upgrade(
     for change in &migrations {
         say(format!("Migrating config: {change}"));
     }
-    if let Some((from, to)) = docs_move {
-        std::fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "cannot move {} to {} ({e}) — nothing was changed; move it by hand (a different filesystem needs a copy) and run the upgrade again",
-                from.display(),
-                to.display()
-            )
-        })?;
+    if let Some((from, to)) = moved {
         say(format!(
             "Moved the local recovery documents {} -> {}",
             from.display(),
@@ -3791,6 +3802,64 @@ auth = "starttls""#,
             etc.join("docs"),
             root.join("etc/das-backup-docs"),
         )
+    }
+
+    /// A move that fails (here: the destination's parent is missing; across
+    /// filesystems it is EXDEV) is a refusal like the others, not an error
+    /// that ends the upgrade before it retires old units and restarts the
+    /// helper; nothing is said as migrated or moved (bd 5237.13).
+    #[test]
+    fn a_documents_move_that_fails_is_a_refusal_and_says_nothing_was_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, legacy, _) = legacy_docs_site(dir.path());
+        let mut config = Config::load(&config_path).unwrap();
+        let dest = dir.path().join("no-such-parent/docs");
+        config.recovery_os.local_docs_dir = Some(dest.to_string_lossy().into_owned());
+        config.save(&config_path).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut lines = Vec::new();
+        let prepared = prepare_upgrade(&config_path, &|_| true, &mut |l| lines.push(l))
+            .unwrap_or_else(|e| panic!("ended by an error, not a refusal: {e}"));
+        let why = prepared.refused.expect("refused");
+        assert!(
+            why.contains("cannot move") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Migrating config:") || l.starts_with("Moved ")),
+            "{lines:?}"
+        );
+        assert!(legacy.join("quick.md").exists());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    }
+
+    /// The two lookups of the move refuse on an error that is not "no such
+    /// file", and a destination that is a dangling link counts as there.
+    #[test]
+    fn a_documents_move_refuses_what_it_cannot_look_at_and_a_dangling_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, legacy, dest) = legacy_docs_site(dir.path());
+        let config = Config::load(&config_path).unwrap();
+        // The legacy path under a regular file: ENOTDIR, not NotFound.
+        let under_a_file = config_path.join("config.toml");
+        let why = plan_docs_move(&config, &under_a_file).unwrap_err();
+        assert!(why.starts_with("cannot look at "), "{why}");
+        // The destination under a regular file.
+        let mut odd = Config::load(&config_path).unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        odd.recovery_os.local_docs_dir = Some(file.join("docs").to_string_lossy().into_owned());
+        let why = plan_docs_move(&odd, &config_path).unwrap_err();
+        assert!(why.starts_with("cannot look at "), "{why}");
+        // A dangling link at the destination is something already there.
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dest).unwrap();
+        let why = plan_docs_move(&config, &config_path).unwrap_err();
+        assert!(why.contains("both exist"), "{why}");
+        assert!(legacy.join("quick.md").exists());
     }
 
     /// `setup --upgrade` moves the documents out of the config's directory to
