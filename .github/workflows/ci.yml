@@ -238,6 +238,28 @@ jobs:
           echo "checking $count files"
           git ls-files -z -- . ':!.beads' | xargs -0 codespell
 
+  yaml:
+    name: YAML — yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned, as codespell is. Settings live in the tracked .yamllint.
+      - name: Install yamllint
+        run: pipx install yamllint==1.38.0
+
+      - name: yamllint
+        run: |
+          count=$(git ls-files -- '.github/*.yml' '.github/*.yaml' | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "no workflow files listed — failing rather than silently passing"
+            exit 1
+          fi
+          echo "checking $count files"
+          yamllint --strict .github/
+
   markdown:
     name: Markdown — markdownlint
     runs-on: ubuntu-latest

@@ -134,8 +134,9 @@ pyproject.toml
 .eslintrc.*
 .editorconfig
 .stylua.toml
-.yamllint
 .yamllint.yml
+# .yamllint is tracked: CI runs yamllint with it. A local .yamllint.yml would not
+# shadow it (yamllint reads .yamllint first).
 # .markdownlint.* is tracked: CI runs markdownlint (github.md "does CI read this file?")
 setup.cfg
 

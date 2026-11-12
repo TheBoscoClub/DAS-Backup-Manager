@@ -1,0 +1,16 @@
+---
+# yamllint configuration (`yamllint .github/`): the defaults, with two
+# deliberate relaxations for GitHub Actions workflows.
+extends: default
+
+rules:
+  # Workflow `run:` blocks carry long shell lines (error messages, URLs) that
+  # cannot be wrapped without changing the command; 80 columns is too tight.
+  line-length:
+    max: 150
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+  # `on:` is the GitHub Actions trigger key; yamllint's truthy check reads it
+  # as a boolean. Values are still checked (true/false only).
+  truthy:
+    check-keys: false
