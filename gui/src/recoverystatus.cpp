@@ -282,7 +282,7 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
         a.upgrade = refused(why);
     } else if (g.unattended) {
         a.upgrade = allowed(QStringLiteral("Update %1 now, unattended: the recovery OS boots in its VM and "
-                                           "upgrades itself through its guest agent, then powers off")
+                                           "upgrades itself through its guest agent, then shuts down in its VM")
                                 .arg(d.displayName));
     } else {
         a.upgrade = allowed(QStringLiteral("Update %1 now, attended: the recovery OS boots in its VM and the "
@@ -335,7 +335,7 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
     else if (d.session->by.startsWith(QLatin1String("unit:")))
         a.endSession = refused(QStringLiteral("a scheduled session is running; it gives the drive back itself"));
     else
-        a.endSession = allowed(QStringLiteral("Give %1 back: power off its VM if it still runs, remove the "
+        a.endSession = allowed(QStringLiteral("Give %1 back: shut down its VM if it still runs, remove the "
                                               "guard and the console bridge, release the lock")
                                    .arg(d.displayName));
 

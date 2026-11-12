@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI no longer says "power off" for shutting the recovery OS down in its VM** (bd `DAS-Backup-Manager-coyx`): the operator read it as turning off the drive or the DAS enclosure, which stays on
+  - The attended-session confirmation now says to shut the recovery OS down inside its VM (the drive stays on); the End session tooltip, the Update tooltip and the Unattended radio's tooltip say "shut down … in its VM" where they said "power off"
+  - The operator messages in `scripts/recovery-os-vm.sh` (`power the recovery OS off`, `waiting for the recovery OS to power off`) are not the GUI's and are unchanged here
+
 - **The GUI's health reply no longer waits on targets a job is using** (bd `DAS-Backup-Manager-5237.16`): with the GUI open while btrbk received onto the targets, `HealthQuery` replies took up to 443 s — 16 over the 10 s warning in twelve minutes — because every reply walked each target's snapshot directories twice (once to count, once more with a `stat` per snapshot for the newest), and each waiting call did both walks itself
   - While the backup singleton or the maintenance lock is held the helper walks no target: it serves each target's last snapshot count with its age, or unknown when it has none — `health::KeptSnapshots`
   - Whether a lock is held is read, never tried: a probe that took the lock for an instant could make a backup's own non-blocking attempt lose and skip the run. Held means the lock file's record names a running holder (every job records `<job> pid <pid>`), or the kernel's lock table lists a flock on the file (`/proc/locks`, by device and inode, read three times: one reading can skip an entry while other locks on the host come and go); a record or table that cannot be read counts as held — `health::lock_file_held`, `maintenance::recorded_holder_runs`

@@ -130,7 +130,7 @@ void RecoveryPanel::buildControls()
     m_attended->setChecked(true);
     m_unattended = new QRadioButton(i18n("Unattended"), this);
     m_unattended->setObjectName(QStringLiteral("unattended"));
-    m_unattended->setToolTip(i18n("The recovery OS upgrades itself through its guest agent and powers off; "
+    m_unattended->setToolTip(i18n("The recovery OS upgrades itself through its guest agent and shuts down in its VM; "
                                   "needs the agent installed and started at boot, and no 'will' record"));
     row->addWidget(m_attended);
     row->addWidget(m_unattended);
@@ -458,7 +458,7 @@ void RecoveryPanel::onUpgrade()
         if (!will.isEmpty()
             && !m_confirm(i18n("This recovery OS runs btrbk at boot"),
                           i18n("%1: %2\n\nThe session boots it under the guard. At the console, disable what "
-                               "the record's reasons name before you power off. Continue?",
+                               "the record's reasons name before you shut the recovery OS down inside its VM (the drive stays on). Continue?",
                                will.join(QStringLiteral(", ")), Banner)))
             return;
     }
