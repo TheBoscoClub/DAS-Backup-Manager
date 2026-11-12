@@ -4108,6 +4108,30 @@ mod tests {
     }
 
     #[test]
+    fn two_sources_on_one_volume_listing_a_boot_subvolume_are_refused_boot_step_on_or_off() {
+        // The same volume named by two sources is still two series in two
+        // target directories (bd DAS-Backup-Manager-5237.15).
+        let two = format!(
+            "{}{}{ONE_TARGET}",
+            source_with("os", "/vol-a", &[("@", None)]),
+            source_with("os-again", "/vol-a", &[("@", None)])
+        );
+        let mut cfg = Config::from_toml(&minimal_toml(&two)).unwrap();
+        cfg.boot.subvolumes = vec!["@".into()];
+        let errors = cfg.boot_input_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("os, os-again"),
+            "both sources named: {errors:?}"
+        );
+        // Refused whatever [boot].enabled says: a config that validates with
+        // the step off must not start failing the day it is switched on.
+        cfg.boot.enabled = false;
+        assert_eq!(cfg.boot_input_errors(), errors);
+        assert!(cfg.validate().contains(&errors[0]));
+    }
+
+    #[test]
     fn save_writes_a_missing_file_fresh_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
