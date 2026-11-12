@@ -27,6 +27,10 @@ WHAT IT ENFORCES
     3. The check itself ran      (a missing/!unreadable outcomes.json is a
                                   FAILURE, never a pass — a check that cannot
                                   report failure is not a check)
+    3b. Every generated mutant has an outcome (caught + missed + timeout +
+       unviable == total_mutants): a run stopped early is not scored
+    1b reads debug.log, unviable mutants' logs and logs no outcome names;
+       a caught mutant's log is test output and is not read
 
 RULE 0, added 2026-09-01 (cachyos-sentinel m4wn)
     cargo-mutants copies the tree to its own scratch directory PER MUTANT and
@@ -131,9 +135,33 @@ def fail(msg: str) -> "int":
     return 1
 
 
-def exhausted_logs(outcomes_path: str) -> "list[str]":
-    """Names of mutant logs next to outcomes.json that show resource exhaustion."""
+# Outcomes whose log holds a test run's output, not a build death. A caught
+# mutant's log quotes its failing assertion, which may be an exhaustion message
+# a test simulates on purpose (DAS-Backup-Manager 2kb1.10: an assertion on
+# 'No space left on device' failed two shards). cargo-mutants files a build
+# that died of exhaustion under "unviable"; a missed or timed-out mutant fails
+# the gate by rule 1 whatever its log says.
+RAN_ITS_TESTS = {"CaughtMutant", "MissedMutant", "Timeout", "Success"}
+
+
+def exhausted_logs(outcomes_path: str, outcomes=None) -> "list[str]":
+    """Names of logs next to outcomes.json that show resource exhaustion.
+
+    Read: debug.log, and every file under log/ except those `outcomes` names
+    as the log of a scenario that ran its tests. A log no outcome names (a
+    mutant the run never finished) is read; with no usable outcomes list,
+    every log is.
+    """
     out_dir = os.path.dirname(os.path.abspath(outcomes_path))
+    skip = set()
+    if isinstance(outcomes, list):
+        for o in outcomes:
+            if (
+                isinstance(o, dict)
+                and o.get("summary") in RAN_ITS_TESTS
+                and isinstance(o.get("log_path"), str)
+            ):
+                skip.add(os.path.normpath(os.path.join(out_dir, o["log_path"])))
     candidates = [os.path.join(out_dir, "debug.log")]
     log_dir = os.path.join(out_dir, "log")
     if os.path.isdir(log_dir):
@@ -141,6 +169,8 @@ def exhausted_logs(outcomes_path: str) -> "list[str]":
             candidates.extend(os.path.join(root, f) for f in sorted(files))
     hits = []
     for path in candidates:
+        if os.path.normpath(path) in skip:
+            continue
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 if log_shows_exhaustion(fh):
@@ -234,8 +264,21 @@ def main() -> int:
                     "reads a file outside the crate directory)."
                 )
 
+    # Rule 3b — a run stopped early (step timeout, kill) leaves an outcomes.json
+    # counting only the mutants it reached; with none of those missed, the
+    # rules below would pass a fraction of the scope (DAS-Backup-Manager
+    # 2kb1.9). Every generated mutant must have an outcome.
+    accounted = caught + missed + timeout + unviable
+    if accounted != total:
+        return fail(
+            f"{tag}outcomes.json accounts for {accounted} of {total} generated "
+            "mutant(s). The run stopped before testing them all (a step "
+            "timeout, a kill) or its counters are inconsistent; a partial run "
+            "is not evidence for the scope. Re-run it to completion."
+        )
+
     # Rule 1b — resource exhaustion hides inside "unviable".
-    exhausted = exhausted_logs(args.outcomes)
+    exhausted = exhausted_logs(args.outcomes, outcomes)
     if exhausted:
         return fail(
             f"{tag}resource exhaustion (disk full / out of memory) in "
