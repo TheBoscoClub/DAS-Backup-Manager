@@ -436,3 +436,31 @@ QString scheduleWords(const ScheduleView &s)
 {
     return QStringLiteral("%1: %2").arg(s.state, s.detail);
 }
+
+QString shutDownInVmWords()
+{
+    return QStringLiteral("Shut down the recovery OS inside its VM window (Shut Down in its menu, or sudo poweroff in it); "
+                          "the drive and the enclosure stay on.");
+}
+
+namespace {
+const QLatin1String KeptPrefix("kept (exit 3)");
+}
+
+bool sessionKept(const QString &summary)
+{
+    return summary.startsWith(KeptPrefix);
+}
+
+QString keptWords(const QString &summary, bool cancelled)
+{
+    QString detail = summary.mid(KeptPrefix.size());
+    if (detail.startsWith(QLatin1String(": ")))
+        detail = detail.mid(2);
+    QString words = QStringLiteral("%1: the recovery OS is still running in its VM. %2 Then press End session in the "
+                                   "Recovery OS panel to give the drive back.")
+                        .arg(cancelled ? QStringLiteral("Cancelled") : QStringLiteral("Kept"), shutDownInVmWords());
+    if (!detail.isEmpty())
+        words += QStringLiteral(" The session said: %1").arg(detail);
+    return words;
+}

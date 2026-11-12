@@ -154,3 +154,21 @@ QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch); // "3 days ago" 
 QString verdictWords(const QString &verdict);                   // will | may | no | "" → unknown
 QString sessionWords(const SessionView &s, qint64 nowEpoch);
 QString scheduleWords(const ScheduleView &s); // "<state>: <detail>"
+
+// What to tell the operator to do with a recovery OS that is still running in
+// its VM; one sentence, so every place says it the same way. It names the VM
+// and says the drive stays on: "power off" read as turning the drive or the
+// DAS enclosure off (bd DAS-Backup-Manager-coyx).
+QString shutDownInVmWords();
+
+// A session job's summary that began `kept (exit 3)`: the script left the
+// recovery OS running in its VM, its claim and lock with a holder
+// (recovery_os::session::SessionOutcome::summary). Not a failure of the
+// job, and not over until the OS is shut down and the session ended
+// (bd DAS-Backup-Manager-z5od).
+bool sessionKept(const QString &summary);
+// The operator's words for it: what state the drive is in and how to give it
+// back. `cancelled`: this window asked for the cancel. The script's own
+// closing lines follow, as the summary carried them.
+QString keptWords(const QString &summary, bool cancelled);
+

@@ -1,5 +1,6 @@
 #include "progresspanel.h"
 #include "dbusclient.h"
+#include "recoverystatus.h"
 
 #include <QFontDatabase>
 #include <QHBoxLayout>
@@ -34,12 +35,14 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     QFont boldFont = m_operationLabel->font();
     boldFont.setBold(true);
     m_operationLabel->setFont(boldFont);
+    m_operationLabel->setObjectName(QStringLiteral("operationLabel"));
 
     // A stage or summary can be thousands of characters (a cancelled
     // recovery-OS session joins every last line of its script). Unwrapped,
     // that length became the dock's minimum width and pushed the main
     // window past four screens: wrap it, and let the window set the width.
     m_stageLabel = new QLabel(this);
+    m_stageLabel->setObjectName(QStringLiteral("stageLabel"));
     m_stageLabel->setWordWrap(true);
     m_stageLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
@@ -136,6 +139,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
 void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     m_currentJobId = jobId;
+    m_cancelRequested = false;
     m_operationLabel->setText(operation);
     m_coverageButton->setVisible(false);
     m_stageLabel->clear();
@@ -253,6 +257,15 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
         m_operationLabel->setText(tr("Complete"));
         m_stageLabel->setText(summary);
         m_stageLabel->setToolTip(summary);
+    } else if (sessionKept(summary)) {
+        // The script left the recovery OS running on purpose (exit 3): not a
+        // failure, and not over until the operator shuts it down and ends the
+        // session (bd DAS-Backup-Manager-z5od).
+        const QString words = keptWords(summary, m_cancelRequested);
+        m_operationLabel->setText(m_cancelRequested ? tr("Cancelled, recovery OS still running")
+                                                    : tr("Kept, recovery OS still running"));
+        m_stageLabel->setText(words);
+        m_stageLabel->setToolTip(words);
     } else {
         // Error styling: red text on the progress bar
         m_progressBar->setStyleSheet(
@@ -287,6 +300,7 @@ void ProgressPanel::cancelJob()
 
 void ProgressPanel::showCancelRequested()
 {
+    m_cancelRequested = true;
     m_cancelButton->setText(tr("Cancelling…"));
     m_cancelButton->setToolTip(
         tr("Cancel requested — the job stops at its next safe point, after "

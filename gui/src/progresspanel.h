@@ -52,6 +52,7 @@ private:
     QLabel *m_stageLabel = nullptr;
     QLabel *m_throughputLabel = nullptr;
     QLabel *m_etaLabel = nullptr;
+    bool m_cancelRequested = false;
     QProgressBar *m_progressBar = nullptr;
     QPushButton *m_cancelButton = nullptr;
     QPushButton *m_coverageButton = nullptr;

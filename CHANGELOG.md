@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI shows a recovery-OS session left running as kept, not failed** (bd `DAS-Backup-Manager-z5od`): cancelling an attended session made the script keep the recovery OS running (exit 3), and the progress panel showed a red `Failed` bar the operator read as "the cancel failed"
+  - A session job whose summary begins `kept (exit 3)` shows `Cancelled, recovery OS still running` (this window asked for the cancel) or `Kept, recovery OS still running`, no red bar, and says the OS is still running in its VM, how to shut it down (the drive and the enclosure stay on) and to press End session; the script's own closing lines follow — `sessionKept`, `keptWords`. The Recovery OS panel's status line says the same instead of `Failed: …`
+  - End session was already allowed once the job is over (the session is then held by a process, not a job); other exit codes still show `Failed`
+
 - **The GUI no longer says "power off" for shutting the recovery OS down in its VM** (bd `DAS-Backup-Manager-coyx`): the operator read it as turning off the drive or the DAS enclosure, which stays on
   - The attended-session confirmation now says to shut the recovery OS down inside its VM (the drive stays on); the End session tooltip, the Update tooltip and the Unattended radio's tooltip say "shut down … in its VM" where they said "power off"
   - The operator messages in `scripts/recovery-os-vm.sh` (`power the recovery OS off`, `waiting for the recovery OS to power off`) are not the GUI's and are unchanged here

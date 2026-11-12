@@ -586,6 +586,8 @@ void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QStr
     m_ownJobId.clear();
     if (success)
         m_status->setText(i18n("Done: %1", summary));
+    else if (sessionKept(summary))
+        m_status->setText(keptWords(summary, false));
     else if (summary.startsWith(QLatin1String("warnings:")))
         m_status->setText(i18n("Needs a look: %1", summary));
     else

@@ -287,13 +287,67 @@ private Q_SLOTS:
                  qPrintable(QStringLiteral("summary width %1").arg(panel.minimumSizeHint().width())));
 
         // Still all there to read: wrapped in the label, whole in its tooltip.
+        // (a kept session's summary is shown as the words for it, script lines whole)
+        const QString shownText = keptWords(summary, false);
         QLabel *shown = nullptr;
         for (auto *label : panel.findChildren<QLabel *>())
-            if (label->text() == summary)
+            if (label->text() == shownText)
                 shown = label;
         QVERIFY(shown != nullptr);
         QVERIFY(shown->wordWrap());
-        QCOMPARE(shown->toolTip(), summary);
+        QCOMPARE(shown->toolTip(), shownText);
+        QVERIFY(shownText.contains(summary.mid(QStringLiteral("kept (exit 3): ").size())));
+    }
+
+    // --- recovery-OS session words (bd DAS-Backup-Manager-coyx, z5od, 343p) --
+
+    void aKeptSessionIsNotAFailureAndSaysHowToGiveTheDriveBack()
+    {
+        const QString kept = QStringLiteral("kept (exit 3): the recovery OS is still running; A skipped");
+        QVERIFY(sessionKept(kept));
+        QVERIFY(!sessionKept(QStringLiteral("failed (exit 3): x")));
+        QVERIFY(!sessionKept(QStringLiteral("stopped at upgrade (exit 7): x")));
+        QVERIFY(!sessionKept(QStringLiteral("clean")));
+
+        const QString words = keptWords(kept, true);
+        QVERIFY2(words.startsWith(QStringLiteral("Cancelled")), qPrintable(words));
+        QVERIFY(keptWords(kept, false).startsWith(QStringLiteral("Kept")));
+        QVERIFY(words.contains(QStringLiteral("still running in its VM")));
+        QVERIFY(words.contains(shutDownInVmWords()));
+        QVERIFY(words.contains(QStringLiteral("End session")));
+        QVERIFY(words.contains(QStringLiteral("A skipped"))); // the script's own lines stay
+        QVERIFY(!words.contains(QStringLiteral("Failed")));
+
+        // The one instruction names the VM and says the drive stays on.
+        QVERIFY(shutDownInVmWords().contains(QStringLiteral("inside its VM")));
+        QVERIFY(shutDownInVmWords().contains(QStringLiteral("drive and the enclosure stay on")));
+    }
+
+    void theProgressPanelShowsAKeptSessionAsKeptNotFailed()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        const QString kept = QStringLiteral("kept (exit 3): the recovery OS is still running");
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.showCancelRequested();
+        panel.onJobFinished(QStringLiteral("job-1"), false, kept);
+        QLabel *op = panel.findChild<QLabel *>(QStringLiteral("operationLabel"));
+        QLabel *stage = panel.findChild<QLabel *>(QStringLiteral("stageLabel"));
+        auto *bar = panel.findChild<QProgressBar *>();
+        QVERIFY(op && stage && bar);
+        QVERIFY2(op->text() != QStringLiteral("Failed"), qPrintable(op->text()));
+        QVERIFY2(op->text().startsWith(QStringLiteral("Cancelled")), qPrintable(op->text()));
+        QVERIFY2(stage->text().contains(QStringLiteral("still running in its VM")), qPrintable(stage->text()));
+        QVERIFY(!bar->styleSheet().contains(QStringLiteral("#cc0000"))); // no red bar
+
+        // Not cancelled here: Kept; and a real failure still fails.
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-2"), false, kept);
+        QVERIFY2(op->text().startsWith(QStringLiteral("Kept")), qPrintable(op->text()));
+        panel.onJobStarted(QStringLiteral("job-3"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-3"), false, QStringLiteral("stopped at upgrade (exit 7): x"));
+        QCOMPARE(op->text(), QStringLiteral("Failed"));
+        QVERIFY(bar->styleSheet().contains(QStringLiteral("#cc0000")));
     }
 
     // --- backup history: an unknown count is "unknown", never 0 -------------
@@ -1596,6 +1650,21 @@ private Q_SLOTS:
         QVERIFY(panel.facts().ownJobId.isEmpty());
         panel.onJobStarted(QStringLiteral("job-6"), QStringLiteral("Recovery OS session"));
         QVERIFY(panel.facts().ownJobId.isEmpty());
+    }
+
+    void aKeptSessionIsNeitherFailedNorDoneInTheRecoveryPanel()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        requestSession(panel, p);
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("kept (exit 3): B is still running"));
+        const QString line = panel.statusLine();
+        QVERIFY2(!line.startsWith(QStringLiteral("Failed")), qPrintable(line));
+        QVERIFY2(line.contains(QStringLiteral("still running in its VM")), qPrintable(line));
+        QVERIFY2(line.contains(QStringLiteral("End session")), qPrintable(line));
     }
 
     void thePanelKnowsItsOwnJobAndItsAttendedness()
