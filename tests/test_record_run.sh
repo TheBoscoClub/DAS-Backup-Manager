@@ -35,7 +35,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in decide_run_counts parse_btrbk_run_log run_sent_nothing record_run_args usage_delta record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status generate_report; do
+for fn in decide_run_counts parse_btrbk_run_log run_sent_nothing record_run_args usage_delta record_backup_run_in_db report_unrecorded_run record_op any_op_is run_status subject_status next_scheduled generate_report; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -191,6 +191,11 @@ check "bzw: an unusable log is a FAIL before any status is read" "${OP_STATUS[bt
 check "bzw: so the run status is FAILURE" "$(run_status)" "FAILURE"
 report="$(generate_report)"
 check "bzw: the report says FAILURES DETECTED" "$(grep -c '^  Status: FAILURES DETECTED$' <<<"$report")" "1"
+# The stubbed systemctl answers nothing, so the real next_scheduled says
+# "unknown"; a report line built from a function the suite forgot to extract
+# would read "Next scheduled: " and print "command not found" (bd yu9z).
+check "yu9z: the report names the next run, from the real next_scheduled" \
+    "$(grep -c '^  Next scheduled: unknown$' <<<"$report")" "1"
 check "bzw: and names the counters" \
     "$(grep -c '^  Snapshot counts       FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' <<<"$report")" "1"
 record_run_args "$(run_status)" false
