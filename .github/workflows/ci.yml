@@ -8,8 +8,9 @@
 # This exists because CodeQL's default setup neither builds nor tests, so the repo
 # could show all-green checks over a broken build (bd DAS-Backup-Manager-b14).
 #
-# Actions are referenced by the same tags used in release-packages.yml so the two
-# stay in step and Dependabot's github_actions ecosystem updates both together.
+# Actions are pinned by commit SHA, the version in a trailing comment, the same
+# in release-packages.yml; Dependabot's github_actions ecosystem updates the SHA
+# and the comment of both together.
 #
 # Every package install in the Arch jobs goes through
 # .github/scripts/pacman-install.sh, which retries a bounded number of times:
@@ -191,6 +192,26 @@ jobs:
           fi
           printf 'checking %s\n' "${files[@]}"
           shellcheck "${files[@]}"
+
+  deny:
+    name: Dependencies — cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo-deny reads `cargo metadata`, so cargo comes with it. The policy,
+      # including the licence allow list, is indexer/deny.toml; it checks every
+      # feature, the D-Bus helper's dependencies included. The RustSec database
+      # is fetched at run time, so a new advisory fails the next run on its own.
+      - name: Install cargo-deny
+        run: .github/scripts/pacman-install.sh cargo-deny rust
+
+      - name: cargo deny check
+        working-directory: indexer
+        run: cargo deny check advisories bans licenses sources
 
   spelling:
     name: Spelling — codespell

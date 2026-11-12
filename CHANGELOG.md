@@ -81,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `release-packages.yml`'s two rustup installs (`.deb` and AppImage jobs) download a pinned `rustup-init` from the versioned archive and run it only after `sha256sum -c` accepts the digest committed in the workflow, instead of `curl https://sh.rustup.rs | sh`
   - `.github/dependabot.yml` gives both ecosystems `cooldown: default-days: 7`; security updates are not delayed by it
 
+- **CI runs `cargo deny check` on every push** (bd `DAS-Backup-Manager-t54k`): nothing in `.github/workflows` ran a RustSec check, so an advisory reached `main` unseen unless Dependabot raised it
+  - New `deny` job in `ci.yml` runs `cargo deny check advisories bans licenses sources` in `indexer/`, with cargo-deny from the Arch repository; the policy is the new `indexer/deny.toml` — permissive licences only (`MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`, `Unicode-3.0`, `Unlicense`, `Zlib`), crates.io as the only registry, no git sources, yanked crates refused, and no advisory ignored
+  - The graph is checked with every feature on, so the D-Bus helper's dependencies (`zbus`, `tokio`) are covered, not just the default build
+
 ### Removed
 
 - **`DAS_TARGET_<n>_RETENTION_{DAILY,WEEKLY,MONTHLY,YEARLY}` from `btrdasd config dump-env`** (bd `DAS-Backup-Manager-9yj`): exported since 2026-02-21 and read by nothing — retention reaches btrbk through the rendered `btrbk.conf`, and the one retention a script reads, `DAS_BOOT_ARCHIVE_RETENTION_DAYS`, is still exported

@@ -1,0 +1,42 @@
+# cargo-deny policy for the `buttered_dasd` crate (CI job `deny` in
+# .github/workflows/ci.yml; locally: `cd indexer && cargo deny check`).
+#
+# Advisories come from the RustSec database. A real advisory is fixed (a
+# patched version, or a replacement crate), never silenced here: an `ignore`
+# entry needs the advisory id, why it does not apply, and a tracking issue.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Everything the dependency tree carries today is permissive. `r-efi` is
+# `LGPL-2.1-or-later OR MIT OR Apache-2.0`, satisfied by MIT, so no copyleft
+# licence is allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate (hashbrown, syn) are reported, not refused.
+multiple-versions = "warn"
+wildcards = "deny"
+# The crate's own `[dev-dependencies]` self-reference is a path dependency.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
