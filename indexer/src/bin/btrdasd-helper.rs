@@ -1068,11 +1068,43 @@ impl panel::PanelReads for SystemPanelReads {
 const HELPER_PATH: &str = "/org/dasbackup/Helper1";
 const HELPER_NAME: &str = "org.dasbackup.Helper1";
 
+/// One reply shared by every call that waited for it (bd
+/// DAS-Backup-Manager-5237.16: the status bar and the dashboard each ask, and
+/// while a reading was slow each waiting call took the whole reading again).
+#[derive(Default)]
+struct SharedReply(Mutex<Option<(std::time::Instant, String)>>);
+
+impl SharedReply {
+    /// The reply `take` makes — or, for a call that arrived while another's
+    /// `take` was running, that one's reply. A failed `take` is shared with
+    /// nobody: the next call in line takes its own.
+    async fn get<F, Fut>(&self, take: F) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let arrived = std::time::Instant::now();
+        let mut last = self.0.lock().await;
+        if let Some((made, reply)) = &*last
+            && *made >= arrived
+        {
+            return Ok(reply.clone());
+        }
+        let reply = take().await?;
+        *last = Some((std::time::Instant::now(), reply.clone()));
+        Ok(reply)
+    }
+}
+
 struct HelperInterface {
     jobs: JobMap,
     conn: Connection,
     stats_cache: StatsCache,
     stats_refresh_in_flight: StatsRefreshSet,
+    /// The last snapshot reading of each target, served while a job holds
+    /// the targets (bd DAS-Backup-Manager-5237.16).
+    kept_snapshots: Arc<health::KeptSnapshots>,
+    health_reply: Arc<SharedReply>,
 }
 
 #[interface(name = "org.dasbackup.Helper1")]
@@ -1871,181 +1903,201 @@ impl HelperInterface {
         // reflect the actual mount state so the user sees which targets are
         // available vs disconnected.
         let handed_over = std::time::Instant::now();
-        let json_str = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut times = health::StepTimes::default();
-            times.record("polkit", polkit_took);
-            // Both outside get_health_timed, so a slow one would show only as
-            // untimed (bd DAS-Backup-Manager-tobl).
-            times.record("config load", load_took);
-            times.record("queued", handed_over.elapsed());
-            let report = health::get_health_timed(&config, &mut times);
-            // Logged whatever the outcome: a slow failure is still the slow step
-            // the GUI timed out on (bd DAS-Backup-Manager-amsg).
-            if let Some(line) =
-                health::slow_health_warning(started.elapsed(), SLOW_HEALTH_QUERY, &times)
-            {
-                eprintln!("btrdasd-helper: {line}");
-            }
-            let report = report.map_err(|e| format!("Health query failed: {e}"))?;
+        let kept = self.kept_snapshots.clone();
+        let take = move || async move {
+            tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let mut times = health::StepTimes::default();
+                times.record("polkit", polkit_took);
+                // Both outside get_health_with, so a slow one would show only as
+                // untimed (bd DAS-Backup-Manager-tobl). `queued` includes the wait
+                // for a reading another call was taking.
+                times.record("config load", load_took);
+                times.record("queued", handed_over.elapsed());
+                // While a job holds the targets their snapshot directories are
+                // not walked: each target's kept reading is served, with its age
+                // (bd DAS-Backup-Manager-5237.16).
+                let busy = times.time("lock table", health::targets_held_by_a_job);
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let report = health::get_health_with(&config, &mut times, busy, &|label, mount| {
+                    kept.answer(label, mount, busy, now_epoch, &health::read_snapshots)
+                });
+                // Logged whatever the outcome: a slow failure is still the slow step
+                // the GUI timed out on (bd DAS-Backup-Manager-amsg).
+                if let Some(line) =
+                    health::slow_health_warning(started.elapsed(), SLOW_HEALTH_QUERY, &times)
+                {
+                    eprintln!("btrdasd-helper: {line}");
+                }
+                let report = report.map_err(|e| format!("Health query failed: {e}"))?;
 
-            let status_str = match report.status {
-                health::HealthStatus::Healthy => "healthy",
-                health::HealthStatus::Warning => "warning",
-                health::HealthStatus::Critical => "critical",
-            };
+                let status_str = match report.status {
+                    health::HealthStatus::Healthy => "healthy",
+                    health::HealthStatus::Warning => "warning",
+                    health::HealthStatus::Critical => "critical",
+                };
 
-            let targets_json: Vec<serde_json::Value> = report
-                .targets
-                .iter()
-                .map(|t| {
-                    let scrub_status_str = match t.scrub.status {
-                        health::ScrubHealthStatus::NotApplicable => "not_applicable",
-                        health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
-                        health::ScrubHealthStatus::Unresolved => "unresolved",
-                        health::ScrubHealthStatus::Ok => "ok",
-                        health::ScrubHealthStatus::Warn => "warn",
-                        health::ScrubHealthStatus::Fail => "fail",
-                    };
-                    serde_json::json!({
-                        "label": t.label,
-                        "serial": t.serial,
-                        "mounted": t.mounted,
-                        "total_bytes": t.total_bytes,
-                        "used_bytes": t.used_bytes,
-                        "usage_percent": t.usage_percent(),
-                        "snapshot_count": t.snapshot_count,
-                        "smart_status": t.smart_status,
-                        "temperature_c": t.temperature_c,
-                        "power_on_hours": t.power_on_hours,
-                        "errors": t.errors,
-                        "scrub": {
-                            "status": scrub_status_str,
-                            "age_days": t.scrub.age_days,
-                            "last_outcome": t.scrub.last_outcome,
-                            "last_ok": t.scrub.last_ok,
-                            "error_total": t.scrub.error_total,
-                            "last_success_epoch": t.scrub.last_success_epoch,
-                        },
+                let targets_json: Vec<serde_json::Value> = report
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        let scrub_status_str = match t.scrub.status {
+                            health::ScrubHealthStatus::NotApplicable => "not_applicable",
+                            health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
+                            health::ScrubHealthStatus::Unresolved => "unresolved",
+                            health::ScrubHealthStatus::Ok => "ok",
+                            health::ScrubHealthStatus::Warn => "warn",
+                            health::ScrubHealthStatus::Fail => "fail",
+                        };
+                        serde_json::json!({
+                            "label": t.label,
+                            "serial": t.serial,
+                            "mounted": t.mounted,
+                            "total_bytes": t.total_bytes,
+                            "used_bytes": t.used_bytes,
+                            "usage_percent": t.usage_percent(),
+                            "snapshot_count": t.snapshot_count,
+                            "snapshot_reading_age_secs": t.snapshot_reading_age_secs,
+                            "smart_status": t.smart_status,
+                            "temperature_c": t.temperature_c,
+                            "power_on_hours": t.power_on_hours,
+                            "errors": t.errors,
+                            "scrub": {
+                                "status": scrub_status_str,
+                                "age_days": t.scrub.age_days,
+                                "last_outcome": t.scrub.last_outcome,
+                                "last_ok": t.scrub.last_ok,
+                                "error_total": t.scrub.error_total,
+                                "last_success_epoch": t.scrub.last_success_epoch,
+                            },
+                        })
                     })
-                })
-                .collect();
+                    .collect();
 
-            // Build total_bytes lookup per target label
-            let target_totals: std::collections::HashMap<&str, u64> = report
-                .targets
-                .iter()
-                .map(|t| (t.label.as_str(), t.total_bytes))
-                .collect();
+                // Build total_bytes lookup per target label
+                let target_totals: std::collections::HashMap<&str, u64> = report
+                    .targets
+                    .iter()
+                    .map(|t| (t.label.as_str(), t.total_bytes))
+                    .collect();
 
-            // Build growth data grouped by target label
-            let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
-                std::collections::BTreeMap::new();
-            for gp in &report.growth_points {
-                let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
-                let date_str = format!("{y:04}-{m:02}-{d:02}");
-                let total = target_totals
-                    .get(gp.target_label.as_str())
-                    .copied()
-                    .unwrap_or(0);
-                growth_map
-                    .entry(gp.target_label.clone())
-                    .or_default()
-                    .push(serde_json::json!({
-                        "date": date_str,
-                        "used_bytes": gp.used_bytes,
-                        "total_bytes": total,
-                    }));
-            }
-            let growth_json: Vec<serde_json::Value> = growth_map
-                .into_iter()
-                .map(|(label, entries)| serde_json::json!({"label": label, "entries": entries}))
-                .collect();
-
-            // Service status
-            let btrbk_available = std::process::Command::new("which")
-                .arg("btrbk")
-                .output()
-                .is_ok_and(|o| o.status.success());
-            let timer_output = std::process::Command::new("systemctl")
-                .args([
-                    "show",
-                    "das-backup.timer",
-                    "--property=ActiveState,NextElapseUSecRealtime",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .unwrap_or_default();
-            let timer_enabled = timer_output.contains("ActiveState=active");
-            let timer_next = timer_output
-                .lines()
-                .find(|l| l.starts_with("NextElapseUSecRealtime="))
-                .and_then(|l| l.strip_prefix("NextElapseUSecRealtime="))
-                .filter(|v| !v.is_empty() && *v != "n/a")
-                .map(String::from);
-            let drives_mounted = report.targets.iter().filter(|t| t.mounted).count();
-
-            // Compute last_backup_age_secs from report.last_backup
-            let last_backup_age_secs: Option<i64> = report.last_backup.as_ref().and_then(|lb| {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let parts: Vec<&str> = lb.split_whitespace().collect();
-                if parts.len() != 2 {
-                    return None;
+                // Build growth data grouped by target label
+                let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+                    std::collections::BTreeMap::new();
+                for gp in &report.growth_points {
+                    let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
+                    let date_str = format!("{y:04}-{m:02}-{d:02}");
+                    let total = target_totals
+                        .get(gp.target_label.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    growth_map.entry(gp.target_label.clone()).or_default().push(
+                        serde_json::json!({
+                            "date": date_str,
+                            "used_bytes": gp.used_bytes,
+                            "total_bytes": total,
+                        }),
+                    );
                 }
-                let date_parts: Vec<&str> = parts[0].split('-').collect();
-                let time_parts: Vec<&str> = parts[1].split(':').collect();
-                if date_parts.len() != 3 || time_parts.len() != 2 {
-                    return None;
-                }
-                let year: i32 = date_parts[0].parse().ok()?;
-                let month: u32 = date_parts[1].parse().ok()?;
-                let day: u32 = date_parts[2].parse().ok()?;
-                let hour: u64 = time_parts[0].parse().ok()?;
-                let minute: u64 = time_parts[1].parse().ok()?;
+                let growth_json: Vec<serde_json::Value> = growth_map
+                    .into_iter()
+                    .map(|(label, entries)| serde_json::json!({"label": label, "entries": entries}))
+                    .collect();
 
-                let y = if month <= 2 { year - 1 } else { year } as i64;
-                let m = if month <= 2 { month + 9 } else { month - 3 } as i64;
-                let era = if y >= 0 { y } else { y - 399 } / 400;
-                let yoe = y - era * 400;
-                let doy = (153 * m + 2) / 5 + day as i64 - 1;
-                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-                let days = era * 146_097 + doe - 719_468;
-                let backup_secs = days * 86400 + hour as i64 * 3600 + minute as i64 * 60;
+                // Service status
+                let btrbk_available = std::process::Command::new("which")
+                    .arg("btrbk")
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                let timer_output = std::process::Command::new("systemctl")
+                    .args([
+                        "show",
+                        "das-backup.timer",
+                        "--property=ActiveState,NextElapseUSecRealtime",
+                    ])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .unwrap_or_default();
+                let timer_enabled = timer_output.contains("ActiveState=active");
+                let timer_next = timer_output
+                    .lines()
+                    .find(|l| l.starts_with("NextElapseUSecRealtime="))
+                    .and_then(|l| l.strip_prefix("NextElapseUSecRealtime="))
+                    .filter(|v| !v.is_empty() && *v != "n/a")
+                    .map(String::from);
+                let drives_mounted = report.targets.iter().filter(|t| t.mounted).count();
 
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                Some(now_secs - backup_secs)
-            });
+                // Compute last_backup_age_secs from report.last_backup
+                let last_backup_age_secs: Option<i64> =
+                    report.last_backup.as_ref().and_then(|lb| {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let parts: Vec<&str> = lb.split_whitespace().collect();
+                        if parts.len() != 2 {
+                            return None;
+                        }
+                        let date_parts: Vec<&str> = parts[0].split('-').collect();
+                        let time_parts: Vec<&str> = parts[1].split(':').collect();
+                        if date_parts.len() != 3 || time_parts.len() != 2 {
+                            return None;
+                        }
+                        let year: i32 = date_parts[0].parse().ok()?;
+                        let month: u32 = date_parts[1].parse().ok()?;
+                        let day: u32 = date_parts[2].parse().ok()?;
+                        let hour: u64 = time_parts[0].parse().ok()?;
+                        let minute: u64 = time_parts[1].parse().ok()?;
 
-            let json = serde_json::json!({
-                "status": status_str,
-                "targets": targets_json,
-                "last_backup": report.last_backup,
-                "warnings": report.warnings,
-                "growth": growth_json,
-                "scrub_thresholds": {
-                    "enabled": config.scrub.enabled,
-                    "warn_age_days": config.scrub.warn_age_days,
-                    "fail_age_days": config.scrub.fail_age_days,
-                },
-                "services": {
-                    "btrbk_available": btrbk_available,
-                    "timer_enabled": timer_enabled,
-                    "timer_next": timer_next,
+                        let y = if month <= 2 { year - 1 } else { year } as i64;
+                        let m = if month <= 2 { month + 9 } else { month - 3 } as i64;
+                        let era = if y >= 0 { y } else { y - 399 } / 400;
+                        let yoe = y - era * 400;
+                        let doy = (153 * m + 2) / 5 + day as i64 - 1;
+                        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                        let days = era * 146_097 + doe - 719_468;
+                        let backup_secs = days * 86400 + hour as i64 * 3600 + minute as i64 * 60;
+
+                        let now_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        Some(now_secs - backup_secs)
+                    });
+
+                let json = serde_json::json!({
+                    "status": status_str,
+                    "targets": targets_json,
                     "last_backup": report.last_backup,
-                    "last_backup_age_secs": last_backup_age_secs,
-                    "drives_mounted": drives_mounted,
-                },
-            });
+                    "warnings": report.warnings,
+                    "growth": growth_json,
+                    "scrub_thresholds": {
+                        "enabled": config.scrub.enabled,
+                        "warn_age_days": config.scrub.warn_age_days,
+                        "fail_age_days": config.scrub.fail_age_days,
+                    },
+                    "services": {
+                        "btrbk_available": btrbk_available,
+                        "timer_enabled": timer_enabled,
+                        "timer_next": timer_next,
+                        "last_backup": report.last_backup,
+                        "last_backup_age_secs": last_backup_age_secs,
+                        "last_backup_reading_age_secs": report.last_backup_reading_age_secs,
+                        "targets_busy": report.targets_busy,
+                        "drives_mounted": drives_mounted,
+                    },
+                });
 
-            Ok(json.to_string())
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Health query task panicked: {e}")));
+                Ok(json.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Health query task panicked: {e}")))
+        };
 
-        json_str.map_err(fdo::Error::Failed)
+        self.health_reply
+            .get(take)
+            .await
+            .map_err(fdo::Error::Failed)
     }
 
     /// The recovery-drive panel's document (bd DAS-Backup-Manager-8249).
@@ -2754,6 +2806,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn: conn.clone(),
         stats_cache: Arc::new(Mutex::new(HashMap::new())),
         stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        kept_snapshots: Arc::default(),
+        health_reply: Arc::default(),
     };
 
     serve_then_claim_name(&conn, iface, HELPER_NAME).await?;
@@ -2852,6 +2906,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- calls that wait for a reply share it (bd 5237.16)
+
+    #[tokio::test]
+    async fn calls_that_arrive_while_a_reply_is_being_made_share_it() {
+        let shared = SharedReply::default();
+        let taken = std::sync::atomic::AtomicU32::new(0);
+        let take = || async {
+            let n = taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, String>(format!("reply {n}"))
+        };
+        let (a, b, c) = tokio::join!(shared.get(take), shared.get(take), shared.get(take));
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            (a, b, c),
+            (
+                Ok("reply 0".to_string()),
+                Ok("reply 0".to_string()),
+                Ok("reply 0".to_string())
+            )
+        );
+        // A call that arrives after the reply was made takes its own.
+        assert_eq!(shared.get(take).await, Ok("reply 1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_reply_is_shared_with_nobody() {
+        let shared = SharedReply::default();
+        let taken = std::sync::atomic::AtomicU32::new(0);
+        let take = || async {
+            let n = taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if n == 0 {
+                Err("no reading".to_string())
+            } else {
+                Ok(format!("reply {n}"))
+            }
+        };
+        let (a, b) = tokio::join!(shared.get(take), shared.get(take));
+        assert_eq!(a, Err("no reading".to_string()));
+        assert_eq!(b, Ok("reply 1".to_string()));
+    }
 
     // --- the readiness probe asks again when its message was lost (bd 3i1)
 

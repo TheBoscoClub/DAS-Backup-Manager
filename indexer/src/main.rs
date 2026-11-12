@@ -3107,7 +3107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         t.mounted,
                         t.total_bytes,
                         t.used_bytes,
-                        t.snapshot_count,
+                        t.snapshot_count
+                            .map_or("null".to_string(), |c| c.to_string()),
                         t.smart_status
                             .as_ref()
                             .map_or("null".to_string(), |s| format!("\"{s}\"")),

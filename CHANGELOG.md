@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The GUI's health reply no longer waits on targets a job is using** (bd `DAS-Backup-Manager-5237.16`): with the GUI open while btrbk received onto the targets, `HealthQuery` replies took up to 443 s — 16 over the 10 s warning in twelve minutes — because every reply walked each target's snapshot directories twice (once to count, once more with a `stat` per snapshot for the newest), and each waiting call did both walks itself
+  - While the backup singleton or the maintenance lock is held the helper walks no target: it serves each target's last reading with its age, or unknown when it has none; the dashboard's Last Backup line says so (`2 hours ago (read 15 minutes ago; a job is using the targets)`, `Unknown (a job is using the targets)`) — `health::KeptSnapshots`, `StatusText::lastBackupLine`
+  - Whether a lock is held is read from the kernel's lock table (`/proc/locks`, by device and inode), never by trying the lock: a probe that took it for an instant could make a backup's own non-blocking attempt lose and skip the run; a table that cannot be read counts as held — `health::lock_file_held`
+  - One pass per target gives both numbers (`health::read_snapshots`), and calls that arrive while a reply is being made share it instead of each taking a reading (`SharedReply`)
+  - A snapshot count that was not taken is `null` in `btrdasd health --json` and in the helper's reply (`snapshot_count`), no longer `0`: an unmounted target, one that could not be listed, and one a job holds with no kept reading; the reply gains `snapshot_reading_age_secs` per target and `last_backup_reading_age_secs` and `targets_busy` under `services`. `btrdasd health` and a run's own report still read live
+
 - **`backup-run.sh` says when a target's mount options cannot take effect** (bd `DAS-Backup-Manager-804`): btrfs keeps the filesystem-wide options of the first mount, so when another program already held a target's filesystem mounted somewhere else, the run's own `mount -o` succeeded and applied none of `compress`, `autodefrag` or `commit` — measured on a loop device, a file written through the second mount had no compressed extent
   - The run now warns before mounting, naming the other mount point and the options not applied, and goes on; the `btrdasd` path already warned (script v4.19.4)
 

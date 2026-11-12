@@ -30,7 +30,13 @@ pub struct TargetHealth {
     /// 0 for the JSON consumers, and a report must say "unknown" rather than
     /// print the zeros as a reading (fail-silent.md "always a defect" #1).
     pub usage_known: bool,
-    pub snapshot_count: usize,
+    /// Snapshots counted on the target; `None` when it was not read (not
+    /// mounted, unreadable, or held by a job with no kept reading), never 0
+    /// (fail-silent.md "always a defect" #1; bd DAS-Backup-Manager-5237.16).
+    pub snapshot_count: Option<usize>,
+    /// Age of `snapshot_count` when it is a kept reading served because a job
+    /// held the targets; `None` when it was read for this report.
+    pub snapshot_reading_age_secs: Option<u64>,
     pub smart_status: Option<String>,
     pub temperature_c: Option<i32>,
     pub power_on_hours: Option<u64>,
@@ -346,6 +352,12 @@ pub struct HealthReport {
     pub status: HealthStatus,
     pub targets: Vec<TargetHealth>,
     pub last_backup: Option<String>,
+    /// Age of the oldest kept reading `last_backup` rests on; `None` when
+    /// every target that answered was read for this report.
+    pub last_backup_reading_age_secs: Option<u64>,
+    /// A backup, scrub or other job held the targets, so their snapshot
+    /// directories were not walked (bd DAS-Backup-Manager-5237.16).
+    pub targets_busy: bool,
     pub growth_points: Vec<GrowthPoint>,
     pub warnings: Vec<String>,
     /// One line per `role = "mirror"` target's OS (bd DAS-Backup-Manager-xd3),
@@ -739,82 +751,178 @@ fn disk_space_statvfs(mount: &str) -> Option<(u64, u64)> {
     Some((total, used))
 }
 
-/// Count snapshot directories inside `mount` that match btrbk naming convention.
-fn count_snapshots(mount: &str) -> usize {
-    let path = Path::new(mount);
-    if !path.is_dir() {
-        return 0;
-    }
-    let mut count = 0usize;
-    // Walk one level of subdirectories (source dirs like "nvme", "ssd")
-    if let Ok(source_entries) = fs::read_dir(path) {
-        for source_entry in source_entries.flatten() {
-            if !source_entry
-                .file_type()
-                .is_ok_and(|ft| ft.is_dir() || ft.is_symlink())
-            {
-                continue;
-            }
-            // Count snapshot dirs inside each source dir
-            if let Ok(snap_entries) = fs::read_dir(source_entry.path()) {
-                for snap_entry in snap_entries.flatten() {
-                    let name = snap_entry.file_name().to_string_lossy().to_string();
-                    if SNAP_RE.is_match(&name) {
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-    count
+/// What one pass over a target's snapshot directories found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotReading {
+    /// Directories named as btrbk names a snapshot, one level below the
+    /// target's top level.
+    pub count: usize,
+    /// The newest modification time among them, seconds since the epoch.
+    pub newest_epoch: Option<u64>,
 }
 
-/// Walk all mounted target mount points and return the most recent snapshot
-/// directory modification time as a Unix timestamp string (`"YYYY-MM-DD HH:MM"`),
-/// or `None` if nothing is accessible.
-fn latest_snapshot_time(targets: &[TargetHealth], mounts: &[String]) -> Option<String> {
-    let mut latest: Option<u64> = None;
-
-    for (th, mount) in targets.iter().zip(mounts.iter()) {
-        if !th.mounted {
+/// Walk `mount` once for both numbers: the snapshot count and the newest
+/// snapshot's time (two walks before bd DAS-Backup-Manager-5237.16). `None`
+/// when the target's top level cannot be listed — not a count of 0.
+pub fn read_snapshots(mount: &str) -> Option<SnapshotReading> {
+    let source_entries = fs::read_dir(Path::new(mount)).ok()?;
+    let mut reading = SnapshotReading {
+        count: 0,
+        newest_epoch: None,
+    };
+    // One level of subdirectories (source dirs like "nvme", "ssd").
+    for source_entry in source_entries.flatten() {
+        if !source_entry
+            .file_type()
+            .is_ok_and(|ft| ft.is_dir() || ft.is_symlink())
+        {
             continue;
         }
-        let path = Path::new(mount.as_str());
-        if let Ok(source_entries) = fs::read_dir(path) {
-            for source_entry in source_entries.flatten() {
-                if let Ok(snap_entries) = fs::read_dir(source_entry.path()) {
-                    for snap_entry in snap_entries.flatten() {
-                        let name = snap_entry.file_name().to_string_lossy().to_string();
-                        if SNAP_RE.is_match(&name)
-                            && let Ok(meta) = snap_entry.metadata()
-                            && let Ok(modified) = meta.modified()
-                        {
-                            let secs = modified
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            if latest.is_none_or(|prev| secs > prev) {
-                                latest = Some(secs);
-                            }
-                        }
-                    }
-                }
+        let Ok(snap_entries) = fs::read_dir(source_entry.path()) else {
+            continue;
+        };
+        for snap_entry in snap_entries.flatten() {
+            let name = snap_entry.file_name().to_string_lossy().to_string();
+            if !SNAP_RE.is_match(&name) {
+                continue;
+            }
+            reading.count += 1;
+            let modified = snap_entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            if let Some(secs) = modified
+                && reading.newest_epoch.is_none_or(|prev| secs > prev)
+            {
+                reading.newest_epoch = Some(secs);
             }
         }
     }
+    Some(reading)
+}
 
-    latest.map(|secs| {
-        // Format as simple UTC date-time string without pulling in chrono.
-        // UNIX timestamp -> broken-down time via manual division.
-        let minutes_total = secs / 60;
-        let minute = minutes_total % 60;
-        let hours_total = minutes_total / 60;
-        let hour = hours_total % 24;
-        let days_since_epoch = hours_total / 24;
-        // Gregorian calendar approximation (good enough for display)
-        let (year, month, day) = days_to_ymd(days_since_epoch as i64);
-        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+/// A target's snapshot numbers as a health report gets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotAnswer {
+    /// `None`: unknown.
+    pub reading: Option<SnapshotReading>,
+    /// `Some(age)`: `reading` is a kept one, taken that long ago.
+    pub kept_age_secs: Option<u64>,
+}
+
+/// The last snapshot reading taken of each target, by label, for a process
+/// that answers health queries while jobs run (the GUI's helper). While a job
+/// holds the targets a directory read on a filesystem btrbk is receiving
+/// into waits for minutes (443 s measured, bd DAS-Backup-Manager-5237.16), so
+/// the kept reading is served, with its age, instead of a walk.
+#[derive(Debug, Default)]
+pub struct KeptSnapshots(
+    std::sync::Mutex<std::collections::HashMap<String, (SnapshotReading, u64)>>,
+);
+
+impl KeptSnapshots {
+    /// The answer for the target `label` mounted at `mount`: when `busy`, the
+    /// kept reading (or unknown) and `walk` is never called; otherwise
+    /// `walk`'s reading, which is kept when it is one.
+    pub fn answer(
+        &self,
+        label: &str,
+        mount: &str,
+        busy: bool,
+        now_epoch: u64,
+        walk: &dyn Fn(&str) -> Option<SnapshotReading>,
+    ) -> SnapshotAnswer {
+        // A poisoned map still holds whole readings: each is one insert.
+        let kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if busy {
+            return match kept.get(label) {
+                Some((reading, taken_epoch)) => SnapshotAnswer {
+                    reading: Some(*reading),
+                    kept_age_secs: Some(now_epoch.saturating_sub(*taken_epoch)),
+                },
+                None => SnapshotAnswer {
+                    reading: None,
+                    kept_age_secs: None,
+                },
+            };
+        }
+        // Not held across the walk: another target's answer must not wait on
+        // this one's directory reads.
+        drop(kept);
+        let reading = walk(mount);
+        if let Some(reading) = reading {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(label.to_string(), (reading, now_epoch));
+        }
+        SnapshotAnswer {
+            reading,
+            kept_age_secs: None,
+        }
+    }
+}
+
+/// Whether some process holds a `flock` on the file with this device and
+/// inode, read from the kernel's lock table (`/proc/locks` text) without
+/// touching the lock: a probing `flock` would make a backup's own
+/// non-blocking attempt find it held and skip the run.
+pub fn flock_listed(proc_locks: &str, dev: u64, ino: u64) -> bool {
+    // `<n>: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> <start> <end>`,
+    // major and minor in hex; a waiter's line has `->` after the number.
+    proc_locks.lines().any(|line| {
+        let mut fields = line.split_whitespace().skip(1);
+        if fields.next() != Some("FLOCK") {
+            return false;
+        }
+        let Some(id) = fields.nth(3) else {
+            return false;
+        };
+        let mut parts = id.split(':');
+        let (Some(major), Some(minor), Some(inode), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        u32::from_str_radix(major, 16).ok() == Some(libc::major(dev))
+            && u32::from_str_radix(minor, 16).ok() == Some(libc::minor(dev))
+            && inode.parse::<u64>().ok() == Some(ino)
     })
+}
+
+/// Whether the lock file at `path` is held. A file that does not exist is
+/// not held; anything that cannot be read counts as held, so the caller does
+/// not walk a target it could not show to be free.
+pub fn lock_file_held(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match fs::read_to_string("/proc/locks") {
+        Ok(table) => flock_listed(&table, meta.dev(), meta.ino()),
+        Err(_) => true,
+    }
+}
+
+/// Whether a job holds the backup targets: the backup singleton or the
+/// maintenance lock is held (backup, scrub, doctor, reconcile, walk, restore).
+pub fn targets_held_by_a_job() -> bool {
+    lock_file_held(Path::new(crate::backup::BACKUP_LOCK_PATH))
+        || lock_file_held(Path::new(scrub::MAINTENANCE_LOCK_PATH))
+}
+
+/// `secs` since the epoch as `YYYY-MM-DD HH:MM` (UTC), without chrono.
+fn format_epoch_minutes(secs: u64) -> String {
+    let minutes_total = secs / 60;
+    let minute = minutes_total % 60;
+    let hours_total = minutes_total / 60;
+    let hour = hours_total % 24;
+    let (year, month, day) = days_to_ymd((hours_total / 24) as i64);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
@@ -924,11 +1032,30 @@ pub fn get_health(config: &Config) -> Result<HealthReport, Box<dyn std::error::E
     get_health_timed(config, &mut StepTimes::default())
 }
 
-/// [`get_health`], recording each step's duration in `times`.
+/// [`get_health`], recording each step's duration in `times`. Every mounted
+/// target is walked: right for a caller that holds the targets itself (a
+/// run's report) or answers once (the CLI).
 pub fn get_health_timed(
     config: &Config,
     times: &mut StepTimes,
 ) -> Result<HealthReport, Box<dyn std::error::Error>> {
+    get_health_with(config, times, false, &|_, mount| SnapshotAnswer {
+        reading: read_snapshots(mount),
+        kept_age_secs: None,
+    })
+}
+
+/// [`get_health_timed`] with each mounted target's snapshot numbers taken
+/// from `snapshots(label, mount)`; `targets_busy` is passed through to the
+/// report.
+pub fn get_health_with(
+    config: &Config,
+    times: &mut StepTimes,
+    targets_busy: bool,
+    snapshots: &dyn Fn(&str, &str) -> SnapshotAnswer,
+) -> Result<HealthReport, Box<dyn std::error::Error>> {
+    let mut newest_epoch: Option<u64> = None;
+    let mut last_backup_reading_age_secs: Option<u64> = None;
     let mut target_healths: Vec<TargetHealth> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_mounts: Vec<String> = Vec::new();
@@ -996,13 +1123,22 @@ pub fn get_health_timed(
         let (total_bytes, used_bytes) = usage.unwrap_or((0, 0));
 
         // 3. Get snapshot count (using effective mount path)
-        let snapshot_count = if mounted {
+        // One pass gives the count and the newest snapshot's time.
+        let answer = if mounted {
             times.time(format!("{label} snapshots"), || {
-                count_snapshots(&effective_path)
+                snapshots(label, &effective_path)
             })
         } else {
-            0
+            SnapshotAnswer {
+                reading: None,
+                kept_age_secs: None,
+            }
         };
+        let snapshot_count = answer.reading.map(|r| r.count);
+        if let Some(secs) = answer.reading.and_then(|r| r.newest_epoch) {
+            newest_epoch = newest_epoch.max(Some(secs));
+            last_backup_reading_age_secs = last_backup_reading_age_secs.max(answer.kept_age_secs);
+        }
 
         // 4. Get SMART details of every configured drive (use -d sat for
         // USB-attached SATA drives); a RAID-1 pair is two (bd uhi).
@@ -1116,6 +1252,7 @@ pub fn get_health_timed(
             used_bytes,
             usage_known: usage.is_some(),
             snapshot_count,
+            snapshot_reading_age_secs: answer.kept_age_secs,
             smart_status,
             temperature_c,
             power_on_hours,
@@ -1166,16 +1303,15 @@ pub fn get_health_timed(
     // 7. Determine overall status
     let status = determine_status(&target_healths, &warnings);
 
-    // 8. Last backup time (use effective mount paths). Timed: it stats every
-    // snapshot on every target (bd DAS-Backup-Manager-tobl).
-    let last_backup = times.time("last backup", || {
-        latest_snapshot_time(&target_healths, &effective_mounts)
-    });
+    // 8. Last backup time: the newest snapshot the targets' passes found.
+    let last_backup = newest_epoch.map(format_epoch_minutes);
 
     Ok(HealthReport {
         status,
         targets: target_healths,
         last_backup,
+        last_backup_reading_age_secs,
+        targets_busy,
         growth_points,
         warnings,
         recovery_os: recovery.lines,
@@ -1245,6 +1381,169 @@ pub fn parse_growth_log(content: &str) -> Vec<GrowthPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- bd DAS-Backup-Manager-5237.16: kept snapshot readings ---
+
+    fn reading(count: usize, newest: u64) -> SnapshotReading {
+        SnapshotReading {
+            count,
+            newest_epoch: Some(newest),
+        }
+    }
+
+    #[test]
+    fn a_busy_target_is_served_its_kept_reading_with_its_age_and_is_not_walked() {
+        let kept = KeptSnapshots::default();
+        let free = kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
+            Some(reading(12, 900))
+        });
+        assert_eq!(
+            free,
+            SnapshotAnswer {
+                reading: Some(reading(12, 900)),
+                kept_age_secs: None
+            }
+        );
+        let walked = std::cell::Cell::new(false);
+        let busy = kept.answer("primary", "/mnt/p", true, 1_240, &|_| {
+            walked.set(true);
+            Some(reading(99, 1_200))
+        });
+        assert!(!walked.get(), "a target a job holds must not be walked");
+        assert_eq!(
+            busy,
+            SnapshotAnswer {
+                reading: Some(reading(12, 900)),
+                kept_age_secs: Some(240)
+            }
+        );
+    }
+
+    #[test]
+    fn a_busy_target_with_no_kept_reading_is_unknown_and_another_targets_is_not_lent() {
+        let kept = KeptSnapshots::default();
+        kept.answer("other", "/mnt/o", false, 1_000, &|_| Some(reading(3, 800)));
+        let busy = kept.answer("primary", "/mnt/p", true, 1_240, &|_| {
+            panic!("walked a target a job holds")
+        });
+        assert_eq!(
+            busy,
+            SnapshotAnswer {
+                reading: None,
+                kept_age_secs: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_walk_that_cannot_read_keeps_the_earlier_reading() {
+        let kept = KeptSnapshots::default();
+        kept.answer("primary", "/mnt/p", false, 1_000, &|_| {
+            Some(reading(12, 900))
+        });
+        let failed = kept.answer("primary", "/mnt/p", false, 1_100, &|_| None);
+        assert_eq!(
+            failed.reading, None,
+            "this answer is unknown, not the old one"
+        );
+        let busy = kept.answer("primary", "/mnt/p", true, 1_300, &|_| None);
+        assert_eq!(busy.reading, Some(reading(12, 900)));
+        assert_eq!(busy.kept_age_secs, Some(300));
+    }
+
+    fn set_mtime(path: &Path, epoch: u64) {
+        let dir = fs::File::open(path).unwrap();
+        dir.set_modified(UNIX_EPOCH + Duration::from_secs(epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn one_pass_counts_the_snapshots_and_finds_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mtime) in [
+            ("nvme/root.20261101T0300", 1_000_000),
+            ("nvme/root.20261102T030001", 3_000_000),
+            ("ssd/vm.20261101T0300", 2_000_000),
+            ("ssd/not-a-snapshot", 9_000_000),
+        ] {
+            let path = dir.path().join(name);
+            fs::create_dir_all(&path).unwrap();
+            set_mtime(&path, mtime);
+        }
+        // A plain file at the top level is no source directory.
+        fs::write(dir.path().join("stray.20261101T0300"), "").unwrap();
+        assert_eq!(
+            read_snapshots(&dir.path().to_string_lossy()),
+            Some(SnapshotReading {
+                count: 3,
+                newest_epoch: Some(3_000_000)
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_listed_is_unknown_and_an_empty_one_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_snapshots(&dir.path().to_string_lossy()),
+            Some(SnapshotReading {
+                count: 0,
+                newest_epoch: None
+            })
+        );
+        assert_eq!(
+            read_snapshots(&dir.path().join("gone").to_string_lossy()),
+            None
+        );
+    }
+
+    #[test]
+    fn an_epoch_is_printed_to_the_minute_in_utc() {
+        assert_eq!(format_epoch_minutes(1_794_478_748), "2026-11-12 10:19");
+        assert_eq!(format_epoch_minutes(0), "1970-01-01 00:00");
+    }
+
+    const PROC_LOCKS: &str = "\
+1: FLOCK  ADVISORY  WRITE 4242 00:1a:1234 0 EOF
+2: POSIX  ADVISORY  WRITE 4243 00:1a:77 0 EOF
+3: -> FLOCK  ADVISORY  WRITE 4244 00:1a:88 0 EOF
+4: FLOCK  ADVISORY  READ 4245 fd:02:99 0 EOF
+";
+
+    #[test]
+    fn a_flock_is_found_by_device_and_inode_in_the_kernels_table() {
+        let dev = |major: u32, minor: u32| libc::makedev(major, minor);
+        assert!(flock_listed(PROC_LOCKS, dev(0, 0x1a), 1234));
+        assert!(flock_listed(PROC_LOCKS, dev(0xfd, 2), 99), "a shared hold");
+        // Same inode number on another filesystem.
+        assert!(!flock_listed(PROC_LOCKS, dev(0, 0x1b), 1234));
+        // A POSIX record lock is not a flock.
+        assert!(!flock_listed(PROC_LOCKS, dev(0, 0x1a), 77));
+        // A waiter holds nothing.
+        assert!(!flock_listed(PROC_LOCKS, dev(0, 0x1a), 88));
+        assert!(!flock_listed("", dev(0, 0x1a), 1234));
+    }
+
+    #[test]
+    fn a_lock_file_reads_held_only_while_a_flock_is_on_it() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("das.lock");
+        assert!(!lock_file_held(&path), "no file, no holder");
+        let file = fs::File::create(&path).unwrap();
+        assert!(!lock_file_held(&path), "a file nobody locked");
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(lock_file_held(&path));
+        // The probe took nothing: a second non-blocking attempt by another
+        // open of the file is refused by the first hold alone, and the hold
+        // is still there afterwards.
+        assert!(lock_file_held(&path));
+        drop(file);
+        assert!(!lock_file_held(&path));
+    }
 
     // --- slow health query reporting (bd DAS-Backup-Manager-amsg) ---
 
@@ -1328,9 +1627,11 @@ daily = 7
             names.contains(&"noserial mount") && names.contains(&"recovery OS"),
             "{names:?}"
         );
-        // The walk for the newest snapshot stats every one on every target
-        // (bd DAS-Backup-Manager-tobl).
-        assert!(names.contains(&"last backup"), "{names:?}");
+        // The newest snapshot comes from each target's one pass, not from a
+        // second walk of every target (bd DAS-Backup-Manager-5237.16).
+        assert!(!names.contains(&"last backup"), "{names:?}");
+        assert!(report.targets.iter().all(|t| t.snapshot_count.is_none()));
+        assert_eq!(report.last_backup, None);
         assert!(
             report
                 .targets
@@ -1379,7 +1680,8 @@ daily = 7
             total_bytes: 1_000_000,
             used_bytes: 250_000,
             usage_known: true,
-            snapshot_count: 10,
+            snapshot_count: Some(10),
+            snapshot_reading_age_secs: None,
             smart_status: Some("PASSED".into()),
             temperature_c: Some(32),
             power_on_hours: Some(12345),
@@ -1400,7 +1702,8 @@ daily = 7
             total_bytes: 0,
             used_bytes: 0,
             usage_known: true,
-            snapshot_count: 0,
+            snapshot_count: Some(0),
+            snapshot_reading_age_secs: None,
             smart_status: None,
             temperature_c: None,
             power_on_hours: None,
@@ -1630,7 +1933,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 total_bytes: 1_000_000_000,
                 used_bytes: 500_000_000, // 50%
                 usage_known: true,
-                snapshot_count: 10,
+                snapshot_count: Some(10),
+                snapshot_reading_age_secs: None,
                 smart_status: Some("PASSED".into()),
                 temperature_c: None,
                 power_on_hours: None,
@@ -1645,7 +1949,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 total_bytes: 2_000_000_000,
                 used_bytes: 800_000_000, // 40%
                 usage_known: true,
-                snapshot_count: 5,
+                snapshot_count: Some(5),
+                snapshot_reading_age_secs: None,
                 smart_status: Some("PASSED".into()),
                 temperature_c: None,
                 power_on_hours: None,
@@ -1667,7 +1972,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             total_bytes: 1_000_000_000,
             used_bytes: 900_000_000, // 90% — warning threshold
             usage_known: true,
-            snapshot_count: 10,
+            snapshot_count: Some(10),
+            snapshot_reading_age_secs: None,
             smart_status: Some("PASSED".into()),
             temperature_c: None,
             power_on_hours: None,
@@ -1688,7 +1994,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             total_bytes: 1_000_000_000,
             used_bytes: 300_000_000, // 30% — usage fine
             usage_known: true,
-            snapshot_count: 10,
+            snapshot_count: Some(10),
+            snapshot_reading_age_secs: None,
             smart_status: Some("FAILED".into()), // SMART failure → Critical
             temperature_c: None,
             power_on_hours: None,
@@ -1712,7 +2019,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             total_bytes: 1_000_000_000,
             used_bytes: 970_000_000, // 97% — critical threshold
             usage_known: true,
-            snapshot_count: 10,
+            snapshot_count: Some(10),
+            snapshot_reading_age_secs: None,
             smart_status: Some("PASSED".into()),
             temperature_c: None,
             power_on_hours: None,
@@ -2017,7 +2325,8 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             total_bytes: 1_000_000_000,
             used_bytes: 100_000_000, // 10% — fine on its own
             usage_known: true,
-            snapshot_count: 10,
+            snapshot_count: Some(10),
+            snapshot_reading_age_secs: None,
             smart_status: Some("PASSED".into()),
             temperature_c: None,
             power_on_hours: None,

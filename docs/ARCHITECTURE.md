@@ -287,6 +287,15 @@ that made an aborted `system-recovery-A` scrub look healthy for 64 days). This k
 (any user) and the GUI's `HealthQuery()` (root, via `btrdasd-helper`) in agreement — see the
 `ScrubHealth` doc comment in `health.rs` for the full rationale.
 
+**Snapshot numbers** (bd `DAS-Backup-Manager-5237.16`): one pass over a mounted target
+(`health::read_snapshots`) gives its snapshot count and the newest snapshot's time; a target that was
+not read has no count (`None` / `null`), never 0. `btrdasd health` and a run's report read live. The
+helper does not walk a target while a job holds the backup singleton or the maintenance lock — a
+directory read on a filesystem btrbk is receiving into waits for minutes — and serves the last reading
+it took (`health::KeptSnapshots`, in memory, by target label) with its age, or unknown. It finds the
+locks held by reading `/proc/locks`, never by trying them. Calls that arrive while a `HealthQuery()`
+reply is being made share that reply.
+
 ### Indexing Pipeline
 
 ```text

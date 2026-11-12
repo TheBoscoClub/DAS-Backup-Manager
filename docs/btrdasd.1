@@ -1812,6 +1812,15 @@ will or may run btrbk (see
 is also a warning, so the status reads
 .BR WARNING .
 .PP
+With
+.BR \-\-json ,
+a target's
+.B snapshot_count
+is
+.B null
+when its snapshots were not counted (the target is not mounted, or could not
+be listed), never 0.
+.PP
 .B btrdasd health
 .RB [ \-\-config
 .IR PATH ]

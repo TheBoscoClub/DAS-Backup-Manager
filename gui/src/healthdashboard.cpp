@@ -1,4 +1,5 @@
 #include "healthdashboard.h"
+#include "statustext.h"
 #include "dbusclient.h"
 #include "filemodel.h"
 
@@ -648,26 +649,17 @@ void HealthDashboard::updateStatus(const QString &json)
 
     // Last backup age
     const qint64 ageSecs = services.value(QLatin1String("last_backup_age_secs")).toInteger(-1);
-    if (ageSecs < 0) {
-        m_lastBackupLabel->setText(i18n("Unknown"));
+    const QString ageStr = StatusText::lastBackupLine(
+        ageSecs,
+        services.value(QLatin1String("last_backup_reading_age_secs")).toInteger(-1),
+        services.value(QLatin1String("targets_busy")).toBool());
+    if (ageSecs > qint64{48} * 3600) {
+        m_lastBackupLabel->setText(
+            QStringLiteral("<span style=\"color:#CC0000;\">%1</span>").arg(ageStr.toHtmlEscaped()));
+        m_lastBackupLabel->setTextFormat(Qt::RichText);
     } else {
-        const qint64 hours = ageSecs / 3600;
-        const qint64 mins  = (ageSecs % 3600) / 60;
-        QString ageStr;
-        if (hours > 0) {
-            ageStr = i18n("%1 hours ago", hours);
-        } else {
-            ageStr = i18n("%1 minutes ago", mins);
-        }
-
-        if (ageSecs > qint64{48} * 3600) {
-            m_lastBackupLabel->setText(
-                QStringLiteral("<span style=\"color:#CC0000;\">%1</span>").arg(ageStr));
-            m_lastBackupLabel->setTextFormat(Qt::RichText);
-        } else {
-            m_lastBackupLabel->setText(ageStr);
-            m_lastBackupLabel->setTextFormat(Qt::AutoText);
-        }
+        m_lastBackupLabel->setText(ageStr);
+        m_lastBackupLabel->setTextFormat(Qt::PlainText);
     }
 
     // Drives mounted count
