@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # pacman-install.sh retries a failed install a bounded number of times, so
       # a connection reset by a mirror cannot fail a release (bd
@@ -57,7 +57,7 @@ jobs:
           su builder -c 'cd packaging/arch && makepkg -sf --noconfirm'
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: arch-package
           path: packaging/arch/*.pkg.tar.zst
@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -80,10 +80,21 @@ jobs:
             libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
 
+      # A pinned, checksummed rustup-init, not `curl | sh`: the installer is
+      # fetched from the versioned archive and run only if it matches the digest
+      # committed here. Bump RUSTUP_VERSION and the digest together
+      # (<archive>/x86_64-unknown-linux-gnu/rustup-init.sha256).
       - name: Install rustup (trixie's rustc 1.85 is too old for let-chains and zbus 5.14)
+        env:
+          RUSTUP_VERSION: 1.29.3
+          RUSTUP_INIT_SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain stable --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --default-toolchain stable --profile minimal
+          rm -f /tmp/rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build .deb
@@ -112,7 +123,7 @@ jobs:
           cp ../*.deb dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: debian-package
           path: dist/*.deb
@@ -124,7 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:43
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -154,7 +165,7 @@ jobs:
           find ~/rpmbuild/RPMS -name '*.rpm' -exec cp {} dist/ \;
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: fedora-package
           path: dist/*.rpm
@@ -166,7 +177,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install build dependencies
         run: |
@@ -178,10 +189,21 @@ jobs:
             libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
 
+      # A pinned, checksummed rustup-init, not `curl | sh`: the installer is
+      # fetched from the versioned archive and run only if it matches the digest
+      # committed here. Bump RUSTUP_VERSION and the digest together
+      # (<archive>/x86_64-unknown-linux-gnu/rustup-init.sha256).
       - name: Install rustup (trixie's rustc 1.85 is too old for let-chains and zbus 5.14)
+        env:
+          RUSTUP_VERSION: 1.29.3
+          RUSTUP_INIT_SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain stable --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --default-toolchain stable --profile minimal
+          rm -f /tmp/rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build AppImage
@@ -193,7 +215,7 @@ jobs:
         run: packaging/appimage/build-appimage.sh "${VERSION_TAG#v}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: appimage
           path: ButteredDASD-*.AppImage
@@ -231,7 +253,7 @@ jobs:
           rm -rf /hostfree/dotnet/* /hostfree/android/* /hostfree/ghc/* /hostfree/codeql/* /hostfree/boost/*
           df -h / | tail -1
 
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3  # v6.8
         with:
@@ -239,7 +261,7 @@ jobs:
           bundle: ButteredDASD-GUI.flatpak
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: flatpak-bundle
           path: ButteredDASD-GUI.flatpak
@@ -270,7 +292,7 @@ jobs:
   source-tarball:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
@@ -288,7 +310,7 @@ jobs:
           echo "entries: $(tar tzf "${NAME}.tar.gz" | wc -l)"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: source-tarball
           path: |
@@ -303,7 +325,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           merge-multiple: true
           path: packages/

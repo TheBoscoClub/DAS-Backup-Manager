@@ -84,7 +84,7 @@ jobs:
       SHARD: ${{ strategy.job-index }}
       SHARDS: ${{ strategy.job-total }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
@@ -194,7 +194,7 @@ jobs:
 
       - name: Archive mutants.out
         if: always() && steps.diff.outputs.listed != '0'
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: mutants-incremental-${{ strategy.job-index }}
           path: indexer/mutants.out
@@ -278,7 +278,7 @@ jobs:
       SHARD: ${{ strategy.job-index }}
       SHARDS: ${{ strategy.job-total }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -332,7 +332,7 @@ jobs:
 
       - name: Archive mutants.out
         if: always()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: mutants-full-scope-${{ strategy.job-index }}
           path: indexer/mutants.out
