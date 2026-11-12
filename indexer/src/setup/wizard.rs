@@ -416,6 +416,7 @@ fn step_subvolumes(
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
                 target_labels: vec![],
+                static_subvolumes: Vec::new(),
             });
 
             let add_more = p.confirm("Add another source?", false)?;
@@ -492,6 +493,7 @@ fn step_subvolumes(
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
                 target_labels: vec![],
+                static_subvolumes: Vec::new(),
             });
         }
 
@@ -511,6 +513,7 @@ fn step_subvolumes(
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec![],
                 target_labels: vec![],
+                static_subvolumes: Vec::new(),
             });
         }
     }
@@ -1360,6 +1363,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".to_string(),
             target_subdirs: Vec::new(),
             target_labels: target_labels.iter().map(|l| l.to_string()).collect(),
+            static_subvolumes: Vec::new(),
         }
     }
 
@@ -1823,6 +1827,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         }
     }
 

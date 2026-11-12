@@ -85,6 +85,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         cfg.sources.push(Source {
             label: "ssd".into(),
@@ -98,6 +99,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["ssd".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         cfg
     }

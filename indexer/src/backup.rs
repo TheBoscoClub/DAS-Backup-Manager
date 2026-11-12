@@ -4880,6 +4880,7 @@ mod tests {
                     // test never writes under a real mount point.
                     target_subdirs: vec!["self".into()],
                     target_labels: vec![],
+                    static_subvolumes: Vec::new(),
                 },
                 Source {
                     label: "other-src".into(),
@@ -4896,6 +4897,7 @@ mod tests {
                     // test never writes under a real mount point.
                     target_subdirs: vec!["self".into()],
                     target_labels: vec![],
+                    static_subvolumes: Vec::new(),
                 },
             ],
             targets: vec![Target {
@@ -5279,6 +5281,7 @@ Legend:
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![label.into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         };
         let mut vm = source("nvme-vm", "/.btrfs-nvme", &["@vm"]);
         vm.target_labels = labels(&["primary-22tb"]);

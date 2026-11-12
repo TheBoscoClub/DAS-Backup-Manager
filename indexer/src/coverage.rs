@@ -1121,6 +1121,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![label.into()],
             target_labels: targets.iter().map(|t| t.to_string()).collect(),
+            static_subvolumes: Vec::new(),
         }
     }
 

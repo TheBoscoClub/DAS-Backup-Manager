@@ -551,6 +551,27 @@ pub struct Source {
     /// Which target labels this source sends to (empty = all targets).
     #[serde(default)]
     pub target_labels: Vec<String>,
+    /// Read-only subvolumes somebody else made on this source's volume, sent
+    /// to the primary targets as they are (bd DAS-Backup-Manager-5237.8;
+    /// [`crate::static_send`]). Written `[[source.static]]`; left out of a
+    /// saved file when there are none.
+    #[serde(default, rename = "static", skip_serializing_if = "Vec::is_empty")]
+    pub static_subvolumes: Vec<StaticSubvolumes>,
+}
+
+/// One `[[source.static]]` table: which subvolumes of a source's volume are
+/// copied to the targets as they are. Their names carry a date and change
+/// whenever one is replaced, so the config names a directory and a pattern,
+/// never the subvolumes themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticSubvolumes {
+    /// Directory on the source's volume, relative to it. Exactly one level of
+    /// it is read, never recursed.
+    pub dir: String,
+    /// Glob on the subvolume's name; only `*` and `?` are special.
+    pub pattern: String,
+    /// Directory on the target, relative to its mount: one path component.
+    pub target_subdir: String,
 }
 
 fn default_snapshot_dir() -> String {
@@ -860,6 +881,11 @@ fn key_schema() -> toml::Table {
         snapshot_dir: String::new(),
         target_subdirs: Vec::new(),
         target_labels: Vec::new(),
+        static_subvolumes: vec![StaticSubvolumes {
+            dir: String::new(),
+            pattern: String::new(),
+            target_subdir: String::new(),
+        }],
     });
     c.targets.push(Target {
         label: String::new(),
@@ -4678,6 +4704,7 @@ mod tests {
             snapshot_dir: ".snapshots".into(),
             target_subdirs: vec!["nvme".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         cfg.targets.push(Target {
             label: "primary-22tb".into(),
@@ -4918,6 +4945,7 @@ daily = 7
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         // Replace the default target with a UUID-only one.
         cfg.targets.clear();
@@ -4957,6 +4985,7 @@ daily = 7
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         cfg.targets.clear();
         cfg.targets.push(Target {
@@ -5004,6 +5033,7 @@ daily = 7
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         let errors = cfg.validate();
         assert!(

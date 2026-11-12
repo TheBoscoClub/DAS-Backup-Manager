@@ -147,6 +147,7 @@ impl Rig {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["src".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         }];
         cfg.targets = vec![Target {
             label: "primary".into(),

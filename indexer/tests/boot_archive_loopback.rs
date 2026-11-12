@@ -144,6 +144,7 @@ fn config_for(fs: &Loopback, snapshot_name: &str) -> (Config, tempfile::NamedTem
         snapshot_dir: ".btrbk-snapshots".into(),
         target_subdirs: vec!["nvme".into()],
         target_labels: vec![],
+        static_subvolumes: Vec::new(),
     }];
     cfg.targets = vec![buttered_dasd::config::Target {
         label: "primary".into(),

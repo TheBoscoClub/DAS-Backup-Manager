@@ -613,6 +613,7 @@ pub fn apply_plan(config: &Config, plan: &SyncPlan, today: &str) -> Result<Confi
                     snapshot_dir: model.snapshot_dir.clone(),
                     target_subdirs: vec![adoption.source_label.clone()],
                     target_labels: primary,
+                    static_subvolumes: Vec::new(),
                 });
                 out.sources.len() - 1
             }
@@ -1429,6 +1430,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![label.into()],
             target_labels: targets.iter().map(|t| t.to_string()).collect(),
+            static_subvolumes: Vec::new(),
         }
     }
 

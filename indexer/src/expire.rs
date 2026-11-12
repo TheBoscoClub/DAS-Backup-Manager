@@ -995,6 +995,7 @@ mod tests {
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec!["ssd".into()],
                 target_labels: Vec::new(),
+                static_subvolumes: Vec::new(),
             }],
             ..Config::default()
         };
@@ -1077,6 +1078,7 @@ mod tests {
             snapshot_dir: snapshot_dir.into(),
             target_subdirs: vec![subdir.into()],
             target_labels: Vec::new(),
+            static_subvolumes: Vec::new(),
         }
     }
 
@@ -1774,6 +1776,7 @@ mod tests {
                 snapshot_dir: ".btrbk-snapshots".into(),
                 target_subdirs: vec!["lonely".into()],
                 target_labels: Vec::new(),
+                static_subvolumes: Vec::new(),
             });
         });
         let out = expire_retired(

@@ -629,6 +629,7 @@ pub(crate) mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         config.targets.push(Target {
             label: "primary-22tb".to_string(),

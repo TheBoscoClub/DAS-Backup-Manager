@@ -834,6 +834,7 @@ mod tests {
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec!["nvme".into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         config.targets.push(Target {
             label: "primary-22tb".to_string(),
@@ -918,6 +919,7 @@ mod tests {
             snapshot_dir: "ClaudeCodeProjects/.btrbk-snapshots".into(),
             target_subdirs: vec![],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         });
         let result = render_btrbk_conf(&config).unwrap();
         // The HDD source must use its custom snapshot_dir, not the default
@@ -998,6 +1000,7 @@ mod tests {
                 snapshot_dir: ".btrbk-snapshots".to_string(),
                 target_subdirs: vec!["nvme".to_string()],
                 target_labels: vec![],
+                static_subvolumes: Vec::new(),
             },
             Source {
                 label: "hdd-projects".to_string(),
@@ -1013,6 +1016,7 @@ mod tests {
                 snapshot_dir: "ClaudeCodeProjects/.btrbk-snapshots".to_string(),
                 target_subdirs: vec![],
                 target_labels: vec!["primary-22tb".to_string()],
+                static_subvolumes: Vec::new(),
             },
             Source {
                 label: "retired".to_string(),
@@ -1022,6 +1026,7 @@ mod tests {
                 snapshot_dir: ".btrbk-snapshots".to_string(),
                 target_subdirs: vec![],
                 target_labels: vec!["no-such-target".to_string()],
+                static_subvolumes: Vec::new(),
             },
         ];
         Config {
@@ -2045,6 +2050,7 @@ enabled = false
             snapshot_dir: ".btrbk-snapshots".into(),
             target_subdirs: vec![label.into()],
             target_labels: vec![],
+            static_subvolumes: Vec::new(),
         };
         cfg.sources.push(source(
             "s1",
