@@ -447,6 +447,14 @@ fn record_pid(line: &str) -> Option<u32> {
     line.rsplit_once(" pid ")?.1.parse().ok()
 }
 
+/// Whether the lock file's record names a holder that is still running:
+/// every holder this project writes records `<job> pid <pid>` and empties
+/// the record before it lets go. `Err` when the record cannot be read.
+pub fn recorded_holder_runs(path: &Path) -> std::io::Result<bool> {
+    let note = std::fs::read_to_string(path)?;
+    Ok(record_pid(&record_line(&note)).is_some_and(pid_is_running))
+}
+
 fn pid_is_running(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }

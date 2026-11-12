@@ -892,9 +892,18 @@ pub fn flock_listed(proc_locks: &str, dev: u64, ino: u64) -> bool {
     })
 }
 
-/// Whether the lock file at `path` is held. A file that does not exist is
-/// not held; anything that cannot be read counts as held, so the caller does
-/// not walk a target it could not show to be free.
+/// How often the kernel's lock table is read before a lock counts as not
+/// listed: the table is handed out a page at a time, and a lock released
+/// elsewhere between two pages can make a read skip an entry (seen: a held
+/// lock missing from about one read in ten while a test suite took and
+/// released locks beside it).
+const LOCK_TABLE_READS: usize = 3;
+
+/// Whether the lock file at `path` is held, by either sign: its record names
+/// a running holder (every holder this project writes records itself), or the
+/// kernel's table lists a flock on it (a holder that recorded nothing). A
+/// file that does not exist is not held; anything that cannot be read counts
+/// as held, so the caller does not walk a target it could not show to be free.
 pub fn lock_file_held(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let meta = match fs::metadata(path) {
@@ -902,17 +911,28 @@ pub fn lock_file_held(path: &Path) -> bool {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true,
     };
-    match fs::read_to_string("/proc/locks") {
+    match crate::maintenance::recorded_holder_runs(path) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return true,
+    }
+    (0..LOCK_TABLE_READS).any(|_| match fs::read_to_string("/proc/locks") {
         Ok(table) => flock_listed(&table, meta.dev(), meta.ino()),
         Err(_) => true,
-    }
+    })
 }
 
 /// Whether a job holds the backup targets: the backup singleton or the
 /// maintenance lock is held (backup, scrub, doctor, reconcile, walk, restore).
 pub fn targets_held_by_a_job() -> bool {
-    lock_file_held(Path::new(crate::backup::BACKUP_LOCK_PATH))
-        || lock_file_held(Path::new(scrub::MAINTENANCE_LOCK_PATH))
+    any_lock_held(&[
+        Path::new(crate::backup::BACKUP_LOCK_PATH),
+        Path::new(scrub::MAINTENANCE_LOCK_PATH),
+    ])
+}
+
+/// Whether any of the lock files at `paths` is held.
+fn any_lock_held(paths: &[&Path]) -> bool {
+    paths.iter().any(|path| lock_file_held(path))
 }
 
 /// `secs` since the epoch as `YYYY-MM-DD HH:MM` (UTC), without chrono.
@@ -1524,25 +1544,63 @@ mod tests {
         assert!(!flock_listed("", dev(0, 0x1a), 1234));
     }
 
+    /// A pid no process has: above the kernel's largest.
+    const NO_SUCH_PID: u32 = 4_000_000_000;
+
     #[test]
-    fn a_lock_file_reads_held_only_while_a_flock_is_on_it() {
-        use std::os::fd::AsRawFd;
+    fn a_lock_file_whose_record_names_a_running_holder_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("das.lock");
         assert!(!lock_file_held(&path), "no file, no holder");
+        fs::write(&path, "").unwrap();
+        assert!(!lock_file_held(&path), "an empty record and no flock");
+        fs::write(&path, format!("backup-run.sh pid {}\n", std::process::id())).unwrap();
+        assert!(lock_file_held(&path));
+        // The record of a holder that died without emptying it.
+        fs::write(&path, format!("backup-run.sh pid {NO_SUCH_PID}\n")).unwrap();
+        assert!(!lock_file_held(&path));
+        // A record that cannot be read counts as held.
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(lock_file_held(&path));
+    }
+
+    #[test]
+    fn a_flock_with_no_record_is_found_in_the_kernels_table_and_gone_once_unlocked() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("das.lock");
         let file = fs::File::create(&path).unwrap();
-        assert!(!lock_file_held(&path), "a file nobody locked");
         assert_eq!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        assert!(lock_file_held(&path));
-        // The probe took nothing: a second non-blocking attempt by another
-        // open of the file is refused by the first hold alone, and the hold
-        // is still there afterwards.
-        assert!(lock_file_held(&path));
-        drop(file);
+        // One reading of the table can skip an entry while other tests take
+        // and release locks (LOCK_TABLE_READS); it is never listed falsely.
+        assert!((0..50).any(|_| lock_file_held(&path)));
+        // Unlocked, not only closed: a flock lives on the open file
+        // description, and a child another test forks at this moment holds a
+        // copy of the descriptor until its exec.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
         assert!(!lock_file_held(&path));
+    }
+
+    #[test]
+    fn the_targets_are_held_when_either_lock_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backup, maintenance) = (dir.path().join("b.lock"), dir.path().join("m.lock"));
+        let both = [backup.as_path(), maintenance.as_path()];
+        assert!(!any_lock_held(&both), "neither file exists");
+        for held in &both {
+            fs::write(&backup, "").unwrap();
+            fs::write(&maintenance, "").unwrap();
+            assert!(!any_lock_held(&both));
+            fs::write(
+                held,
+                format!("btrdasd scrub run pid {}\n", std::process::id()),
+            )
+            .unwrap();
+            assert!(any_lock_held(&both), "one held is enough");
+        }
     }
 
     // --- slow health query reporting (bd DAS-Backup-Manager-amsg) ---
