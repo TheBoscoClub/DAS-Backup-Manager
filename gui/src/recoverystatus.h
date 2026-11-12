@@ -172,3 +172,9 @@ bool sessionKept(const QString &summary);
 // closing lines follow, as the summary carried them.
 QString keptWords(const QString &summary, bool cancelled);
 
+// An attended session at its operator phase: the helper reports the stage
+// `<label>:wait` from the script's `PROGRESS <label> wait start` until the VM
+// shuts down, with the bar at a fixed percentage and nothing else on the
+// panel saying the session waits for the operator (bd DAS-Backup-Manager-343p).
+bool isOperatorWaitStage(const QString &stage);
+QString operatorWaitWords();

@@ -75,6 +75,15 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     m_progressBar->setTextVisible(true);
     mainLayout->addWidget(m_progressBar);
 
+    // What the operator does while an attended recovery-OS session waits for
+    // them; shown only then (bd DAS-Backup-Manager-343p).
+    m_operatorHint = new QLabel(this);
+    m_operatorHint->setObjectName(QStringLiteral("operatorHint"));
+    m_operatorHint->setWordWrap(true);
+    m_operatorHint->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_operatorHint->setVisible(false);
+    mainLayout->addWidget(m_operatorHint);
+
     // Row 3: throughput label + ETA label + log toggle
     auto *row3 = new QHBoxLayout();
     row3->setSpacing(8);
@@ -140,6 +149,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     m_currentJobId = jobId;
     m_cancelRequested = false;
+    m_operatorHint->setVisible(false);
     m_operationLabel->setText(operation);
     m_coverageButton->setVisible(false);
     m_stageLabel->clear();
@@ -174,6 +184,11 @@ void ProgressPanel::onJobProgress(const QString &jobId, const QString &stage,
     }
     m_stageLabel->setText(stage);
     m_stageLabel->setToolTip(stage);
+    if (isOperatorWaitStage(stage)) {
+        m_operatorHint->setText(operatorWaitWords());
+        m_operatorHint->setToolTip(operatorWaitWords());
+    }
+    m_operatorHint->setVisible(isOperatorWaitStage(stage));
 
     // Parse throughput and ETA from message if present.
     // Expected format fragments: "throughput: 123 MB/s" and "ETA: 5m 30s"
@@ -246,6 +261,7 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
     }
 
     showCancelIdle(false);
+    m_operatorHint->setVisible(false);
     // A job that ended in a busy stage must not leave the bar running.
     m_progressBar->setRange(0, 100);
     // The backup's finish text carries coverage::message_line's warning

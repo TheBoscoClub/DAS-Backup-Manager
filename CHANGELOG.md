@@ -96,6 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The progress panel tells the operator what an attended recovery-OS session waits for** (bd `DAS-Backup-Manager-343p`): the session sat at 11% for an hour while its only instruction scrolled out of the log, and the operator took `waiting for the recovery OS to power off` for a hang
+  - While the stage is the session's `wait` step (`<label>:wait`) a line under the bar says to update the recovery OS in its console, then shut it down inside its VM (the drive and the enclosure stay on), and that the session completes when it does and the bar does not move until then; it goes with the next stage, the job's end or the next job — `isOperatorWaitStage`, `operatorWaitWords`
+
 - **The GUI shows a recovery-OS session left running as kept, not failed** (bd `DAS-Backup-Manager-z5od`): cancelling an attended session made the script keep the recovery OS running (exit 3), and the progress panel showed a red `Failed` bar the operator read as "the cancel failed"
   - A session job whose summary begins `kept (exit 3)` shows `Cancelled, recovery OS still running` (this window asked for the cancel) or `Kept, recovery OS still running`, no red bar, and says the OS is still running in its VM, how to shut it down (the drive and the enclosure stay on) and to press End session; the script's own closing lines follow — `sessionKept`, `keptWords`. The Recovery OS panel's status line says the same instead of `Failed: …`
   - End session was already allowed once the job is over (the session is then held by a process, not a job); other exit codes still show `Failed`

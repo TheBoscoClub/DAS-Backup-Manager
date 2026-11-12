@@ -464,3 +464,15 @@ QString keptWords(const QString &summary, bool cancelled)
         words += QStringLiteral(" The session said: %1").arg(detail);
     return words;
 }
+
+bool isOperatorWaitStage(const QString &stage)
+{
+    return stage.endsWith(QLatin1String(":wait"));
+}
+
+QString operatorWaitWords()
+{
+    return QStringLiteral("Attended: update the recovery OS in its console. When the update is done: %1 The session "
+                          "completes when it shuts down; the progress bar does not move until then.")
+        .arg(shutDownInVmWords());
+}

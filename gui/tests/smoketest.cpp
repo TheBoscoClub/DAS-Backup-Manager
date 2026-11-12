@@ -350,6 +350,38 @@ private Q_SLOTS:
         QVERIFY(bar->styleSheet().contains(QStringLiteral("#cc0000")));
     }
 
+    void anAttendedSessionAtItsOperatorPhaseSaysWhatTheOperatorDoes()
+    {
+        QVERIFY(isOperatorWaitStage(QStringLiteral("system-recovery-B-2tb:wait")));
+        QVERIFY(!isOperatorWaitStage(QStringLiteral("system-recovery-B-2tb:boot")));
+        QVERIFY(!isOperatorWaitStage(QStringLiteral("Sending snapshots")));
+        QVERIFY(operatorWaitWords().contains(shutDownInVmWords()));
+
+        DBusClient client;
+        ProgressPanel panel(&client);
+        QLabel *hint = panel.findChild<QLabel *>(QStringLiteral("operatorHint"));
+        QVERIFY(hint != nullptr);
+        QVERIFY(hint->isHidden());
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("system-recovery-B-2tb:start"), 5, QString());
+        QVERIFY(hint->isHidden());
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("system-recovery-B-2tb:wait"), 11, QString());
+        QVERIFY(!hint->isHidden());
+        QCOMPARE(hint->text(), operatorWaitWords());
+        QVERIFY(!hint->toolTip().isEmpty());
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("system-recovery-B-2tb:boot"), 15, QString());
+        QVERIFY(hint->isHidden());
+
+        // Ended or replaced by another job while waiting: gone.
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("system-recovery-B-2tb:wait"), 11, QString());
+        QVERIFY(!hint->isHidden());
+        panel.onJobFinished(QStringLiteral("job-1"), true, QStringLiteral("clean"));
+        QVERIFY(hint->isHidden());
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("system-recovery-B-2tb:wait"), 11, QString());
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Backup"));
+        QVERIFY(hint->isHidden());
+    }
+
     // --- backup history: an unknown count is "unknown", never 0 -------------
     //
     // A run that could not count its snapshots is stored with NULL counts and
