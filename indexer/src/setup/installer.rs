@@ -1621,6 +1621,7 @@ fn restart_helper_by_signal(
 /// when the `btrbk.conf` renderer refuses it (bd xtnq) — why. A refused
 /// config was not saved; the upgrade still retires old units and restarts
 /// the helper, then fails with the refusal.
+#[derive(Default)]
 struct Prepared {
     config: Config,
     refused: Option<String>,
