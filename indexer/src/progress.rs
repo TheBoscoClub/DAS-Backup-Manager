@@ -145,6 +145,16 @@ pub enum ProgressEvent {
 impl ProgressEvent {
     /// `current` as a whole percentage of `total`, capped at 100; 0 when
     /// `total` is 0 (nothing to measure against).
+    /// The percentage a stage starts at: 0 when it has steps to count, and
+    /// [`Self::UNCOUNTED`] when it is one step (a single btrbk call, one
+    /// snapshot restored) and nothing will be counted until it ends.
+    pub fn stage_percent(total_steps: u64) -> i32 {
+        if total_steps > 1 { 0 } else { Self::UNCOUNTED }
+    }
+
+    /// A stage's progress that cannot be measured: shown as busy, not as 0%.
+    pub const UNCOUNTED: i32 = -1;
+
     pub fn percent(current: u64, total: u64) -> i32 {
         (u128::from(current) * 100)
             .checked_div(u128::from(total))
@@ -605,6 +615,14 @@ mod tests {
         progress.on_log(LogLevel::Info, "partial");
         drop(progress);
         assert_eq!(*got.lock().unwrap(), vec![log_msg("partial")]);
+    }
+
+    #[test]
+    fn a_one_step_stage_starts_uncounted_and_a_counted_one_at_zero() {
+        assert_eq!(ProgressEvent::stage_percent(1), ProgressEvent::UNCOUNTED);
+        assert_eq!(ProgressEvent::stage_percent(0), ProgressEvent::UNCOUNTED);
+        assert_eq!(ProgressEvent::stage_percent(2), 0);
+        assert_eq!(ProgressEvent::stage_percent(469), 0);
     }
 
     #[test]

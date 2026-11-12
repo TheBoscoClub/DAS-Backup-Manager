@@ -121,8 +121,11 @@ impl ProgressSink for DbusSink {
                 .await?;
             let ctxt = iface.signal_emitter();
             match event {
-                ProgressEvent::Stage { stage, .. } => {
-                    HelperInterface::job_progress(ctxt, job_id, &stage, 0, "").await
+                ProgressEvent::Stage { stage, total_steps } => {
+                    // A one-step stage has nothing to count: the GUI shows it
+                    // busy instead of 0% (bd DAS-Backup-Manager-iic8).
+                    let percent = ProgressEvent::stage_percent(total_steps);
+                    HelperInterface::job_progress(ctxt, job_id, &stage, percent, "").await
                 }
                 ProgressEvent::Progress {
                     current,

@@ -32,6 +32,7 @@
 #include <QCheckBox>
 #include <QGroupBox>
 #include <QLabel>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QHeaderView>
@@ -231,6 +232,41 @@ private Q_SLOTS:
     // script joined into one summary, thousands of characters. In a label
     // that does not wrap, that length became the dock's minimum width and
     // pushed the main window past four screens (2026-10-20).
+
+    // --- a stage with nothing to count runs busy, never a false 0% ----------
+    //
+    // "Sending snapshots" is one btrbk call: the bar read 0% for the whole
+    // send and then jumped to 100 (bd iic8). The helper marks such a stage
+    // with a negative percentage.
+
+    void anUncountedStageShowsABusyBarUntilProgressOrTheEnd()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        auto *bar = panel.findChild<QProgressBar *>();
+        QVERIFY(bar != nullptr);
+
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Backup"));
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("Sending snapshots"), -1, QString());
+        QCOMPARE(bar->minimum(), 0);
+        QCOMPARE(bar->maximum(), 0);
+
+        // A counted event brings the percentage back.
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("progress"), 40, QString());
+        QCOMPARE(bar->maximum(), 100);
+        QCOMPARE(bar->value(), 40);
+
+        // Ended while busy, failed or not: the bar stops.
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("Sending snapshots"), -1, QString());
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("btrbk failed"));
+        QCOMPARE(bar->maximum(), 100);
+
+        // And the next job starts counted.
+        panel.onJobProgress(QStringLiteral("job-1"), QStringLiteral("Sending snapshots"), -1, QString());
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Backup"));
+        QCOMPARE(bar->maximum(), 100);
+        QCOMPARE(bar->value(), 0);
+    }
 
     void aLongSummaryWrapsAndNeverWidensThePanel()
     {

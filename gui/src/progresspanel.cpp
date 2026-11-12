@@ -142,6 +142,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
     m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();
     m_etaLabel->clear();
+    m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(QString());  // reset any error styling
     showCancelIdle(true);
@@ -158,7 +159,15 @@ void ProgressPanel::onJobProgress(const QString &jobId, const QString &stage,
         return;
     }
 
-    m_progressBar->setValue(percent);
+    // A negative percentage is a stage with nothing to count (one btrbk call
+    // that sends every snapshot): the bar runs busy rather than reading 0%
+    // until it jumps to 100 (bd DAS-Backup-Manager-iic8).
+    if (percent < 0) {
+        m_progressBar->setRange(0, 0);
+    } else {
+        m_progressBar->setRange(0, 100);
+        m_progressBar->setValue(percent);
+    }
     m_stageLabel->setText(stage);
     m_stageLabel->setToolTip(stage);
 
@@ -233,6 +242,8 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
     }
 
     showCancelIdle(false);
+    // A job that ended in a busy stage must not leave the bar running.
+    m_progressBar->setRange(0, 100);
     // The backup's finish text carries coverage::message_line's warning
     // (bd sp78.4): offer the dialog that lists and accepts the pairs.
     m_coverageButton->setVisible(summary.contains(QLatin1String("subvolume coverage WARN")));
@@ -313,6 +324,7 @@ void ProgressPanel::toggleLog()
 void ProgressPanel::resetPanel()
 {
     m_currentJobId.clear();
+    m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(QString());  // reset any error styling
     m_operationLabel->clear();

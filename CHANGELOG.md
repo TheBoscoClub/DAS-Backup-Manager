@@ -97,6 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The first such reply writes one line to the helper's journal, `treating the targets as held by a job: <reason>` — `health::lock_file_state`, `health::targets_hold_state`
   - A kept snapshot reading of a target no longer in `config.toml` is dropped at the next reply, no longer kept until the helper exits
 
+- **The GUI's progress bar runs busy through a stage that has nothing to count** (bd `DAS-Backup-Manager-iic8`): `Sending snapshots` is a single btrbk call that reports nothing until it ends, so the bar read 0% for the whole send — over an hour on a full run — and then jumped to 100%, which looked like a stall
+  - The helper's `JobProgress` signal carries `-1` as the percentage at the start of a one-step stage (`ProgressEvent::stage_percent`); the panel shows the bar busy until a counted event or the job's end; a stage with steps to count starts at 0 as before
+  - The signal's signature is unchanged, and an older GUI shows `-1` as 0%, as it did
+
 - **`btrdasd setup --modify` no longer proposes a second copy of the configured sources** (bd `DAS-Backup-Manager-5237.17`): the wizard's source step offered every detected subvolume again, all ticked, and pushed them as a new source beside the configured ones — Enter through the step on a one-source installation ended with two sources listing `@` and `@home` twice — and with no subvolume detected it required a new source to be typed before it would go on
   - With sources configured the step now shows them (label, volume, subvolumes), points to `btrdasd subvol add` / `subvol remove` for changing one, and asks `Add another source?`, defaulting to no
   - Asked for one, it offers only detected subvolumes no source lists yet; when every detected one is listed the new source is entered by hand
