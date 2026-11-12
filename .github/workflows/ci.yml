@@ -1,3 +1,4 @@
+---
 # Continuous integration — builds and tests, publishes nothing.
 #
 # Deliberately separate from release-packages.yml, which triggers ONLY on version

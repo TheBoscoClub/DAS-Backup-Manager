@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`backup snapshot` and `backup send` run through one tested library step** (bd `DAS-Backup-Manager-r1tr`): the CLI arms each did locks, mount sources, sync, mount targets, the step and the unmount inline, so deleting the send arm's sync left every test green; both now call `backup::run_manual_step` on `BackupJobHost` (new `sync_manual`, `snapshot` and `send` steps), whose tests pin the order, that a failed sync reaches no step and still releases the sources, and that a declined lock does nothing
   - The D-Bus helper exposes no snapshot or send method (only `BackupRun`), so only the CLI was affected
+- **`yamllint .github/` is clean, with a repo `.yamllint`** (bd `DAS-Backup-Manager-gi73`): the workflows failed yamllint's default 80-column rule (51 errors) and the repo had no config, so "yamllint is clean" was only true with style rules off
+  - New `.yamllint` extends `default` with two relaxations: `line-length` at 150 (workflow `run:` blocks carry long shell lines that cannot be wrapped), and `truthy` not checking keys (`on:` is the Actions trigger key); every other default rule stays on
+  - The real findings are fixed instead: a `---` document start in the four workflows that lacked one, and two spaces before four trailing comments
 
 ### Removed
 

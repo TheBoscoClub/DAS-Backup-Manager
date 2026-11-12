@@ -1,3 +1,4 @@
+---
 # Falsifiability gate — can the test suite fail?
 #
 # A passing test proves nothing on its own; it must also be capable of FAILING.
@@ -35,7 +36,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 4 * * 1' # Mondays 04:00 UTC — full-scope run
+    - cron: '0 4 * * 1'  # Mondays 04:00 UTC — full-scope run
   workflow_dispatch:
 
 permissions:
@@ -176,7 +177,7 @@ jobs:
       - name: Mutants
         if: steps.diff.outputs.listed != '0'
         working-directory: indexer
-        continue-on-error: true # the gate below decides, not this exit code
+        continue-on-error: true  # the gate below decides, not this exit code
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           # Word-split on purpose: empty for an unsharded small push.

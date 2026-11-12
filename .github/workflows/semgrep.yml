@@ -1,3 +1,4 @@
+---
 # Semgrep — SAST, Secrets and Supply Chain scanning, findings reported to the
 # Semgrep AppSec Platform (deployment gjbr-pm-me). This is the SOLE integration
 # with Semgrep: no GitHub App is installed on the org, and the only credential

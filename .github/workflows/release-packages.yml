@@ -1,3 +1,4 @@
+---
 name: Build Release Packages
 
 on:
@@ -232,7 +233,7 @@ jobs:
 
       - uses: actions/checkout@v7.0.1
 
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3  # v6.8
         with:
           manifest-path: packaging/flatpak/org.theboscoclub.btrdasd-gui.yml
           bundle: ButteredDASD-GUI.flatpak
@@ -311,6 +312,6 @@ jobs:
         run: ls -lhR packages/
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
         with:
           files: packages/*
