@@ -1055,6 +1055,11 @@ when the run could not count them: the history then stores them as unknown
 A count is never made up: one count without the other, or a count with
 .BR \-\-counts\-unknown ,
 is refused, and a count cannot be negative.
+The size is given the same way: either
+.B \-\-bytes\-sent
+or
+.BR \-\-bytes\-unknown ,
+never both and never neither.
 .PP
 .B btrdasd backup record\-run
 .RB [ \-\-db
@@ -1068,8 +1073,10 @@ is refused, and a count cannot be negative.
 .I N
 |
 .BR \-\-counts\-unknown }
-.RB [ \-\-bytes\-sent
-.IR N ]
+.RB { \-\-bytes\-sent
+.I N
+|
+.BR \-\-bytes\-unknown }
 .RB [ \-\-duration\-secs
 .IR N ]
 .RB [ \-\-errors
@@ -1113,7 +1120,14 @@ or
 .BR \-\-snaps\-sent .
 .TP
 .BI \-\-bytes\-sent " N"
-Bytes sent to targets. Default: 0.
+Bytes sent to targets; 0 is a measured nothing sent. Required unless
+.B \-\-bytes\-unknown
+is given; there is no default.
+.TP
+.B \-\-bytes\-unknown
+The run could not measure what it sent (a target read before btrbk and not after).
+The size is recorded as unknown (NULL), never as 0. Not with
+.BR \-\-bytes\-sent .
 .TP
 .BI \-\-duration\-secs " N"
 Duration in seconds. Default: 0.
@@ -1860,6 +1874,26 @@ will or may run btrbk (see
 .BR "recovery\-os inspect" ),
 is also a warning, so the status reads
 .BR WARNING .
+.PP
+The
+.B "Last backup:"
+line is the end of the newest successful run in the run history
+(not a reading of the targets, so it is known with every target unmounted),
+printed in UTC and labelled
+.BR UTC ,
+for example
+.BR "Last backup: 2026\-01\-31 22:02 UTC" .
+It is left out when no run has succeeded yet or the history could not be read
+(the latter is also a warning).
+With
+.BR \-\-json
+the same time is the
+.B last_backup
+key, as
+.B YYYY\-MM\-DD HH:MM
+in UTC, or
+.B null
+when there is none.
 .PP
 With
 .BR \-\-json ,

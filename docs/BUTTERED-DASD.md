@@ -60,6 +60,9 @@ backup-run.sh                   btrdasd CLI
 | `progress` | `src/progress.rs` | `ProgressCallback` trait and log levels shared by the CLI and the D-Bus helper (the helper turns events into ordered signals) |
 | `recovery_os` | `src/recovery_os.rs` | Read-only inspection of the independent OS on each mirror target: whether it has fallen behind the host, and whether booting it would run btrbk (what its systemd trees and cron start, what those run, and the btrbk config each would use) (`btrdasd recovery-os`) |
 | `report` | `src/report.rs` | Backup report formatting |
+| `maintenance` | `src/maintenance.rs` | The DAS maintenance lock (`/run/das-maintenance.lock`) and `MaintenanceHeld`, the proof every target mount requires; holder records and the wait of `walk` and `restore` |
+| `run_steps` | `src/run_steps.rs` | The steps `backup-run.sh` does around btrbk, as pure functions the CLI/GUI run calls: USB link check, `throughput.jsonl` and `growth.log` lines, expiry of retired subvolumes |
+| `unit_links` | `src/unit_links.rs` | The `das-*` systemd units kept in `<config dir>-units` and linked into systemd's directory; every writer, enabler, disabler and remover goes through it |
 | `restore` | `src/restore.rs` | File and snapshot restore via btrfs send/receive, gated by `[restore] allowed_roots` and a denylist |
 | `schedule` | `src/schedule.rs` | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | Scheduled BTRFS scrub engine for the DAS filesystems |
@@ -81,7 +84,7 @@ backup-run.sh                   btrdasd CLI
 
 ### Tables
 
-**snapshots** — One row per indexed BTRFS snapshot (schema version 6, stored in `PRAGMA user_version`; an older database is migrated on open).
+**snapshots** — One row per indexed BTRFS snapshot (schema version 8, stored in `PRAGMA user_version`; an older database is migrated on open).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -311,7 +314,7 @@ See [INSTALL.md](INSTALL.md) for comprehensive installation instructions includi
 
 ```bash
 cd indexer
-cargo test --features dbus   # 856 run (864 listed with `-- --list` incl. 8 manual root-only loopback tests, 2026-10-02): lib and CLI unit tests, helper and integration suites
+cargo test --features dbus   # lib and CLI unit tests, helper and integration suites; counts: the Tests table in ARCHITECTURE.md
 cargo clippy --features dbus # Lint check
 cargo fmt --check            # Format check
 cargo audit                  # Security audit

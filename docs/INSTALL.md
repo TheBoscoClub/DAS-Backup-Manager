@@ -254,7 +254,7 @@ match your volumes and drives; every other key is in the
 <!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
 ```toml
 [general]
-version = "0.7.23"                   # the crate's three-part version (`btrdasd --version` prints all four parts)
+version = "0.7.23.3"                 # the four-part version `btrdasd --version` prints
 install_prefix = "/usr"              # the prefix btrdasd is installed under
 db_path = "/var/lib/das-backup/backup-index.db"
 
@@ -318,7 +318,7 @@ This installs everything except the GUI; `btrdasd setup` then configures the hos
 | `BUILD_INDEXER` | `ON` | Build the `btrdasd` Rust binary via cargo |
 | `BUILD_HELPER` | `ON` | Build the `btrdasd-helper` D-Bus daemon and install polkit/D-Bus config |
 | `REQUIRE_ALL_SHELL_CASES` | `OFF` | `ctest` fails a shell suite that prints `NOT RUN`, a case its host could not run (no `en_US.UTF-8` locale, no built `btrdasd`); CI sets it |
-| `CMAKE_INSTALL_PREFIX` | `/usr/local` | Installation prefix for binaries and scripts |
+| `CMAKE_INSTALL_PREFIX` | `/usr` | Installation prefix for binaries and scripts |
 | `CMAKE_BUILD_TYPE` | (unset) | `Release`, `RelWithDebInfo`, or `Debug` |
 
 ### CLI-Only Build (no GUI dependencies)
@@ -342,15 +342,16 @@ Build through CMake rather than a bare `cargo build`: CMake passes `--target-dir
 
 ## Distribution Packages
 
-Native packaging recipes are included under `packaging/` and build-tested on their respective distributions before each release.
+Native packaging recipes are included under `packaging/`. The release workflow (`.github/workflows/release-packages.yml`) builds the Arch, Debian, Fedora, AppImage and Flatpak packages and a reproducible source tarball when a release tag is pushed, each on its own distribution or container. The Snap recipe is kept in `packaging/snap/` but is **not** built or tested by the release workflow: its job is disabled until a snapcraft base ships KF6 (bd `DAS-Backup-Manager-w49m` tracks packaging follow-ups).
 
 | Distribution | Format | Directory | GUI Support |
 | --- | --- | --- | --- |
 | Arch Linux / CachyOS | PKGBUILD (`makepkg`) | `packaging/arch/` | Full |
 | Debian 13+ / Ubuntu 24.10+ | dpkg (`dpkg-buildpackage`) | `packaging/debian/` | Full (KF6 required) |
 | Fedora 43+ | RPM (`rpmbuild`) | `packaging/fedora/` | Full |
+| AppImage | `build-appimage.sh` | `packaging/appimage/` | GUI only |
 | Flatpak | Flatpak manifest | `packaging/flatpak/` | Full |
-| Snap | snapcraft | `packaging/snap/` | Full |
+| Snap (not built by the release workflow) | snapcraft | `packaging/snap/` | Recipe only, untested |
 | Ubuntu 24.04 LTS | cmake (CLI-only) | — | No (KF6 unavailable) |
 
 **Arch Linux example:**
@@ -378,13 +379,14 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `version` | string | the running build's `CARGO_PKG_VERSION` (3-part semver, e.g. `"0.7.23"`) | Config format version |
+| `version` | string | the running build's version, the four-part one `btrdasd --version` prints (e.g. `"0.7.23.3"`) | Config format version |
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 | `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |
 | `growth_log` | string | `"/var/lib/das-backup/growth.log"` | Capacity growth trend log path |
 | `last_report` | string | `"/var/lib/das-backup/last-report.txt"` | Most recent email report body, cached for the GUI |
 | `btrbk_conf` | string | `"/etc/btrbk/btrbk.conf"` | btrbk config path |
+| `recovery_drive` | boolean | `false` | Set by `btrdasd config derive-recovery` in the configuration a recovery drive's own OS carries: no sources, every target kept with the booted drive first, restores allowed only under the recovery roots (see `btrdasd(1)`); never set by hand on a host |
 
 ### `[init]`
 

@@ -1273,7 +1273,7 @@ Then for each drive in turn — `A` and `B` stand for the `role = "mirror"` targ
 # Every check, the lock and the claim, taken and given back; nothing attached or booted
 sudo /usr/lib/das-backup/recovery-os-vm.sh session A --dry-run
 
-# The real session: boots drive A's own OS and waits until it powers off
+# The real session: boots drive A's own OS and waits until you shut it down in its VM (the drive stays on)
 sudo /usr/lib/das-backup/recovery-os-vm.sh session A
 ```
 
@@ -1290,7 +1290,7 @@ Other commands:
 - `status` — each drive's VM: its state, the disk it holds, the session guard and its report's judgement (`engaged` with its last report's age, `no report yet`, `never ran`, `pending: the recovery OS was reset …`, `NOT engaged: …`, `NOT confirmed: the recovery OS was reset …`, `NOT confirmed: silent for …`, `cannot be judged: …` when its session state is gone — a host restart clears `/run` — or, with the guard in the definition and no session state at all, `cannot be judged: no session state for it`; exit status 6, or 5 on a `no` record, for the three that begin with NOT, and 6 for the two that cannot be judged), the holder and its scope, who holds the maintenance lock, and whether an egress rule is noted and how many are in place (`unknown`, with ip's words, when `ip rule show` fails — never 0). A shared `recovery-os-updater` still defined is named, with `define` to retire it. A definition virsh cannot read makes the guard `unknown (virsh: …)`, exit status 6. A VM that is not defined at all has no guard (exit status 0).
 - `screenshot A screen.png` — drive A's VM screen, while it runs (read through QEMU's monitor, so it does not need the VNC socket).
 - `session A --unattended`, `session A B [--mode sequential|parallel]`, `history`, `clean-runs A`, `console-socket A <uid>` — [below](#unattended-updates).
-- `session-end A` — finishes a session whose script was interrupted or killed (exit status 3 or 4), once the recovery OS is powered off: judges the guard's report first and says what it found (exit status 6, or 5 on a `no` record, when it was not engaged, is missing for a recovery OS that ran, cannot be read, or a reset the session saw was never answered by a boot reporting engaged; 5 when its last line was left unfinished), detaches, defines the VM from its template again (no guard), stops the holder (which releases the lock), rescans. With no disk attached it still takes out a guard left in the definition. Whenever it changes the VM's definition with no live holder, it takes the maintenance lock first, and refuses while another job holds it.
+- `session-end A` — finishes a session whose script was interrupted or killed (exit status 3 or 4), once the recovery OS is shut down in its VM (the drive stays on): judges the guard's report first and says what it found (exit status 6, or 5 on a `no` record, when it was not engaged, is missing for a recovery OS that ran, cannot be read, or a reset the session saw was never answered by a boot reporting engaged; 5 when its last line was left unfinished), detaches, defines the VM from its template again (no guard), stops the holder (which releases the lock), rescans. With no disk attached it still takes out a guard left in the definition. Whenever it changes the VM's definition with no live holder, it takes the maintenance lock first, and refuses while another job holds it.
 
 #### The first update, at the VM console
 

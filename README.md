@@ -35,13 +35,13 @@ That said, suggestions, recommendations, and requests that fall within this narr
 - **ButteredDASD Content Indexer** (`buttered_dasd` library + `btrdasd` CLI) — Rust library and CLI with SQLite FTS5 database tracking every file across all snapshots
 - **Auto-Mount/Unmount** — RAII `MountGuard` finds each target by its `mount_uuid` or drive serial (the same rule as `backup-run.sh`), auto-mounts BTRFS partitions before operations, and unmounts on completion, retrying a busy target; one it cannot release fails the operation with `still mounted: <path>` (all D-Bus methods and CLI commands)
 - **Targets Hidden From Desktop Automount** — a generated udev rule marks every backup target as ignored by udisks2, so nothing mounts it under `/run/media`; only the backup run and `btrdasd` mount targets (`btrdasd setup --check` reads back whether each attached target carries the flag)
-- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 27 methods for backup, restore, config, schedule, health, index read and recovery-OS update operations
+- **D-Bus Privileged Helper** (`btrdasd-helper`) — polkit-authorized daemon with 29 methods for backup, restore, config, schedule, health, index read and recovery-OS update operations
 - **KDE Plasma GUI** (`btrdasd-gui`) — Native Qt6/KF6 full backup management application with sidebar navigation, Dolphin-style file browser, backup operations, health dashboard, config editor, desktop notifications, and system tray
 - **USB SMART Passthrough** — Health queries use `-d sat` for USB-attached DAS drives to read SMART data through USB-SATA bridges
 - **Interactive Installer** (`btrdasd setup`) — 9-step wizard with 5 modes: install, modify, upgrade, uninstall, check
 - **Shell Completions** — `btrdasd completions` generates completions for bash, zsh, fish, elvish, and PowerShell
 - **Distro-Agnostic** — Supports systemd, sysvinit, and OpenRC init systems
-- **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), Flatpak, and Snap — all build-tested on their respective distributions before each release
+- **Native Packaging** — Packaging recipes for Arch (PKGBUILD), Debian/Ubuntu (dpkg), Fedora (RPM), AppImage, Flatpak and Snap — the release workflow builds all but Snap (whose job is disabled, bd `DAS-Backup-Manager-w49m`) when a release tag is pushed, plus a source tarball
 
 ## Components
 
@@ -55,7 +55,7 @@ That said, suggestions, recommendations, and requests that fall within this narr
 | `scripts/recovery-os-vm.sh` | Lends one recovery drive, whole, to its own `recovery-os-updater-<label>` VM (template `packaging/libvirt/recovery-os-updater.xml`) to update its own OS without rebooting the workstation; the host is kept off the drive meanwhile by the maintenance lock and an `O_EXCL` claim, and btrbk is kept from running in its OS by a per-session guard | Active |
 | `config/btrbk.conf` | Reference btrbk configuration | Active |
 | `indexer/` | ButteredDASD (`buttered_dasd` lib + `btrdasd` CLI + `btrdasd-helper` D-Bus daemon) | Active (v0.7.0+) |
-| `gui/` | Qt6/KDE Plasma full backup management GUI (18 C++ components) | Active (v0.7.0+) |
+| `gui/` | Qt6/KDE Plasma full backup management GUI (23 C++ components: every `gui/src/*.cpp` but `main.cpp`) | Active (v0.7.0+) |
 | `dbus/` | D-Bus system bus configuration and service activation files | Active (v0.7.0+) |
 | `polkit/` | Polkit policy for privilege escalation (8 actions: backup, restore, config, config.read, index, index.read, health, recovery-os) | Active (v0.7.0+) |
 
@@ -68,15 +68,15 @@ DAS-Backup-Manager/
 ├── scripts/           # Shell scripts (backup, verify, cleanup, partition, recovery OS VM)
 ├── config/            # btrbk.conf reference template
 ├── indexer/           # ButteredDASD — Rust library + CLI + D-Bus helper
-│   ├── src/           # Library modules (22): adopt, backup, btrbk_conf, caldate, config, db, doctor, expire, forget, fsutil, health, indexer, mount, progress, reconcile, recovery_os, report, restore, scanner, schedule, scrub, subvol
+│   ├── src/           # Library modules (one per `pub mod` in `lib.rs`; `grep '^pub mod ' indexer/src/lib.rs` lists them): adopt, backup, btrbk_conf, caldate, config, coverage, db, doctor, expire, forget, fsutil, health, indexer, maintenance, mount, progress, reconcile, recovery_os, report, restore, run_steps, scanner, schedule, scrub, static_send, subvol, unit_links
 │   ├── src/setup/     # Binary-only: interactive installer (wizard, templates, detection)
 │   ├── src/bin/       # btrdasd-helper D-Bus daemon
 │   └── completions/   # Shell completion installation instructions
-├── gui/               # Qt6/KDE Plasma GUI (18 C++ components)
+├── gui/               # Qt6/KDE Plasma GUI (23 C++ components, `main.cpp` apart)
 │   └── src/           # MainWindow, Sidebar, DBusClient, panels, dialogs, models
 ├── dbus/              # D-Bus bus config and service activation
 ├── polkit/            # Polkit privilege escalation policy
-├── packaging/         # Distro packaging (Arch, Debian, Fedora, Flatpak, Snap); libvirt/ the recovery OS VM
+├── packaging/         # Distro packaging (Arch, Debian, Fedora, AppImage, Flatpak, Snap); libvirt/ the recovery OS VM
 ├── docs/              # Architecture, installation, dependencies, recovery, man page
 └── CMakeLists.txt     # Build system (BUILD_GUI, BUILD_INDEXER, BUILD_HELPER)
 ```

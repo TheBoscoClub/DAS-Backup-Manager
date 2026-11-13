@@ -80,7 +80,7 @@ The system has six major components:
 | Component | Language | Binary | Purpose |
 | --- | --- | --- | --- |
 | Backup scripts | bash | N/A | btrbk orchestration, verification, boot archival |
-| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | 24 modules: single source of truth for all business logic |
+| Rust library | Rust 2024 | `libbuttered_dasd.rlib` | One module per `pub mod` in `indexer/src/lib.rs` (`grep '^pub mod ' indexer/src/lib.rs` lists them): single source of truth for all business logic |
 | Content indexer / CLI | Rust 2024 | `btrdasd` | SQLite FTS5 database, full subcommand CLI |
 | D-Bus privileged helper | Rust 2024 | `btrdasd-helper` | polkit-authorized daemon (29 methods, 8 polkit actions). No method accepts a path from the caller — the daemon reads `CANONICAL_CONFIG` only (since 0.7.20.0) and opens only the index database named in it (since 0.7.21.0) |
 | KDE Plasma GUI | C++20 | `btrdasd-gui` | Full backup management: file browser, backup ops, health, config |
@@ -298,6 +298,13 @@ lock held by reading, never by trying it: the holder's record in the lock file n
 process, or `/proc/locks` lists a flock on the file. Calls that arrive while a `HealthQuery()`
 reply is being made share that reply.
 
+The `HealthQuery()` reply carries these readings (`btrdasd-helper.rs`, from `health::HealthReport`):
+
+- `targets[].snapshot_reading_age_secs`: age in seconds of that target's `snapshot_count` when it is the kept reading served because a job held the targets; `null` when the count was read for this reply
+- `services.targets_busy`: `true` when a backup, scrub or other job held the targets, so their snapshot directories were not walked
+- `last_backup`, and the same value under `services.last_backup`: when the newest successful run ended, `YYYY-MM-DD HH:MM` in UTC; `null` when none has succeeded or the history could not be read
+- `services.last_backup_age_secs`: seconds from `last_backup` to now, computed by the helper; `null` when `last_backup` is `null` (the GUI's `Last Backup` line says so rather than showing a number)
+
 **Last backup** (bd `DAS-Backup-Manager-5237.18`): the time the newest successful run in the run
 history ended (`db::newest_successful_run_read_only`), not a reading of the targets, so it is known
 while they are unmounted. An unreadable history is a warning.
@@ -367,7 +374,7 @@ btrdasd-gui
 
 ### Schema
 
-The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 6, kept in
+The SQLite database at `/var/lib/das-backup/backup-index.db` (schema version 8, kept in
 `PRAGMA user_version`) uses four index tables, two history tables, three coverage tables and an FTS5
 virtual table:
 
@@ -747,6 +754,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `schedule` | `src/schedule.rs` | ~430 | systemd timer management (show/set/enable/disable) |
 | `scrub` | `src/scrub.rs` | ~3570 | Scheduled BTRFS scrub engine — locking, target resolution, pass tracking, exit-code split |
 | `subvol` | `src/subvol.rs` | ~215 | Subvolume CRUD operations |
+| `unit_links` | `src/unit_links.rs` | — | The systemd units kept in `<config dir>-units` and linked into systemd's directory: every writer, enabler, disabler and remover of the `das-*` units goes through it (bd `DAS-Backup-Manager-5237.7`) |
 | `main` | `src/main.rs` | ~5020 | CLI entry point with clap subcommands |
 | `setup/mod` | `src/setup/mod.rs` | — | Setup subcommand routing and root check |
 | `setup/config` | `src/setup/config.rs` | — | Re-export of the library's `config` types |
@@ -756,11 +764,11 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `setup/installer` | `src/setup/installer.rs` | — | Install/uninstall/upgrade/check with manifest |
 | `setup/retired_units` | `src/setup/retired_units.rs` | — | `setup --upgrade`'s one-time removal of the backup units older versions' `cmake --install` left under `/usr` (bd 7rf), recognised against `src/setup/retired_units/` — every byte but the install prefix in a service's `ExecStart=` — and kept when a link is above it or it was replaced while checked |
 | `setup/wizard` | `src/setup/wizard.rs` | — | 9-step interactive dialoguer wizard |
-| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~3980 | D-Bus daemon (feature `dbus`): 29 methods, 3 signals, polkit checks, job ownership |
+| `btrdasd-helper` | `src/bin/btrdasd-helper.rs` | ~4820 | D-Bus daemon (feature `dbus`): 29 methods, 3 signals, polkit checks, job ownership |
 
 ### KDE Plasma GUI (`gui/src/`)
 
-22 C++ components implementing full backup management (the previous read-only `Database`
+23 C++ components (one per `gui/src/*.cpp` apart from `main.cpp`) implementing full backup management (the previous read-only `Database`
 QSqlDatabase wrapper was removed when the GUI's models were rewired to go through
 `DBusClient`/`btrdasd-helper` exclusively — see `dbusclient.h/cpp` below):
 
@@ -780,7 +788,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | BackupHistoryView | `backuphistory.h/cpp` | QTableView of backup runs; auto-refresh on JobFinished |
 | HealthDashboard | `healthdashboard.h/cpp` | Tabbed widget: Drives (D-Bus), Growth (chart), Status (timers/mounts) |
 | RecoveryStatus | `recoverystatus.h/cpp` | Pure model (QtCore only) of `RecoveryOsStatus`'s document and the Recovery drives panel's enablement rules (`deriveActions`, `derivePairActions`); unit-tested in `gui-smoketest` against `gui/tests/fixtures/recovery-status.json`, which a `panel.rs` test writes and compares byte for byte |
-| RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Schedule / Clear schedule / Open console (TigerVNC's vncviewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
+| RecoveryPanel | `recoverypanel.h/cpp` | Recovery drives: one card per drive, a selector (one drive or both), attended/unattended, sequential/parallel, Now or a time; Upgrade / Record (re-reads the selected drive's OS and writes its boot record through `RecoveryOsRecord`, the CLI's `recovery-os record`; one drive at a time, and offered only while that record is missing, older than 8 days, dated in the future or made before the drive's last session ended — otherwise disabled with the reason, as it is when the record is current or while any session holds a drive; also the remedy the panel names when a session is refused for its record) / Schedule / Clear schedule / Open console (TigerVNC's vncviewer on the helper's console socket) / End session, every button bound to `{enabled, why}` |
 | ConfigDialog | `configdialog.h/cpp` | KPageDialog TOML editor with reload/diff/save toolbar |
 | CoverageDialog | `coveragedialog.h/cpp` | The subvolume/target pairs no longer backed up (`CoverageList`), each with the rule that dropped it, and Accept for one selected pair (`CoverageAccept`); the list is read again after each accept. Opened from Tools → Subvolume Coverage… and the progress panel's Review Coverage button; its rows and button rules unit-tested in `gui-smoketest` |
 | SnapshotTimeline | `snapshottimeline.h/cpp` | Custom QPainter widget for visual snapshot navigation |
@@ -788,6 +796,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | SnapshotWatcher | `snapshotwatcher.h/cpp` | QFileSystemWatcher with 30s debounce |
 | RestoreAction | `restoreaction.h/cpp` | KIO::copy with file dialog destination |
 | SettingsDialog | `settingsdialog.h/cpp` | KConfigDialog for paths and preferences |
+| StatusText | `statustext.h/cpp` | The main window's status line, assembled from one 60 s tick's stats, schedule and health replies and the refreshes that failed; a reading that did not come is said to be unknown or left out, never shown as 0 or as the previous tick's (bd `DAS-Backup-Manager-amsg`). Also the dashboard's `Last Backup` line from `last_backup_age_secs` |
 
 ### Tests
 
@@ -796,10 +805,10 @@ Counts from `cargo test --features dbus -- --list` and the `gui-smoketest` ctest
 
 | Suite | Count | Framework |
 | --- | --- | --- |
-| Rust unit tests | 1522 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s 24 `pub mod`s) |
+| Rust unit tests | 1522 | `#[cfg(test)]` modules in lib crate (`indexer/src/lib.rs`'s `pub mod`s, listed by `grep '^pub mod ' indexer/src/lib.rs`) |
 | Rust CLI + setup tests | 296 | `#[cfg(test)]` modules in `main.rs` and `setup/` (`btrdasd` binary, not part of the lib crate) |
 | D-Bus helper tests | 42 | `#[cfg(test)]` module in `src/bin/btrdasd-helper.rs` (built only with `--features dbus`) |
 | Rust integration tests | 62 | `indexer/tests/integration_test.rs` (9), `subvol_cli.rs` (29), `recovery_os_cli.rs` (7), `record_run_contract.rs` (9), `derive_recovery_cli.rs` (5), `test_builds_never_mail.rs` (2), `setup_requires_root.rs` (1) |
-| Rust loopback tests (manual, root-gated) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — `#[ignore]`d; real loop-device BTRFS, not run by plain `cargo test` |
+| Rust loopback tests (`#[ignore]`d, root-gated; CI's `loopback` job runs them on every push) | 11 | `indexer/tests/scrub_loopback.rs` (3), `subvol_sync_loopback.rs` (6), `boot_archive_loopback.rs` (2) — real loop-device BTRFS, not run by plain `cargo test`; run as root by `.github/scripts/run-root-loopback-suites.sh`, which the `loopback` job of `.github/workflows/ci.yml` calls on every push, and by hand with `--ignored` |
 | C++ GUI smoke tests | 55 | `gui/tests/smoketest.cpp` (QTest, `QT_QPA_PLATFORM=offscreen`, built with `BUILD_TESTING`): formatting, D-Bus error mapping, panels constructing without a helper, the Backup panel's button rules, the recovery status document's parser and enablement rules against the checked-in fixture. The click-simulation suites were removed 2026-03-01 |
 | **Total** | **1922 Rust (1933 incl. manual) + 55 Qt** | |

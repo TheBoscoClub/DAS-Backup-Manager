@@ -119,7 +119,7 @@ Required to compile the `btrdasd` indexer binary from source.
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF
 cmake --build build
 # Output: build/cargo-target/release/btrdasd (and btrdasd-helper)
-sudo cmake --install build   # installs to ${CMAKE_INSTALL_PREFIX}/bin (default /usr/local/bin)
+sudo cmake --install build   # installs to ${CMAKE_INSTALL_PREFIX}/bin (default /usr/bin)
 sudo btrdasd setup           # required: writes /etc/das-backup/config.toml and the units (INSTALL.md)
 ```
 
