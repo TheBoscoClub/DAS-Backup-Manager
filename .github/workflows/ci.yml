@@ -133,6 +133,21 @@ jobs:
           minor=$(rustc --version | sed -E 's/^rustc [0-9]+\.([0-9]+)\..*/\1/')
           [ "$minor" -ge 88 ] || { echo "::error::rustc is older than 1.88"; exit 1; }
 
+      # One sync test shows the bare-mountpoint trap: `btrfs subvolume list` on
+      # a bare directory answers for the filesystem under it, which takes a
+      # BTRFS filesystem under that directory. The runner's /var/lib is ext4,
+      # so the test gets a small BTRFS of its own (the image sits outside
+      # /tmp, for the job's whole life; the last step looks only at /tmp).
+      - name: A BTRFS directory for the bare-mountpoint test
+        run: |
+          img="$RUNNER_TEMP/das-loopback-base.img"
+          truncate -s 512M "$img"
+          mkfs.btrfs -q "$img"
+          sudo mkdir -p /var/lib/das-loopback-base
+          sudo mount -o loop "$img" /var/lib/das-loopback-base
+          [ "$(stat -f -c %T /var/lib/das-loopback-base)" = btrfs ]
+          echo "DAS_LOOPBACK_BTRFS_BASE=/var/lib/das-loopback-base" >> "$GITHUB_ENV"
+
       - name: Run the loopback suites as root
         run: .github/scripts/run-root-loopback-suites.sh
 

@@ -483,14 +483,17 @@ fn a_deleted_subvolume_is_retired_and_its_backups_expire_after_the_window() {
 fn sync_refuses_an_unmounted_source_volume_and_changes_nothing() {
     // The trap is real only if the bare directory sits on a BTRFS filesystem:
     // `btrfs subvolume list` on it then SUCCEEDS, answering for that
-    // filesystem instead of failing. So put the mount point on the VM's own
-    // BTRFS root, and refuse to run the test if that is not what it is.
-    let base = Path::new("/var/lib");
+    // filesystem instead of failing. So put the mount point on a BTRFS
+    // filesystem (the VM's own root by default; a host whose /var/lib is not
+    // BTRFS, such as CI's runner, names a directory that is one in
+    // DAS_LOOPBACK_BTRFS_BASE) and refuse to run the test if it is not one.
+    let base_dir = std::env::var("DAS_LOOPBACK_BTRFS_BASE").unwrap_or_else(|_| "/var/lib".into());
+    let base = Path::new(&base_dir);
     let fstype = must("stat", &["-f", "-c", "%T", base.to_str().unwrap()]);
     assert_eq!(
         fstype.trim(),
         "btrfs",
-        "this test needs {base:?} on BTRFS to show the bare-mountpoint trap"
+        "this test needs {base:?} on BTRFS to show the bare-mountpoint trap (DAS_LOOPBACK_BTRFS_BASE names another directory)"
     );
     let rig = Rig::with_source_mount_in(Some(base));
     // The first sync adopts the volume's top level (bd xtnq); after it, the
