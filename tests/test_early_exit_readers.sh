@@ -1681,6 +1681,44 @@ check "boot, the listing's mktemp fails: said, and no listing, snapshot, delete 
 check "boot, the plan's mktemp fails: FAIL, nothing asked of btrfs" \
     "$(BOOT_MKTEMP_FAIL_NTH=1 run_boot_subvols "$SHARED") $(boot_btrfs_calls)" "FAIL|0 updated, 1 failed none"
 
+# --- recovery-os-vm.sh: captured (bd DAS-Backup-Manager-uk3v.2) -------------
+# `if x="$(cmd)"` is TRUE with x empty when bash has no descriptor free for
+# the substitution's pipe: the command never ran. captured() brings the
+# command's own status back inside the capture, so a capture that could not be
+# made is a failure (125) with a reason, never a success with nothing said.
+extract recovery-os-vm.sh captured "status="
+# captured_case <no-fd|fd> <command...>: "<status>|<what it stored>"
+captured_case() {
+    local starve="$1"
+    shift
+    (
+        # shellcheck source=/dev/null
+        source "$WORK/captured.sh"
+        if [[ $starve == no-fd ]]; then ulimit -n 3; fi
+        r=0
+        captured got "$@" || r=$?
+        printf '%s|%s\n' "$r" "$got"
+    ) 2>/dev/null
+}
+says_and_ends() { printf '%s\n' "$1"; return "$2"; }
+check "captured: a command that succeeds, its words, status 0" "$(captured_case fd says_and_ends 'running' 0)" "0|running"
+check "captured: a command that fails, its words, its status" "$(captured_case fd says_and_ends 'error: no domain' 7)" "7|error: no domain"
+check "captured: a command that says nothing and succeeds is still a success" "$(captured_case fd true)" "0|"
+check "captured: two lines stay two lines, the trailing newline goes" "$(captured_case fd printf 'a\nb\n')" "0|a
+b"
+# The starved subshell cannot redirect either, so only its status is read.
+starved_status() {
+    (
+        # shellcheck source=/dev/null
+        source "$WORK/captured.sh"
+        ulimit -n 3
+        captured got "$@"
+    ) 2>/dev/null
+    echo "$?"
+}
+check "captured: no descriptor free, a command that would succeed: 125, never 0" "$(starved_status true)" "125"
+check "captured: no descriptor free, a command that would fail: 125" "$(starved_status false)" "125"
+
 echo ""
 echo "passed=$pass failed=$fail"
 [[ -z "$not_run" ]] || echo "NOT RUN: $not_run"

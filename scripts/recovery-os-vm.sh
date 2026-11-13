@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.3
-# Date: 2026-10-21
+# Version: 2.2.4
+# Date: 2026-11-12
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -852,6 +852,31 @@ virsh_() {
     virsh --connect "$LIBVIRT_URI" "$@"
 }
 
+# captured <variable> <command...>: run the command, put what it printed
+# (stdout and stderr, trailing newlines gone) into <variable>, and return its
+# status. `if x="$(cmd)"` cannot be trusted for that: bash runs nothing, and
+# calls the assignment true with x empty, when it has no descriptor free for
+# the substitution's pipe (measured, bash 5.3, `ulimit -n` 3 and 4; bd
+# DAS-Backup-Manager-tzwf, uk3v.2). So the command's status comes back inside
+# its own capture, on a last line of its own; a capture without that line was
+# never made: 125, and the variable says so.
+captured() {
+    local __var="$1" __out __last
+    shift
+    __out="$("$@" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    __last="${__out##*$'\n'}"
+    if [[ "$__last" != status=* || ! "${__last#status=}" =~ ^[[:digit:]]+$ ]]; then
+        printf -v "$__var" '%s' "no answer: the command's output could not be captured (no descriptor free for its pipe?)"
+        return 125
+    fi
+    __out="${__out%"$__last"}"
+    while [[ "$__out" == *$'\n' ]]; do
+        __out="${__out%$'\n'}"
+    done
+    printf -v "$__var" '%s' "$__out"
+    return "${__last#status=}"
+}
+
 require_root() {
     if [[ "$(id -u)" != 0 ]]; then
         refuse "must run as root: sudo $SELF ..."
@@ -915,7 +940,7 @@ disk_in_definition() {
 
 current_state() {
     local s
-    if s="$(virsh_ domstate "$DOMAIN" 2>&1)"; then
+    if captured s virsh_ domstate "$DOMAIN"; then
         printf '%s\n' "$s"
     else
         printf 'unknown (virsh: %s)\n' "$s"
@@ -3448,7 +3473,7 @@ rescan_disk() {
         SCAN_RESULT="not done: $part does not exist"
         return 0
     fi
-    if out="$(btrfs device scan "$part" 2>&1)"; then
+    if captured out btrfs device scan "$part"; then
         log "btrfs device scan $part: ${out:-done}"
         SCAN_RESULT="done ($part)"
     else
@@ -3794,7 +3819,7 @@ egress_report() {
         return 0
     fi
     # ip failing is "unknown", never 0: a count it did not read is no count.
-    if rules="$(ip rule show priority "$EGRESS_PRIORITY" 2>&1)"; then
+    if captured rules ip rule show priority "$EGRESS_PRIORITY"; then
         count="$(grep -cF "from $subnet lookup main" <<<"$rules")" || :
     else
         count="unknown (ip rule show failed: $(printable "$rules"))"
@@ -5902,7 +5927,7 @@ status_of_domain() {
     ST_RC=0
     state="$(current_state)"
     printf 'Domain            %s (%s): %s\n' "$DOMAIN" "$LABEL" "$state"
-    if xml="$(virsh_ dumpxml "$DOMAIN" 2>&1)"; then
+    if captured xml virsh_ dumpxml "$DOMAIN"; then
         sources="$(disk_sources "$xml")"
         printf '  Attached disk   %s\n' "${sources:-none}"
     else
@@ -5910,7 +5935,7 @@ status_of_domain() {
     fi
     if ! xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)"; then
         # Not defined at all is no guard; anything else cannot be told.
-        if names="$(virsh_ list --all --name 2>&1)" && ! grep -qxF -- "$DOMAIN" <<<"$names"; then
+        if captured names virsh_ list --all --name && ! grep -qxF -- "$DOMAIN" <<<"$names"; then
             printf '  Session guard   none (%s is not defined: %s define)\n' "$DOMAIN" "$SELF"
         else
             printf '  Session guard   unknown (virsh: %s)\n' "$xml"
