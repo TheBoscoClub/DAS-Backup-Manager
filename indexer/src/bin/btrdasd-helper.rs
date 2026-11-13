@@ -444,7 +444,8 @@ fn session_end_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<Str
     session_busy(jobs, units)
 }
 
-/// Why a `RecoveryOsRecord` must not start: whatever keeps a session from
+/// Why a `RecoveryOsRecord` or a `RecoveryOsSession` must not start (bd
+/// DAS-Backup-Manager-5j2x, -1ley): whatever keeps a session from
 /// starting ([`session_busy`]: a session or record job, a scheduled session
 /// service), or a `RecoveryOsSessionEnd` in flight (`ends_in_flight`, the
 /// number of [`SessionEndGuard`]s alive). A session end is not a job, and the
@@ -2230,8 +2231,8 @@ impl HelperInterface {
     /// Start a recovery-OS session (`recovery-os-vm.sh session …`) as a job;
     /// returns its id. `mode` is `sequential`, `parallel`, or empty for none
     /// (one drive, or the script's choice for two). Refused before the script
-    /// starts while another session job or a scheduled-session service runs,
-    /// naming it. `JobCancel` is the only way to stop it: it sends SIGINT to
+    /// starts while another session job, a record job, a scheduled-session
+    /// service or a `RecoveryOsSessionEnd` runs, naming it. `JobCancel` is the only way to stop it: it sends SIGINT to
     /// the script's process group once. In --mode parallel the signal reaches
     /// both drives' sessions (the script starts them with SIGINT deliverable;
     /// bd DAS-Backup-Manager-c8lf).
@@ -2274,7 +2275,13 @@ impl HelperInterface {
             &self.jobs,
             sender,
             SESSION_KIND,
-            |running| session_busy(running, &unit_states),
+            |running| {
+                record_busy(
+                    running,
+                    &unit_states,
+                    self.session_ends.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            },
             |job_id| {
                 let progress = job_progress(&self.conn, &job_id);
                 let cancel = progress.clone();
@@ -4175,9 +4182,11 @@ mod tests {
                 assert!(!method.contains(forbidden), "{m} still has {forbidden}");
             }
         }
-        let method = method_body(body, "recovery_os_record");
-        assert!(method.contains("record_busy("));
-        assert!(method.contains("self.session_ends.load("));
+        for m in ["recovery_os_session", "recovery_os_record"] {
+            let method = method_body(body, m);
+            assert!(method.contains("record_busy("), "{m}");
+            assert!(method.contains("self.session_ends.load("), "{m}");
+        }
         assert_eq!(cancel_action(RECORD_KIND), "org.dasbackup.recovery-os");
         // The start itself is polkit-first in every method (the polkit test
         // above covers the recovery-OS ones).

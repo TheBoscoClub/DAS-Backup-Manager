@@ -140,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`RecoveryOsSession` is refused while a `RecoveryOsSessionEnd` is in flight** (bd `DAS-Backup-Manager-1ley`): the session end releases the job map's lock before its script runs, so a session started in that window was not refused by the helper (the script's own lock backstopped only the case with a disk to give back; a session end with nothing attached could remove the new session's console bridge or egress rule)
+  - The session method now asks the same check as `RecoveryOsRecord` (`record_busy`: a session or record job, a scheduled session service, or a session end counted by its in-flight guard), made under the lock that then inserts the session's job; the refusal reads "a recovery-OS session is being ended"
+
 - **A helper job that ends at once no longer leaves a stale entry in the job map, and two calls cannot both start** (bd `DAS-Backup-Manager-oz7w`): `BackupRun`, `IndexWalk`, `RestoreFiles` and `RestoreSnapshot` spawned the job and inserted its entry afterwards, outside the lock, so a job that finished first removed nothing and the entry stayed for good (a later `JobCancel` found a dead job, and shutdown aborted it)
   - Every job method, the two recovery-OS ones included, now starts through one function, `start_job`: it takes the job map's lock, asks its refusal check, spawns and inserts under that one guard, and the spawned task removes its entry through the same lock; method names, signatures, polkit actions (still the first step) and refusal texts are unchanged
   - Tested by behaviour: a job whose body ends at once leaves an empty map, the job is started while the lock is held, and a refused start runs and inserts nothing
