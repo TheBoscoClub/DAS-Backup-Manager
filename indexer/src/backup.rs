@@ -4619,6 +4619,34 @@ impl RecordOutcome {
     }
 }
 
+impl RecordOutcome {
+    /// Whether the job succeeded (exactly when [`Self::exit_code`] is 0), and
+    /// the line that says how it ended: what the GUI shows when a record job
+    /// finishes. A deferral is not a success: nothing was recorded.
+    pub fn finish_line(&self) -> (bool, String) {
+        let line = match self {
+            Self::CouldNotStart(why) | Self::Aborted(why) => why.clone(),
+            Self::Deferred(why) => format!("Deferred: {why}; nothing was mounted"),
+            Self::Ran {
+                recording,
+                not_mounted,
+                still_mounted,
+            } => {
+                let mut line = format!(
+                    "Recovery OS: {}  ({})",
+                    recording.status.word(),
+                    recording.detail
+                );
+                if !not_mounted.is_empty() {
+                    line.push_str(&format!("; not mounted: {}", not_mounted.join(", ")));
+                }
+                with_still_mounted(line, still_mounted)
+            }
+        };
+        (self.exit_code() == 0, line)
+    }
+}
+
 /// `btrdasd recovery-os record`: refuse an unknown label, take the backup
 /// singleton and the maintenance lock (defer if either is held), mount the
 /// recovery drives asked for, check each mounted one is the filesystem it
@@ -13693,6 +13721,66 @@ Legend:
 
     fn record_job(host: &FakeRecordHost, labels: &[String]) -> RecordOutcome {
         record_recovery_os_job(host, &two_drive_config(), labels, &TestProgress::new())
+    }
+
+    /// What the GUI's job shows when a record job ends: success exactly when
+    /// the CLI would exit 0, and the line says which drive state it found.
+    #[test]
+    fn a_record_outcome_says_in_one_line_how_it_ended_and_is_a_success_only_at_exit_0() {
+        let ok = record_job(&FakeRecordHost::new(), &labels(&["recovery"]));
+        let (success, line) = ok.finish_line();
+        assert!(success, "{line}");
+        assert_eq!(line, "Recovery OS: OK  (nothing inspected)");
+        // A stale or warned drive is a finding: still a success, as exit 0.
+        let host = FakeRecordHost {
+            answer: recording(RecordStatus::Warn, "stale"),
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &labels(&["other"])).finish_line();
+        assert!(success);
+        assert_eq!(line, "Recovery OS: WARN  (stale)");
+        // A lock held: not a success, and nothing was mounted.
+        let host = FakeRecordHost {
+            locks: Ok(Err("a backup is running".into())),
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &[]).finish_line();
+        assert!(!success);
+        assert_eq!(line, "Deferred: a backup is running; nothing was mounted");
+        // Could not start, and aborted: the reason, as the CLI prints it.
+        let (success, line) = record_job(&FakeRecordHost::new(), &labels(&["nope"])).finish_line();
+        assert!(!success);
+        assert!(line.contains("'nope'"), "{line}");
+        let host = FakeRecordHost {
+            mount: Err("no drives found".into()),
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &[]).finish_line();
+        assert!(!success);
+        assert_eq!(line, "Mount failed: no drives found");
+        // A failed recording, a drive not mounted, and a mount left behind are
+        // each exit 3 and so a failure, and each is named.
+        let host = FakeRecordHost {
+            answer: recording(RecordStatus::Fail, "unreadable"),
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &[]).finish_line();
+        assert!(!success);
+        assert_eq!(line, "Recovery OS: FAIL  (unreadable)");
+        let host = FakeRecordHost {
+            mounted: vec!["/proc".into()],
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &[]).finish_line();
+        assert!(!success);
+        assert!(line.contains("not mounted: other"), "{line}");
+        let host = FakeRecordHost {
+            left_mounted: vec!["/proc".into()],
+            ..FakeRecordHost::new()
+        };
+        let (success, line) = record_job(&host, &[]).finish_line();
+        assert!(!success);
+        assert!(line.contains("still mounted: /proc"), "{line}");
     }
 
     #[test]
