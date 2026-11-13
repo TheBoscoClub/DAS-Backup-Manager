@@ -352,6 +352,10 @@ pub fn format_report_from(
         result.expiry.row()
     ));
     r.push_str(&format!(
+        "  Static subvolumes     {}\n",
+        result.static_subvolumes.row()
+    ));
+    r.push_str(&format!(
         "  Recovery OS           {}\n",
         result.recovery_os.row()
     ));
@@ -368,6 +372,13 @@ pub fn format_report_from(
     }
     // What the expiry of retired subvolumes did, after the sync's section.
     if let crate::run_steps::ExpiryStep::Ran { section, .. } = &result.expiry
+        && !section.is_empty()
+    {
+        r.push('\n');
+        r.push_str(section);
+    }
+    // What the static subvolumes did, after the expiry's section.
+    if let crate::static_send::StaticStep::Ran { section, .. } = &result.static_subvolumes
         && !section.is_empty()
     {
         r.push('\n');
@@ -967,6 +978,7 @@ mod tests {
                 recovery_os: crate::backup::RecoveryOsStep::NotSelected,
                 usb_link: crate::run_steps::UsbLinkStep::NotChecked,
                 expiry: crate::run_steps::ExpiryStep::NotRun,
+                static_subvolumes: crate::static_send::StaticStep::NotRun,
                 indexed: false,
                 report_sent: false,
                 errors: vec![],
@@ -1002,6 +1014,7 @@ mod tests {
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             usb_link: crate::run_steps::UsbLinkStep::NotChecked,
             expiry: crate::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: crate::static_send::StaticStep::NotRun,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -1140,6 +1153,46 @@ mod tests {
     }
 
     #[test]
+    fn the_static_subvolumes_row_and_section_are_in_the_report_after_the_expiry() {
+        let mut result = result_with(Some(0), Some(0), 0, &[]);
+        let outcome = crate::static_send::Outcome {
+            tables: vec![crate::static_send::TableReport {
+                head: "source 's' -> target 't'".into(),
+                lines: vec![(
+                    crate::static_send::Kind::Sent,
+                    "vm.pristine-2 (full send)".into(),
+                )],
+            }],
+        };
+        result.static_subvolumes = crate::static_send::StaticStep::from_outcome(&outcome, false);
+        let report = format_report(&result, &Config::default());
+        let ops = rows(&report);
+        let at = |prefix: &str| ops.iter().position(|r| r.starts_with(prefix)).unwrap();
+        assert_eq!(
+            ops[at("  Static subvolumes")],
+            "  Static subvolumes     OK  (n/a)"
+        );
+        assert!(
+            at("  Retired expiry") < at("  Static subvolumes"),
+            "{report}"
+        );
+        assert!(at("  Static subvolumes") < at("  Recovery OS"), "{report}");
+        assert!(report.contains("STATIC SUBVOLUMES\n  source 's' -> target 't'\n    SENT       vm.pristine-2 (full send)"), "{report}");
+        // A failed one fails its row; never reached has no section.
+        let mut failed = outcome.clone();
+        failed.tables[0]
+            .lines
+            .push((crate::static_send::Kind::Fail, "boom".into()));
+        result.static_subvolumes = crate::static_send::StaticStep::from_outcome(&failed, false);
+        assert!(
+            format_report(&result, &Config::default())
+                .contains("Static subvolumes     FAIL  (see STATIC SUBVOLUMES")
+        );
+        result.static_subvolumes = crate::static_send::StaticStep::NotRun;
+        assert!(!format_report(&result, &Config::default()).contains("STATIC SUBVOLUMES"));
+    }
+
+    #[test]
     fn the_retired_expiry_row_and_section_are_in_the_report() {
         let mut result = result_with(Some(0), Some(0), 0, &[]);
         result.expiry = crate::run_steps::ExpiryStep::from_run(
@@ -1232,6 +1285,7 @@ mod tests {
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             usb_link: crate::run_steps::UsbLinkStep::NotChecked,
             expiry: crate::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: crate::static_send::StaticStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: errors.iter().map(|e| e.to_string()).collect(),
@@ -1313,6 +1367,7 @@ mod tests {
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             usb_link: crate::run_steps::UsbLinkStep::NotChecked,
             expiry: crate::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: crate::static_send::StaticStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: vec!["Subvolume sync failed — see SUBVOLUME SYNC in the report".into()],
@@ -1370,6 +1425,7 @@ mod tests {
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             usb_link: crate::run_steps::UsbLinkStep::NotChecked,
             expiry: crate::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: crate::static_send::StaticStep::NotRun,
             indexed: true,
             report_sent: false,
             errors: vec![],
@@ -1462,6 +1518,7 @@ mod tests {
             recovery_os: crate::backup::RecoveryOsStep::NotSelected,
             usb_link: crate::run_steps::UsbLinkStep::NotChecked,
             expiry: crate::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: crate::static_send::StaticStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: vec!["btrbk failed".into(), "target not mounted".into()],

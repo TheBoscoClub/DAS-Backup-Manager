@@ -3428,6 +3428,7 @@ mod tests {
             recovery_os: backup::RecoveryOsStep::NotSelected,
             usb_link: buttered_dasd::run_steps::UsbLinkStep::NotChecked,
             expiry: buttered_dasd::run_steps::ExpiryStep::NotRun,
+            static_subvolumes: buttered_dasd::static_send::StaticStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: Vec::new(),

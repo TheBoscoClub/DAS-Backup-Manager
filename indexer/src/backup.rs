@@ -10,6 +10,7 @@ use crate::progress::{LogLevel, ProgressCallback, cut_short, stop_requested};
 use crate::recovery_os::{self, RecordStatus};
 use crate::run_steps::{self, ExpireRun, ExpiryStep, UsbLinkStep};
 use crate::scrub;
+use crate::static_send::{self, StaticStep};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -667,6 +668,9 @@ pub struct BackupResult {
     pub usb_link: UsbLinkStep,
     /// The expiry of retired subvolumes, after btrbk, on a run of everything.
     pub expiry: ExpiryStep,
+    /// The static subvolumes sent to the primary targets, after expiry
+    /// (bd DAS-Backup-Manager-5237.8).
+    pub static_subvolumes: StaticStep,
     pub indexed: bool,
     pub report_sent: bool,
     pub errors: Vec<String>,
@@ -3056,6 +3060,14 @@ fn run_backup_with(
         {
             errors.push(format!("{}{detail}", run_steps::EXPIRY_ERROR_PREFIX));
         }
+        let static_subvolumes = static_step(
+            config,
+            (&effective_sources, &effective_targets),
+            options,
+            progress,
+            env,
+            &mut errors,
+        );
 
         let success = errors.is_empty();
         let result = BackupResult {
@@ -3069,6 +3081,7 @@ fn run_backup_with(
             recovery_os: RecoveryOsStep::NotSelected,
             usb_link: UsbLinkStep::NotChecked,
             expiry,
+            static_subvolumes,
             indexed: false,
             report_sent: false,
             errors,
@@ -3235,6 +3248,19 @@ fn run_backup_with(
         }
         step
     };
+    // The static subvolumes, after the expiry as backup-run.sh sends them.
+    let static_subvolumes = if done_cancelled {
+        StaticStep::NotRun
+    } else {
+        static_step(
+            config,
+            (&effective_sources, &effective_targets),
+            options,
+            progress,
+            env,
+            &mut errors,
+        )
+    };
 
     // Recovery OSes — after btrbk, while the targets are mounted, as
     // backup-run.sh's check_recovery_os runs after btrbk and expiry: read
@@ -3314,6 +3340,7 @@ fn run_backup_with(
         recovery_os,
         usb_link,
         expiry,
+        static_subvolumes,
         indexed,
         report_sent: false,
         errors,
@@ -3322,6 +3349,53 @@ fn run_backup_with(
     };
 
     Ok(result)
+}
+
+/// The static subvolumes of a run (bd DAS-Backup-Manager-5237.8): every
+/// `[[source.static]]` table of the selected sources, sent to the selected
+/// primary targets, which `env.verify` has just verified. Only a run that
+/// sends does it; a failure is an entry of `errors`. A dry run prints the
+/// plan and changes nothing.
+fn static_step(
+    config: &Config,
+    (sources, targets): (&[String], &[String]),
+    options: &BackupOptions,
+    progress: &dyn ProgressCallback,
+    env: &StepEnv,
+    errors: &mut Vec<String>,
+) -> StaticStep {
+    if !options.steps.sends() {
+        return StaticStep::NotRun;
+    }
+    let verify = |t: &[Target], l: &[String]| (env.verify)(t, l, progress);
+    let outcome = static_send::run(
+        config,
+        sources,
+        targets,
+        options.dry_run,
+        &static_send::Env {
+            runner: env.runner,
+            is_mountpoint: env.is_mountpoint,
+            verify: &verify,
+        },
+    );
+    let step = StaticStep::from_outcome(&outcome, options.dry_run);
+    if let StaticStep::Ran {
+        section, failures, ..
+    } = &step
+    {
+        for line in section.lines() {
+            progress.on_log(LogLevel::Info, &format!("  {line}"));
+        }
+        for failure in failures {
+            progress.on_log(
+                LogLevel::Error,
+                &format!("Static subvolumes failed: {failure}"),
+            );
+            errors.push(format!("{}{failure}", static_send::ERROR_PREFIX));
+        }
+    }
+    step
 }
 
 /// Whether what `options` selects is everything the configuration declares —
@@ -3958,6 +4032,7 @@ fn abort_job(
         recovery_os: RecoveryOsStep::NotSelected,
         usb_link: UsbLinkStep::NotChecked,
         expiry: ExpiryStep::NotRun,
+        static_subvolumes: StaticStep::NotRun,
         indexed: false,
         report_sent: false,
         errors: vec![why.clone()],
@@ -10449,6 +10524,7 @@ Legend:
             recovery_os: r.recovery_os.clone(),
             usb_link: r.usb_link.clone(),
             expiry: r.expiry.clone(),
+            static_subvolumes: r.static_subvolumes.clone(),
             indexed: r.indexed,
             report_sent: r.report_sent,
             errors: r.errors.clone(),
@@ -10556,6 +10632,7 @@ Legend:
                 recovery_os: RecoveryOsStep::NotSelected,
                 usb_link: UsbLinkStep::NotChecked,
                 expiry: ExpiryStep::NotRun,
+                static_subvolumes: StaticStep::NotRun,
                 indexed: true,
                 report_sent: false,
                 errors,
@@ -11872,6 +11949,7 @@ Legend:
             recovery_os: RecoveryOsStep::NotSelected,
             usb_link: UsbLinkStep::NotChecked,
             expiry: ExpiryStep::NotRun,
+            static_subvolumes: StaticStep::NotRun,
             indexed: false,
             report_sent: false,
             errors: if success {
@@ -12855,6 +12933,92 @@ Legend:
             "{:?}",
             run.result.errors
         );
+    }
+
+    // -- the static subvolumes of a run (bd 5237.8) ---------------------------
+
+    fn with_static_table(mut config: Config) -> Config {
+        config.sources[0].static_subvolumes = vec![crate::config::StaticSubvolumes {
+            dir: ".snapshots".into(),
+            pattern: "*.pristine-*".into(),
+            target_subdir: "static/vm".into(),
+        }];
+        config
+    }
+
+    #[test]
+    fn a_run_with_no_static_table_asks_the_host_nothing_and_says_none_configured() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &whole_selection(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert_eq!(run.result.static_subvolumes.row(), "N/A  (none configured)");
+        assert!(run.result.success, "{:?}", run.result.errors);
+    }
+
+    #[test]
+    fn a_static_table_whose_source_cannot_be_read_fails_the_run_after_the_expiry() {
+        // The scripted host answers nothing about the source volume.
+        let config = with_static_table(mirror_live_config());
+        let run = run_steps_with(
+            &config,
+            &whole_selection(),
+            UsbLinkStep::NotChecked,
+            unchanged(),
+            quiet_expiry(),
+            false,
+        );
+        assert!(!run.result.success);
+        assert!(run.result.static_subvolumes.failed());
+        assert!(
+            run.result
+                .errors
+                .iter()
+                .any(|e| e.starts_with("Static subvolumes: ") && e.contains("nothing done")),
+            "{:?}",
+            run.result.errors
+        );
+        assert!(
+            crate::report::format_report(&run.result, &config).contains("STATIC SUBVOLUMES"),
+            "the failure is in the report's section"
+        );
+    }
+
+    #[test]
+    fn a_run_that_sends_nothing_does_not_run_the_static_step_and_a_selection_limits_it() {
+        let config = with_static_table(mirror_live_config());
+        // Snapshots only: nothing is sent, so nothing static is.
+        let snap = BackupOptions {
+            steps: BtrbkSteps::SnapshotOnly,
+            ..whole_selection()
+        };
+        let runner = Scripted::new(&[]);
+        let mut errors = Vec::new();
+        let step = static_step(
+            &config,
+            (&labels(&["nvme-root"]), &labels(&["primary-22tb"])),
+            &snap,
+            &TestProgress::new(),
+            &env(&runner),
+            &mut errors,
+        );
+        assert_eq!(step, StaticStep::NotRun);
+        assert!(runner.calls().is_empty() && errors.is_empty());
+        // The table's source is not selected: nothing is asked.
+        let step = static_step(
+            &config,
+            (&labels(&["other-src"]), &labels(&["primary-22tb"])),
+            &whole_selection(),
+            &TestProgress::new(),
+            &env(&runner),
+            &mut errors,
+        );
+        assert_eq!(step.row(), "N/A  (none configured)");
+        assert!(runner.calls().is_empty() && errors.is_empty());
     }
 
     #[test]
