@@ -117,6 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `btrdasd health`, `health --json` (`last_backup`) and the helper's reply (`services.last_backup`, `last_backup_age_secs`) now give the time the newest successful run in the run history ended; a later failed run is passed over — `db::newest_successful_run_read_only`, read-only, never creating or migrating the database
   - No successful run yet is still no figure; a history that cannot be read is a warning (`Backup history could not be read: <reason>`), never shown as no backup
   - The targets' snapshot directories are read for the count alone: no `stat` per snapshot
+  - `btrdasd health` prints that time as UTC and now says so (`Last backup: 2026-11-12 22:02 UTC`); unlabelled, it read as local time
 
 - **The GUI's health reply reads no recovery drive while a job is using the targets** (bd `DAS-Backup-Manager-5237.21`): during a backup the recovery drives are mounted, so each reply read their operating systems live from drives btrbk was receiving into — 10–11 s of a reply, twice over the helper's 10 s warning in one 82-minute run
   - While the backup singleton or the maintenance lock is held the helper answers every `role = "mirror"` target from the record the last run kept, dated as that record is (`as of <time>`); a drive with no record reads `held by a running job and never checked` instead of `not mounted and never checked` — `recovery_os::health_reading`

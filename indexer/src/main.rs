@@ -3146,7 +3146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Backup System Health: {status_str}");
                 println!();
                 if let Some(lb) = &report.last_backup {
-                    println!("Last backup: {lb}");
+                    // `last_backup` is UTC (health::format_epoch_minutes); say so,
+                    // or 22:02 reads as ten at night on a host six hours behind.
+                    println!("Last backup: {lb} UTC");
                 }
                 println!();
                 println!(
