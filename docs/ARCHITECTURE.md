@@ -350,6 +350,7 @@ btrdasd-gui
          │         ├──▶ IndexSnapshotPath()    → Snapshot path resolution
          │         ├──▶ HealthQuery()          → HealthDashboard (SMART, growth, services)
          │         ├──▶ RecoveryOsStatus()     → RecoveryPanel (recovery drives: records, schedules, sessions)
+         │         ├──▶ RecoveryOsRecord()     → RecoveryPanel Record button (a job: the CLI's `recovery-os record` for one drive; org.dasbackup.recovery-os)
          │         ├──▶ PanelConfigGet()       → BackupPanel (labels, boot.enabled, from the parsed config)
          │         ├──▶ ConfigCheck()          → ConfigDialog (unknown-key warnings before a save)
          │         ├──▶ ConfigGet()            → ConfigDialog (the file's text, as it is)
