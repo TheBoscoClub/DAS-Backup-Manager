@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.19.4
-# Date: 2026-11-11
+# Version: 4.20.0
+# Date: 2026-11-12
 #
 # Features:
+#   - Static subvolumes are sent to the primary targets (v4.20.0, bd
+#     DAS-Backup-Manager-5237.8): send_static_subvolumes() runs `btrdasd backup
+#     static` after the expiry, while the targets are mounted and verified,
+#     handing this run's singleton down (DAS_BACKUP_LOCK_FD=9) as for the
+#     expiry. A `[[source.static]]` table names read-only subvolumes somebody
+#     else made (the VM pristines); they are sent as they are, received at their
+#     final name in the table's target_subdir. A failed one is a FAIL
+#     (exit 3) that stops nothing after it; its section is STATIC SUBVOLUMES.
 #   - A target whose filesystem is already mounted somewhere else is said
 #     (v4.19.4, bd DAS-Backup-Manager-804): btrfs keeps the first mount's
 #     filesystem-wide options, so this run's `mount -o` returns 0 and applies
@@ -18,8 +26,8 @@
 #     now hold /run/das-backup.lock while they read-modify-write config.toml
 #     (and expire deletes), so a hand run cannot lose a write to, or race, a
 #     backup or setup. This run holds that lock on fd 9 while it runs them, so
-#     it hands its hold down — DAS_BACKUP_LOCK_FD=9 on exactly those two
-#     calls, as DAS_MAINTENANCE_LOCK_FD=8 is for `btrdasd walk` — and the
+#     it hands its hold down — DAS_BACKUP_LOCK_FD=9 on exactly those calls
+#     (sync, expire and, since v4.20.0, `backup static`), as DAS_MAINTENANCE_LOCK_FD=8 is for `btrdasd walk` — and the
 #     child proves it (fd 9 is the lock file and holds the lock) instead of
 #     meeting this run's own lock and refusing every night.
 #   - Target directories are the btrbk.conf `target` lines (v4.19.1, bd
@@ -745,7 +753,7 @@ acquire_singleton_lock() {
     # fd 9 is not close-on-exec, so every child this run starts inherits it
     # and shares the hold. sync_subvolumes and expire_retired_subvolumes rely
     # on that and say so (DAS_BACKUP_LOCK_FD=9 for `btrdasd subvol sync` and
-    # `subvol expire`, which otherwise take this lock themselves; bd
+    # `subvol expire` and `backup static`, which otherwise take this lock themselves; bd
     # DAS-Backup-Manager-5237.9). Never `flock -u 9` while a child may hold
     # the description — that releases it for the child as well.
     if ! exec 9<>"$LOCKFILE"; then
@@ -1670,6 +1678,7 @@ verify_sources_before_write() {
 
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
+STATIC_REPORT=""
 RECOVERY_OS_REPORT=""
 # Where the recovery OS check keeps its last reading for `btrdasd health`;
 # the same variable btrdasd itself reads (`btrdasd health`), defaulting to
@@ -1848,6 +1857,35 @@ expire_retired_subvolumes() {
     if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
         local line
         while IFS= read -r line; do log_info "  $line"; done <<<"$SUBVOL_EXPIRE_REPORT"
+    fi
+    return 0
+}
+
+# Send the static subvolumes ([[source.static]]: read-only subvolumes somebody
+# else made) to the primary targets, after the expiry and while the targets are
+# still mounted and verified. Handed this run's singleton on fd 9
+# (DAS_BACKUP_LOCK_FD) like the expiry. A dry run prints the plan and changes
+# nothing. With no table configured it prints nothing and is OK. A failure is
+# a FAIL (exit 3) and stops nothing after it.
+send_static_subvolumes() {
+    local mode="$1"
+    local args=(backup static --config "$DAS_CONFIG")
+    if [[ "$mode" == "dryrun" ]]; then
+        args+=(--dry-run)
+    fi
+    local rc=0
+    STATIC_REPORT="$(DAS_BACKUP_LOCK_FD=9 "$BTRDASD_BIN" "${args[@]}")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        record_op "static_subvolumes" "FAIL" "exit code $rc — see STATIC SUBVOLUMES in the report"
+        log_error "Static subvolumes failed (exit $rc)"
+    elif [[ -z "$STATIC_REPORT" ]]; then
+        record_op "static_subvolumes" "OK" "none configured"
+    else
+        record_op "static_subvolumes" "OK"
+    fi
+    if [[ -n "$STATIC_REPORT" ]]; then
+        local line
+        while IFS= read -r line; do log_info "  $line"; done <<<"$STATIC_REPORT"
     fi
     return 0
 }
@@ -3861,6 +3899,9 @@ generate_report() {
     if [[ -n "$SUBVOL_EXPIRE_REPORT" ]]; then
         subvol_sections+=$'\n'"$SUBVOL_EXPIRE_REPORT"$'\n'
     fi
+    if [[ -n "$STATIC_REPORT" ]]; then
+        subvol_sections+=$'\n'"$STATIC_REPORT"$'\n'
+    fi
     if [[ -n "$RECOVERY_OS_REPORT" ]]; then
         subvol_sections+=$'\n'"$RECOVERY_OS_REPORT"$'\n'
     fi
@@ -3897,6 +3938,7 @@ BACKUP OPERATIONS
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
   Subvolume coverage    ${OP_STATUS[subvol_coverage]:-N/A}  (${OP_STATUS[subvol_coverage_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
+  Static subvolumes     ${OP_STATUS[static_subvolumes]:-N/A}  (${OP_STATUS[static_subvolumes_detail]:-n/a})
   Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})${target_rows}
 ${subvol_sections}
 THROUGHPUT
@@ -3920,7 +3962,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.19.4
+  backup-run.sh v4.20.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -4858,6 +4900,9 @@ main() {
 
     # Still before unmount_all: expiry deletes snapshots on the mounted targets.
     expire_retired_subvolumes "$mode"
+    # Still before unmount_all: the static subvolumes are received onto the
+    # mounted, verified primary targets.
+    send_static_subvolumes "$mode"
     # Still before unmount_all: reads each recovery drive's OS. After btrbk so
     # it can never delay or affect the backup itself.
     check_recovery_os "$mode"

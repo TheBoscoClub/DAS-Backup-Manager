@@ -82,6 +82,7 @@ BTRBK_LATEST=""
 # shellcheck disable=SC2034
 SUBVOL_SYNC_REPORT=""
 SUBVOL_EXPIRE_REPORT=""
+STATIC_REPORT=""
 
 reset() { OP_STATUS=([btrbk]=OK [subvol_sync]=OK); : >"$WORK/calls"; : >"$WORK/log"; : >"$WORK/timeout_calls"; rm -f "${WORK:?}/err" "${WORK:?}/no_subcommand" "${WORK:?}/time_out" "${WORK:?}/partial_err"; }
 
@@ -111,7 +112,17 @@ check "section order" "$(grep -E '^(RETIRED SUBVOLUMES|RECOVERY OS|THROUGHPUT)$'
     "RETIRED SUBVOLUMES RECOVERY OS THROUGHPUT "
 check "still no double blank line" "$(grep -c -Pzo '\n\n\n' <<<"$report" || true)" "0"
 # shellcheck disable=SC2034  # read by the extracted generate_report
+SUBVOL_EXPIRE_REPORT=$'RETIRED SUBVOLUMES\n  @opt'
+STATIC_REPORT=$'STATIC SUBVOLUMES\n  SENT x'
+report="$(generate_report)"
+check "static section sits after the expiry's and before the recovery OS's" \
+    "$(grep -E '^(RETIRED SUBVOLUMES|STATIC SUBVOLUMES|RECOVERY OS|THROUGHPUT)$' <<<"$report" | tr '\n' ' ')" \
+    "RETIRED SUBVOLUMES STATIC SUBVOLUMES RECOVERY OS THROUGHPUT "
+check "its row is in the table" "$(grep -c '^  Static subvolumes ' <<<"$report")" "1"
+# shellcheck disable=SC2034  # read by the extracted generate_report
 SUBVOL_EXPIRE_REPORT=""
+# shellcheck disable=SC2034  # read by the extracted generate_report
+STATIC_REPORT=""
 
 # --- dry run: read, never record ------------------------------------------------
 reset
@@ -326,9 +337,9 @@ main_body="$(awk '/^main\(\) \{/,/^}/' "$SCRIPT")"
 # The patterns below are literal script text, not expansions.
 # shellcheck disable=SC2016
 # shellcheck disable=SC2016
-check "main: the check runs after btrbk and expiry, before unmount" \
-    "$(grep -n -E '^ +(run_btrbk "\$mode"|expire_retired_subvolumes "\$mode"|check_recovery_os "\$mode"|unmount_all)$' <<<"$main_body" | cut -d: -f2 | tr -s ' ' | tr '\n' '|')" \
-    ' run_btrbk "$mode"| expire_retired_subvolumes "$mode"| check_recovery_os "$mode"| unmount_all| unmount_all|'
+check "main: the check runs after btrbk, expiry and the static pass, before unmount" \
+    "$(grep -n -E '^ +(run_btrbk "\$mode"|expire_retired_subvolumes "\$mode"|send_static_subvolumes "\$mode"|check_recovery_os "\$mode"|unmount_all)$' <<<"$main_body" | cut -d: -f2 | tr -s ' ' | tr '\n' '|')" \
+    ' run_btrbk "$mode"| expire_retired_subvolumes "$mode"| send_static_subvolumes "$mode"| check_recovery_os "$mode"| unmount_all| unmount_all|'
 # shellcheck disable=SC2016
 check "main: the DB status comes from run_status" "$(grep -c 'overall_status="\$(run_status)"' <<<"$main_body")" "1"
 # shellcheck disable=SC2016

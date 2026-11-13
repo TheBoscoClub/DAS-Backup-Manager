@@ -248,6 +248,9 @@ case "$1 ${2:-}" in
     printf 'RETIRED SUBVOLUMES\n  None.\n'
     exit "$(knob expire_rc 0)"
     ;;
+"backup static")
+    exit "$(knob static_rc 0)"
+    ;;
 "backup boot-plan")
     # The plan btrbk.conf gives: @ and @home on the nvme volume.
     printf '@\troot-\tnvme\n@home\thome\tnvme\n'

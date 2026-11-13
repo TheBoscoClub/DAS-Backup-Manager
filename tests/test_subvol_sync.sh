@@ -13,7 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
 
 extract() { sed -n "/^$1() {/,/^}/p" "$SCRIPT"; }
-for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes record_op any_op_is generate_report run_btrbk parse_btrbk_run_log cleanup monotonic_secs create_target_dirs make_target_dirs_named_in make_target_dir capture_report_data; do
+for fn in load_config_env sync_subvolumes record_subvol_coverage expire_retired_subvolumes send_static_subvolumes record_op any_op_is generate_report run_btrbk parse_btrbk_run_log cleanup monotonic_secs create_target_dirs make_target_dirs_named_in make_target_dir capture_report_data; do
     body="$(extract "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -79,6 +79,7 @@ case "$1 $2" in
         done
         cat "$here/sync_out"; exit "$(cat "$here/sync_rc")" ;;
     "subvol expire") cat "$here/expire_out"; exit "$(cat "$here/expire_rc")" ;;
+    "backup static") cat "$here/static_out"; exit "$(cat "$here/static_rc")" ;;
 esac
 STUB
 chmod +x "$BTRDASD_BIN"
@@ -347,6 +348,26 @@ check "bare expire call under set -e survives a failing expire" "ok" "ok"
 expire_retired_subvolumes run
 check "empty expire report is empty" "$SUBVOL_EXPIRE_REPORT" ""
 
+# --- static subvolumes ----------------------------------------------------------
+: >"$WORK/calls"
+printf 'STATIC SUBVOLUMES\n  SENT x\n' >"$WORK/static_out"; echo 0 >"$WORK/static_rc"
+send_static_subvolumes run
+check "clean static pass records OK" "${OP_STATUS[static_subvolumes]}" "OK"
+check "its section is kept for the report" "$STATIC_REPORT" "$(printf 'STATIC SUBVOLUMES\n  SENT x')"
+check "static is asked as backup static with the config" "$(grep -c -- "^backup static --config $DAS_CONFIG$" "$WORK/calls")" "1"
+: >"$WORK/calls"
+send_static_subvolumes dryrun
+check "dry run passes --dry-run to static" "$(grep -c -- 'backup static .*--dry-run' "$WORK/calls")" "1"
+echo 1 >"$WORK/static_rc"
+rc=0; send_static_subvolumes run || rc=$?
+check "failing static returns 0" "$rc" "0"
+check "failing static records FAIL" "${OP_STATUS[static_subvolumes]}" "FAIL"
+check "the FAIL says where to look" "${OP_STATUS[static_subvolumes_detail]}" "exit code 1 — see STATIC SUBVOLUMES in the report"
+: >"$WORK/static_out"; echo 0 >"$WORK/static_rc"
+send_static_subvolumes run
+check "no table configured: OK, nothing in the report" "${OP_STATUS[static_subvolumes]} [$STATIC_REPORT]" "OK []"
+check "and says so" "${OP_STATUS[static_subvolumes_detail]}" "none configured"
+
 # --- expire after a failed sync: shown, never performed ----------------------
 # Sync could not look at the volumes, so a retired subvolume may exist again;
 # expiry must not outrun it (Ruling 27).
@@ -392,10 +413,12 @@ sync_subvolumes run
 OP_STATUS[subvol_sync]=OK
 expire_retired_subvolumes run
 expire_retired_subvolumes dryrun
+send_static_subvolumes run
 check "sync is handed fd 9" "$(grep -c '^subvol sync fd=9$' "$WORK/fd_calls")" "1"
 check "expire is handed fd 9, real and dry run" "$(grep -c '^subvol expire fd=9$' "$WORK/fd_calls")" "2"
 check "the config reload is not handed it" "$(grep -c '^config dump-env fd=unset$' "$WORK/fd_calls")" "1"
-check "nothing else is handed it" "$(grep -vc -e '^subvol sync fd=9$' -e '^subvol expire fd=9$' -e 'fd=unset$' "$WORK/fd_calls" || true)" "0"
+check "static is handed fd 9" "$(grep -c '^backup static fd=9$' "$WORK/fd_calls")" "1"
+check "nothing else is handed it" "$(grep -vc -e '^subvol sync fd=9$' -e '^subvol expire fd=9$' -e '^backup static fd=9$' -e 'fd=unset$' "$WORK/fd_calls" || true)" "0"
 check "the variable does not leak into the run" "${DAS_BACKUP_LOCK_FD-unset}" "unset"
 
 # --- subvolume coverage (bd DAS-Backup-Manager-sp78.1) -----------------------

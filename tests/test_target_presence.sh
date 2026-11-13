@@ -48,7 +48,7 @@ generate_capacity_section() { echo "  cap"; }
 generate_growth_section() { echo "  growth"; }
 next_scheduled() { echo "n/a"; }
 # shellcheck disable=SC2034  # read by the extracted generate_report
-BTRBK_START_TIME=0 BTRBK_END_TIME=0 BTRBK_LATEST="" SUBVOL_SYNC_REPORT="" SUBVOL_EXPIRE_REPORT="" RECOVERY_OS_REPORT=""
+BTRBK_START_TIME=0 BTRBK_END_TIME=0 BTRBK_LATEST="" SUBVOL_SYNC_REPORT="" SUBVOL_EXPIRE_REPORT="" STATIC_REPORT="" RECOVERY_OS_REPORT=""
 
 # Two targets: a RAID-1 primary of two drives and a one-drive recovery mirror.
 # shellcheck disable=SC2034  # read by the extracted functions
