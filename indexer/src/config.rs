@@ -3132,9 +3132,8 @@ impl Config {
                         table.dir
                     ));
                 } else {
-                    let same_volume = |o: &&Source| {
-                        normalise_dir(&o.volume) == normalise_dir(&src.volume)
-                    };
+                    let same_volume =
+                        |o: &&Source| normalise_dir(&o.volume) == normalise_dir(&src.volume);
                     if let Some(own) = self
                         .sources
                         .iter()
@@ -4084,7 +4083,15 @@ mod tests {
     #[test]
     fn validate_refuses_a_static_target_subdir_that_is_not_a_clean_relative_path() {
         for bad in [
-            "", "/x", ".", "..", "a/../b", "a//b", ".incoming", "x/.incoming", "x/.incoming/y",
+            "",
+            "/x",
+            ".",
+            "..",
+            "a/../b",
+            "a//b",
+            ".incoming",
+            "x/.incoming",
+            "x/.incoming/y",
         ] {
             let errors = static_config(static_table(".snapshots", "x*", bad)).validate();
             assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");

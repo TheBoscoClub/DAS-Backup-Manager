@@ -509,6 +509,10 @@ pub(crate) mod testing {
         /// codes, and a directory the consumer makes when it exits 0 (what
         /// `btrfs receive` leaves behind).
         pipes: Vec<(String, i32, i32, Option<String>)>,
+        /// Whether an argv scripted more than once answers with each entry in
+        /// turn (the last one repeating), where it otherwise always answers
+        /// with the first.
+        sequenced: bool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -538,6 +542,7 @@ pub(crate) mod testing {
                 snapshotting: false,
                 failing: Vec::new(),
                 pipes: Vec::new(),
+                sequenced: false,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -554,6 +559,14 @@ pub(crate) mod testing {
         /// `fragment` fails (exit 1) even when snapshots are being made.
         pub(crate) fn failing_snapshots_of(mut self, fragment: &str) -> Self {
             self.failing.push(fragment.to_string());
+            self
+        }
+
+        /// The same runner, where an argv scripted several times answers with
+        /// each entry in turn, the last repeating: a listing read before and
+        /// after a step says different things.
+        pub(crate) fn sequenced(mut self) -> Self {
+            self.sequenced = true;
             self
         }
 
@@ -625,7 +638,24 @@ pub(crate) mod testing {
                     stderr: Vec::new(),
                 });
             }
-            let scripted = self.answers.iter().find(|(k, _, _)| *k == argv);
+            let nth = if self.sequenced {
+                // This call is already recorded: the ones before it are the
+                // entries of the same argv it has used up.
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| **c == argv)
+                    .count()
+                    - 1
+            } else {
+                0
+            };
+            let matching: Vec<&(String, i32, String)> =
+                self.answers.iter().filter(|(k, _, _)| *k == argv).collect();
+            let scripted = matching
+                .get(nth.min(matching.len().saturating_sub(1)))
+                .copied();
             if scripted.is_none()
                 && self.snapshotting
                 && let Some(args) = argv.strip_prefix("btrfs subvolume snapshot ")

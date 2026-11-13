@@ -22,6 +22,7 @@ pub mod run_steps;
 pub mod scanner;
 pub mod schedule;
 pub mod scrub;
+pub mod static_send;
 pub mod subvol;
 pub mod unit_links;
 

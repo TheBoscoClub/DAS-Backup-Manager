@@ -117,7 +117,7 @@ pub struct ListedSubvolume {
 }
 
 /// Whether `text` is a canonical hyphenated UUID.
-fn is_uuid(text: &str) -> bool {
+pub(crate) fn is_uuid(text: &str) -> bool {
     text.len() == 36
         && text.char_indices().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
@@ -658,6 +658,50 @@ fn run_stdout(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> Resul
     }
 }
 
+/// Prove `volume` is a real mountpoint holding the filesystem `device` names,
+/// mounted at its top level; the filesystem's UUID when it is. `device` is
+/// `UUID=<uuid>` or a device path (its UUID read with `blkid`). Anything else
+/// is an `Err` naming why — never a guess.
+pub fn verify_volume(
+    runner: &dyn CommandRunner,
+    is_mountpoint: &dyn Fn(&Path) -> bool,
+    volume: &str,
+    device: &str,
+) -> Result<String, String> {
+    if !is_mountpoint(Path::new(volume)) {
+        return Err(format!("{volume} is not mounted"));
+    }
+    let expected = match device.strip_prefix("UUID=") {
+        Some(uuid) => uuid.to_string(),
+        None => {
+            let uuid = run_stdout(runner, "blkid", &["-s", "UUID", "-o", "value", device])?;
+            let uuid = uuid.trim().to_string();
+            if uuid.is_empty() {
+                return Err(format!("blkid reported no UUID for {device}"));
+            }
+            uuid
+        }
+    };
+    let found = run_stdout(
+        runner,
+        "findmnt",
+        &["-n", "-o", "UUID,FSROOT", "--target", volume],
+    )?;
+    let mut fields = found.split_whitespace();
+    let (uuid, fsroot) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+    if uuid != expected {
+        return Err(format!(
+            "{volume} holds filesystem '{uuid}', expected '{expected}'"
+        ));
+    }
+    if fsroot != "/" {
+        return Err(format!(
+            "{volume} is mounted at subvolume '{fsroot}', not at the filesystem's top level"
+        ));
+    }
+    Ok(uuid.to_string())
+}
+
 /// List the subvolumes on one source volume, after proving the path is a
 /// real mountpoint holding the expected filesystem at its top level.
 ///
@@ -673,37 +717,7 @@ pub fn list_volume(
     let mut uuids = BTreeMap::new();
     let mut fs_uuid = None;
     let listed = (|| {
-        if !is_mountpoint(Path::new(volume)) {
-            return Err(format!("{volume} is not mounted"));
-        }
-        let expected = match device.strip_prefix("UUID=") {
-            Some(uuid) => uuid.to_string(),
-            None => {
-                let uuid = run_stdout(runner, "blkid", &["-s", "UUID", "-o", "value", device])?;
-                let uuid = uuid.trim().to_string();
-                if uuid.is_empty() {
-                    return Err(format!("blkid reported no UUID for {device}"));
-                }
-                uuid
-            }
-        };
-        let found = run_stdout(
-            runner,
-            "findmnt",
-            &["-n", "-o", "UUID,FSROOT", "--target", volume],
-        )?;
-        let mut fields = found.split_whitespace();
-        let (uuid, fsroot) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
-        if uuid != expected {
-            return Err(format!(
-                "{volume} holds filesystem '{uuid}', expected '{expected}'"
-            ));
-        }
-        if fsroot != "/" {
-            return Err(format!(
-                "{volume} is mounted at subvolume '{fsroot}', not at the filesystem's top level"
-            ));
-        }
+        let uuid = verify_volume(runner, is_mountpoint, volume, device)?;
         let out = run_stdout(runner, "btrfs", &["subvolume", "list", "-u", volume])?;
         let rows = parse_subvolume_list(&out);
         uuids = uuids_of(&rows);
@@ -1262,6 +1276,38 @@ fn sync_lines(outcome: &SyncOutcome, dry_run: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn verify_volume_names_the_uuid_only_for_a_mounted_top_level_of_the_expected_filesystem() {
+        use crate::fsutil::testing::Scripted;
+        let runner = Scripted::new(&[
+            ("findmnt -n -o UUID,FSROOT --target /v", 0, "u1 /\n"),
+            ("findmnt -n -o UUID,FSROOT --target /sub", 0, "u1 /@sub\n"),
+            ("findmnt -n -o UUID,FSROOT --target /other", 0, "u2 /\n"),
+        ]);
+        let up = |_: &Path| true;
+        assert_eq!(
+            verify_volume(&runner, &up, "/v", "UUID=u1"),
+            Ok("u1".into())
+        );
+        assert!(
+            verify_volume(&runner, &up, "/sub", "UUID=u1")
+                .unwrap_err()
+                .contains("top level")
+        );
+        assert!(
+            verify_volume(&runner, &up, "/other", "UUID=u1")
+                .unwrap_err()
+                .contains("expected 'u1'")
+        );
+        assert!(
+            verify_volume(&runner, &|_: &Path| false, "/v", "UUID=u1")
+                .unwrap_err()
+                .contains("not mounted")
+        );
+        // findmnt unscripted exits 1: an error, never a pass.
+        assert!(verify_volume(&runner, &up, "/nowhere", "UUID=u1").is_err());
+    }
     use super::*;
 
     /// The sync the tests below were written against: coverage compared with
