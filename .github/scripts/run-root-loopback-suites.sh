@@ -19,6 +19,8 @@
 #   LOG_DIR       where each suite's output goes (default: a new temp directory)
 #   ONLY_SUITES   space-separated suite names to run (hand runs only; CI runs all)
 #   SUITE_TIMEOUT seconds one suite may run (default: 1200)
+#   DAS_LOOPBACK_BTRFS_BASE  a directory on BTRFS for the bare-mountpoint test,
+#                 when /var/lib is not one; passed on to the root command
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../indexer"
@@ -27,6 +29,15 @@ read -ra root_runner <<<"${ROOT_RUNNER:-sudo -E}"
 log_dir=${LOG_DIR:-$(mktemp -d)}
 mkdir -p "$log_dir"
 suite_timeout=${SUITE_TIMEOUT:-1200}
+
+# What the suites read from the environment is handed to the root command by
+# name: sudo keeps a variable only if its policy allows it, and the runner's
+# dropped DAS_LOOPBACK_BTRFS_BASE under `sudo -E` (the job's second run failed
+# the bare-mountpoint test on "/var/lib" with the variable set in the step).
+pass_env=(env)
+if [ -n "${DAS_LOOPBACK_BTRFS_BASE:-}" ]; then
+  pass_env+=("DAS_LOOPBACK_BTRFS_BASE=$DAS_LOOPBACK_BTRFS_BASE")
+fi
 
 shopt -s nullglob
 sources=(tests/*_loopback.rs)
@@ -65,7 +76,7 @@ for src in "${sources[@]}"; do
 
   echo "::group::$suite: run as root ($expected tests expected)"
   rc=0
-  timeout "$suite_timeout" "${root_runner[@]}" "$bin" --ignored --nocapture --test-threads=1 \
+  timeout "$suite_timeout" "${root_runner[@]}" "${pass_env[@]}" "$bin" --ignored --nocapture --test-threads=1 \
     >"$log_dir/$suite.log" 2>&1 || rc=$?
   cat "$log_dir/$suite.log"
   echo "::endgroup::"
