@@ -2446,6 +2446,38 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_is_matched_to_a_subvolume_by_directory_and_name_together() {
+        // Each row below has the shape of an unfinished receive that the
+        // pattern matches, but it is NOT what the marker `vm.pristine-9`
+        // names: one has another name in the same directory, the other the
+        // same name in another directory. The marker names nothing, so it is
+        // removed and nothing is deleted.
+        for (path, dir_to_make) in [
+            ("static/vm/vm.pristine-3", "static/vm/vm.pristine-3"),
+            ("elsewhere/vm.pristine-9", "elsewhere/vm.pristine-9"),
+        ] {
+            let row = line(101, path, U[6], None, None);
+            let mut fx = Fx::new();
+            standard(&mut fx, std::slice::from_ref(&row), &[]);
+            fx.make_dir(dir_to_make);
+            fx.make_dir("static/vm/.incoming");
+            std::fs::write(fx.marker("vm.pristine-9"), "x").unwrap();
+            let r = fx.runner();
+            let o = fx.go(&r, false);
+            assert!(deletes(&r).is_empty(), "{path}: {:?}", r.calls());
+            assert!(
+                !has(&o, Kind::Pruned, "unfinished receive"),
+                "{path}: {}",
+                o.section(false)
+            );
+            assert!(
+                !fx.marker("vm.pristine-9").exists(),
+                "{path}: a marker that names nothing is removed"
+            );
+        }
+    }
+
+    #[test]
     fn a_delete_that_exits_non_zero_is_a_failure_and_the_marker_and_copy_stay() {
         // At the start of a pass: an unfinished receive whose delete fails.
         let partial = line(101, "static/vm/vm.pristine-2", U[6], None, None);
@@ -2535,7 +2567,7 @@ mod tests {
         // Exit 0: done.
         let ok = Scripted::new(&[(&argv, 0, "")]);
         assert_eq!(delete_subvolume(&ok, &sub), Ok(()));
-        assert_eq!(ok.calls(), [argv.clone()]);
+        assert_eq!(ok.calls(), std::slice::from_ref(&argv));
         // Exit 1 (also what an unscripted command does): an error naming it.
         let failing = Scripted::new(&[(&argv, 1, "")]);
         let err = delete_subvolume(&failing, &sub).unwrap_err();
@@ -2652,6 +2684,17 @@ mod tests {
         assert!(parse_show(&text("63d7331e-1758-a74c-a7a6-da65eeaca50a")).is_ok());
         for bad in ["nonsense", "-", "", "63d7331e-1758-a74c-a7a6"] {
             assert!(parse_show(&text(bad)).is_err(), "{bad:?}");
+        }
+        // The same for the Received UUID: a value that is not a UUID (nor
+        // the `-` of none) is an error, never taken as the identity.
+        let received = |value: &str| {
+            format!(
+                "x\n\tUUID: \t\t\t63d7331e-1758-a74c-a7a6-da65eeaca50a\n\tReceived UUID: \t\t{value}\n\tFlags: \t\t\treadonly\n"
+            )
+        };
+        assert!(parse_show(&received("d4c3637a-dffe-e140-a7b7-daaa3b200df1")).is_ok());
+        for bad in ["nonsense", "", "d4c3637a-dffe-e140-a7b7"] {
+            assert!(parse_show(&received(bad)).is_err(), "{bad:?}");
         }
     }
 
