@@ -630,7 +630,9 @@ pub fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
-/// Outcome of a full `run_drift_check` invocation.
+/// Outcome of a full `run_drift_check` invocation. One value per process run,
+/// so the size of the `Ran` report costs nothing worth boxing it for.
+#[allow(clippy::large_enum_variant)]
 pub enum DoctorOutcome {
     /// A lock was held by another process — this invocation deferred without
     /// examining anything. Always maps to exit code 0 (see `main.rs`).
