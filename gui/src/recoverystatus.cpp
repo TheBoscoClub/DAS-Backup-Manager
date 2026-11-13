@@ -213,7 +213,57 @@ QString sessionBlocker(const DriveView &d, const PairView &p, const GuiFacts &g)
         return QStringLiteral("a session holds both drives (%1)").arg(sessionWords(*p.session, g.nowEpoch));
     if (!g.ownJobId.isEmpty())
         return QStringLiteral("this window's session %1 is running").arg(g.ownJobId);
+    if (!g.ownRecordJobId.isEmpty())
+        return QStringLiteral("this window's record %1 is running").arg(g.ownRecordJobId);
     return {};
+}
+
+// Why this drive's boot record is one a session would refuse (the script's
+// check_boot_record: made before the last session ended, dated in the future,
+// older than RecordMaxAgeDays), or that there is none; empty when it is current
+// as far as the document can tell. The last session's end is the newest history
+// line's `end`: a line with none (a session that died) is not a time, and a
+// history that cannot be read is no history.
+QString recordReason(const DriveView &d, qint64 nowEpoch)
+{
+    if (!d.record || !d.checkedEpoch)
+        return QStringLiteral("there is no usable record of %1 yet").arg(d.displayName);
+    const qint64 checked = *d.checkedEpoch;
+    if (!d.historyError) {
+        for (const QJsonObject &h : d.history) {
+            const QJsonValue end = h.value(QStringLiteral("end"));
+            if (end.isDouble() && end.toInteger() >= checked)
+                return QStringLiteral("its boot record was made before the drive's last session ended");
+        }
+    }
+    if (checked > nowEpoch + 300)
+        return QStringLiteral("its boot record is dated in the future");
+    if (nowEpoch - checked > qint64(RecordMaxAgeDays) * 86400)
+        return QStringLiteral("its boot record is older than %1 days").arg(RecordMaxAgeDays);
+    return {};
+}
+
+Action recordAction(const DriveView &d, const QString &blocker, qint64 nowEpoch)
+{
+    if (!blocker.isEmpty())
+        return refused(blocker);
+    const QString reason = recordReason(d, nowEpoch);
+    if (reason.isEmpty()) {
+        if (d.historyError)
+            return refused(QStringLiteral("the boot record of %1 is under %2 days old; its last session cannot be "
+                                          "read (%3), so Record is not offered")
+                               .arg(d.displayName)
+                               .arg(RecordMaxAgeDays)
+                               .arg(*d.historyError));
+        return refused(QStringLiteral("the boot record of %1 is current: made after its last session and not "
+                                      "older than %2 days")
+                           .arg(d.displayName)
+                           .arg(RecordMaxAgeDays));
+    }
+    return allowed(QStringLiteral("Record %1: mount it read-only, read its OS and write its boot record, then "
+                                  "unmount it; no backup runs and nothing on the drive changes. Offered because "
+                                  "%2. Refused while a backup, a scrub or a session holds a lock.")
+                       .arg(d.displayName, reason));
 }
 
 QString unattendedBlocker(const DriveView &d)
@@ -300,6 +350,12 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
         : refused(why);
 
     a.clearSchedule = clearAction(d.scheduleError, d.schedule);
+
+    // Record: one drive's boot record, never while any session holds a drive
+    QString recordBlocker = sessionBlocker(d, p, g);
+    if (recordBlocker.isEmpty())
+        recordBlocker = others;
+    a.record = recordAction(d, recordBlocker, g.nowEpoch);
 
     // Console
     if (d.sessionError) {
@@ -391,6 +447,19 @@ PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g)
         p.schedule = allowed(QStringLiteral("Schedule an unattended update of both drives at the chosen time"));
     p.clearSchedule = clearAction(doc.pair.scheduleError, doc.pair.schedule);
     return p;
+}
+
+bool sessionRefusedForRecord(const QString &summary)
+{
+    return summary.contains(QLatin1String("recovery-os record"));
+}
+
+QString recordRefusalWords(const QString &summary)
+{
+    return QStringLiteral("Not started: the drive's boot record is missing or out of date. Press the Record button "
+                          "beside Upgrade (it does what `sudo btrdasd recovery-os record <label>` does in a "
+                          "terminal), then start the update again.\n%1")
+        .arg(summary);
 }
 
 QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch)

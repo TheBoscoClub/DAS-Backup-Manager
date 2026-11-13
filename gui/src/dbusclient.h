@@ -85,6 +85,7 @@ public:
     void recoveryOsStatusAsync();                                   // -> recoveryOsStatusResult(json); empty on error/unavailable
     void recoveryOsSession(const QStringList &labels, bool unattended,
                            const QString &mode);                    // a job: jobStarted(id, "Recovery OS session"); never passes accept_boot_record_risk
+    void recoveryOsRecord(const QString &label);                  // a job: jobStarted(id, "Recovery OS record"); the CLI's `recovery-os record` for one drive
     void recoveryOsSessionEnd(const QString &label);                // -> recoveryOsSessionEndResult(label, ok, lines); 10-minute timeout
     void recoveryOsScheduleSet(const QStringList &labels, qint64 atEpoch,
                                const QString &mode);                // -> recoveryOsScheduleResult(unit); atEpoch 0 clears

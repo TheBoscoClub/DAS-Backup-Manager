@@ -59,6 +59,7 @@ private Q_SLOTS:
     void onClearSchedule();
     void onConsole();
     void onEndSession();
+    void onRecord();
     void rederive();
 
 private:
@@ -88,6 +89,7 @@ private:
     QPushButton *m_clear = nullptr;
     QPushButton *m_console = nullptr;
     QPushButton *m_end = nullptr;
+    QPushButton *m_record = nullptr;
     QLabel *m_status = nullptr;
     QTimer *m_timer = nullptr;
     bool m_refreshInFlight = false;
@@ -96,4 +98,6 @@ private:
     bool m_jobRequested = false; // Upgrade clicked, jobStarted not yet seen
     QSet<QString> m_earlyFinished; // JobFinished ids seen before jobStarted named the job
     bool m_endInFlight = false;
+    QString m_ownRecordJobId;       // this panel's running record job; empty until jobStarted names it
+    bool m_recordRequested = false; // Record clicked, jobStarted not yet seen
 };

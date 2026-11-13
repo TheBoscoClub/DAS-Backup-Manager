@@ -1316,6 +1316,136 @@ private Q_SLOTS:
         QCOMPARE(a.upgrade.why, s.a().unattendedWhy);
     }
 
+    // --- Record (bd DAS-Backup-Manager-5j2x): enabled when the drive's boot
+    // record is one a session would refuse, never while anything holds the drive
+
+    void recordIsEnabledOnlyWhenTheRecordIsOneASessionWouldRefuse()
+    {
+        // Fresh: made after the last session ended, hours old. Nothing to do.
+        Scenario s = idleA();
+        DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.record.enabled);
+        QVERIFY2(a.record.why.contains(QStringLiteral("current")), qPrintable(a.record.why));
+
+        // Made before the drive's last session ended (the field case): the
+        // newest history line ends at, or after, the record's check.
+        Scenario after = idleA();
+        QJsonObject last = after.a().history.last();
+        last[QStringLiteral("end")] = *after.a().checkedEpoch + 10;
+        after.a().history.last() = last;
+        a = deriveActions(after.a(), after.doc.pair, after.facts);
+        QVERIFY2(a.record.enabled, qPrintable(a.record.why));
+        QVERIFY2(a.record.why.contains(QStringLiteral("last session")), qPrintable(a.record.why));
+        QVERIFY(a.record.why.contains(QStringLiteral("read-only")));
+
+        // Older than the script's 8 days.
+        Scenario old = idleA();
+        old.facts.nowEpoch = *old.a().checkedEpoch + 9 * 86400;
+        a = deriveActions(old.a(), old.doc.pair, old.facts);
+        QVERIFY2(a.record.enabled, qPrintable(a.record.why));
+        QVERIFY2(a.record.why.contains(QStringLiteral("8 days")), qPrintable(a.record.why));
+        old.facts.nowEpoch = *old.a().checkedEpoch + 7 * 86400;
+        QVERIFY(!deriveActions(old.a(), old.doc.pair, old.facts).record.enabled);
+
+        // A record dated in the future, past the script's 5 minutes.
+        Scenario future = idleA();
+        future.facts.nowEpoch = *future.a().checkedEpoch - 600;
+        a = deriveActions(future.a(), future.doc.pair, future.facts);
+        QVERIFY2(a.record.enabled && a.record.why.contains(QStringLiteral("future")), qPrintable(a.record.why));
+
+        // No record of the drive at all: recording makes one.
+        Scenario none = idleA();
+        none.a().record.reset();
+        none.a().checkedEpoch.reset();
+        none.a().recordError = QStringLiteral("no record of system-recovery-A-2tb");
+        a = deriveActions(none.a(), none.doc.pair, none.facts);
+        QVERIFY2(a.record.enabled, qPrintable(a.record.why));
+
+        // A history that cannot be read hides the last session: only the age
+        // can be judged, and a fresh record stays "current", never guessed.
+        Scenario blind = idleA();
+        blind.a().history.clear();
+        blind.a().historyError = QStringLiteral("history cannot be read: line 3 is not JSON");
+        QVERIFY(!deriveActions(blind.a(), blind.doc.pair, blind.facts).record.enabled);
+        // A session that ended with no end time (crashed) is not a time.
+        Scenario open = idleA();
+        QJsonObject running = open.a().history.last();
+        running[QStringLiteral("end")] = QJsonValue::Null;
+        open.a().history.last() = running;
+        QVERIFY(!deriveActions(open.a(), open.doc.pair, open.facts).record.enabled);
+    }
+
+    void recordIsRefusedWhileAnythingHoldsTheDriveWithTheReasonInItsTooltip()
+    {
+        const auto stale = [](Scenario &s) {
+            s.facts.nowEpoch = *s.a().checkedEpoch + 9 * 86400;
+        };
+        Scenario h = idleA();
+        stale(h);
+        h.a().session = SessionView{QStringLiteral("other:recovery-os VM session system-recovery-A-2tb pid 1"), 1791400000, QStringLiteral("running"), std::nullopt};
+        DriveActions a = deriveActions(h.a(), h.doc.pair, h.facts);
+        QVERIFY(!a.record.enabled);
+        QVERIFY(a.record.why.contains(QStringLiteral("a session holds")));
+
+        Scenario o = idleA(); // another drive's session: one maintenance lock serves them all
+        stale(o);
+        o.b().sessionError.reset();
+        QVERIFY(deriveActions(o.a(), o.doc, o.facts).record.enabled); // B idle: only A's own record matters
+        o.b().session = SessionView{QStringLiteral("job:job-3"), 1791400000, QStringLiteral("running"), std::nullopt};
+        a = deriveActions(o.a(), o.doc, o.facts);
+        QVERIFY(!a.record.enabled);
+        QVERIFY(a.record.why.contains(QStringLiteral("a session holds")));
+
+        Scenario pr = idleA();
+        stale(pr);
+        pr.doc.pair.session = SessionView{QStringLiteral("unit:das-recovery-os-update-both.service"), 1791400000, QString(), false};
+        a = deriveActions(pr.a(), pr.doc.pair, pr.facts);
+        QVERIFY(!a.record.enabled);
+        QVERIFY(a.record.why.contains(QStringLiteral("both drives")));
+
+        Scenario e = idleA();
+        stale(e);
+        e.a().sessionError = QStringLiteral("the unit cannot be read");
+        a = deriveActions(e.a(), e.doc.pair, e.facts);
+        QVERIFY(!a.record.enabled);
+        QCOMPARE(a.record.why, *e.a().sessionError);
+
+        // This window's own session job, and its own record job.
+        Scenario j = idleA();
+        stale(j);
+        j.facts.ownJobId = QStringLiteral("job-9");
+        QVERIFY(!deriveActions(j.a(), j.doc.pair, j.facts).record.enabled);
+        Scenario r = idleA();
+        stale(r);
+        r.facts.ownRecordJobId = QStringLiteral("job-10");
+        a = deriveActions(r.a(), r.doc.pair, r.facts);
+        QVERIFY(!a.record.enabled);
+        QVERIFY2(a.record.why.contains(QStringLiteral("this window")), qPrintable(a.record.why));
+        // ... which also keeps an Upgrade away (the helper would refuse it).
+        QVERIFY(!a.upgrade.enabled);
+    }
+
+    void aRefusalForAStaleRecordIsRecognisedAndPointsAtTheRecordButton()
+    {
+        // The script's own refusals, as a failed session job carries them.
+        const QString after = QStringLiteral(
+            "the record was made before this drive's last VM session ended (2026-11-08 17:35:35 UTC): the OS may have "
+            "changed in it (the record was checked 2026-11-08 10:08:00 UTC, 1 day ago) -- let the next backup run, with "
+            "this drive attached, record it again, or record it now, without a backup: sudo btrdasd recovery-os record system-recovery-B-2tb");
+        QVERIFY(sessionRefusedForRecord(after));
+        const QString words = recordRefusalWords(after);
+        QVERIFY2(words.contains(QStringLiteral("Record")), qPrintable(words));
+        QVERIFY2(words.contains(QStringLiteral("sudo btrdasd recovery-os record system-recovery-B-2tb")), qPrintable(words));
+        QVERIFY(words.contains(after)); // the script's reasons are kept whole
+
+        QVERIFY(sessionRefusedForRecord(QStringLiteral(
+            "no boot record: /var/lib/das-backup/recovery-os.json does not exist -- (sudo btrdasd recovery-os record a), then start again")));
+        // Other failures are not about the record.
+        QVERIFY(!sessionRefusedForRecord(QStringLiteral("exit 7 at upgrade")));
+        QVERIFY(!sessionRefusedForRecord(QStringLiteral("a session is already running as job job-3")));
+        QVERIFY(!sessionRefusedForRecord(QString()));
+    }
+
     void theBannerIsNeededForAttendedOnAWillRecordOnly()
     {
         Scenario s = idleA();
@@ -1502,14 +1632,14 @@ private Q_SLOTS:
 
 private:
     struct RecoveryParts {
-        QPushButton *upgrade, *schedule, *clear, *console, *end;
+        QPushButton *upgrade, *schedule, *clear, *console, *end, *record;
         QComboBox *selector;
         QRadioButton *attended, *unattended;
         QCheckBox *now;
         QDateTimeEdit *when;
         bool ok() const
         {
-            return upgrade && schedule && clear && console && end && selector && attended && unattended && now && when;
+            return upgrade && schedule && clear && console && end && record && selector && attended && unattended && now && when;
         }
     };
 
@@ -1520,6 +1650,7 @@ private:
                 w.findChild<QPushButton *>(QStringLiteral("clearSchedule")),
                 w.findChild<QPushButton *>(QStringLiteral("console")),
                 w.findChild<QPushButton *>(QStringLiteral("endSession")),
+                w.findChild<QPushButton *>(QStringLiteral("record")),
                 w.findChild<QComboBox *>(QStringLiteral("selector")),
                 w.findChild<QRadioButton *>(QStringLiteral("attended")),
                 w.findChild<QRadioButton *>(QStringLiteral("unattended")),
@@ -1566,7 +1697,7 @@ private Q_SLOTS:
         RecoveryPanel panel(&client);
         const RecoveryParts p = recoveryPartsOf(panel);
         QVERIFY(p.ok());
-        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record}) {
             QVERIFY(!b->isEnabled());
             QVERIFY(!b->toolTip().isEmpty());
         }
@@ -1642,7 +1773,7 @@ private Q_SLOTS:
         panel.applyDocument("{\"schema\": 2}");
         QVERIFY2(panel.statusLine().contains(QStringLiteral("schema 2")), qPrintable(panel.statusLine()));
         const RecoveryParts p = recoveryPartsOf(panel);
-        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end})
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record})
             QVERIFY(!b->isEnabled());
         // A good document afterwards recovers it
         panel.applyDocument(fixture());
@@ -1682,6 +1813,105 @@ private Q_SLOTS:
         QVERIFY(panel.facts().ownJobId.isEmpty());
         panel.onJobStarted(QStringLiteral("job-6"), QStringLiteral("Recovery OS session"));
         QVERIFY(panel.facts().ownJobId.isEmpty());
+    }
+
+    // The document of two idle drives, drive A's record made before its last
+    // session ended (the 2026-11-08 field case).
+    static QByteArray recordStaleOnA()
+    {
+        return twoIdleDrives([](QJsonObject &a, QJsonObject &) {
+            QJsonArray history = a[QStringLiteral("history")].toArray();
+            QJsonObject last = history.last().toObject();
+            last[QStringLiteral("end")] = a[QStringLiteral("checked_epoch")].toInteger() + 10;
+            history[history.size() - 1] = last;
+            a[QStringLiteral("history")] = history;
+        });
+    }
+
+    void theRecordButtonFollowsTheRuleAndAlwaysSaysWhy()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        QVERIFY(!p.record->isEnabled());
+        QVERIFY(!p.record->toolTip().isEmpty());
+        QCOMPARE(p.record->text(), QStringLiteral("Record"));
+
+        panel.applyDocument(recordStaleOnA());
+        p.selector->setCurrentIndex(0);
+        QVERIFY2(p.record->isEnabled(), qPrintable(p.record->toolTip()));
+        QVERIFY(p.record->toolTip().startsWith(QStringLiteral("<qt>")));
+        QVERIFY(p.record->toolTip().contains(QStringLiteral("last session")));
+        // Both drives: one drive's record at a time, and it says so.
+        p.selector->setCurrentIndex(2);
+        QVERIFY(!p.record->isEnabled());
+        QVERIFY(p.record->toolTip().contains(QStringLiteral("one drive")));
+        // A drive whose session is running: disabled, and the tooltip says why.
+        panel.applyDocument(fixture());
+        p.selector->setCurrentIndex(0);
+        QVERIFY(!p.record->isEnabled());
+        QVERIFY2(p.record->toolTip().contains(QStringLiteral("a session holds")), qPrintable(p.record->toolTip()));
+    }
+
+    void aRecordClickIsAwaitedAndAnUnreachableHelperEndsTheRequest()
+    {
+        DBusClient client; // unavailable: the call is dropped and the request must not stick
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        panel.applyDocument(recordStaleOnA());
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.record->isEnabled());
+        p.record->click();
+        QVERIFY2(!p.record->isEnabled(), "the click is awaited, a second one is not allowed");
+        QVERIFY(!p.upgrade->isEnabled());
+        QCoreApplication::processEvents(); // callDropped arrives, queued
+        QVERIFY2(p.record->isEnabled(), qPrintable(p.record->toolTip()));
+    }
+
+    void aRecordJobOfThisWindowIsTrackedAndItsOutcomeIsSaid()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        panel.applyDocument(recordStaleOnA());
+        p.selector->setCurrentIndex(0);
+        p.record->click();
+        panel.onJobStarted(QStringLiteral("job-21"), QStringLiteral("Recovery OS record"));
+        QCOMPARE(panel.facts().ownRecordJobId, QStringLiteral("job-21"));
+        QVERIFY(!p.record->isEnabled());
+        QVERIFY(!p.upgrade->isEnabled());
+        panel.onJobFinished(QStringLiteral("job-21"), true, QStringLiteral("Recovery OS: OK  (all good)"));
+        QVERIFY(panel.facts().ownRecordJobId.isEmpty());
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Recorded")), qPrintable(panel.statusLine()));
+
+        p.record->click();
+        panel.onJobStarted(QStringLiteral("job-22"), QStringLiteral("Recovery OS record"));
+        panel.onJobFinished(QStringLiteral("job-22"), false, QStringLiteral("Deferred: a backup is running; nothing was mounted"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Recording failed")), qPrintable(panel.statusLine()));
+        QVERIFY(panel.statusLine().contains(QStringLiteral("a backup is running")));
+
+        // A record job nothing here asked for is not this panel's.
+        panel.onJobStarted(QStringLiteral("job-23"), QStringLiteral("Recovery OS record"));
+        QVERIFY(panel.facts().ownRecordJobId.isEmpty());
+    }
+
+    void anUpgradeRefusedForAStaleRecordSaysSoAndPointsAtRecord()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        requestSession(panel, p);
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false,
+                            QStringLiteral("the record was made before this drive's last VM session ended: the OS may have changed in it "
+                                           "-- record it now, without a backup: sudo btrdasd recovery-os record system-recovery-A-2tb"));
+        const QString line = panel.statusLine();
+        QVERIFY2(line.startsWith(QStringLiteral("Not started")), qPrintable(line));
+        QVERIFY2(line.contains(QStringLiteral("Record button")), qPrintable(line));
+        QVERIFY2(!line.startsWith(QStringLiteral("Failed")), qPrintable(line));
     }
 
     void aKeptSessionIsNeitherFailedNorDoneInTheRecoveryPanel()
@@ -1808,7 +2038,7 @@ private Q_SLOTS:
         QVERIFY(p.clear->isEnabled());
 
         Q_EMIT client.recoveryOsStatusError(QStringLiteral("polkit denied the status read"));
-        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end}) {
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record}) {
             QVERIFY(!b->isEnabled());
             QVERIFY2(b->toolTip().contains(QStringLiteral("polkit denied")), qPrintable(b->toolTip()));
         }
@@ -1930,7 +2160,7 @@ private Q_SLOTS:
         const RecoveryParts p = recoveryPartsOf(panel);
         QVERIFY(p.ok());
         // Qt wraps only rich-text tooltips: every tooltip is one
-        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end})
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record})
             QVERIFY2(b->toolTip().startsWith(QStringLiteral("<qt>")), qPrintable(b->toolTip()));
         QVERIFY(p.attended->toolTip().startsWith(QStringLiteral("<qt>")));
         QVERIFY(p.selector->toolTip().startsWith(QStringLiteral("<qt>")));

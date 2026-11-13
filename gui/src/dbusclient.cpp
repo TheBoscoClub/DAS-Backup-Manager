@@ -543,6 +543,14 @@ void DBusClient::recoveryOsSession(const QStringList &labels, bool unattended,
               QStringLiteral("Recovery OS session"));
 }
 
+void DBusClient::recoveryOsRecord(const QString &label)
+{
+    // One drive's `btrdasd recovery-os record`, as a helper job (bd
+    // DAS-Backup-Manager-5j2x): the helper refuses a label that is no recovery
+    // drive and any overlap with a session; its summary says how it ended.
+    callAsync(QStringLiteral("RecoveryOsRecord"), {label}, QStringLiteral("Recovery OS record"));
+}
+
 void DBusClient::recoveryOsSessionEnd(const QString &label)
 {
     if (!m_available) {

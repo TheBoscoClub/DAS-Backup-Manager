@@ -629,16 +629,23 @@ void MainWindow::onBackupFinished(const QString &jobId, bool success, const QStr
 
 void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QString &summary)
 {
-    // Must match the operation DBusClient::recoveryOsSession's job starts with.
-    const bool recovery = m_startedJobs.take(jobId) == QLatin1String("Recovery OS session");
+    // Must match the operations DBusClient::recoveryOsSession's and
+    // recoveryOsRecord's jobs start with.
+    const QString operation = m_startedJobs.take(jobId);
+    const bool record = operation == QLatin1String("Recovery OS record");
+    const bool recovery = record || operation == QLatin1String("Recovery OS session");
 
     const QString &eventId = recovery
         ? (success ? NotifyEvent::RecoveryOsComplete : NotifyEvent::RecoveryOsFailed)
         : (success ? NotifyEvent::BackupComplete : NotifyEvent::BackupFailed);
     auto *notification = new KNotification(eventId, KNotification::CloseOnTimeout, this);
     if (recovery) {
-        notification->setTitle(success ? i18n("Recovery Drive Update Finished")
-                                       : i18n("Recovery Drive Update Failed"));
+        if (record)
+            notification->setTitle(success ? i18n("Recovery Drive Record Finished")
+                                           : i18n("Recovery Drive Record Failed"));
+        else
+            notification->setTitle(success ? i18n("Recovery Drive Update Finished")
+                                           : i18n("Recovery Drive Update Failed"));
     } else {
         notification->setTitle(success ? i18n("Backup Complete") : i18n("Backup Failed"));
     }
@@ -650,7 +657,11 @@ void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QSt
 
     // Update tray tooltip with result
     if (m_trayIcon) {
-        if (recovery) {
+        if (record) {
+            m_trayIcon->setToolTipSubTitle(
+                success ? i18n("Last recovery drive record: success")
+                        : i18n("Last recovery drive record: FAILED"));
+        } else if (recovery) {
             m_trayIcon->setToolTipSubTitle(
                 success ? i18n("Last recovery drive update: success")
                         : i18n("Last recovery drive update: FAILED"));

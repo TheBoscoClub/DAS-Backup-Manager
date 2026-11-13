@@ -24,6 +24,8 @@
 
 namespace {
 const auto Operation = QStringLiteral("Recovery OS session");
+// Must match the operation DBusClient::recoveryOsRecord's job starts with.
+const auto RecordOperation = QStringLiteral("Recovery OS record");
 const auto Both = QStringLiteral("both");
 constexpr int RefreshMs = 30000;
 // The script's own words, shown before an attended session of a `will` OS.
@@ -84,10 +86,16 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
         return QMessageBox::warning(this, title, text, QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
             == QMessageBox::Yes;
     };
-    connect(m_client, &DBusClient::errorOccurred, this, [this](const QString &op, const QString &) {
+    connect(m_client, &DBusClient::errorOccurred, this, [this](const QString &op, const QString &error) {
         // A refused RecoveryOsSession call: the request is over, nothing runs.
         if (op == Operation)
             m_jobRequested = false;
+        // A refused RecoveryOsRecord call: over too, and the panel says why
+        // (the helper's words name what is in the way).
+        if (op == RecordOperation) {
+            m_recordRequested = false;
+            m_status->setText(i18n("Record refused: %1", error));
+        }
         if (op == QLatin1String("RecoveryOsScheduleSet") || op == QLatin1String("RecoveryOsConsole"))
             refresh();
         rederive();
@@ -95,8 +103,8 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     // No helper: the session call was never made, so the request is over
     // too (bd DAS-Backup-Manager-qxxv); helperUnavailable already said why.
     connect(m_client, &DBusClient::callDropped, this, [this](const QString &op) {
-        if (op == Operation) {
-            m_jobRequested = false;
+        if (op == Operation || op == RecordOperation) {
+            (op == Operation ? m_jobRequested : m_recordRequested) = false;
             rederive();
         }
     });
@@ -181,6 +189,7 @@ void RecoveryPanel::buildControls()
         return b;
     };
     m_upgrade = button("upgrade", i18n("Upgrade"), &RecoveryPanel::onUpgrade);
+    m_record = button("record", i18n("Record"), &RecoveryPanel::onRecord);
     m_schedule = button("schedule", i18n("Schedule"), &RecoveryPanel::onSchedule);
     m_clear = button("clearSchedule", i18n("Clear schedule"), &RecoveryPanel::onClearSchedule);
     m_console = button("console", i18n("Open console"), &RecoveryPanel::onConsole);
@@ -343,6 +352,7 @@ GuiFacts RecoveryPanel::facts() const
     GuiFacts g;
     g.ownJobId = m_ownJobId;
     g.ownJobAttended = m_ownJobAttended;
+    g.ownRecordJobId = m_ownRecordJobId;
     g.viewerInstalled = !QStandardPaths::findExecutable(QStringLiteral("vncviewer")).isEmpty();
     g.nowEpoch = QDateTime::currentSecsSinceEpoch();
     g.chosenNow = m_now->isChecked();
@@ -399,7 +409,7 @@ void RecoveryPanel::rederive()
     };
     if (!m_doc || !m_parseError.isEmpty()) {
         const Action off{false, m_parseError.isEmpty() ? i18n("no status document yet") : m_parseError};
-        for (QPushButton *b : {m_upgrade, m_schedule, m_clear, m_console, m_end})
+        for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
             bind(b, off);
         if (!m_parseError.isEmpty())
             m_status->setText(m_parseError);
@@ -408,7 +418,7 @@ void RecoveryPanel::rederive()
     if (!m_staleReason.isEmpty()) {
         // The cards show the last document; nothing may act on it.
         const Action stale{false, i18n("the last status refresh failed: %1", m_staleReason)};
-        for (QPushButton *b : {m_upgrade, m_schedule, m_clear, m_console, m_end})
+        for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
             bind(b, stale);
         m_status->setText(m_staleReason);
         return;
@@ -417,6 +427,7 @@ void RecoveryPanel::rederive()
     if (both) {
         const PairActions p = derivePairActions(*m_doc, g);
         bind(m_upgrade, p.upgrade);
+        bind(m_record, {false, i18n("pick one drive to record its boot record")});
         bind(m_schedule, p.schedule);
         bind(m_clear, p.clearSchedule);
         bind(m_console, {false, i18n("pick one drive to open its console")});
@@ -424,6 +435,7 @@ void RecoveryPanel::rederive()
     } else if (const DriveView *d = selectedDrive()) {
         const DriveActions a = deriveActions(*d, *m_doc, g);
         bind(m_upgrade, a.upgrade);
+        bind(m_record, a.record);
         bind(m_schedule, a.schedule);
         bind(m_clear, a.clearSchedule);
         bind(m_console, a.console);
@@ -431,7 +443,15 @@ void RecoveryPanel::rederive()
     }
     if (m_jobRequested || !m_ownJobId.isEmpty()) {
         m_upgrade->setEnabled(false);
-        m_upgrade->setToolTip(i18n("this window's session is running"));
+        m_upgrade->setToolTip(tip(i18n("this window's session is running")));
+        m_record->setEnabled(false);
+        m_record->setToolTip(tip(i18n("this window's session is running")));
+    }
+    if (m_recordRequested || !m_ownRecordJobId.isEmpty()) {
+        m_record->setEnabled(false);
+        m_record->setToolTip(tip(i18n("this window's record is running")));
+        m_upgrade->setEnabled(false);
+        m_upgrade->setToolTip(tip(i18n("this window's record is running")));
     }
     if (m_endInFlight) {
         m_end->setEnabled(false);
@@ -467,6 +487,17 @@ void RecoveryPanel::onUpgrade()
     rederive();
     // accept_boot_record_risk is never passed from the GUI (the client hard-codes false).
     m_client->recoveryOsSession(labels, unattended, chosenMode());
+}
+
+void RecoveryPanel::onRecord()
+{
+    const QStringList labels = selectedLabels();
+    if (labels.size() != 1)
+        return;
+    m_recordRequested = true;
+    m_status->setText(i18n("Recording the boot record of %1…", labels.first()));
+    rederive();
+    m_client->recoveryOsRecord(labels.first());
 }
 
 void RecoveryPanel::onSchedule()
@@ -560,6 +591,20 @@ void RecoveryPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     // Any job may be a session another window started: the document says.
     refresh();
+    if (operation == RecordOperation) {
+        if (m_earlyFinished.remove(jobId)) {
+            // Finished before its reply arrived: over already.
+            m_recordRequested = false;
+            rederive();
+            return;
+        }
+        if (!m_recordRequested)
+            return; // another window's record: the helper refuses what overlaps it
+        m_recordRequested = false;
+        m_ownRecordJobId = jobId;
+        rederive();
+        return;
+    }
     if (operation != Operation)
         return;
     if (m_earlyFinished.remove(jobId)) {
@@ -577,8 +622,15 @@ void RecoveryPanel::onJobStarted(const QString &jobId, const QString &operation)
 
 void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QString &summary)
 {
-    if (m_ownJobId.isEmpty() && m_jobRequested)
+    if ((m_ownJobId.isEmpty() && m_jobRequested) || m_recordRequested)
         m_earlyFinished.insert(jobId);
+    if (!m_ownRecordJobId.isEmpty() && jobId == m_ownRecordJobId) {
+        m_ownRecordJobId.clear();
+        m_status->setText(success ? i18n("Recorded: %1", summary) : i18n("Recording failed: %1", summary));
+        rederive();
+        refresh();
+        return;
+    }
     if (jobId != m_ownJobId) {
         refresh();
         return;
@@ -590,6 +642,8 @@ void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QStr
         m_status->setText(keptWords(summary, false));
     else if (summary.startsWith(QLatin1String("warnings:")))
         m_status->setText(i18n("Needs a look: %1", summary));
+    else if (sessionRefusedForRecord(summary))
+        m_status->setText(recordRefusalWords(summary));
     else
         m_status->setText(i18n("Failed: %1", summary));
     rederive();

@@ -108,6 +108,7 @@ struct RecoveryDocument {
 // What only the window knows.
 struct GuiFacts {
     QString ownJobId;             // this window's running session job, empty if none
+    QString ownRecordJobId;       // this window's running record job, empty if none
     bool ownJobAttended = false;  // how this window started that job
     bool viewerInstalled = false; // TigerVNC's vncviewer found on PATH
     qint64 nowEpoch = 0;
@@ -129,6 +130,7 @@ struct DriveActions {
     Action clearSchedule;
     Action console;
     Action endSession;
+    Action record; // re-read this drive's OS and write its boot record (RecoveryOsRecord)
     bool bannerNeeded = false; // attended on a `will` record: show the banner before the call
 };
 
@@ -140,6 +142,8 @@ struct PairActions {
 };
 
 constexpr qint64 ScheduleMinLeadSeconds = 120; // panel.rs SCHEDULE_MIN_LEAD
+// recovery-os-vm.sh MAX_RECORD_AGE_DAYS: a session refuses an older boot record.
+constexpr int RecordMaxAgeDays = 8;
 
 // The cautious side wins: the first failing condition's words are the tooltip.
 // The document form also refuses Upgrade while ANY drive's session runs or
@@ -148,6 +152,15 @@ constexpr qint64 ScheduleMinLeadSeconds = 120; // panel.rs SCHEDULE_MIN_LEAD
 DriveActions deriveActions(const DriveView &d, const RecoveryDocument &doc, const GuiFacts &g);
 DriveActions deriveActions(const DriveView &d, const PairView &p, const GuiFacts &g);
 PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g);
+
+// A session job's summary that is the script's refusal of a boot record that is
+// missing, too old, dated in the future, or made before the drive's last session
+// ended: every one of them offers `recovery-os record`, which the Record button
+// does (bd DAS-Backup-Manager-5j2x).
+bool sessionRefusedForRecord(const QString &summary);
+// What the panel says for it: the session did not start, the Record button is the
+// remedy, then the script's reasons whole.
+QString recordRefusalWords(const QString &summary);
 
 // Words for the cards.
 QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch); // "3 days ago" | "today" | "unknown"
