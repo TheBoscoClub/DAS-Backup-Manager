@@ -71,7 +71,7 @@ for src in "${sources[@]}"; do
   echo "::endgroup::"
 
   result=$(grep -E '^test result:' "$log_dir/$suite.log" || true)
-  re='^test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored; [0-9]+ measured; ([0-9]+) filtered out'
+  re='^test result: ok\. ([[:digit:]]+) passed; ([[:digit:]]+) failed; ([[:digit:]]+) ignored; [[:digit:]]+ measured; ([[:digit:]]+) filtered out'
   if [ "$rc" -ne 0 ]; then
     echo "::error::$suite: exited $rc (124 is the ${suite_timeout}s timeout): ${result:-no result line}"
     failed=1
