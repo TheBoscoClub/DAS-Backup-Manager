@@ -166,6 +166,45 @@ async fn finish_job(progress: Arc<OrderedProgress>, success: bool, summary: Stri
     }
 }
 
+/// Register and start a job: the one way every job method does it (bd
+/// DAS-Backup-Manager-oz7w). The job map's lock is taken, `refuse` is asked
+/// (it sees every live job as `(id, kind)`, and anything it reads of its own
+/// is read under this lock), `start` builds the job's progress queue and body
+/// from the new job id, the body is spawned and its entry inserted, all under
+/// that one guard. The spawned task removes its own entry through the same
+/// lock, so a job that ends at once cannot remove it before it is inserted,
+/// and two calls cannot both pass `refuse`. Nothing awaits between the
+/// check and the insert. Polkit is the caller's first step, never in here.
+async fn start_job<Fut>(
+    jobs: &JobMap,
+    sender: String,
+    kind: &'static str,
+    refuse: impl FnOnce(&[(&str, &str)]) -> Option<String>,
+    start: impl FnOnce(String) -> (Arc<OrderedProgress>, Fut),
+) -> fdo::Result<String>
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut guard = jobs.lock().await;
+    let running: Vec<(&str, &str)> = guard
+        .iter()
+        .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+        .collect();
+    if let Some(why) = refuse(&running) {
+        return Err(fdo::Error::Failed(why));
+    }
+    let job_id = new_job_id();
+    let (cancel, body) = start(job_id.clone());
+    let remover = jobs.clone();
+    let jid = job_id.clone();
+    let handle = tokio::spawn(async move {
+        body.await;
+        remover.lock().await.remove(&jid);
+    });
+    guard.insert(job_id.clone(), (handle, cancel, sender, kind));
+    Ok(job_id)
+}
+
 // ---------------------------------------------------------------------------
 // Polkit authorization
 // ---------------------------------------------------------------------------
@@ -1207,43 +1246,41 @@ impl HelperInterface {
         // never "all" (BackupOptions::from_gui, tested there).
         let options = BackupOptions::from_gui(mode, sources, targets, dry_run, steps);
 
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
+        start_job(
+            &self.jobs,
+            sender,
+            "backup",
+            |_| None,
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    // The same job the CLI runs (`backup::run_backup_job`): the
+                    // two-lock interlock (bd DAS-Backup-Manager-pe6, -dca), subvolume
+                    // sync (its section reaches the GUI through the job log), mounts,
+                    // btrbk, unmount — a target left mounted fails the run
+                    // (bd DAS-Backup-Manager-5oc) — report and record.
+                    let (success, summary) = tokio::task::spawn_blocking(move || {
+                        backup::run_backup_job(
+                            &backup::SystemBackupHost::new(
+                                Path::new(CANONICAL_CONFIG),
+                                "btrdasd-helper BackupRun job",
+                            ),
+                            config,
+                            options,
+                            &*progress,
+                        )
+                        .finish_line(dry_run)
+                    })
+                    .await
+                    .unwrap_or_else(|e| (false, format!("Backup task panicked: {e}")));
 
-        let handle = tokio::spawn(async move {
-            // The same job the CLI runs (`backup::run_backup_job`): the
-            // two-lock interlock (bd DAS-Backup-Manager-pe6, -dca), subvolume
-            // sync (its section reaches the GUI through the job log), mounts,
-            // btrbk, unmount — a target left mounted fails the run
-            // (bd DAS-Backup-Manager-5oc) — report and record.
-            let (success, summary) = tokio::task::spawn_blocking(move || {
-                backup::run_backup_job(
-                    &backup::SystemBackupHost::new(
-                        Path::new(CANONICAL_CONFIG),
-                        "btrdasd-helper BackupRun job",
-                    ),
-                    config,
-                    options,
-                    &*progress,
-                )
-                .finish_line(dry_run)
-            })
-            .await
-            .unwrap_or_else(|e| (false, format!("Backup task panicked: {e}")));
-
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone(), "backup"));
-        Ok(job_id)
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     /// Walk backup targets and index new snapshots.
@@ -1259,35 +1296,34 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.index").await?;
 
         let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
         let target_path = target_path.to_owned();
 
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                index_walk_job(&config, &target_path, &LockSite::production(), &progress)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
+        start_job(
+            &self.jobs,
+            sender,
+            "index",
+            |_| None,
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        index_walk_job(&config, &target_path, &LockSite::production(), &progress)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Indexing task panicked: {e}")));
 
-            let (success, summary) = match result {
-                Ok(msg) => (true, msg),
-                Err(msg) => (false, msg),
-            };
+                    let (success, summary) = match result {
+                        Ok(msg) => (true, msg),
+                        Err(msg) => (false, msg),
+                    };
 
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone(), "index"));
-        Ok(job_id)
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     // ---- Index read methods (synchronous, polkit: org.dasbackup.index.read) ----
@@ -1602,43 +1638,42 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
         let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
         let snapshot = snapshot.to_owned();
         let dest = dest.to_owned();
 
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                restore_files_job(
-                    &config,
-                    &snapshot,
-                    &dest,
-                    &files,
-                    &LockSite::production(),
-                    &progress,
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
+        start_job(
+            &self.jobs,
+            sender,
+            "restore",
+            |_| None,
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        restore_files_job(
+                            &config,
+                            &snapshot,
+                            &dest,
+                            &files,
+                            &LockSite::production(),
+                            &progress,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Restore task panicked: {e}")));
 
-            let (success, summary) = match result {
-                Ok((s, msg)) => (s, msg),
-                Err(msg) => (false, msg),
-            };
+                    let (success, summary) = match result {
+                        Ok((s, msg)) => (s, msg),
+                        Err(msg) => (false, msg),
+                    };
 
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
-        Ok(job_id)
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     /// Restore an entire snapshot to a destination.
@@ -1652,42 +1687,41 @@ impl HelperInterface {
         check_polkit(&self.conn, &sender, "org.dasbackup.restore").await?;
 
         let config = load_config()?;
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
         let snapshot = snapshot.to_owned();
         let dest = dest.to_owned();
 
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                restore_snapshot_job(
-                    &config,
-                    &snapshot,
-                    &dest,
-                    &LockSite::production(),
-                    &progress,
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));
+        start_job(
+            &self.jobs,
+            sender,
+            "restore",
+            |_| None,
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        restore_snapshot_job(
+                            &config,
+                            &snapshot,
+                            &dest,
+                            &LockSite::production(),
+                            &progress,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Snapshot restore task panicked: {e}")));
 
-            let (success, summary) = match result {
-                Ok((s, msg)) => (s, msg),
-                Err(msg) => (false, msg),
-            };
+                    let (success, summary) = match result {
+                        Ok((s, msg)) => (s, msg),
+                        Err(msg) => (false, msg),
+                    };
 
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), (handle, cancel, sender.clone(), "restore"));
-        Ok(job_id)
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     // ---- Synchronous methods ----
@@ -2229,53 +2263,44 @@ impl HelperInterface {
             .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
 
-        // Held from the check to the insert, so two calls cannot both pass.
-        let mut jobs_guard = self.jobs.lock().await;
-        let running: Vec<(&str, &str)> = jobs_guard
-            .iter()
-            .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
-            .collect();
+        // Checked and inserted under one job-map lock (`start_job`), and the
+        // count of session ends is read under the lock `RecoveryOsSessionEnd`
+        // raises it under (bd DAS-Backup-Manager-1ley).
         let unit_states: Vec<(&str, &str)> = states
             .iter()
             .map(|(u, s)| (u.as_str(), s.as_str()))
             .collect();
-        if let Some(why) = session_busy(&running, &unit_states) {
-            return Err(fdo::Error::Failed(why));
-        }
-
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                session::run_session(
-                    &session::SystemSpawner,
-                    Path::new(session::SCRIPT),
-                    &config,
-                    &req,
-                    &*progress,
-                )
-            })
-            .await;
-            let (success, summary) = match result {
-                // Exit 0 only; exit 5 is `false`, "warnings: …".
-                Ok(Ok(out)) => (out.success(), out.summary()),
-                Ok(Err(e)) => (false, e),
-                Err(e) => (false, format!("The recovery-OS session task panicked: {e}")),
-            };
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        jobs_guard.insert(
-            job_id.clone(),
-            (handle, cancel, sender.clone(), SESSION_KIND),
-        );
-        Ok(job_id)
+        start_job(
+            &self.jobs,
+            sender,
+            SESSION_KIND,
+            |running| session_busy(running, &unit_states),
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        session::run_session(
+                            &session::SystemSpawner,
+                            Path::new(session::SCRIPT),
+                            &config,
+                            &req,
+                            &*progress,
+                        )
+                    })
+                    .await;
+                    let (success, summary) = match result {
+                        // Exit 0 only; exit 5 is `false`, "warnings: …".
+                        Ok(Ok(out)) => (out.success(), out.summary()),
+                        Ok(Err(e)) => (false, e),
+                        Err(e) => (false, format!("The recovery-OS session task panicked: {e}")),
+                    };
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     /// End a drive's session (`recovery-os-vm.sh session-end <label>`):
@@ -2350,56 +2375,49 @@ impl HelperInterface {
             .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
 
-        // Held from the check to the insert, so two calls cannot both pass,
-        // and the count of session ends is read under the lock that
+        // Checked and inserted under one job-map lock (`start_job`), and the
+        // count of session ends is read under the lock that
         // `RecoveryOsSessionEnd` raises it under.
-        let mut jobs_guard = self.jobs.lock().await;
-        let running: Vec<(&str, &str)> = jobs_guard
-            .iter()
-            .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
-            .collect();
         let unit_states: Vec<(&str, &str)> = states
             .iter()
             .map(|(u, s)| (u.as_str(), s.as_str()))
             .collect();
-        if let Some(why) = record_busy(
-            &running,
-            &unit_states,
-            self.session_ends.load(std::sync::atomic::Ordering::SeqCst),
-        ) {
-            return Err(fdo::Error::Failed(why));
-        }
-
-        let job_id = new_job_id();
-        let progress = job_progress(&self.conn, &job_id);
-        let cancel = progress.clone();
-        let finisher = progress.clone();
-        let jobs = self.jobs.clone();
-        let jid = job_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let (success, summary) = tokio::task::spawn_blocking(move || {
-                backup::record_recovery_os_job(
-                    &backup::SystemRecordHost {
-                        job: "btrdasd-helper RecoveryOsRecord job".into(),
-                    },
-                    &config,
-                    &[label],
-                    &*progress,
+        start_job(
+            &self.jobs,
+            sender,
+            RECORD_KIND,
+            |running| {
+                record_busy(
+                    running,
+                    &unit_states,
+                    self.session_ends.load(std::sync::atomic::Ordering::SeqCst),
                 )
-                .finish_line()
-            })
-            .await
-            .unwrap_or_else(|e| (false, format!("The recovery-OS record task panicked: {e}")));
-            finish_job(finisher, success, summary).await;
-            jobs.lock().await.remove(&jid);
-        });
-
-        jobs_guard.insert(
-            job_id.clone(),
-            (handle, cancel, sender.clone(), RECORD_KIND),
-        );
-        Ok(job_id)
+            },
+            |job_id| {
+                let progress = job_progress(&self.conn, &job_id);
+                let cancel = progress.clone();
+                let finisher = progress.clone();
+                (cancel, async move {
+                    let (success, summary) = tokio::task::spawn_blocking(move || {
+                        backup::record_recovery_os_job(
+                            &backup::SystemRecordHost {
+                                job: "btrdasd-helper RecoveryOsRecord job".into(),
+                            },
+                            &config,
+                            &[label],
+                            &*progress,
+                        )
+                        .finish_line()
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        (false, format!("The recovery-OS record task panicked: {e}"))
+                    });
+                    finish_job(finisher, success, summary).await;
+                })
+            },
+        )
+        .await
     }
 
     /// Schedule an unattended session of `labels` (one drive, or both) at
@@ -4004,39 +4022,178 @@ mod tests {
         assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    // --- one job start for every job method (bd oz7w, 1ley)
+
+    /// A job body that finishes at once, with a progress queue to cancel by.
+    fn instant_job(
+        job_id: String,
+    ) -> (Arc<OrderedProgress>, impl std::future::Future<Output = ()>) {
+        let _ = job_id;
+        (gui_progress().0, async {})
+    }
+
+    async fn map_is_empty_soon(jobs: &JobMap) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if jobs.lock().await.is_empty() {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_job_that_ends_at_once_leaves_no_entry_in_the_job_map() {
+        let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
+        for round in 0..300 {
+            let id = start_job(&jobs, ":1.1".into(), "backup", |_| None, instant_job)
+                .await
+                .unwrap();
+            assert!(!id.is_empty());
+            assert!(
+                map_is_empty_soon(&jobs).await,
+                "round {round}: a finished job's entry stayed in the map"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_is_spawned_while_the_job_map_lock_is_still_held() {
+        let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
+        let probe = jobs.clone();
+        let held_at_start = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = held_at_start.clone();
+        start_job(
+            &jobs,
+            ":1.1".into(),
+            "index",
+            |_| None,
+            move |_| {
+                seen.store(
+                    probe.try_lock().is_err(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                (gui_progress().0, async {})
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            held_at_start.load(std::sync::atomic::Ordering::SeqCst),
+            "the job map was unlocked when the job was started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_start_runs_nothing_and_inserts_nothing_and_sees_every_live_job() {
+        let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
+        let parked = tokio::spawn(std::future::pending::<()>());
+        jobs.lock().await.insert(
+            "job-1".into(),
+            (parked, gui_progress().0, ":1.9".into(), SESSION_KIND),
+        );
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = started.clone();
+        let err = start_job(
+            &jobs,
+            ":1.1".into(),
+            RECORD_KIND,
+            |running| record_busy(running, &[], 0),
+            move |_| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                (gui_progress().0, async {})
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a recovery-OS session is already running as job job-1"),
+            "{err}"
+        );
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(jobs.lock().await.len(), 1);
+        jobs.lock().await.remove("job-1").unwrap().0.abort();
+    }
+
+    #[tokio::test]
+    async fn a_session_end_in_flight_refuses_a_session_start_and_a_record_start() {
+        let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
+        let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = SessionEndGuard::begin(&ends);
+        for kind in [SESSION_KIND, RECORD_KIND] {
+            let err = start_job(
+                &jobs,
+                ":1.1".into(),
+                kind,
+                |running| record_busy(running, &[], ends.load(std::sync::atomic::Ordering::SeqCst)),
+                instant_job,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "org.freedesktop.DBus.Error.Failed: a recovery-OS session is being ended"
+            );
+        }
+        assert!(jobs.lock().await.is_empty());
+        drop(guard);
+        start_job(
+            &jobs,
+            ":1.1".into(),
+            SESSION_KIND,
+            |running| record_busy(running, &[], ends.load(std::sync::atomic::Ordering::SeqCst)),
+            instant_job,
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
-    fn the_record_method_checks_and_inserts_under_one_job_map_lock_before_it_runs_anything() {
+    fn every_job_method_starts_through_start_job_and_the_session_kinds_read_the_session_end_count()
+    {
         let src = include_str!("btrdasd-helper.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
-        let rec = method_body(body, "recovery_os_record");
-        let at = |needle: &str| {
-            rec.find(needle)
-                .unwrap_or_else(|| panic!("recovery_os_record lacks {needle}"))
-        };
-        let (mirror, states, lock, busy, spawn, insert) = (
-            at("configured_mirror_label("),
-            at("read_active_states("),
-            at("let mut jobs_guard = self.jobs.lock().await"),
-            at("record_busy("),
-            at("tokio::spawn("),
-            at("jobs_guard.insert("),
-        );
-        assert!(mirror < states && states < lock && lock < busy && busy < spawn && spawn < insert);
-        let ends = at("self.session_ends.load(");
-        assert!(
-            busy < ends && ends < spawn,
-            "the session-end count is read inside the check, under the same lock"
-        );
-        assert!(
-            rec.matches("self.jobs.lock()").count() == 1,
-            "the job map is locked once, never locked again to insert"
-        );
-        // It runs the library's job, with the system host, for one label.
-        assert!(rec.contains("backup::record_recovery_os_job("));
-        assert!(rec.contains("backup::SystemRecordHost"));
-        assert!(rec.contains("RECORD_KIND"));
-        // The job's kind is authorized by the recovery-OS action on cancel.
+        for m in [
+            "backup_run",
+            "index_walk",
+            "restore_files",
+            "restore_snapshot",
+            "recovery_os_session",
+            "recovery_os_record",
+        ] {
+            let method = method_body(body, m);
+            let squeezed: String = method.split_whitespace().collect();
+            assert!(
+                squeezed.contains("start_job(&self.jobs,"),
+                "{m} does not use start_job"
+            );
+            for forbidden in ["tokio::spawn(", ".insert(", "self.jobs.lock()"] {
+                assert!(!method.contains(forbidden), "{m} still has {forbidden}");
+            }
+        }
+        let method = method_body(body, "recovery_os_record");
+        assert!(method.contains("record_busy("));
+        assert!(method.contains("self.session_ends.load("));
         assert_eq!(cancel_action(RECORD_KIND), "org.dasbackup.recovery-os");
+        // The start itself is polkit-first in every method (the polkit test
+        // above covers the recovery-OS ones).
+        for (m, action) in [
+            ("backup_run", "org.dasbackup.backup"),
+            ("index_walk", "org.dasbackup.index"),
+            ("restore_files", "org.dasbackup.restore"),
+            ("restore_snapshot", "org.dasbackup.restore"),
+        ] {
+            let method = method_body(body, m);
+            let polkit = method
+                .find(&format!("check_polkit(&self.conn, &sender, \"{action}\")"))
+                .unwrap_or_else(|| panic!("{m} does not check {action}"));
+            assert!(polkit < method.find("start_job(").unwrap());
+            assert!(polkit < method.find("load_config(").unwrap());
+        }
     }
 
     #[test]
