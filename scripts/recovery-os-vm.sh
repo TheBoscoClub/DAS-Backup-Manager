@@ -3577,7 +3577,7 @@ EOF
         cat >&2 <<EOF
   It is paused, $how: it may have run, and a paused guest
   runs nothing -- not even a power-off asked from its console. Either:
-  1. Resume it, judge the guard, and power it off from inside it:
+  1. Resume it, judge the guard, and shut it down from inside its VM (the drive stays on):
        virsh --connect $LIBVIRT_URI resume $DOMAIN
        $SELF status
        virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
@@ -3590,7 +3590,8 @@ EOF
     elif [[ "$GUARD_CONFIRMED" == true && "$GUARD_FAILED" != true && -z "$PROOF_WHY" ]]; then
         cat >&2 <<EOF
   1. Open the console:  virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN
-     Let the update finish, then power the recovery OS off from inside it.
+     Let the update finish, then shut the recovery OS down from inside its VM
+     (Shut Down in its menu, or systemctl poweroff there); the drive stays on.
   2. Then run:          $SELF session-end $LABEL
   Only if it has hung:
 EOF
@@ -3599,13 +3600,13 @@ EOF
         if [[ "$GUARD_FAILED" != true ]]; then
             cat >&2 <<EOF
   0. Judge the guard first:  $SELF status
-     engaged: let the update finish, power it off from inside, then step 3.
+     engaged: let the update finish, shut it down from inside its VM, then step 3.
      Anything else: steps 1 to 3.
 EOF
         fi
         cat >&2 <<EOF
-  1. Power it off now: open the console (virt-viewer --connect $LIBVIRT_URI
-     --attach $DOMAIN) and run systemctl poweroff there.
+  1. Shut it down now: open the console (virt-viewer --connect $LIBVIRT_URI
+     --attach $DOMAIN) and run systemctl poweroff there (the drive stays on).
   2. If it does not go:
 EOF
         force_off_choice "a recovery OS without a confirmed session guard, running beside the backups on $DISK"
@@ -5321,7 +5322,7 @@ wait_for_poweroff() {
     if [[ -n "$TIMEOUT_MIN" ]]; then
         deadline=$((SECONDS + TIMEOUT_MIN * MINUTE_SECS))
     fi
-    log "waiting for the recovery OS to power off (state polled every ${POLL_SECS}s; the session guard must report within $(format_duration "$GUARD_SECS")${TIMEOUT_MIN:+; shutdown requested after $TIMEOUT_MIN minute(s)})"
+    log "waiting for the recovery OS to be shut down in its VM, the drive stays on (state polled every ${POLL_SECS}s; the session guard must report within $(format_duration "$GUARD_SECS")${TIMEOUT_MIN:+; shutdown requested after $TIMEOUT_MIN minute(s)})"
     while :; do
         sleep "$POLL_SECS"
         state="$(current_state)"
@@ -5594,7 +5595,7 @@ cmd_session() {
         run_unattended
     else
         log "inside it, before updating: systemctl stop das-vm-guard; after: pacman -Qkk btrbk must find 0 altered files, then systemctl start das-vm-guard"
-        progress wait start "waiting for the recovery OS to power off"
+        progress wait start "waiting for the recovery OS to be shut down in its VM (the drive stays on)"
         wait_for_poweroff
     fi
     # It may have reported between two looks, or never.
@@ -5698,7 +5699,7 @@ cmd_session_end() {
     fi
     state="$(virsh_ domstate "$DOMAIN" 2>&1)" || refuse "cannot read the state of $DOMAIN: $state"
     if [[ "$state" != "shut off" ]]; then
-        refuse "$DOMAIN is $state -- session-end never stops a running recovery OS. Power it off from inside it (virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN), then run this again"
+        refuse "$DOMAIN is $state -- session-end never stops a running recovery OS. Shut it down from inside its VM (virt-viewer --connect $LIBVIRT_URI --attach $DOMAIN; the drive stays on), then run this again"
     fi
     xml="$(virsh_ dumpxml --inactive "$DOMAIN" 2>&1)" || refuse "cannot read $DOMAIN's definition: $xml"
     mapfile -t attached < <(disk_sources "$xml")

@@ -1318,7 +1318,7 @@ run_interrupted() {
     for ((i = 0; i < 200; i++)); do
         if [[ -n "${WAIT_FILE:-}" ]]; then
             [[ ! -e "$WAIT_FILE" ]] || break
-        elif grep -q 'waiting for the recovery OS to power off' "$T/driver.out"; then
+        elif grep -q 'waiting for the recovery OS to be shut down in its VM' "$T/driver.out"; then
             break
         fi
         sleep 0.05
@@ -1359,7 +1359,7 @@ run_stopped() {
     dpid=$!
     set +m
     for ((i = 0; i < 200; i++)); do
-        if grep -q 'waiting for the recovery OS to power off' "$T/driver.out"; then break; fi
+        if grep -q 'waiting for the recovery OS to be shut down in its VM' "$T/driver.out"; then break; fi
         sleep 0.05
     done
     sleep 0.2
@@ -1424,7 +1424,7 @@ run_watch_hung() {
     dpid=$!
     set +m
     for ((i = 0; i < 200; i++)); do
-        grep -q 'waiting for the recovery OS to power off' "$T/driver.out" && break
+        grep -q 'waiting for the recovery OS to be shut down in its VM' "$T/driver.out" && break
         sleep 0.05
     done
     epid=$(head -n 1 "$S/event.pids") || epid=""
@@ -3086,7 +3086,7 @@ check "guard silent, may, the guest ignores every request: kept (exit 3)" "$RC" 
 matches "guard silent, may, the guest ignores every request: asked again and again" "$(grep -c '^shutdown' "$S/virsh.calls")" "^[2-9]$"
 check "guard silent, may, the guest ignores every request: never destroyed" "$(file "$S/forbidden")" ""
 has "guard silent, may, the guest ignores every request: says it is unguarded" "$OUT" "THE RECOVERY OS IS RUNNING WITHOUT A CONFIRMED SESSION GUARD"
-has "guard silent, may, the guest ignores every request: says to power it off now" "$OUT" "Power it off now"
+has "guard silent, may, the guest ignores every request: says to power it off now" "$OUT" "Shut it down now"
 lacks "guard silent, may, the guest ignores every request: never says to let the update finish" "$OUT" "Let the update finish"
 
 # The recovery OS stays silent. On a "may" record: shut down (never
@@ -3704,7 +3704,7 @@ touch "$S/guard_silent"
 for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
 GUARD_SECS=300 run_interrupted session A
 check "not judged: kept (exit 3)" "$RC" "3"
-matches "not judged: status first, then the power-off" "$(tr '\n' ' ' <<<"$OUT")" "0\\. Judge the guard first: .*recovery-os-vm\\.sh status .* 1\\. Power it off now"
+matches "not judged: status first, then the power-off" "$(tr '\n' ' ' <<<"$OUT")" "0\\. Judge the guard first: .*recovery-os-vm\\.sh status .* 1\\. Shut it down now"
 # A resume that failed leaves it paused: never told to power it off from a
 # console that runs nothing.
 fixture
@@ -3887,7 +3887,7 @@ run_watch_stopped() {
     dpid=$!
     set +m
     for ((i = 0; i < 200; i++)); do
-        grep -q 'waiting for the recovery OS to power off' "$T/driver.out" && break
+        grep -q 'waiting for the recovery OS to be shut down in its VM' "$T/driver.out" && break
         sleep 0.05
     done
     sleep 0.3

@@ -131,7 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The GUI no longer says "power off" for shutting the recovery OS down in its VM** (bd `DAS-Backup-Manager-coyx`): the operator read it as turning off the drive or the DAS enclosure, which stays on
   - The attended-session confirmation now says to shut the recovery OS down inside its VM (the drive stays on); the End session tooltip, the Update tooltip and the Unattended radio's tooltip say "shut down … in its VM" where they said "power off"
-  - The operator messages in `scripts/recovery-os-vm.sh` (`power the recovery OS off`, `waiting for the recovery OS to power off`) are not the GUI's and are unchanged here
+  - The operator messages of `scripts/recovery-os-vm.sh` say it the same way: the attended session's stage reads `waiting for the recovery OS to be shut down in its VM (the drive stays on)`, and the instructions after a kept or unconfirmed session, and `session-end`'s refusal of a running recovery OS, say `shut it down from inside its VM` — the script's own log lines about what the recovery OS did (`powered off`) are unchanged
 
 - **The GUI's health reply no longer waits on targets a job is using** (bd `DAS-Backup-Manager-5237.16`): with the GUI open while btrbk received onto the targets, `HealthQuery` replies took up to 443 s — 16 over the 10 s warning in twelve minutes — because every reply walked each target's snapshot directories twice (once to count, once more with a `stat` per snapshot for the newest), and each waiting call did both walks itself
   - While the backup singleton or the maintenance lock is held the helper walks no target: it serves each target's last snapshot count with its age, or unknown when it has none — `health::KeptSnapshots`
