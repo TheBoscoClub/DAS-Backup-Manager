@@ -512,6 +512,15 @@ enum BackupAction {
         #[arg(long, value_delimiter = ',')]
         targets: Vec<String>,
     },
+    /// Send the static subvolumes (`[[source.static]]`: read-only subvolumes somebody else made) to the primary targets, as they are
+    Static {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Show what would be sent and deleted — change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Archive boot subvolumes on backup targets
     BootArchive {
         /// Path to config.toml
@@ -1499,6 +1508,7 @@ fn run_manual_step_cli(
         backup::ManualStepDone::Snapshots(None) => {
             println!("Created an unknown number of snapshots (btrbk's log did not say)");
         }
+        backup::ManualStepDone::Static => println!("Static subvolumes: done (see the log above)"),
         backup::ManualStepDone::Sent { snapshots, bytes } => {
             println!(
                 "Sent {snapshots} snapshots ({})",
@@ -2600,6 +2610,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "btrdasd backup send",
                     &backup::ManualStep::Send { targets },
                 )?;
+            }
+            BackupAction::Static { config, dry_run } => {
+                let cfg = Config::load(&config)?;
+                if std::env::var_os(backup::DELEGATED_SINGLETON_FD_ENV).is_some() {
+                    // Run by backup-run.sh, which holds the singleton and the
+                    // maintenance lock, has mounted and verified the targets
+                    // and handed its hold down: like `subvol expire`, nothing
+                    // is locked, mounted or synced here.
+                    let _singleton = singleton_for_subvol_cli();
+                    let sources: Vec<String> =
+                        cfg.sources.iter().map(|s| s.label.clone()).collect();
+                    let targets: Vec<String> =
+                        cfg.targets.iter().map(|t| t.label.clone()).collect();
+                    let verify = |t: &[buttered_dasd::config::Target], l: &[String]| {
+                        mount::verify_write_targets(t, l, &CliProgress)
+                    };
+                    let outcome = buttered_dasd::static_send::run(
+                        &cfg,
+                        &sources,
+                        &targets,
+                        dry_run,
+                        &buttered_dasd::static_send::Env {
+                            runner: &buttered_dasd::fsutil::SystemRunner,
+                            is_mountpoint: &health::is_mountpoint,
+                            verify: &verify,
+                        },
+                    );
+                    print!("{}", outcome.section(dry_run));
+                    if outcome.failed() {
+                        std::process::exit(1);
+                    }
+                } else {
+                    // A hand run: as `backup send`, the locks, the mounts
+                    // and the sync are this command's, and given back.
+                    run_manual_step_cli(
+                        &config,
+                        &cfg,
+                        "btrdasd backup static",
+                        &backup::ManualStep::Static { dry_run },
+                    )?;
+                }
             }
             BackupAction::BootArchive { config } => {
                 let cfg = Config::load(&config)?;

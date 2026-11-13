@@ -3765,6 +3765,15 @@ pub trait BackupJobHost {
         targets: &[String],
         progress: &dyn ProgressCallback,
     ) -> Result<(usize, u64), String>;
+    /// `btrdasd backup static`'s step: the static subvolumes of every source
+    /// sent to the primary targets ([`static_send::run`]), the report section
+    /// logged. `Err` carries every failure.
+    fn static_send(
+        &self,
+        config: &Config,
+        dry_run: bool,
+        progress: &dyn ProgressCallback,
+    ) -> Result<(), String>;
 }
 
 /// The step `btrdasd backup snapshot` or `send` runs ([`run_manual_step`]).
@@ -3774,6 +3783,9 @@ pub enum ManualStep {
     Snapshot { sources: Option<Vec<String>> },
     /// The targets selected; empty: all.
     Send { targets: Vec<String> },
+    /// The static subvolumes of every source, to the primary targets. A dry
+    /// run changes nothing: `btrbk.conf` is not even synced.
+    Static { dry_run: bool },
 }
 
 /// What a manual step got done.
@@ -3785,6 +3797,8 @@ pub enum ManualStepDone {
         snapshots: usize,
         bytes: u64,
     },
+    /// The static subvolumes were handled; the report section was logged.
+    Static,
 }
 
 /// How a manual step ended.
@@ -3824,12 +3838,16 @@ pub fn run_manual_step(
     // With the sources mounted and before the targets are: btrbk.conf is
     // brought into line first, because a send of everything passes btrbk no
     // filter. A failed sync stops the step, with the sources given back.
-    let synced = match host.sync_manual(config, progress) {
-        Ok(synced) => synced,
-        Err(why) => {
-            let still = sources.release(progress);
-            return failed(with_still_mounted(why, &still));
-        }
+    let synced = match step {
+        // Nothing is changed, so nothing is synced.
+        ManualStep::Static { dry_run: true } => config.clone(),
+        _ => match host.sync_manual(config, progress) {
+            Ok(synced) => synced,
+            Err(why) => {
+                let still = sources.release(progress);
+                return failed(with_still_mounted(why, &still));
+            }
+        },
     };
     let (done, mut still_mounted) = match step {
         ManualStep::Snapshot { sources: selected } => (
@@ -3837,6 +3855,26 @@ pub fn run_manual_step(
                 .map(ManualStepDone::Snapshots),
             Vec::new(),
         ),
+        ManualStep::Static { dry_run } => {
+            // Only the primary targets receive static subvolumes, so only
+            // they are mounted.
+            let primaries: Vec<String> = synced
+                .targets
+                .iter()
+                .filter(|t| t.role == TargetRole::Primary)
+                .map(|t| t.label.clone())
+                .collect();
+            let to_mount = targets_named_only(&synced, Some(&primaries));
+            match host.mount_targets(&to_mount, progress, locks.maintenance()) {
+                Err(why) => (Err(why), Vec::new()),
+                Ok(mut mounted) => {
+                    let done = host
+                        .static_send(&synced, *dry_run, progress)
+                        .map(|()| ManualStepDone::Static);
+                    (done, mounted.release(progress))
+                }
+            }
+        }
         ManualStep::Send { targets } => {
             // Only the targets the send names are mounted (none named: all),
             // the rule of the job (bd DAS-Backup-Manager-s5jv.10, `u8kk`).
@@ -4391,6 +4429,39 @@ impl BackupJobHost for SystemBackupHost {
         progress: &dyn ProgressCallback,
     ) -> Result<Option<usize>, String> {
         create_snapshots(config, sources, progress).map_err(|e| e.to_string())
+    }
+
+    fn static_send(
+        &self,
+        config: &Config,
+        dry_run: bool,
+        progress: &dyn ProgressCallback,
+    ) -> Result<(), String> {
+        let sources: Vec<String> = config.sources.iter().map(|s| s.label.clone()).collect();
+        let targets: Vec<String> = config.targets.iter().map(|t| t.label.clone()).collect();
+        let verify = |t: &[Target], l: &[String]| mount::verify_write_targets(t, l, progress);
+        let outcome = static_send::run(
+            config,
+            &sources,
+            &targets,
+            dry_run,
+            &static_send::Env {
+                runner: &SystemRunner,
+                is_mountpoint: &health::is_mountpoint,
+                verify: &verify,
+            },
+        );
+        for line in outcome.section(dry_run).lines() {
+            progress.on_log(LogLevel::Info, line);
+        }
+        match outcome.failures() {
+            failures if failures.is_empty() => Ok(()),
+            failures => Err(format!(
+                "{}{}",
+                static_send::ERROR_PREFIX,
+                failures.join("; ")
+            )),
+        }
     }
 
     fn send(
@@ -10412,6 +10483,7 @@ Legend:
         manual_sync: Result<(), String>,
         snapshot_step: Result<Option<usize>, String>,
         send_step: Result<(usize, u64), String>,
+        static_step: Result<(), String>,
     }
 
     /// A clean coverage check, as a recorded backup run with nothing dropped
@@ -10474,6 +10546,7 @@ Legend:
                 manual_sync: Ok(()),
                 snapshot_step: Ok(Some(3)),
                 send_step: Ok((2, 10)),
+                static_step: Ok(()),
             }
         }
     }
@@ -10714,6 +10787,18 @@ Legend:
         ) -> Result<(usize, u64), String> {
             self.step(&format!("send ({}, {targets:?})", config.general.version));
             self.send_step.clone()
+        }
+        fn static_send(
+            &self,
+            config: &Config,
+            dry_run: bool,
+            _: &dyn ProgressCallback,
+        ) -> Result<(), String> {
+            self.step(&format!(
+                "static ({}, dry {dry_run})",
+                config.general.version
+            ));
+            self.static_step.clone()
         }
     }
 
@@ -11693,6 +11778,73 @@ Legend:
         ManualStep::Send {
             targets: vec!["primary-22tb".into()],
         }
+    }
+
+    fn static_manual(dry_run: bool) -> ManualStep {
+        ManualStep::Static { dry_run }
+    }
+
+    #[test]
+    fn a_static_step_syncs_mounts_the_primary_targets_only_and_gives_everything_back() {
+        let host = FakeHost {
+            second_target: true,
+            ..Default::default()
+        };
+        let outcome = manual(&host, static_manual(false));
+        assert_eq!(outcome, ManualStepOutcome::Done(ManualStepDone::Static));
+        assert_eq!(
+            host.steps(),
+            [
+                "locks",
+                "mount sources",
+                "sync manual before=0.6.0",
+                "mount targets (after-sync)",
+                "static (after-sync, dry false)",
+                "release targets",
+                "release sources",
+            ]
+        );
+        // A target that is not primary is not mounted for it.
+        let mounted = host.mounted.lock().unwrap().clone();
+        assert!(
+            mounted.iter().flatten().all(|l| l == "primary-22tb"),
+            "{mounted:?}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_static_step_does_not_sync_btrbk_conf() {
+        let host = FakeHost::default();
+        let outcome = manual(&host, static_manual(true));
+        assert_eq!(outcome, ManualStepOutcome::Done(ManualStepDone::Static));
+        assert!(
+            host.steps().iter().all(|s| !s.starts_with("sync manual")),
+            "{:?}",
+            host.steps()
+        );
+        assert!(
+            host.steps()
+                .iter()
+                .any(|s| s.starts_with("static (") && s.ends_with("dry true)")),
+            "{:?}",
+            host.steps()
+        );
+    }
+
+    #[test]
+    fn a_failed_static_pass_fails_the_step_and_still_gives_the_mounts_back() {
+        let host = FakeHost {
+            static_step: Err("Static subvolumes: boom".into()),
+            ..Default::default()
+        };
+        let ManualStepOutcome::Failed { why, .. } = manual(&host, static_manual(false)) else {
+            panic!("a failed static pass must fail the step");
+        };
+        assert!(why.contains("boom"), "{why}");
+        assert!(
+            host.steps()
+                .ends_with(&["release targets".to_string(), "release sources".to_string()])
+        );
     }
 
     #[test]
