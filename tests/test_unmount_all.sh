@@ -626,6 +626,30 @@ rm -rf "${WORK:?}/esp"
 unmount_all
 check "no esp directory at all: nothing to do" "${OP_STATUS[unmount]}" "OK"
 
+# No descriptor to spare (bd DAS-Backup-Manager-tzwf). bash cannot make the
+# pipe for a command substitution then: it runs nothing and the assignment is
+# TRUE and empty (measured, bash 5.3, `ulimit -n` 3 and 4), so
+# `if err="$(umount …)"` reported a target unmounted that umount never
+# touched, and the run could say the DAS was safe to disconnect. Only the
+# status comes back from the starved subshell: nothing in it can redirect.
+for nofile in 3 4; do
+    setup
+    rc=0
+    (
+        ulimit -n "$nofile"
+        umount_with_retry /mnt/backup-22tb
+    ) 2>/dev/null || rc=$?
+    check "no descriptor free (ulimit -n $nofile): the target is not reported unmounted" "$rc" "1"
+    check "no descriptor free (ulimit -n $nofile): and it is still mounted" \
+        "$([[ -e "$WORK/mounted/backup-22tb" ]] && echo yes || echo no)" "yes"
+done
+# With descriptors to spare the same call unmounts it and says so.
+setup
+rc=0
+umount_with_retry /mnt/backup-22tb || rc=$?
+check "descriptors free: unmounted, status 0" "$rc" "0"
+check "descriptors free: really unmounted" "$([[ -e "$WORK/mounted/backup-22tb" ]] && echo yes || echo no)" "no"
+
 if [[ $fails -eq 0 ]]; then
     echo "UNMOUNT RETRY SUITE GREEN"
 else

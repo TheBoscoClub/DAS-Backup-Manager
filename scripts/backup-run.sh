@@ -1,9 +1,15 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.20.0
+# Version: 4.20.1
 # Date: 2026-11-12
 #
 # Features:
+#   - An unmount that could not run is not an unmount (v4.20.1, bd
+#     DAS-Backup-Manager-tzwf): umount_with_retry() read `if err="$(umount …)"`,
+#     which bash calls true, running nothing, when it has no descriptor free
+#     for the substitution's pipe; a target still mounted then passed the
+#     "safe to disconnect" gate. umount's status now comes back inside the
+#     capture; a capture without it is a failed attempt.
 #   - Static subvolumes are sent to the primary targets (v4.20.0, bd
 #     DAS-Backup-Manager-5237.8): send_static_subvolumes() runs `btrdasd backup
 #     static` after the expiry, while the targets are mounted and verified,
@@ -2077,8 +2083,21 @@ take_down_leftover() {
     log_warn "  $label: $mnt was left mounted by an earlier job — unmounting it, to mount it afresh for this run"
     umount_with_retry "$mnt" && return 0
     log_warn "  $label: retrying with umount -f"
-    if err="$(umount -f "$mnt" 2>&1)"; then
+    # The status inside the capture, as in umount_with_retry: a umount -f that
+    # could not be run is not one that succeeded (bd DAS-Backup-Manager-tzwf).
+    local out last
+    out="$(umount -f "$mnt" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    if [[ "$last" == "status=0" ]]; then
         return 0
+    fi
+    if [[ "$last" == status=* ]]; then
+        err="${out%"$last"}"
+        while [[ "$err" == *$'\n' ]]; do
+            err="${err%$'\n'}"
+        done
+    else
+        err="umount -f could not be run: its output could not be captured (no descriptor free for its pipe?)"
     fi
     local why="$label: $mnt was left mounted by an earlier job and will not unmount, even with umount -f: ${err:-no message}"
     log_error "ABORTING: $why"
@@ -3118,10 +3137,26 @@ ESP_MOUNT_ROOT="${DAS_ESP_MOUNT_ROOT:-/run/das-backup/esp}"
 # unmounted, 1 after the last attempt failed; every failed attempt is logged
 # with umount's own message.
 umount_with_retry() {
-    local mnt="$1" attempt err
+    local mnt="$1" attempt err out last
     for (( attempt = 1; attempt <= UMOUNT_ATTEMPTS; attempt++ )); do
-        if err="$(umount "$mnt" 2>&1)"; then
+        # umount's status travels inside its own capture, as the mount probe's
+        # does (probe_mount_point): bash runs nothing, and calls the assignment
+        # TRUE and empty, for a substitution it has no descriptor to make a
+        # pipe for, so `if err="$(umount …)"` took a umount that never ran for
+        # one that succeeded (bd DAS-Backup-Manager-tzwf). No status line is a
+        # failed attempt.
+        out="$(umount "$mnt" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+        last="${out##*$'\n'}"
+        if [[ "$last" == "status=0" ]]; then
             return 0
+        fi
+        if [[ "$last" == status=* ]]; then
+            err="${out%"$last"}"
+            while [[ "$err" == *$'\n' ]]; do
+                err="${err%$'\n'}"
+            done
+        else
+            err="umount could not be run: its output could not be captured (no descriptor free for its pipe?)"
         fi
         if (( attempt < UMOUNT_ATTEMPTS )); then
             log_warn "  umount $mnt failed (attempt $attempt of $UMOUNT_ATTEMPTS): ${err:-no message} — retrying in ${UMOUNT_RETRY_PAUSE}s"
@@ -3235,7 +3270,7 @@ unmount_all() {
     # umount's own message (which used to be discarded), is left as it is,
     # and stays the run's, for a later pass to try again.
     local -a owned=("${SOURCE_MOUNTS_OWNED[@]}")
-    local src_mnt umount_err left
+    local src_mnt umount_err umount_out umount_last left
     for (( i=${#owned[@]}-1; i>=0; i-- )); do
         src_mnt="${owned[$i]}"
         probe_state "$src_mnt"
@@ -3249,7 +3284,20 @@ unmount_all() {
             log_warn "  Could not tell whether source volume $src_mnt, which this run mounted, is still mounted — $PROBE_WHY; unmounting it anyway"
             left="left as it is"
         fi
-        if umount_err="$(umount "$src_mnt" 2>&1)"; then
+        # The status inside the capture, as in umount_with_retry (bd
+        # DAS-Backup-Manager-tzwf): a umount that could not be run leaves the
+        # mount this run's, and says so.
+        umount_out="$(umount "$src_mnt" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+        umount_last="${umount_out##*$'\n'}"
+        if [[ "$umount_last" == status=* ]]; then
+            umount_err="${umount_out%"$umount_last"}"
+            while [[ "$umount_err" == *$'\n' ]]; do
+                umount_err="${umount_err%$'\n'}"
+            done
+        else
+            umount_err="umount could not be run: its output could not be captured (no descriptor free for its pipe?)"
+        fi
+        if [[ "$umount_last" == "status=0" ]]; then
             disown_source_mount "$src_mnt"
             log_info "  Unmounted source volume $src_mnt (this run mounted it)"
         else
@@ -3962,7 +4010,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.20.0
+  backup-run.sh v4.20.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

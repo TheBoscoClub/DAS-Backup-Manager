@@ -36,6 +36,7 @@ drives `mount::verify_write_targets` into refusal. The same `Err(_) => false` is
 4. **A parameter, flag or setting accepted and ignored.** Remove it; don't leave it inert.
 5. **`local x=$(cmd)` masking `cmd`'s exit status**, and any pipeline whose producer dies of SIGPIPE under `set -o pipefail`.
 6. **Empty output read as a negative answer** — "blkid printed nothing" is not "unlabelled". Split on exit status and fail closed: a `flock` that failed is not one that found the lock held (`bd ismb`).
+7. **`if x="$(cmd)"` as the success test in a script.** bash runs nothing and calls it true, with `x` empty, when it has no descriptor free for the pipe; the status travels inside the capture (`… && printf '\nstatus=0' || printf '\nstatus=%s' "$?"`), and a capture without that line is a failure (`bd hhow`, `bd tzwf`).
 
 ## Auditing this as a diff
 
