@@ -1155,20 +1155,20 @@ fn format_scrub_status(views: &[ScrubTargetView], config: &Config) -> String {
     out
 }
 
-/// Render one target's status view as a single JSON object.
+/// Render one target's status view as a single JSON object. Every string
+/// goes through serde_json, so a control character in a label, an outcome or
+/// an error text is escaped (bd DAS-Backup-Manager-4kd); the key order is
+/// the one this command has always printed.
 fn scrub_target_json(v: &ScrubTargetView) -> String {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let text = |s: &str| serde_json::Value::from(s).to_string();
+    let opt_text = |s: Option<&str>| s.map_or("null".to_string(), text);
     format!(
-        "{{\"label\":\"{}\",\"fsuuid\":{},\"source\":\"{}\",\"status\":\"{}\",\"outcome\":{},\"ok\":{},\"last_success_epoch\":{},\"finished_epoch\":{},\"duration_secs\":{},\"bytes_scrubbed\":{},\"resolve_error\":{}}}",
-        esc(&v.label),
-        v.fsuuid
-            .as_deref()
-            .map_or("null".to_string(), |u| format!("\"{}\"", esc(u))),
-        v.source,
-        v.status_word(),
-        v.outcome
-            .as_deref()
-            .map_or("null".to_string(), |o| format!("\"{}\"", esc(o))),
+        "{{\"label\":{},\"fsuuid\":{},\"source\":{},\"status\":{},\"outcome\":{},\"ok\":{},\"last_success_epoch\":{},\"finished_epoch\":{},\"duration_secs\":{},\"bytes_scrubbed\":{},\"resolve_error\":{}}}",
+        text(&v.label),
+        opt_text(v.fsuuid.as_deref()),
+        text(v.source),
+        text(v.status_word()),
+        opt_text(v.outcome.as_deref()),
         v.ok.map_or("null".to_string(), |b| b.to_string()),
         v.last_success_epoch
             .map_or("null".to_string(), |e| e.to_string()),
@@ -1178,9 +1178,7 @@ fn scrub_target_json(v: &ScrubTargetView) -> String {
             .map_or("null".to_string(), |d| d.to_string()),
         v.bytes_scrubbed
             .map_or("null".to_string(), |b| b.to_string()),
-        v.resolve_error
-            .as_deref()
-            .map_or("null".to_string(), |e| format!("\"{}\"", esc(e))),
+        opt_text(v.resolve_error.as_deref()),
     )
 }
 
@@ -3829,6 +3827,24 @@ mod tests {
     /// report "never scrubbed" — not an error, not a crash. This is the
     /// exact shape `system-recovery-B-2tb` was in before its first scrub
     /// (bd DAS-Backup-Manager-0kn acceptance criterion).
+    /// `scrub status --json` must stay JSON whatever a label, an outcome or an
+    /// error text holds: a newline or a tab went out raw (bd 4kd).
+    #[test]
+    fn scrub_target_json_escapes_control_characters() {
+        let mut v = ScrubTargetView::new("line one\nline two\\back\tslash \"q\"");
+        v.fsuuid = Some("uuid\u{1}x".into());
+        v.outcome = Some("finished\r\n".into());
+        v.resolve_error = Some("no such\u{7f} target\n".into());
+        let json = scrub_target_json(&v);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("not JSON ({e}): {json}"));
+        assert_eq!(parsed["label"], "line one\nline two\\back\tslash \"q\"");
+        assert_eq!(parsed["fsuuid"], "uuid\u{1}x");
+        assert_eq!(parsed["outcome"], "finished\r\n");
+        assert_eq!(parsed["resolve_error"], "no such\u{7f} target\n");
+        assert_eq!(parsed["ok"], serde_json::Value::Null);
+    }
+
     #[test]
     fn never_scrubbed_target_is_graceful() {
         let _guard = ENV_LOCK.lock().unwrap();
