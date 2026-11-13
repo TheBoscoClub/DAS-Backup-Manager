@@ -111,6 +111,7 @@ The system has six major components:
          │                                    afresh; one that will not come down, or is not the target, aborts with 3 before btrbk, bd jgm)
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
+         ├──▶ btrdasd backup static        → sends the `[[source.static]]` subvolumes (read-only subvolumes somebody else made) to the primary targets as they are, while the targets are still mounted; nothing is written on the source (a dry run prints the plan)
          ├──▶ btrdasd recovery-os status   → reads each mounted mirror target's own OS under @ (never writes to it), including what it starts at boot and whether that runs btrbk; STALE, or a WARNING that its boot will or may run btrbk, is a WARN, not a FAIL; records the reading in recovery-os.json for `btrdasd health` (not under --dryrun); the Rust `backup run` (CLI, GUI) does the same in process for the mirror targets it selected (`backup::recovery_os_step`), and `btrdasd recovery-os record` does it without a backup
          ├──▶ update_boot_subvolumes()     → creates missing @/@home on non-mirror targets; archives + recreates them only on --full runs
          ├──▶ btrdasd walk                 → indexes new snapshots on the primary target into SQLite
@@ -722,6 +723,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `db` | `src/db.rs` | ~4150 | Database connection, schema, CRUD, FTS5 search, stats, pagination |
 | `doctor` | `src/doctor.rs` | ~1550 | Subvolume drift detector (`btrdasd doctor --check-drift`) — compares configured subvolumes against what's actually on disk, and checks that every target holds a recent snapshot of every declared pair (`delivery_check`) |
 | `expire` | `src/expire.rs` | ~2430 | Expiry of retired subvolumes' backups per target and location, with its safety refusals (`btrdasd subvol expire`) |
+| `static_send` | `src/static_send.rs` | ~2300 | Static subvolumes: planner (identity rule, incremental parent, series) and executor behind the `CommandRunner` seam, with its two deletes (`btrdasd backup static`) |
 | `fsutil` | `src/fsutil.rs` | ~1260 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~460 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
 | `health` | `src/health.rs` | ~2250 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |

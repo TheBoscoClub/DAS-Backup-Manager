@@ -52,6 +52,7 @@ backup-run.sh                   btrdasd CLI
 | `coverage` | `src/coverage.rs` | Subvolume coverage run over run: the pairs a config schedules compared with the last backup run's record inside every sync, the `SUBVOLUME COVERAGE` section, `btrdasd subvol coverage accept`/`list` |
 | `db` | `src/db.rs` | SQLite connection, schema, CRUD, FTS5 search |
 | `doctor` | `src/doctor.rs` | Subvolume drift detector (`btrdasd doctor --check-drift`), with the delivery check: each target holds a recent snapshot of every declared pair |
+| `static_send` | `src/static_send.rs` | Static subvolumes sent to the primary targets as they are, with their checks and two deletes (`btrdasd backup static`) |
 | `expire` | `src/expire.rs` | Expiry of retired subvolumes' backups per target and location (`btrdasd subvol expire`) |
 | `fsutil` | `src/fsutil.rs` | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `health` | `src/health.rs` | Drive health (SMART), mountpoint checks, serial to device resolution, scrub health |
@@ -263,6 +264,7 @@ that basis would discard a valid index.
 sudo btrdasd subvol sync --dry-run   # Print the adopt/retire plan, change nothing
 sudo btrdasd subvol sync             # Adopt new subvolumes, retire vanished ones
 sudo btrdasd subvol expire --dry-run # Show retired series whose backups are past their window
+sudo btrdasd backup static --dry-run # Show which static subvolumes would be sent and which superseded copies deleted
 sudo btrdasd subvol coverage list    # Pairs no longer backed up, and the accept log
 ```
 

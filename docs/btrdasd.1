@@ -733,7 +733,11 @@ every target: a run of fewer expires nothing and the report's
 row says so), it expires retired subvolumes as
 .B "subvol expire"
 does: a dry run on a dry run, and a dry run only when the run's subvolume sync
-failed; a failure of it fails the run. The boot-archive pruner runs only in
+failed; a failure of it fails the run. A run that sends then sends the static
+subvolumes of the selected sources to the selected primary targets, as
+.B "backup static"
+does (a dry run prints the plan); a failure of it fails the run. The
+boot-archive pruner runs only in
 .BR backup\-run.sh .
 .PP
 If another backup already holds the singleton lock, the command prints that it
@@ -898,6 +902,46 @@ Default:
 .BI \-\-targets " LABELS"
 Comma-separated target labels.
 Default: all mounted.
+.\"
+.SS backup static
+Send the static subvolumes to the primary targets as they are: the read-only
+subvolumes somebody else made (VM pristines) that each
+.B [[source.static]]
+table of config.toml names by directory and name pattern.
+Nothing is written on the source.
+A candidate that is not read-only is a warning and is never sent.
+A new one is sent incrementally against the newest read-only sibling the
+target holds, else in full, received at its final name in the table's
+.I target_subdir
+and checked (received UUID, read-only) before it counts; a name taken by
+anything else fails that one and nothing is overwritten.
+A copy whose pristine is gone is deleted only once a current subvolume of the
+same series has a checked copy and nothing of that series failed; otherwise it
+is kept and listed.
+The report is the
+.B STATIC SUBVOLUMES
+section.
+A hand run locks, mounts and syncs as
+.B backup send
+does (a dry run does not sync); run by
+.BR backup\-run.sh ,
+which hands down its singleton lock in
+.BR DAS_BACKUP_LOCK_FD ,
+it locks, mounts and syncs nothing.
+Exits 1 when anything failed.
+.PP
+.B btrdasd backup static
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-dry\-run ]
+.TP
+.BI \-\-config " PATH"
+Path to config.toml.
+Default:
+.IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-dry\-run
+Print what would be sent and deleted; change nothing.
 .\"
 .SS backup boot\-archive
 Archive boot subvolumes on backup targets: on each non-mirror target, each

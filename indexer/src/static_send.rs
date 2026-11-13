@@ -276,7 +276,7 @@ pub enum Item {
     /// Not read-only on the source: never sent, never made read-only.
     NotReadOnly { name: String },
     /// A read-only copy of it is on the target already (named `copy`).
-    UpToDate { name: String, copy: String },
+    Current { name: String, copy: String },
     /// Something else is in the way on the target; nothing is overwritten.
     Refused { name: String, why: String },
     /// To be sent; `parent` the newest read-only sibling the target holds a
@@ -328,7 +328,7 @@ pub fn plan_sends(
                 .find(|e| e.received_uuid.as_deref() == Some(identity))
             {
                 return if copy.readonly {
-                    Item::UpToDate {
+                    Item::Current {
                         name,
                         copy: copy.name().to_string(),
                     }
@@ -464,7 +464,7 @@ pub fn plan_prunes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Sent,
-    UpToDate,
+    Current,
     Warn,
     Fail,
     Pruned,
@@ -475,7 +475,7 @@ impl Kind {
     fn word(self) -> &'static str {
         match self {
             Self::Sent => "SENT",
-            Self::UpToDate => "UP TO DATE",
+            Self::Current => "UP TO DATE",
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
             Self::Pruned => "PRUNED",
@@ -775,8 +775,8 @@ fn one_table(
                 Kind::Warn,
                 format!("{name}: not read-only on the source — not sent, and never made read-only"),
             )),
-            Item::UpToDate { name, copy } => rep.lines.push((
-                Kind::UpToDate,
+            Item::Current { name, copy } => rep.lines.push((
+                Kind::Current,
                 if copy == name {
                     name
                 } else {
@@ -905,6 +905,15 @@ fn clear_interrupted(
     env: &Env,
     rep: &mut TableReport,
 ) -> Result<bool, String> {
+    match std::fs::symlink_metadata(marker_dir) {
+        Ok(m) if !m.is_dir() => {
+            return Err(format!(
+                "nothing done: {} is not a real directory",
+                marker_dir.display()
+            ));
+        }
+        _ => {}
+    }
     let read = match std::fs::read_dir(marker_dir) {
         Ok(read) => read,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1025,6 +1034,9 @@ fn send_one(
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{} could not be examined: {e}", dest.display())),
+    }
+    if std::fs::symlink_metadata(marker_dir).is_ok_and(|m| !m.is_dir()) {
+        return Err(format!("{} is not a real directory", marker_dir.display()));
     }
     std::fs::create_dir_all(marker_dir)
         .map_err(|e| format!("{} could not be made: {e}", marker_dir.display()))?;
@@ -1160,7 +1172,7 @@ mod tests {
         )];
         assert!(matches!(
             plan_sends(&table(), vol, &src, "static/vm", &tgt)[..],
-            [Item::UpToDate { .. }]
+            [Item::Current { .. }]
         ));
         // Candidate WITH a received_uuid (a restored pristine): the copy
         // carries THAT, not the candidate's own uuid.
@@ -1182,7 +1194,7 @@ mod tests {
         )];
         assert!(matches!(
             plan_sends(&table(), vol, &src, "static/vm", &tgt)[..],
-            [Item::UpToDate { .. }]
+            [Item::Current { .. }]
         ));
         // A copy carrying the candidate's own uuid is NOT its copy then.
         let tgt = vec![sv(
@@ -1855,7 +1867,7 @@ mod tests {
         let r = fx.runner();
         let o = fx.go(&r, false);
         assert!(
-            has(&o, Kind::UpToDate, "vm.pristine-2"),
+            has(&o, Kind::Current, "vm.pristine-2"),
             "{}",
             o.section(false)
         );
@@ -2270,6 +2282,29 @@ mod tests {
         let o = fx.go(&r, false);
         assert!(has(&o, Kind::Fail, "symlink"), "{}", o.section(false));
         assert!(pipes(&r).is_empty() && deletes(&r).is_empty());
+    }
+
+    #[test]
+    fn a_marker_directory_that_is_a_symlink_is_refused_and_nothing_is_deleted() {
+        let partial = line(101, "static/vm/vm.pristine-2", U[6], None, None);
+        let mut fx = Fx::new();
+        standard(&mut fx, std::slice::from_ref(&partial), &[]);
+        fx.make_dir("static/vm/vm.pristine-2");
+        fx.make_dir("elsewhere");
+        std::fs::write(fx.dir.path().join("elsewhere/vm.pristine-2"), "x").unwrap();
+        std::os::unix::fs::symlink(
+            fx.dir.path().join("elsewhere"),
+            fx.dir.path().join("static/vm").join(MARKER_DIR),
+        )
+        .unwrap();
+        let r = fx.runner();
+        let o = fx.go(&r, false);
+        assert!(
+            has(&o, Kind::Fail, "not a real directory"),
+            "{}",
+            o.section(false)
+        );
+        assert!(deletes(&r).is_empty() && pipes(&r).is_empty());
     }
 
     #[test]

@@ -420,6 +420,29 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 | `target_subdirs` | string[] | `[]` | Subdirectory on each target this source sends into |
 | `target_labels` | string[] | `[]` (all targets) | `[[target]].label` values this source sends to; bulk data should name only the primary; a label no `[[target]]` has is refused |
 
+Static subvolumes — read-only subvolumes somebody else made, such as VM pristines, whose names change at every refresh — are an array of tables, `[[source.static]]`, sent to the source's **primary** targets exactly as they are (`btrdasd backup static`, run by every backup run after the expiry):
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `dir` | string | — | Directory on the source's volume holding them, relative to it, one level read (never recursed); it must be, or be inside, a `.snapshots` or `.btrbk-snapshots` directory, because subvolume sync adopts every subvolume outside one (e.g. `".snapshots"`) |
+| `pattern` | string | — | Glob on the subvolume NAME, `*` and `?` only, no `/`, at least one other character, never `.archive` (e.g. `"*.pristine-*"`) |
+| `target_subdir` | string | — | Directory under each primary target's mount where the copies land (e.g. `"static/vm-pristines"`); relative, no `.`, `..` or `.incoming` component, and neither equal to, inside nor holding any directory a source sends snapshots to (every `target_subdirs` entry, else the label) or another table's |
+
+Nothing is written on the source. A candidate that is not read-only is a WARN and is never sent or made read-only. A new one is sent incrementally against the newest read-only sibling on the source volume that the target holds, else in full, received at its final name and checked (received UUID, read-only) before it counts; a name already taken on the target by anything else is a FAIL for that one and nothing is overwritten. A copy whose pristine is gone from the whole volume is deleted only once a current subvolume of the same series (the name up to what the pattern's final `*` matched) has a checked copy and nothing of that series failed; one nothing replaces is kept and listed in the `STATIC SUBVOLUMES` section, and a pattern that does not end in `*` never deletes. The target filesystem must already hold at least one subvolume and be mounted at its top level.
+
+```toml
+[[source]]
+label = "vm-images"
+volume = "/mnt/vm-volume"
+device = "UUID=00000000-0000-4000-8000-000000000001"
+target_labels = ["primary"]
+
+[[source.static]]
+dir = ".snapshots"
+pattern = "*.pristine-*"
+target_subdir = "static/vm-pristines"
+```
+
 Subvolumes are an array of tables, `[[source.subvolumes]]`, one per subvolume (a bare string such as `"@"` is also accepted):
 
 | Field | Type | Default | Description |

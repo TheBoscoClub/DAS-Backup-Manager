@@ -185,7 +185,7 @@ The `das-backup.timer` systemd unit (or cron job on sysvinit/OpenRC) runs nightl
 4. Mounts the targets by filesystem UUID (`mount_uuid`), else by drive serial, and verifies each is the expected filesystem before anything writes to it
 5. Records pre-backup disk usage for throughput measurement
 6. Runs `btrbk run` -- creates snapshots and sends incremental deltas to the targets each source names
-7. Deletes the backups of retired subvolumes that are past their retention window (`btrdasd subvol expire`)
+7. Deletes the backups of retired subvolumes that are past their retention window (`btrdasd subvol expire`), then sends the static subvolumes (`btrdasd backup static`)
 8. Records post-backup usage, logs throughput and the negotiated USB link speed
 9. Creates missing boot subvolumes on non-mirror targets, and archives and recreates them on `--full` runs (skips `role=mirror` targets)
 10. Indexes the new snapshots (`btrdasd walk`) and records a growth data point

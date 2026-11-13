@@ -3131,6 +3131,17 @@ impl Config {
                          relative, with no empty, '.' or '..' component",
                         table.dir
                     ));
+                } else if !crate::adopt::in_snapshot_tree(&table.dir) {
+                    // Subvolume sync adopts every subvolume of a volume
+                    // except those in a snapshot tree (a `.snapshots` or
+                    // `.btrbk-snapshots` component): one anywhere else would
+                    // also be snapshotted by btrbk and flagged as drift.
+                    errors.push(format!(
+                        "{who} has dir {:?} — it must be, or be inside, a `.snapshots` or \
+                         `.btrbk-snapshots` directory: subvolume sync adopts every subvolume \
+                         outside one, so these would be backed up by btrbk as well",
+                        table.dir
+                    ));
                 } else {
                     let same_volume =
                         |o: &&Source| normalise_dir(&o.volume) == normalise_dir(&src.volume);
@@ -3151,10 +3162,12 @@ impl Config {
                     || table.pattern.contains('/')
                     || table.pattern.chars().any(char::is_control)
                     || table.pattern.chars().all(|c| c == '*' || c == '?')
+                    || table.pattern.contains(".archive")
                 {
                     errors.push(format!(
                         "{who} has pattern {:?} — it must be a glob on one subvolume name: no '/', \
-                         and at least one character that is not '*' or '?'",
+                         at least one character that is not '*' or '?', and not '.archive' \
+                         (the boot-archive cleanup deletes names shaped like that)",
                         table.pattern
                     ));
                 }
@@ -4053,9 +4066,11 @@ mod tests {
             "*.pristine-*",
             "static/vm-pristines",
         ));
-        cfg.sources[0]
-            .static_subvolumes
-            .push(static_table("a/b/", "gold-?", "static/gold"));
+        cfg.sources[0].static_subvolumes.push(static_table(
+            "a/.snapshots/",
+            "gold-?",
+            "static/gold",
+        ));
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
         // A table round-trips through a saved file.
         let again = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
@@ -4064,7 +4079,20 @@ mod tests {
 
     #[test]
     fn validate_refuses_a_static_dir_that_leaves_the_volume_or_is_not_one_level_clean() {
-        for bad in ["", "/x", ".", "..", "a/..", "a//b", "./x", "a\nb", "../x"] {
+        for bad in [
+            "",
+            "/x",
+            ".",
+            "..",
+            "a/..",
+            "a//b",
+            "./x",
+            "a\n.snapshots",
+            "../x",
+            // Not a snapshot tree: sync would adopt what is in it.
+            "pristines",
+            "a/b",
+        ] {
             let errors = static_config(static_table(bad, "x*", "static/x")).validate();
             assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
             assert!(errors[0].contains("[[source.static]]") && errors[0].contains("dir"));
@@ -4073,7 +4101,16 @@ mod tests {
 
     #[test]
     fn validate_refuses_a_static_pattern_that_is_not_a_name_glob() {
-        for bad in ["", "a/b", "*", "?*", "**", "a\nb"] {
+        for bad in [
+            "",
+            "a/b",
+            "*",
+            "?*",
+            "**",
+            "a\nb",
+            "x.archive.*",
+            "@.archive*",
+        ] {
             let errors = static_config(static_table(".snapshots", bad, "static/x")).validate();
             assert_eq!(errors.len(), 1, "{bad:?}: {errors:?}");
             assert!(errors[0].contains("pattern"), "{bad:?}: {errors:?}");
