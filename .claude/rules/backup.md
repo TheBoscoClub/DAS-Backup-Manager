@@ -156,7 +156,7 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
   - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
     step, the unmount after it, or the mount once its locks were held failed, **1** only when it could not
     start (config, locks).
-  - `btrdasd doctor`: **0** clean or deferred, **1** drift found (an undelivered pair included, bd `sp78.7`),
+  - `btrdasd doctor`: **0** clean or deferred, **1** drift found (an undelivered pair, bd `sp78.7`, or a stale recovery OS by its recorded reading, bd `xd3`, included),
     **2** could not run, **3** some volume or target failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`; that line is load-bearing.
   - `das-recovery-os-update-*.service` carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing.
