@@ -49,6 +49,7 @@ use crate::health;
 use crate::maintenance::MaintenanceHeld;
 use crate::mount;
 use crate::progress::{LogLevel, ProgressCallback};
+use crate::recovery_os::{self, RecordFinding, RecordOutcome};
 use crate::scrub;
 
 /// Non-blocking singleton lock — a second concurrent doctor run skips rather
@@ -330,12 +331,70 @@ pub struct DriftReport {
     /// Pairs `btrbk.conf` declares whose target holds no snapshot newer than
     /// `[doctor].max_snapshot_age_days`.
     pub undelivered: Vec<UndeliveredPair>,
+    /// Recovery OSes the recorded reading judges stale, behind the host,
+    /// never upgraded since install, or unknown (bd DAS-Backup-Manager-xd3).
+    pub recovery_os_stale: Vec<StaleRecoveryOs>,
+    /// Mirror targets whose recorded reading could not be judged — `(label,
+    /// why)`: never counted current, and not a failure of the check.
+    pub recovery_os_not_checked: Vec<(String, String)>,
+    /// Recovery OSes the recorded reading judges current.
+    pub recovery_os_current: usize,
+}
+
+/// A recovery OS whose recorded reading is stale (bd DAS-Backup-Manager-xd3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRecoveryOs {
+    /// The mirror target's label.
+    pub drive: String,
+    /// When the reading was taken, `YYYY-MM-DD HH:MM UTC`.
+    pub checked: String,
+    /// Whole days since the last applied upgrade, else the install; `None`
+    /// when neither is known.
+    pub age_days: Option<i64>,
+    /// Why it is stale, as the nightly report and `health` say it.
+    pub reasons: Vec<String>,
 }
 
 impl DriftReport {
-    /// Whether any drift (missing, stale or undelivered) was found.
+    /// Whether any drift (missing, stale, undelivered or a stale recovery
+    /// OS) was found.
     pub fn has_drift(&self) -> bool {
-        !self.missing.is_empty() || !self.stale.is_empty() || !self.undelivered.is_empty()
+        !self.missing.is_empty()
+            || !self.stale.is_empty()
+            || !self.undelivered.is_empty()
+            || !self.recovery_os_stale.is_empty()
+    }
+
+    /// Record what [`crate::recovery_os::judge_records`] found. Only the
+    /// presentation lives here; the judgement is `recovery_os::assess`.
+    pub fn set_recovery_os(&mut self, findings: Vec<RecordFinding>) {
+        self.recovery_os_stale.clear();
+        self.recovery_os_not_checked.clear();
+        self.recovery_os_current = 0;
+        for f in findings {
+            match f.outcome {
+                RecordOutcome::NotChecked { why } => {
+                    self.recovery_os_not_checked.push((f.label, why));
+                }
+                RecordOutcome::Judged {
+                    checked,
+                    assessment,
+                } if assessment.stale => self.recovery_os_stale.push(StaleRecoveryOs {
+                    drive: f.label,
+                    checked,
+                    age_days: assessment.age_days,
+                    reasons: assessment.reasons,
+                }),
+                RecordOutcome::Judged { .. } => self.recovery_os_current += 1,
+            }
+        }
+    }
+
+    /// Whether any mirror target had an item at all.
+    fn has_recovery_os_item(&self) -> bool {
+        self.recovery_os_current > 0
+            || !self.recovery_os_stale.is_empty()
+            || !self.recovery_os_not_checked.is_empty()
     }
 
     /// Whether the check examined at least one volume. `false` means "could
@@ -658,7 +717,24 @@ fn perform_drift_check(
     let mut report = drift_from_listings(config, &listings);
     report.left_mounted = guard.unmount(progress);
     perform_delivery_check(config, progress, held, &mut report);
+    perform_recovery_os_check(config, &mut report);
     report
+}
+
+/// The recovery OS item: the recorded reading the nightly run keeps, judged
+/// against today and the host as it is now. Reads one JSON file and runs
+/// `uname` and `pacman -Q`; mounts nothing and reads no recovery drive.
+fn perform_recovery_os_check(config: &Config, report: &mut DriftReport) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    report.set_recovery_os(recovery_os::judge_records(
+        config,
+        &recovery_os::load_state(&recovery_os::state_path()),
+        &recovery_os::host_versions,
+        &crate::caldate::today(),
+        now,
+    ));
 }
 
 /// Every target a declared pair goes to, once, when no target could be
@@ -764,11 +840,12 @@ pub fn run_drift_check(
             progress.on_complete(
                 !report.has_drift(),
                 &format!(
-                    "{} volume(s) checked, {} missing, {} stale, {} undelivered",
+                    "{} volume(s) checked, {} missing, {} stale, {} undelivered, {} stale recovery OS(es)",
                     report.volumes_checked,
                     report.missing.len(),
                     report.stale.len(),
-                    report.undelivered.len()
+                    report.undelivered.len(),
+                    report.recovery_os_stale.len()
                 ),
             );
             Ok(DoctorOutcome::Ran(report))
@@ -832,6 +909,12 @@ pub fn format_report(report: &DriftReport) -> String {
         "  Undelivered pairs     {}\n",
         report.undelivered.len()
     ));
+    if report.has_recovery_os_item() {
+        r.push_str(&format!(
+            "  Recovery OSes stale   {}\n",
+            report.recovery_os_stale.len()
+        ));
+    }
 
     if !report.volumes_failed.is_empty() {
         r.push_str(&format!("\nVOLUMES NOT CHECKED\n{thin}\n"));
@@ -915,6 +998,31 @@ pub fn format_report(report: &DriftReport) -> String {
              was skipped or failed without failing the run. Read the last backup report\n  \
              and the btrbk log for the pair.\n",
         );
+    }
+
+    if !report.recovery_os_stale.is_empty() {
+        r.push_str(&format!(
+            "\nSTALE RECOVERY OSES — judged from the reading the backup run recorded\n{thin}\n"
+        ));
+        for s in &report.recovery_os_stale {
+            r.push_str(&format!("  {}  (reading of {}):\n", s.drive, s.checked));
+            for reason in &s.reasons {
+                r.push_str(&format!("    {reason}\n"));
+            }
+        }
+        r.push_str(
+            "\n  A recovery OS is the system to boot when the host cannot. Update it with it\n  \
+             booted, never from the host (docs/DISASTER-RECOVERY-GUIDE.md, section Keeping the recovery OSes current).\n",
+        );
+    }
+
+    if !report.recovery_os_not_checked.is_empty() {
+        r.push_str(&format!(
+            "\nRECOVERY OSES NOT CHECKED (no reading to judge; never taken as current)\n{thin}\n"
+        ));
+        for (label, why) in &report.recovery_os_not_checked {
+            r.push_str(&format!("  {label}: {why}\n"));
+        }
     }
 
     if !report.left_mounted.is_empty() {
@@ -2050,5 +2158,409 @@ mod tests {
         // Scoped to the primary by name: backed up, clean again.
         cfg.sources[0].target_labels = vec!["big".into()];
         assert!(!drift_from_listings(&cfg, &listings).not_clean());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the recovery OS item (bd DAS-Backup-Manager-xd3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recovery_os_item_tests {
+    use crate::caldate::{date_of, day_number};
+    use crate::config::{Config, Target, TargetRole};
+    use crate::recovery_os::{
+        DOCTOR_RECORD_MAX_AGE_DAYS, HostVersions, RecordFinding, RecordOutcome, RecoveryOs,
+        StoredDrive, StoredState, judge_records,
+    };
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+
+    const TODAY: &str = "2026-11-10";
+
+    fn now() -> i64 {
+        day_number(TODAY).unwrap() * 86_400 + 4 * 3600
+    }
+
+    fn ago(days: i64) -> String {
+        date_of(day_number(TODAY).unwrap() - days)
+    }
+
+    fn mirror(label: &str, role: TargetRole) -> Target {
+        Target {
+            label: label.into(),
+            serial: "SERIAL01".into(),
+            serials: vec!["SERIAL01".into()],
+            mount_uuid: None,
+            mount: format!("/mnt/{label}"),
+            role,
+            retention: Default::default(),
+            display_name: String::new(),
+            esp_partuuid: None,
+        }
+    }
+
+    fn cfg(labels: &[(&str, TargetRole)]) -> Config {
+        Config {
+            targets: labels.iter().map(|(l, r)| mirror(l, r.clone())).collect(),
+            ..Config::default()
+        }
+    }
+
+    fn host() -> HostVersions {
+        HostVersions {
+            kernel: Some("7.2.8-1-cachyos".into()),
+            btrfs_progs: Some("7.1-1".into()),
+        }
+    }
+
+    /// A recovery OS as the nightly run reads it, upgraded `upgraded_days_ago`.
+    fn os(upgraded_days_ago: Option<i64>) -> RecoveryOs {
+        let applied = upgraded_days_ago.map(ago);
+        RecoveryOs {
+            installed: Some("2026-01-02".into()),
+            last_full_upgrade_applied: applied.clone(),
+            last_full_upgrade_attempted: applied.clone(),
+            last_attempt_completed: applied.is_some(),
+            log_read: true,
+            modules_read: true,
+            kernels: vec!["7.2.8-1-cachyos".into()],
+            packages: BTreeMap::from([("btrfs-progs".to_string(), "7.1-1".to_string())]),
+            packages_read: true,
+            ..Default::default()
+        }
+    }
+
+    fn drive(os: Option<RecoveryOs>, checked_days_ago: i64) -> StoredDrive {
+        StoredDrive {
+            checked_epoch: now() - checked_days_ago * 86_400,
+            mount_uuid: None,
+            error: os.is_none().then(|| "OS root unreadable".to_string()),
+            os,
+        }
+    }
+
+    fn state(drives: Vec<(&str, StoredDrive)>) -> Result<Option<StoredState>, String> {
+        Ok(Some(StoredState {
+            schema_version: 4,
+            drives: drives
+                .into_iter()
+                .map(|(l, d)| (l.to_string(), d))
+                .collect(),
+        }))
+    }
+
+    fn judge(c: &Config, s: &Result<Option<StoredState>, String>) -> Vec<RecordFinding> {
+        judge_records(c, s, &host, TODAY, now())
+    }
+
+    fn one(c: &Config, s: &Result<Option<StoredState>, String>) -> RecordOutcome {
+        let mut f = judge(c, s);
+        assert_eq!(f.len(), 1, "{f:?}");
+        f.remove(0).outcome
+    }
+
+    fn stale_reasons(o: &RecordOutcome) -> Option<&[String]> {
+        match o {
+            RecordOutcome::Judged { assessment, .. } if assessment.stale => {
+                Some(&assessment.reasons)
+            }
+            _ => None,
+        }
+    }
+
+    fn why(o: &RecordOutcome) -> &str {
+        match o {
+            RecordOutcome::NotChecked { why } => why,
+            other => panic!("expected not checked, got {other:?}"),
+        }
+    }
+
+    const A: (&str, TargetRole) = ("recov-a", TargetRole::Mirror);
+
+    #[test]
+    fn a_recently_upgraded_recovery_os_is_judged_current() {
+        let c = cfg(&[A]);
+        let o = one(&c, &state(vec![("recov-a", drive(Some(os(Some(10))), 1))]));
+        match o {
+            RecordOutcome::Judged { assessment, .. } => {
+                assert!(!assessment.stale, "{:?}", assessment.reasons);
+                assert_eq!(assessment.age_days, Some(10));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_old_upgrade_is_stale() {
+        let c = cfg(&[A]);
+        let o = one(&c, &state(vec![("recov-a", drive(Some(os(Some(61))), 3))]));
+        let reasons = stale_reasons(&o).expect("stale");
+        assert!(reasons[0].contains("61 days ago"), "{reasons:?}");
+    }
+
+    #[test]
+    fn a_never_upgraded_install_reads_installed_never_upgraded_since() {
+        let c = cfg(&[A]);
+        let o = one(&c, &state(vec![("recov-a", drive(Some(os(None)), 1))]));
+        let reasons = stale_reasons(&o).expect("stale");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("never upgraded since install on 2026-01-02")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_kernel_series_behind_the_host_is_stale() {
+        let c = cfg(&[A]);
+        let mut behind = os(Some(5));
+        behind.kernels = vec!["6.19.12-1-cachyos".into()];
+        let o = one(&c, &state(vec![("recov-a", drive(Some(behind), 1))]));
+        let reasons = stale_reasons(&o).expect("stale");
+        assert!(
+            reasons.iter().any(|r| r.contains("behind the host")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_log_is_unknown_and_never_current() {
+        let c = cfg(&[A]);
+        let mut unknown = os(Some(5));
+        unknown.log_read = false;
+        unknown.last_full_upgrade_applied = None;
+        unknown.installed = None;
+        let o = one(&c, &state(vec![("recov-a", drive(Some(unknown), 1))]));
+        let reasons = stale_reasons(&o).expect("unknown is stale, never current");
+        assert!(reasons[0].contains("unknown"), "{reasons:?}");
+        match o {
+            RecordOutcome::Judged { assessment, .. } => assert_eq!(assessment.age_days, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_record_at_all_is_not_checked_and_says_why() {
+        let c = cfg(&[A]);
+        assert!(why(&one(&c, &Ok(None))).contains("no reading has been recorded yet"));
+    }
+
+    #[test]
+    fn a_drive_missing_from_the_record_is_not_checked() {
+        let c = cfg(&[A, ("recov-b", TargetRole::Mirror)]);
+        let s = state(vec![("recov-a", drive(Some(os(Some(1))), 1))]);
+        let f = judge(&c, &s);
+        assert_eq!(f.len(), 2);
+        assert!(matches!(f[0].outcome, RecordOutcome::Judged { .. }));
+        assert_eq!(f[1].label, "recov-b");
+        assert!(why(&f[1].outcome).contains("no reading has been recorded for this drive"));
+    }
+
+    #[test]
+    fn an_unreadable_record_is_not_checked_and_carries_the_error() {
+        let c = cfg(&[A]);
+        let o = one(&c, &Err("/x/recovery-os.json: corrupt".into()));
+        assert!(why(&o).contains("unreadable"), "{}", why(&o));
+        assert!(why(&o).contains("corrupt"));
+    }
+
+    #[test]
+    fn a_failed_last_reading_is_not_checked_not_current() {
+        let c = cfg(&[A]);
+        let o = one(&c, &state(vec![("recov-a", drive(None, 1))]));
+        assert!(
+            why(&o).contains("failed: OS root unreadable"),
+            "{}",
+            why(&o)
+        );
+    }
+
+    #[test]
+    fn a_reading_older_than_the_doctor_vouches_for_is_not_checked() {
+        let c = cfg(&[A]);
+        let edge = DOCTOR_RECORD_MAX_AGE_DAYS;
+        let at = one(
+            &c,
+            &state(vec![("recov-a", drive(Some(os(Some(5))), edge))]),
+        );
+        assert!(matches!(at, RecordOutcome::Judged { .. }), "{at:?}");
+        let over = one(
+            &c,
+            &state(vec![("recov-a", drive(Some(os(Some(5))), edge + 1))]),
+        );
+        assert!(why(&over).contains("15 days old"), "{}", why(&over));
+    }
+
+    #[test]
+    fn a_reading_dated_after_now_is_not_checked() {
+        let c = cfg(&[A]);
+        let o = one(&c, &state(vec![("recov-a", drive(Some(os(Some(5))), -2))]));
+        assert!(why(&o).contains("after now"), "{}", why(&o));
+    }
+
+    #[test]
+    fn a_reading_of_another_filesystem_is_not_checked() {
+        let mut c = cfg(&[A]);
+        c.targets[0].mount_uuid = Some("uuid-configured".into());
+        let mut d = drive(Some(os(Some(5))), 1);
+        d.mount_uuid = Some("uuid-other".into());
+        assert!(why(&one(&c, &state(vec![("recov-a", d.clone())]))).contains("another filesystem"));
+        d.mount_uuid = Some("uuid-configured".into());
+        assert!(matches!(
+            one(&c, &state(vec![("recov-a", d)])),
+            RecordOutcome::Judged { .. }
+        ));
+    }
+
+    #[test]
+    fn only_mirror_targets_have_an_item_and_none_means_no_item_and_no_probe() {
+        let c = cfg(&[("big", TargetRole::Primary)]);
+        let probed = Cell::new(0);
+        let f = judge_records(
+            &c,
+            &state(vec![("big", drive(Some(os(Some(1))), 1))]),
+            &|| {
+                probed.set(probed.get() + 1);
+                host()
+            },
+            TODAY,
+            now(),
+        );
+        assert!(f.is_empty(), "{f:?}");
+        assert_eq!(probed.get(), 0);
+    }
+
+    #[test]
+    fn the_host_is_probed_once_for_two_drives_and_not_without_a_reading() {
+        let c = cfg(&[A, ("recov-b", TargetRole::Mirror)]);
+        let probed = Cell::new(0);
+        let probe = || {
+            probed.set(probed.get() + 1);
+            host()
+        };
+        let s = state(vec![
+            ("recov-a", drive(Some(os(Some(1))), 1)),
+            ("recov-b", drive(Some(os(Some(1))), 1)),
+        ]);
+        judge_records(&c, &s, &probe, TODAY, now());
+        assert_eq!(probed.get(), 1);
+        probed.set(0);
+        judge_records(&c, &Ok(None), &probe, TODAY, now());
+        assert_eq!(probed.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_os_report_tests {
+    use super::*;
+    use crate::recovery_os::{Assessment, RecordFinding, RecordOutcome};
+
+    fn judged(label: &str, stale_reason: Option<&str>) -> RecordFinding {
+        RecordFinding {
+            label: label.into(),
+            outcome: RecordOutcome::Judged {
+                checked: "2026-11-09 03:40 UTC".into(),
+                assessment: Assessment {
+                    age_days: Some(174),
+                    stale: stale_reason.is_some(),
+                    reasons: stale_reason.map(String::from).into_iter().collect(),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    fn not_checked(label: &str, why: &str) -> RecordFinding {
+        RecordFinding {
+            label: label.into(),
+            outcome: RecordOutcome::NotChecked { why: why.into() },
+        }
+    }
+
+    fn ran() -> DriftReport {
+        DriftReport {
+            volumes_checked: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stale_recovery_os_is_drift_named_per_drive() {
+        let mut r = ran();
+        r.set_recovery_os(vec![
+            judged(
+                "recov-a",
+                Some("never upgraded since install on 2026-04-12 (174 days)"),
+            ),
+            judged("recov-b", None),
+        ]);
+        assert!(r.has_drift() && r.not_clean() && !r.could_not_examine());
+        assert_eq!(r.recovery_os_stale.len(), 1);
+        assert_eq!(r.recovery_os_stale[0].drive, "recov-a");
+        assert_eq!(r.recovery_os_stale[0].age_days, Some(174));
+        assert_eq!(r.recovery_os_current, 1);
+    }
+
+    #[test]
+    fn current_and_not_checked_recovery_oses_are_not_drift() {
+        let mut r = ran();
+        r.set_recovery_os(vec![
+            judged("recov-a", None),
+            not_checked("recov-b", "no reading has been recorded yet"),
+        ]);
+        assert!(!r.has_drift() && !r.not_clean());
+        assert_eq!(r.recovery_os_not_checked.len(), 1);
+        assert_eq!(
+            r.recovery_os_current, 1,
+            "not checked is never counted current"
+        );
+    }
+
+    #[test]
+    fn no_mirror_target_means_no_recovery_os_text_at_all() {
+        let mut r = ran();
+        r.set_recovery_os(Vec::new());
+        let text = format_report(&r);
+        assert!(!text.to_lowercase().contains("recovery"), "{text}");
+    }
+
+    #[test]
+    fn the_report_names_a_stale_drive_with_its_reasons_and_says_current_ones_were_judged() {
+        let mut r = ran();
+        r.set_recovery_os(vec![
+            judged(
+                "recov-a",
+                Some("never upgraded since install on 2026-04-12 (174 days)"),
+            ),
+            judged("recov-b", None),
+        ]);
+        let text = format_report(&r);
+        assert!(text.contains("DRIFT DETECTED — FAILURE"), "{text}");
+        assert!(text.contains("STALE RECOVERY OSES"), "{text}");
+        assert!(
+            text.contains("recov-a") && text.contains("never upgraded since install on 2026-04-12"),
+            "{text}"
+        );
+        assert!(text.contains("2026-11-09 03:40 UTC"), "{text}");
+        assert!(text.contains("Recovery OSes stale   1"), "{text}");
+    }
+
+    #[test]
+    fn the_report_lists_a_not_checked_drive_with_why_and_stays_clean() {
+        let mut r = ran();
+        r.set_recovery_os(vec![not_checked(
+            "recov-b",
+            "no reading has been recorded yet",
+        )]);
+        let text = format_report(&r);
+        assert!(text.contains("NO DRIFT — CLEAN"), "{text}");
+        assert!(text.contains("RECOVERY OSES NOT CHECKED"), "{text}");
+        assert!(
+            text.contains("recov-b: no reading has been recorded yet"),
+            "{text}"
+        );
+        assert!(!text.contains("STALE RECOVERY OSES"), "{text}");
     }
 }

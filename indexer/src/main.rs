@@ -1332,6 +1332,18 @@ pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
 /// never pasted into the text by hand. The keys keep their order, status first.
 fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Error> {
     #[derive(serde::Serialize)]
+    struct StaleOs<'a> {
+        drive: &'a str,
+        checked: &'a str,
+        age_days: Option<i64>,
+        reasons: &'a [String],
+    }
+    #[derive(serde::Serialize)]
+    struct NotChecked<'a> {
+        drive: &'a str,
+        why: &'a str,
+    }
+    #[derive(serde::Serialize)]
     #[serde(tag = "status", rename_all = "lowercase")]
     enum Line<'a> {
         Deferred {
@@ -1345,6 +1357,9 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             undelivered: usize,
             targets_failed: usize,
             targets_absent: usize,
+            recovery_os_current: usize,
+            recovery_os_stale: Vec<StaleOs<'a>>,
+            recovery_os_not_checked: Vec<NotChecked<'a>>,
         },
     }
     serde_json::to_string(&match outcome {
@@ -1357,6 +1372,22 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             undelivered: dr.undelivered.len(),
             targets_failed: dr.targets_failed.len(),
             targets_absent: dr.targets_absent.len(),
+            recovery_os_current: dr.recovery_os_current,
+            recovery_os_stale: dr
+                .recovery_os_stale
+                .iter()
+                .map(|o| StaleOs {
+                    drive: &o.drive,
+                    checked: &o.checked,
+                    age_days: o.age_days,
+                    reasons: &o.reasons,
+                })
+                .collect(),
+            recovery_os_not_checked: dr
+                .recovery_os_not_checked
+                .iter()
+                .map(|(drive, why)| NotChecked { drive, why })
+                .collect(),
         },
     })
 }
@@ -1419,6 +1450,9 @@ fn email_doctor_report(
 ///   so is a target the delivery check could not read (bd
 ///   DAS-Backup-Manager-sp78.7). A pair a readable target holds no recent
 ///   snapshot of is drift (1).
+///   A recovery OS the recorded reading judges stale is drift (1) too; one
+///   with no reading to judge is listed and neither (bd
+///   DAS-Backup-Manager-xd3).
 /// - `Ran` cleanly with drift is **1** — a successful check with a result.
 ///   `render_systemd_doctor_service` pairs this with `SuccessExitStatus=1`.
 /// - Otherwise 0.
@@ -4437,7 +4471,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         }
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0,"targets_absent":0}"#
+            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0,"targets_absent":0,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[]}"#
         );
     }
 
@@ -4461,8 +4495,86 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         };
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1,"targets_absent":1}"#
+            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1,"targets_absent":1,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[]}"#
         );
+    }
+
+    fn stale_os(drive: &str) -> doctor::StaleRecoveryOs {
+        doctor::StaleRecoveryOs {
+            drive: drive.into(),
+            checked: "2026-11-09 03:40 UTC".into(),
+            age_days: Some(174),
+            reasons: vec!["never upgraded since install on 2026-04-12 (174 days)".into()],
+        }
+    }
+
+    /// A stale recovery OS is drift: exit 1 (the unit counts it a success); a
+    /// volume or target that could not be read outranks it with 3; one that
+    /// could not be judged is no finding and no fault: 0 (bd xd3).
+    #[test]
+    fn exit_code_for_doctor_stale_recovery_os_is_one_and_a_mount_failure_outranks_it() {
+        let mut report = doctor::DriftReport {
+            volumes_checked: 1,
+            recovery_os_stale: vec![stale_os("recov-a")],
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report.clone())),
+            1
+        );
+        report.volumes_failed = vec![("/vol".into(), "not mounted".into())];
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report.clone())),
+            3
+        );
+        report.volumes_failed.clear();
+        report.targets_failed = vec![("small".into(), "not mounted".into())];
+        assert_eq!(exit_code_for_doctor(&doctor::DoctorOutcome::Ran(report)), 3);
+        let not_judged = doctor::DriftReport {
+            volumes_checked: 1,
+            recovery_os_not_checked: vec![("recov-a".into(), "no reading".into())],
+            recovery_os_current: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_code_for_doctor(&doctor::DoctorOutcome::Ran(not_judged)),
+            0
+        );
+    }
+
+    #[test]
+    fn doctor_json_names_each_stale_and_unchecked_recovery_os() {
+        let report = doctor::DriftReport {
+            volumes_checked: 1,
+            recovery_os_stale: vec![stale_os("recov-a")],
+            recovery_os_not_checked: vec![("recov-b".into(), "no \"reading\" yet".into())],
+            recovery_os_current: 2,
+            ..Default::default()
+        };
+        let line = doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["recovery_os_current"], 2);
+        assert_eq!(v["recovery_os_stale"][0]["drive"], "recov-a");
+        assert_eq!(v["recovery_os_stale"][0]["age_days"], 174);
+        assert_eq!(
+            v["recovery_os_stale"][0]["reasons"][0],
+            "never upgraded since install on 2026-04-12 (174 days)"
+        );
+        assert_eq!(v["recovery_os_not_checked"][0]["drive"], "recov-b");
+        assert_eq!(v["recovery_os_not_checked"][0]["why"], "no \"reading\" yet");
+    }
+
+    #[test]
+    fn doctor_json_has_empty_recovery_os_lists_when_there_is_no_mirror() {
+        let line = doctor_json(&doctor::DoctorOutcome::Ran(doctor::DriftReport {
+            volumes_checked: 1,
+            ..Default::default()
+        }))
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["recovery_os_stale"], serde_json::json!([]));
+        assert_eq!(v["recovery_os_not_checked"], serde_json::json!([]));
+        assert_eq!(v["recovery_os_current"], 0);
     }
 
     /// The delivery check (bd DAS-Backup-Manager-sp78.7): a pair a target

@@ -2063,6 +2063,121 @@ pub fn health_reading(
     h
 }
 
+/// How old a stored reading may be and still be judged by `btrdasd doctor`.
+/// The backup run records every night, so a reading older than two weeks
+/// means no run has had the drive mounted since: what the OS was upgraded to
+/// in the meantime is unknown, and the doctor does not vouch for it.
+pub const DOCTOR_RECORD_MAX_AGE_DAYS: i64 = 14;
+
+/// What `btrdasd doctor` makes of one drive's stored reading.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordOutcome {
+    /// Judged by [`assess`], the one rule the nightly report and `health`
+    /// use; `stale` says whether it is current.
+    Judged {
+        /// When the reading was taken, `YYYY-MM-DD HH:MM UTC`.
+        checked: String,
+        assessment: Assessment,
+    },
+    /// No judgement: the reading is absent, unreadable, failed, of another
+    /// filesystem or too old. Never counted as current.
+    NotChecked { why: String },
+}
+
+/// One mirror target's [`RecordOutcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordFinding {
+    pub label: String,
+    pub outcome: RecordOutcome,
+}
+
+/// The stored reading of every `role = "mirror"` target, judged for
+/// `btrdasd doctor`: it mounts and reads nothing, and takes the record as the
+/// nightly run left it. A drive's facts are re-assessed by [`assess`] against
+/// `today` and the host as it is now (`probe_host`, run at most once, and
+/// only when there is a reading to judge). `now_epoch` dates the age of the
+/// record itself. No mirror target: no finding at all.
+pub fn judge_records(
+    cfg: &Config,
+    state: &Result<Option<StoredState>, String>,
+    probe_host: &dyn Fn() -> HostVersions,
+    today: &str,
+    now_epoch: i64,
+) -> Vec<RecordFinding> {
+    let host_cell = std::cell::OnceCell::new();
+    let max = cfg.recovery_os.max_age_days;
+    cfg.targets
+        .iter()
+        .filter(|t| t.role == TargetRole::Mirror)
+        .map(|t| {
+            let not_checked = |why: &str| RecordOutcome::NotChecked { why: why.to_string() };
+            let outcome = match state {
+                Err(err) => RecordOutcome::NotChecked {
+                    why: format!("the recorded reading is unreadable: {err}"),
+                },
+                Ok(None) => not_checked(
+                    "no reading has been recorded yet (the backup run records one when it mounts the drive)",
+                ),
+                Ok(Some(s)) => match s.drives.get(&t.label) {
+                    None => not_checked(
+                        "no reading has been recorded for this drive (the backup run records one when it mounts it)",
+                    ),
+                    Some(d) => judge_stored_drive(t, d, &host_cell, probe_host, today, max, now_epoch),
+                },
+            };
+            RecordFinding {
+                label: t.label.clone(),
+                outcome,
+            }
+        })
+        .collect()
+}
+
+/// One drive's stored reading: refused for what the doctor cannot vouch for,
+/// else judged by [`assess`].
+fn judge_stored_drive(
+    target: &crate::config::Target,
+    d: &StoredDrive,
+    host: &std::cell::OnceCell<HostVersions>,
+    probe_host: &dyn Fn() -> HostVersions,
+    today: &str,
+    max_age_days: u32,
+    now_epoch: i64,
+) -> RecordOutcome {
+    let when = format_epoch_utc(d.checked_epoch);
+    let not_checked = |why: String| RecordOutcome::NotChecked { why };
+    if let (Some(want), Some(got)) = (&target.mount_uuid, &d.mount_uuid)
+        && want != got
+    {
+        return not_checked(format!(
+            "the reading of {when} is of another filesystem than the one this target is configured with"
+        ));
+    }
+    let behind = now_epoch - d.checked_epoch;
+    if behind < 0 {
+        return not_checked(format!(
+            "the reading is dated {when}, after now — check the clock"
+        ));
+    }
+    let age = behind / 86_400;
+    if age > DOCTOR_RECORD_MAX_AGE_DAYS {
+        return not_checked(format!(
+            "the last reading, {when}, is {} old (the doctor judges one at most {DOCTOR_RECORD_MAX_AGE_DAYS} days old): no backup run has had the drive mounted since",
+            days(age)
+        ));
+    }
+    match &d.os {
+        None => not_checked(format!(
+            "the last reading, {when}, failed: {}",
+            or_unknown(d.error.as_deref())
+        )),
+        Some(os) => RecordOutcome::Judged {
+            checked: when,
+            assessment: assess(os, host.get_or_init(probe_host), today, max_age_days),
+        },
+    }
+}
+
 /// The outcome of `btrdasd recovery-os status`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusRun {
