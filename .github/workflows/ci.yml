@@ -85,6 +85,70 @@ jobs:
         working-directory: indexer
         run: cargo test --features dbus
 
+  # The root loopback suites (indexer/tests/*_loopback.rs): scrub, subvolume
+  # sync and boot archival against real BTRFS filesystems on loop devices. They
+  # are #[ignore]d, so the `rust` job never runs them, and they once sat red for
+  # weeks unseen (bd DAS-Backup-Manager-2kb1.8).
+  #
+  # On the runner VM, not in a container: they need root, loop devices, mounts,
+  # device-mapper and the btrfs module, and a container can have those only if
+  # it is privileged. The runner VM has passwordless sudo and its own kernel,
+  # and is discarded after the run, so nothing here needs the host-side task and
+  # memory bound a developer's machine gets (`.claude/rules/test-safety.md`);
+  # the timeouts are the bound. The runner's preinstalled stable Rust is used,
+  # with a floor check, instead of a second installer; no `curl | sh`.
+  loopback:
+    name: Root loopback suites — scrub, subvol sync, boot archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # btrbk is what the sync suite runs for real; dmsetup and the dm-delay
+      # target are how the scrub suite makes a scrub slow enough to interrupt.
+      - name: Install btrfs-progs, btrbk, dmsetup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs btrbk dmsetup jq
+
+      # dm-delay ships in linux-modules-extra on some kernels; the suite fails
+      # on its own if it is still missing, but this says why.
+      - name: Load kernel modules
+        run: |
+          sudo modprobe btrfs
+          sudo modprobe dm_mod
+          sudo modprobe dm_delay || {
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm_delay
+          }
+          grep -E '^(btrfs|dm_delay) ' /proc/modules
+
+      # let-chains (edition 2024) need 1.88; fail here, not as a compile error.
+      - name: Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+          minor=$(rustc --version | sed -E 's/^rustc [0-9]+\.([0-9]+)\..*/\1/')
+          [ "$minor" -ge 88 ] || { echo "::error::rustc is older than 1.88"; exit 1; }
+
+      - name: Run the loopback suites as root
+        run: .github/scripts/run-root-loopback-suites.sh
+
+      # The suites tidy up after themselves, including on a failed assertion; a
+      # device left behind is a leak in a suite, so it is named. Only loops
+      # backed by a temp file count: the runner image has loops of its own.
+      - name: Nothing left behind
+        if: always()
+        run: |
+          leaked=$(losetup -a | grep -E '\((/var)?/tmp/' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::loop devices left behind:"
+            echo "$leaked"
+            exit 1
+          fi
+
   build:
     name: Build — Rust library, CLI, and Qt6 GUI
     runs-on: ubuntu-latest
