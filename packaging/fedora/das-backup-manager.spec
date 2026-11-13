@@ -1,5 +1,5 @@
 Name:           das-backup-manager
-Version:        0.7.23.3
+Version:        0.7.24.0
 Release:        1%{?dist}
 Summary:        DAS backup manager with btrbk, SQLite FTS5, KDE GUI
 
@@ -63,22 +63,31 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_mandir}/man1/btrdasd.1*
 
 %changelog
-* Sun Nov 08 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.3-1
+* Thu Nov 12 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.24.0-1
+- Static subvolumes: read-only subvolumes somebody else made (VM pristines) are sent to the primary target as they are ([[source.static]], btrdasd backup static)
+- BREAKING: manual_only, subvol set-manual/set-auto, subvol add --manual-only and the helper's SubvolSetManual are removed
+- The D-Bus helper moves to zbus 6; new method RecoveryOsRecord and a Record button on the GUI's recovery panel
+- btrdasd doctor reports undelivered pairs and a stale recovery OS as drift
+- An unmount that could not run is no longer reported as done (backup-run.sh 4.20.1)
+- The generated systemd units live in a directory of their own, linked into systemd
+- Config saves splice bytes at the parser's spans: comments and unknown keys survive every save
+
+* Sun Nov 08 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.23.3-1
 - A run's bytes sent is unknown (NULL, schema 6) when it was not measured, never 0
 - A subvolume no longer backed up while it still exists is a WARN every run until restored, gone or accepted (subvol coverage accept/list)
 - Scrubs run at best-effort I/O level 0, nice -20 (btrfs scrub -c 2 -n 0)
 - Every report send goes through one mailer; no test build can spawn mailx
 
-* Sat Oct 31 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.2-1
+* Sat Oct 31 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.23.2-1
 - Recovery-drive update: a NIC with no carrier gets one host-side link toggle before egress
 - config.toml is edited in place: unknown keys and comments survive every save; backup-scoping keys pinned
 - GUI config editor shows and saves the real file; unknown keys are warned about with a nearest-key hint
 
-* Thu Oct 22 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.1-1
+* Thu Oct 22 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.23.1-1
 - Packaging: Debian control has one Suggests field; the spec lists btrdasd-gui.notifyrc
 - Release workflow frees runner disk before the Flatpak build
 
-* Tue Oct 06 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.23.0-1
+* Tue Oct 06 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.23.0-1
 - GUI operations honoured: every ticked box reaches the helper; Run needs Snapshot or Send
 - One boot-step classification on the Rust path and in backup-run.sh 4.12.0
 - The boot step's input is enforced where it is read, including refusing a staging symlink
@@ -86,7 +95,7 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 - recovery-os-vm reset-watch race fixed
 - Next scheduled is never blank in the GUI
 
-* Fri Aug 28 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.20.0-1
+* Fri Aug 28 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.20.0-1
 - Security and correctness release from an independent review of the privilege boundary
 - archive_boot no longer deletes the live @ before locating its replacement (bd 5ig)
 - D-Bus helper joins the backup/scrub maintenance interlock (bd dca)
@@ -96,35 +105,35 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 - job_cancel enforces job ownership (bd h2s)
 - Fail-silent cluster: btrbk counters, MountGuard::Drop, mkdir shell-outs, schedule parsers (bd 06p)
 
-* Sat Apr 11 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.12.2-1
+* Sat Apr 11 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.12.2-1
 - Bump to 0.7.12.2: debian Build .deb step now uses shell:bash (fixes ${var//-/\~} "Bad substitution" on dash); PKGBUILD bumped from stale 0.7.10 and gained hicolor-icon-theme dep; verified clean local Arch build
 
-* Sat Apr 11 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.12.1-1
+* Sat Apr 11 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.12.1-1
 - Bump to 0.7.12.1: fix debian/changelog version lag; CI now sed-patches debian changelog version at build time
 
-* Sat Apr 11 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.12-1
+* Sat Apr 11 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.12-1
 - Bump to 0.7.12: repair release-packages CI workflow end-to-end; permanent fix for 2026-03-05 DAS ESP wipe incident (render_esp_hook removed)
 
-* Mon Mar 16 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.11-1
+* Mon Mar 16 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.11-1
 - Bump to 0.7.11: GUI accelerator/progress dock/status bar fixes
 
-* Mon Mar 16 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.10-1
+* Mon Mar 16 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.10-1
 - Bump to 0.7.10: fix backup history recording from CLI and shell script
 
-* Sat Mar 07 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.9-1
+* Sat Mar 07 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.9-1
 - Bump to 0.7.9: remove Dockerfile and Docker references (incompatible with DAS backup operations)
 
-* Sat Mar 07 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.8-1
+* Sat Mar 07 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.8-1
 - Bump to 0.7.8: replace QSplitter with native dock resize for progress panel
 
-* Sat Mar 07 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.7-1
+* Sat Mar 07 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.7-1
 - Bump to 0.7.7: resizable log view (native dock resize), smart auto-scroll, non-fatal email errors, s-nail v15-compat
 
-* Thu Mar 05 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.6-1
+* Thu Mar 05 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.6-1
 - Bump to 0.7.6: email reports, btrbk.conf canonical path fix, dry-run DB fix
 
-* Thu Mar 05 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.5-1
+* Thu Mar 05 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.5-1
 - Bump to 0.7.5: source volume auto-mount, snapshot_name/target_labels config
 
-* Thu Mar 05 2026 TheBoscoClub <20981297+greogory@users.noreply.github.com> - 0.7.4-1
+* Thu Mar 05 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.4-1
 - Initial RPM package for Fedora

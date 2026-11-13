@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.7.24.0] - 2026-11-12
+
+### Added
+
 - **`btrdasd doctor` reports a stale recovery OS as drift** (bd `DAS-Backup-Manager-xd3`): each `role = "mirror"` target's recorded reading (`recovery-os.json`) is judged by `recovery_os::assess`, the one rule the backup report and `btrdasd health` use; nothing is mounted and no recovery drive is read
   - Stale, behind the host, never upgraded since install (`never upgraded since install on <date> (<N> days)`) or unknown is `STALE RECOVERY OSES` by drive, exit `1`; a drive with no reading to judge (none, unreadable, failed, of another filesystem, older than 14 days) is `RECOVERY OSES NOT CHECKED` with the reason, never counted current, exit `0`
   - `--json` gains `recovery_os_current`, `recovery_os_stale` and `recovery_os_not_checked`
@@ -1872,7 +1880,8 @@ project rules; binaries are functionally identical.
 - GitHub repo with full security: Dependabot, CodeQL, secret scanning, branch protection
 - GPL-3.0 license (changed to MIT in v0.4.0)
 
-[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.3...HEAD
+[Unreleased]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.24.0...HEAD
+[0.7.24.0]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.3...v0.7.24.0
 [0.7.23.3]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.2...v0.7.23.3
 [0.7.23.2]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.1...v0.7.23.2
 [0.7.23.1]: https://github.com/TheBoscoClub/DAS-Backup-Manager/compare/v0.7.23.0...v0.7.23.1

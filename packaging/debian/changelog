@@ -1,3 +1,15 @@
+das-backup-manager (0.7.24.0-1) unstable; urgency=medium
+
+  * Static subvolumes: read-only subvolumes somebody else made (VM pristines) are sent to the primary target as they are ([[source.static]], btrdasd backup static)
+  * BREAKING: manual_only, subvol set-manual/set-auto, subvol add --manual-only and the helper's SubvolSetManual are removed
+  * The D-Bus helper moves to zbus 6; new method RecoveryOsRecord and a Record button on the GUI's recovery panel
+  * btrdasd doctor reports undelivered pairs and a stale recovery OS as drift
+  * An unmount that could not run is no longer reported as done (backup-run.sh 4.20.1)
+  * The generated systemd units live in a directory of their own, linked into systemd
+  * Config saves splice bytes at the parser's spans: comments and unknown keys survive every save
+
+ -- TheBoscoClub <theboscoclub@users.noreply.github.com>  Thu, 12 Nov 2026 22:20:27 -0600
+
 das-backup-manager (0.7.23.3-1) unstable; urgency=medium
 
   * A run's bytes sent is unknown (NULL, schema 6) when it was not measured, never 0

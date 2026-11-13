@@ -1,6 +1,6 @@
 # DAS-Backup-Manager — Architecture
 
-**Version**: 0.7.23.3
+**Version**: 0.7.24.0
 
 This document describes the system architecture, data flows, design decisions, and security posture of the DAS-Backup-Manager project.
 
@@ -46,7 +46,7 @@ long as it exists. A read-only snapshot of the parent shows **0 bytes** at that
 path. See `.claude/rules/backup.md` for the reproduction and the
 per-filesystem command that finds coverage gaps.
 
-## Component Overview (v0.7.23.3)
+## Component Overview (v0.7.24.0)
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐

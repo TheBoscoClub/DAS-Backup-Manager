@@ -11,7 +11,7 @@ if(NOT DEFINED CMAKE_INSTALL_PREFIX)
 endif()
 
 project(DAS-Backup-Manager
-    VERSION 0.7.23.3
+    VERSION 0.7.24.0
     DESCRIPTION "DAS backup manager with btrbk integration, SQLite FTS5 content indexing, and KDE Plasma GUI"
     LANGUAGES CXX
 )
