@@ -2347,4 +2347,367 @@ mod tests {
         );
         assert!(!o.failed());
     }
+
+    // ---- what a marker may delete: each refusal on its own (bd 5237.8) ------
+
+    /// A marker is present for `row`'s name and the subvolume's directory is
+    /// a real one (so that a delete the pass wrongly decided on would reach
+    /// the runner, not stop at "not a real directory"). Returns whether the
+    /// marker survived, the delete argvs, and the outcome.
+    fn marker_case(row: &str, ro: bool, name: &str, dry: bool) -> (bool, Vec<String>, Outcome) {
+        let mut fx = Fx::new();
+        let ro_rows: Vec<String> = if ro { vec![row.to_string()] } else { vec![] };
+        standard(&mut fx, std::slice::from_ref(&row.to_string()), &ro_rows);
+        fx.make_dir(&format!("static/vm/{name}"));
+        fx.make_dir("static/vm/.incoming");
+        std::fs::write(fx.marker(name), "x").unwrap();
+        let r = fx.runner();
+        let o = fx.go(&r, dry);
+        (fx.marker(name).exists(), deletes(&r), o)
+    }
+
+    #[test]
+    fn a_marker_never_licenses_a_delete_of_a_read_only_subvolume_without_a_received_uuid() {
+        // Read-only, no received UUID, a name the pattern matches.
+        let row = line(101, "static/vm/vm.pristine-2", U[6], None, None);
+        for dry in [false, true] {
+            let (marker, dels, o) = marker_case(&row, true, "vm.pristine-2", dry);
+            assert!(dels.is_empty(), "dry={dry}: {dels:?}");
+            assert!(
+                !has(&o, Kind::Pruned, "unfinished receive")
+                    && !has(&o, Kind::Pruned, "would delete vm.pristine-2"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+            assert!(marker, "dry={dry}: the marker stays, nothing explains it");
+            assert!(
+                has(&o, Kind::Kept, "not an unfinished receive"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_never_licenses_a_delete_of_a_read_write_subvolume_that_carries_a_received_uuid() {
+        // Read-write, a received UUID (not a cut-short receive), matching name.
+        let row = line(101, "static/vm/vm.pristine-2", U[6], None, Some(U[4]));
+        for dry in [false, true] {
+            let (marker, dels, o) = marker_case(&row, false, "vm.pristine-2", dry);
+            assert!(dels.is_empty(), "dry={dry}: {dels:?}");
+            assert!(
+                !has(&o, Kind::Pruned, "unfinished receive")
+                    && !has(&o, Kind::Pruned, "would delete vm.pristine-2"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+            assert!(marker, "dry={dry}: the marker stays, nothing explains it");
+            assert!(
+                has(&o, Kind::Kept, "not an unfinished receive"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_never_licenses_a_delete_of_a_subvolume_whose_name_the_pattern_does_not_match() {
+        // Read-write, no received UUID — the shape of an unfinished receive —
+        // but not a name this table's pattern (`*.pristine-*`) could produce.
+        let row = line(101, "static/vm/other.thing", U[6], None, None);
+        for dry in [false, true] {
+            let (marker, dels, o) = marker_case(&row, false, "other.thing", dry);
+            assert!(dels.is_empty(), "dry={dry}: {dels:?}");
+            assert!(
+                !has(&o, Kind::Pruned, "other.thing"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+            assert!(marker, "dry={dry}: the marker stays");
+            assert!(
+                has(&o, Kind::Kept, "not an unfinished receive"),
+                "dry={dry}: {}",
+                o.section(dry)
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_and_a_matching_unfinished_receive_is_the_one_shape_that_is_deleted() {
+        // The positive twin of the three refusals above, dry run included.
+        let row = line(101, "static/vm/vm.pristine-2", U[6], None, None);
+        let (_, dels, o) = marker_case(&row, false, "vm.pristine-2", true);
+        assert!(dels.is_empty(), "a dry run deletes nothing: {dels:?}");
+        assert!(
+            has(&o, Kind::Pruned, "would delete vm.pristine-2"),
+            "{}",
+            o.section(true)
+        );
+    }
+
+    #[test]
+    fn a_delete_that_exits_non_zero_is_a_failure_and_the_marker_and_copy_stay() {
+        // At the start of a pass: an unfinished receive whose delete fails.
+        let partial = line(101, "static/vm/vm.pristine-2", U[6], None, None);
+        let mut fx = Fx::new();
+        standard(&mut fx, std::slice::from_ref(&partial), &[]);
+        let m = fx.mount();
+        let sub = fx.make_dir("static/vm/vm.pristine-2");
+        fx.make_dir("static/vm/.incoming");
+        std::fs::write(fx.marker("vm.pristine-2"), "x").unwrap();
+        fx.answers.push((
+            format!("btrfs subvolume delete {m}/static/vm/vm.pristine-2"),
+            1,
+            String::new(),
+        ));
+        let r = fx.runner();
+        let o = fx.go(&r, false);
+        assert_eq!(deletes(&r).len(), 1, "{:?}", r.calls());
+        assert!(
+            has(&o, Kind::Fail, "could not delete"),
+            "{}",
+            o.section(false)
+        );
+        assert!(o.failed());
+        assert!(
+            !has(&o, Kind::Pruned, "unfinished receive"),
+            "a delete that failed is not reported as done: {}",
+            o.section(false)
+        );
+        assert!(
+            fx.marker("vm.pristine-2").exists() && sub.exists(),
+            "marker and copy are still there"
+        );
+    }
+
+    #[test]
+    fn a_superseded_copy_whose_delete_exits_non_zero_is_a_failure_not_a_prune() {
+        let mut fx = Fx::new();
+        let old = line(101, "static/vm/vm.pristine-1", U[6], None, Some(U[3]));
+        standard(
+            &mut fx,
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&old),
+        );
+        let m = fx.mount();
+        let old_dir = fx.make_dir("static/vm/vm.pristine-1");
+        fx.pipe(
+            &format!("send -p /v/.btrbk-snapshots/vm.1 /v/{PRISTINE}"),
+            (0, 0),
+            Some("vm.pristine-2"),
+        );
+        fx.show("vm.pristine-2", Some(U[1]), true);
+        let new = line(102, "static/vm/vm.pristine-2", U[6], None, Some(U[1]));
+        let after = [
+            line(100, "vm/vm.1", U[6], None, Some(U[0])),
+            old.clone(),
+            new,
+        ];
+        fx.list(&m, &after, &after);
+        fx.answers.push((
+            format!("btrfs subvolume delete {m}/static/vm/vm.pristine-1"),
+            1,
+            String::new(),
+        ));
+        let r = fx.runner();
+        let o = fx.go(&r, false);
+        assert_eq!(deletes(&r).len(), 1, "{:?}", r.calls());
+        assert!(
+            has(&o, Kind::Fail, "vm.pristine-1: could not delete"),
+            "{}",
+            o.section(false)
+        );
+        assert!(o.failed());
+        assert!(
+            !has(&o, Kind::Pruned, "vm.pristine-1"),
+            "{}",
+            o.section(false)
+        );
+        assert!(old_dir.exists(), "the copy is still there");
+    }
+
+    #[test]
+    fn delete_subvolume_reports_the_exit_status_and_refuses_what_is_not_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let argv = format!("btrfs subvolume delete {}", sub.display());
+        // Exit 0: done.
+        let ok = Scripted::new(&[(&argv, 0, "")]);
+        assert_eq!(delete_subvolume(&ok, &sub), Ok(()));
+        assert_eq!(ok.calls(), [argv.clone()]);
+        // Exit 1 (also what an unscripted command does): an error naming it.
+        let failing = Scripted::new(&[(&argv, 1, "")]);
+        let err = delete_subvolume(&failing, &sub).unwrap_err();
+        assert!(err.contains("could not delete"), "{err}");
+        assert!(delete_subvolume(&Scripted::new(&[]), &sub).is_err());
+        // Not a real directory: no command at all.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let never = Scripted::new(&[]);
+        assert!(delete_subvolume(&never, &file).is_err());
+        assert!(delete_subvolume(&never, &dir.path().join("absent")).is_err());
+        assert!(never.calls().is_empty(), "{:?}", never.calls());
+    }
+
+    // ---- an I/O error that is not "absent" is a refusal ---------------------
+
+    #[test]
+    fn path_is_clean_refuses_a_component_that_is_not_a_directory_and_one_it_cannot_examine() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing there yet is fine, at any depth.
+        assert_eq!(path_is_clean(dir.path(), "static/vm"), Ok(()));
+        // A regular file as the LAST component (a mutant that lets it pass
+        // would then return Ok: nothing lies beyond it).
+        std::fs::create_dir(dir.path().join("static")).unwrap();
+        std::fs::write(dir.path().join("static/vm"), "x").unwrap();
+        let err = path_is_clean(dir.path(), "static/vm").unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+        // A regular file in the middle.
+        let err = path_is_clean(dir.path(), "static/vm/deeper").unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+        // A symlink is refused as one.
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("link")).unwrap();
+        assert!(
+            path_is_clean(dir.path(), "link/x")
+                .unwrap_err()
+                .contains("symlink")
+        );
+        // An error that is not NotFound: the mount itself is a regular file,
+        // so looking beneath it fails with NotADirectory. Never read as
+        // "absent, fine".
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let err = path_is_clean(&file, "static").unwrap_err();
+        assert!(err.contains("could not be examined"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_marker_directory_is_an_error_never_no_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        // `dir` is a regular file, so `<dir>/.incoming` cannot be read: the
+        // error is NotADirectory, not NotFound.
+        let file = dir.path().join("subdir-is-a-file");
+        std::fs::write(&file, "x").unwrap();
+        let marker_dir = file.join(MARKER_DIR);
+        let runner = Scripted::new(&[]);
+        let env = Env {
+            runner: &runner,
+            is_mountpoint: &|_| true,
+            verify: &|_, _| Ok(()),
+        };
+        let mut rep = TableReport {
+            head: String::new(),
+            lines: Vec::new(),
+        };
+        let err = clear_interrupted(&table(), &[], &file, &marker_dir, false, &env, &mut rep)
+            .unwrap_err();
+        assert!(err.contains("could not be read"), "{err}");
+        // And the genuinely absent directory is "no markers".
+        let absent = dir.path().join("nothing-here").join(MARKER_DIR);
+        assert_eq!(
+            clear_interrupted(&table(), &[], dir.path(), &absent, false, &env, &mut rep),
+            Ok(false)
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn send_one_refuses_a_destination_it_cannot_examine_and_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The receive directory is a regular file: the destination under it
+        // cannot be examined (NotADirectory, not NotFound). `mount`/`subdir`
+        // name a path that is clean, so only the destination check can stop it.
+        let file = dir.path().join("receive-dir-is-a-file");
+        std::fs::write(&file, "x").unwrap();
+        let marker_dir = file.join(MARKER_DIR);
+        let runner = Scripted::new(&[]);
+        let env = Env {
+            runner: &runner,
+            is_mountpoint: &|_| true,
+            verify: &|_, _| Ok(()),
+        };
+        let err = send_one(
+            "vm.pristine-2",
+            U[1],
+            Path::new("/v/.snapshots/vm.pristine-2"),
+            None,
+            (&file, &marker_dir),
+            dir.path(),
+            "absent-subdir",
+            &env,
+        )
+        .unwrap_err();
+        assert!(err.contains("could not be examined"), "{err}");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    // ---- the details the pass reads and the line it prints ------------------
+
+    #[test]
+    fn show_refuses_a_uuid_that_is_not_one() {
+        let text = |uuid: &str| {
+            format!("x\n\tUUID: \t\t\t{uuid}\n\tReceived UUID: \t\t-\n\tFlags: \t\t\treadonly\n")
+        };
+        assert!(parse_show(&text("63d7331e-1758-a74c-a7a6-da65eeaca50a")).is_ok());
+        for bad in ["nonsense", "-", "", "63d7331e-1758-a74c-a7a6"] {
+            assert!(parse_show(&text(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_current_copy_is_named_plainly_and_a_renamed_one_says_what_it_is_called() {
+        // The copy has the candidate's own name: the bare name.
+        let mut fx = Fx::new();
+        let copy = line(101, "static/vm/vm.pristine-2", U[6], None, Some(U[1]));
+        standard(
+            &mut fx,
+            std::slice::from_ref(&copy),
+            std::slice::from_ref(&copy),
+        );
+        let r = fx.runner();
+        let o = fx.go(&r, false);
+        assert!(
+            kinds(&o).contains(&(Kind::Current, "vm.pristine-2".to_string())),
+            "{}",
+            o.section(false)
+        );
+        // The copy of it is on the target under another name.
+        let mut fx = Fx::new();
+        let renamed = line(101, "static/vm/renamed.copy", U[6], None, Some(U[1]));
+        standard(
+            &mut fx,
+            std::slice::from_ref(&renamed),
+            std::slice::from_ref(&renamed),
+        );
+        let r = fx.runner();
+        let o = fx.go(&r, false);
+        assert!(
+            kinds(&o).contains(&(
+                Kind::Current,
+                "vm.pristine-2 (the copy is named renamed.copy)".to_string()
+            )),
+            "{}",
+            o.section(false)
+        );
+        assert!(pipes(&r).is_empty() && deletes(&r).is_empty());
+    }
+
+    #[test]
+    fn a_step_is_failed_only_when_it_ran_and_a_failure_is_in_it() {
+        assert!(!StaticStep::NotRun.failed());
+        let clean = StaticStep::from_outcome(&Outcome::default(), false);
+        assert!(!clean.failed());
+        let ok = Outcome {
+            tables: vec![TableReport {
+                head: "h".into(),
+                lines: vec![(Kind::Sent, "a".into()), (Kind::Warn, "w".into())],
+            }],
+        };
+        assert!(!StaticStep::from_outcome(&ok, false).failed());
+        let mut bad = ok.clone();
+        bad.tables[0].lines.push((Kind::Fail, "boom".into()));
+        assert!(StaticStep::from_outcome(&bad, false).failed());
+        assert!(StaticStep::from_outcome(&bad, true).failed());
+    }
 }

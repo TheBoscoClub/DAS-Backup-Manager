@@ -12383,6 +12383,46 @@ Legend:
     }
 
     #[test]
+    fn system_host_static_send_is_ok_with_nothing_configured_and_an_error_when_a_table_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = system_host(dir.path());
+        // No static table: nothing runs, nothing fails.
+        let progress = TestProgress::new();
+        let config = make_test_config();
+        assert_eq!(host.static_send(&config, true, &progress), Ok(()));
+        assert!(progress.logs.lock().unwrap().is_empty());
+
+        // A table whose source volume is not mounted (a path that does not
+        // exist: the pass stops at "not mounted" before any `btrfs` runs):
+        // the step is an error carrying the prefix and the failure.
+        let mut config = make_test_config();
+        config.sources[0].volume = dir
+            .path()
+            .join("no-such-volume")
+            .to_string_lossy()
+            .into_owned();
+        config.sources[0].static_subvolumes = vec![crate::config::StaticSubvolumes {
+            dir: ".snapshots".into(),
+            pattern: "*.pristine-*".into(),
+            target_subdir: "static/vm".into(),
+        }];
+        let progress = TestProgress::new();
+        let err = host.static_send(&config, false, &progress).unwrap_err();
+        assert!(err.starts_with(static_send::ERROR_PREFIX), "{err}");
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(err.contains("is not mounted"), "{err}");
+        assert!(
+            progress
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, m)| m.contains("STATIC SUBVOLUMES")),
+            "the section is logged"
+        );
+    }
+
+    #[test]
     fn system_host_records_the_run_in_backup_runs() {
         let dir = tempfile::tempdir().unwrap();
         let host = system_host(dir.path());
