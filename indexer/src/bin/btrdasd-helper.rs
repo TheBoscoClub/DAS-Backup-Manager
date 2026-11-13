@@ -344,6 +344,9 @@ fn canonical_db_path() -> Result<String, fdo::Error> {
 /// The `JobMap` kind of a `RecoveryOsSession` job.
 const SESSION_KIND: &str = "recovery-os-session";
 
+/// The `JobMap` kind of a `RecoveryOsRecord` job (bd DAS-Backup-Manager-5j2x).
+const RECORD_KIND: &str = "recovery-os-record";
+
 /// The scheduled-session services a session must not overlap: one per
 /// `role = "mirror"` target, and the one that runs both.
 fn update_unit_names(cfg: &Config) -> Vec<String> {
@@ -373,6 +376,13 @@ fn session_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<String>
             "a recovery-OS session is already running as job {id}"
         ));
     }
+    // A record job has a recovery drive mounted: no session may take it, and
+    // no second record may mount it again.
+    if let Some((id, _)) = jobs.iter().find(|(_, kind)| *kind == RECORD_KIND) {
+        return Some(format!(
+            "a recovery-OS record is already running as job {id}"
+        ));
+    }
     units
         .iter()
         .find(|(_, state)| !matches!(*state, "inactive" | "failed"))
@@ -395,10 +405,43 @@ fn session_end_busy(jobs: &[(&str, &str)], units: &[(&str, &str)]) -> Option<Str
     session_busy(jobs, units)
 }
 
+/// Why a `RecoveryOsRecord` must not start: whatever keeps a session from
+/// starting ([`session_busy`]: a session or record job, a scheduled session
+/// service), or a `RecoveryOsSessionEnd` in flight (`ends_in_flight`, the
+/// number of [`SessionEndGuard`]s alive). A session end is not a job, and the
+/// disk it gives back must not be mounted under a record.
+fn record_busy(
+    jobs: &[(&str, &str)],
+    units: &[(&str, &str)],
+    ends_in_flight: usize,
+) -> Option<String> {
+    session_busy(jobs, units).or_else(|| {
+        (ends_in_flight > 0).then(|| "a recovery-OS session is being ended".to_string())
+    })
+}
+
+/// A `RecoveryOsSessionEnd` that is running, counted so that a
+/// `RecoveryOsRecord` can see it. Made while the job map's lock is held by the
+/// check that found nothing in the way; the count goes down when it is dropped.
+struct SessionEndGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl SessionEndGuard {
+    fn begin(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for SessionEndGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The polkit action `JobCancel` checks for a job of `kind`: the one that
 /// authorized starting it.
 fn cancel_action(kind: &str) -> &'static str {
-    if kind == SESSION_KIND {
+    if kind == SESSION_KIND || kind == RECORD_KIND {
         "org.dasbackup.recovery-os"
     } else {
         "org.dasbackup.backup"
@@ -1108,6 +1151,8 @@ struct HelperInterface {
     /// the targets (bd DAS-Backup-Manager-5237.16).
     kept_snapshots: Arc<health::KeptSnapshots>,
     health_reply: Arc<SharedReply>,
+    /// `RecoveryOsSessionEnd` calls running now ([`SessionEndGuard`]).
+    session_ends: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[interface(name = "org.dasbackup.Helper1")]
@@ -2249,7 +2294,9 @@ impl HelperInterface {
             .await
             .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
-        {
+        // Marked in flight under the lock that checked, so a record arriving
+        // now sees it (bd DAS-Backup-Manager-5j2x).
+        let _ending = {
             let jobs = self.jobs.lock().await;
             let running: Vec<(&str, &str)> = jobs
                 .iter()
@@ -2262,7 +2309,8 @@ impl HelperInterface {
             if let Some(why) = session_end_busy(&running, &unit_states) {
                 return Err(fdo::Error::Failed(why));
             }
-        }
+            SessionEndGuard::begin(&self.session_ends)
+        };
         let (status, text) = tokio::task::spawn_blocking(move || {
             run_script_merged(
                 Path::new(session::SCRIPT),
@@ -2273,6 +2321,85 @@ impl HelperInterface {
         .map_err(|e| fdo::Error::Failed(format!("The session-end task panicked: {e}")))?
         .map_err(fdo::Error::Failed)?;
         Ok((status.success(), last_lines(&text, 12)))
+    }
+
+    /// Record one recovery drive's OS (`btrdasd recovery-os record <label>`)
+    /// as a job; returns its id. It is the CLI's own library job
+    /// (`backup::record_recovery_os_job`): it takes the backup singleton and
+    /// the maintenance lock itself, defers if either is held, mounts the drive
+    /// read-only, verifies it is the filesystem it must be, reads it, writes
+    /// the boot record and unmounts. The method mounts nothing by any other
+    /// route. `JobFinished` says how it ended (success is the CLI's exit 0;
+    /// 3 and 75 are failures). Refused before anything runs for a label that
+    /// is no configured `role = "mirror"` target, and, naming it, while a
+    /// session job, a record job, a scheduled session service or a
+    /// `RecoveryOsSessionEnd` is running.
+    async fn recovery_os_record(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, "org.dasbackup.recovery-os").await?;
+
+        let label = configured_mirror_label(label)?;
+        let config = load_config()?;
+        let units = update_unit_names(&config);
+        let states = tokio::task::spawn_blocking(move || read_active_states(&units))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("The unit-state task panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+
+        // Held from the check to the insert, so two calls cannot both pass,
+        // and the count of session ends is read under the lock that
+        // `RecoveryOsSessionEnd` raises it under.
+        let mut jobs_guard = self.jobs.lock().await;
+        let running: Vec<(&str, &str)> = jobs_guard
+            .iter()
+            .map(|(id, (_, _, _, kind))| (id.as_str(), *kind))
+            .collect();
+        let unit_states: Vec<(&str, &str)> = states
+            .iter()
+            .map(|(u, s)| (u.as_str(), s.as_str()))
+            .collect();
+        if let Some(why) = record_busy(
+            &running,
+            &unit_states,
+            self.session_ends.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
+            return Err(fdo::Error::Failed(why));
+        }
+
+        let job_id = new_job_id();
+        let progress = job_progress(&self.conn, &job_id);
+        let cancel = progress.clone();
+        let finisher = progress.clone();
+        let jobs = self.jobs.clone();
+        let jid = job_id.clone();
+
+        let handle = tokio::spawn(async move {
+            let (success, summary) = tokio::task::spawn_blocking(move || {
+                backup::record_recovery_os_job(
+                    &backup::SystemRecordHost {
+                        job: "btrdasd-helper RecoveryOsRecord job".into(),
+                    },
+                    &config,
+                    &[label],
+                    &*progress,
+                )
+                .finish_line()
+            })
+            .await
+            .unwrap_or_else(|e| (false, format!("The recovery-OS record task panicked: {e}")));
+            finish_job(finisher, success, summary).await;
+            jobs.lock().await.remove(&jid);
+        });
+
+        jobs_guard.insert(
+            job_id.clone(),
+            (handle, cancel, sender.clone(), RECORD_KIND),
+        );
+        Ok(job_id)
     }
 
     /// Schedule an unattended session of `labels` (one drive, or both) at
@@ -2826,6 +2953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         kept_snapshots: Arc::default(),
         health_reply: Arc::default(),
+        session_ends: Arc::default(),
     };
 
     serve_then_claim_name(&conn, iface, HELPER_NAME).await?;
@@ -3024,6 +3152,7 @@ mod tests {
             ("recovery_os_session", "org.dasbackup.recovery-os"),
             ("recovery_os_session_end", "org.dasbackup.recovery-os"),
             ("recovery_os_console", "org.dasbackup.recovery-os"),
+            ("recovery_os_record", "org.dasbackup.recovery-os"),
             ("recovery_os_schedule_set", "org.dasbackup.recovery-os"),
         ] {
             let method = method_body(body, m);
@@ -3826,6 +3955,108 @@ mod tests {
         );
     }
 
+    // --- RecoveryOsRecord (bd DAS-Backup-Manager-5j2x)
+
+    #[test]
+    fn a_record_is_refused_while_a_session_a_record_or_a_session_end_runs() {
+        let unit = "das-recovery-os-update-system-recovery-B-2tb.service";
+        assert_eq!(record_busy(&[], &[], 0), None);
+        assert_eq!(
+            record_busy(&[("job-1", "backup")], &[(unit, "inactive")], 0),
+            None
+        );
+        assert_eq!(
+            record_busy(&[("job-2", "recovery-os-session")], &[], 0).unwrap(),
+            "a recovery-OS session is already running as job job-2"
+        );
+        assert_eq!(
+            record_busy(&[], &[(unit, "active")], 0).unwrap(),
+            format!("a scheduled recovery-OS session is running: {unit} (active)")
+        );
+        assert_eq!(
+            record_busy(&[("job-3", "recovery-os-record")], &[], 0).unwrap(),
+            "a recovery-OS record is already running as job job-3"
+        );
+        assert_eq!(
+            record_busy(&[], &[], 1).unwrap(),
+            "a recovery-OS session is being ended"
+        );
+        // A running record also keeps a session, and a session end, away.
+        assert_eq!(
+            session_busy(&[("job-3", "recovery-os-record")], &[]).unwrap(),
+            "a recovery-OS record is already running as job job-3"
+        );
+        assert_eq!(
+            session_end_busy(&[("job-3", "recovery-os-record")], &[]).unwrap(),
+            "a recovery-OS record is already running as job job-3"
+        );
+    }
+
+    #[test]
+    fn a_session_end_in_flight_is_counted_until_its_guard_is_dropped() {
+        let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let one = SessionEndGuard::begin(&ends);
+        let two = SessionEndGuard::begin(&ends);
+        assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(one);
+        assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(two);
+        assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_record_method_checks_and_inserts_under_one_job_map_lock_before_it_runs_anything() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let rec = method_body(body, "recovery_os_record");
+        let at = |needle: &str| {
+            rec.find(needle)
+                .unwrap_or_else(|| panic!("recovery_os_record lacks {needle}"))
+        };
+        let (mirror, states, lock, busy, spawn, insert) = (
+            at("configured_mirror_label("),
+            at("read_active_states("),
+            at("let mut jobs_guard = self.jobs.lock().await"),
+            at("record_busy("),
+            at("tokio::spawn("),
+            at("jobs_guard.insert("),
+        );
+        assert!(mirror < states && states < lock && lock < busy && busy < spawn && spawn < insert);
+        let ends = at("self.session_ends.load(");
+        assert!(
+            busy < ends && ends < spawn,
+            "the session-end count is read inside the check, under the same lock"
+        );
+        assert!(
+            rec.matches("self.jobs.lock()").count() == 1,
+            "the job map is locked once, never locked again to insert"
+        );
+        // It runs the library's job, with the system host, for one label.
+        assert!(rec.contains("backup::record_recovery_os_job("));
+        assert!(rec.contains("backup::SystemRecordHost"));
+        assert!(rec.contains("RECORD_KIND"));
+        // The job's kind is authorized by the recovery-OS action on cancel.
+        assert_eq!(cancel_action(RECORD_KIND), "org.dasbackup.recovery-os");
+    }
+
+    #[test]
+    fn a_session_end_marks_itself_in_flight_under_the_lock_that_checked_the_job_map() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let end = method_body(body, "recovery_os_session_end");
+        let at = |needle: &str| {
+            end.find(needle)
+                .unwrap_or_else(|| panic!("recovery_os_session_end lacks {needle}"))
+        };
+        let (lock, check, mark, run) = (
+            at("self.jobs.lock()"),
+            at("session_end_busy("),
+            at("SessionEndGuard::begin("),
+            at("run_script_merged("),
+        );
+        assert!(lock < check && check < mark && mark < run);
+    }
+
     #[test]
     fn the_polkit_policy_declares_the_recovery_os_action_as_auth_admin_keep() {
         let policy = include_str!("../../../polkit/org.dasbackup.policy");
@@ -4403,6 +4634,7 @@ mod tests {
             stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             kept_snapshots: Arc::default(),
             health_reply: Arc::default(),
+            session_ends: Arc::default(),
         };
         server
             .object_server()
@@ -4542,6 +4774,9 @@ mod tests {
 <method name="RecoveryOsSessionEnd">
 <arg name="label" type="s" direction="in"/>
 <arg type="b" direction="out"/>
+<arg type="s" direction="out"/>
+<method name="RecoveryOsRecord">
+<arg name="label" type="s" direction="in"/>
 <arg type="s" direction="out"/>
 <method name="RecoveryOsScheduleSet">
 <arg name="labels" type="as" direction="in"/>
