@@ -24,7 +24,7 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 | `serde_json` | 1.0.154 | JSON parsing for `lsblk --json` output in system detection and for SMART/health readings and the scrub state file | MIT / Apache-2.0 |
 | `clap_complete` | 4.6.11 | Shell completion generation for bash, zsh, fish, elvish, and PowerShell | MIT / Apache-2.0 |
 | `tokio` | 1.54.1 | Async runtime for `btrdasd-helper` D-Bus daemon; job execution with cancellation (optional, `dbus` feature) | MIT |
-| `zbus` | 5.19.0 | D-Bus implementation for `btrdasd-helper` system bus daemon (optional, `dbus` feature) | MIT |
+| `zbus` | 6.2.1 | D-Bus implementation for `btrdasd-helper` system bus daemon (optional, `dbus` feature) | MIT |
 
 ### Dev Dependencies (test only)
 
@@ -32,6 +32,7 @@ These are the direct dependencies declared in `indexer/Cargo.toml` for the
 | --- | --- | --- | --- |
 | `tempfile` | 3.27.0 | Creates temporary files and directories for integration tests | MIT / Apache-2.0 |
 | `filetime` | 0.2.29 | Sets file modification timestamps in tests to simulate incremental indexing | MIT / Apache-2.0 |
+| `zbus` | 6.2.1 | The same crate with its `p2p` feature, so the helper interface test serves it over a socket pair instead of a bus (bd `DAS-Backup-Manager-o3zk`) | MIT |
 
 ### Notable Transitive Dependencies
 

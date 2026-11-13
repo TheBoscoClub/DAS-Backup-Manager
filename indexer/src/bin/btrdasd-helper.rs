@@ -172,7 +172,7 @@ async fn finish_job(progress: Arc<OrderedProgress>, success: bool, summary: Stri
 
 /// The steps dictionary as (key, value) pairs; a value that is not a
 /// boolean becomes `None`, which `RunSteps::from_entries` refuses.
-fn step_entries(map: HashMap<String, zbus::zvariant::OwnedValue>) -> Vec<(String, Option<bool>)> {
+fn step_entries(map: HashMap<String, zbus::OwnedVariant>) -> Vec<(String, Option<bool>)> {
     map.into_iter()
         .map(|(key, value)| (key, bool::try_from(&value).ok()))
         .collect()
@@ -198,8 +198,8 @@ fn parse_mode(mode: &str) -> Result<BackupMode, String> {
 async fn check_polkit(conn: &Connection, sender: &str, action_id: &str) -> Result<(), fdo::Error> {
     // Subject: ("system-bus-name", { "name" => sender })
     let subject_kind = "system-bus-name";
-    let subject_details: HashMap<&str, zbus::zvariant::Value<'_>> =
-        HashMap::from([("name", zbus::zvariant::Value::from(sender))]);
+    let subject_details: HashMap<&str, zbus::Variant<'_>> =
+        HashMap::from([("name", zbus::Variant::from(sender))]);
 
     // Empty details dict for the action.
     let details: HashMap<&str, &str> = HashMap::new();
@@ -1149,7 +1149,7 @@ impl HelperInterface {
         sources: Vec<String>,
         targets: Vec<String>,
         dry_run: bool,
-        steps: HashMap<String, zbus::zvariant::OwnedValue>,
+        steps: HashMap<String, zbus::OwnedVariant>,
     ) -> fdo::Result<String> {
         let sender = sender_from_header(&header)?;
         check_polkit(&self.conn, &sender, "org.dasbackup.backup").await?;
@@ -2817,7 +2817,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
 
     // Build the system D-Bus connection and serve the interface.
-    let conn = Builder::system()?.build().await?;
+    let conn = Builder::system().build().await?;
 
     let iface = HelperInterface {
         jobs: jobs.clone(),
@@ -3907,15 +3907,15 @@ mod tests {
 
     #[test]
     fn a_step_value_that_is_not_a_boolean_reaches_the_library_as_none() {
-        use zbus::zvariant::{OwnedValue, Value};
+        use zbus::{OwnedVariant, Variant};
         let mut map = std::collections::HashMap::new();
         map.insert(
             "index".to_string(),
-            OwnedValue::try_from(Value::from(true)).unwrap(),
+            OwnedVariant::try_from(Variant::from(true)).unwrap(),
         );
         map.insert(
             "email".to_string(),
-            OwnedValue::try_from(Value::from("yes")).unwrap(),
+            OwnedVariant::try_from(Variant::from("yes")).unwrap(),
         );
         let mut got = step_entries(map);
         got.sort();
@@ -4383,6 +4383,179 @@ mod tests {
             }
             other => panic!("{job:?} must end with Finished, got {other:?}"),
         }
+    }
+
+    // --- the interface the GUI sees is pinned (bd DAS-Backup-Manager-o3zk)
+
+    /// Serves a `HelperInterface` over a peer-to-peer connection on a socket
+    /// pair (no bus, so never the live helper) and returns the lines of the
+    /// introspection XML that name the interface's members and their types.
+    async fn introspected_members() -> Vec<String> {
+        let (server_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let guid = zbus::Guid::from_static_str("0123456789abcdef0123456789abcdef").unwrap();
+        let server = Builder::unix_stream(server_end).server(guid).p2p();
+        let client = Builder::unix_stream(client_end).p2p();
+        let (server, client) = tokio::try_join!(server.build(), client.build()).unwrap();
+        let iface = HelperInterface {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            conn: server.clone(),
+            stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            stats_refresh_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            kept_snapshots: Arc::default(),
+            health_reply: Arc::default(),
+        };
+        server
+            .object_server()
+            .at("/org/dasbackup/Helper1", iface)
+            .await
+            .unwrap();
+        // `at` returns before the dispatch task listens; ask until answered.
+        let mut xml = None;
+        for _ in 0..40 {
+            let call = client.call_method(
+                None::<&str>,
+                "/org/dasbackup/Helper1",
+                Some("org.freedesktop.DBus.Introspectable"),
+                "Introspect",
+                &(),
+            );
+            if let Ok(Ok(reply)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), call).await
+            {
+                xml = Some(reply.body().deserialize::<String>().unwrap());
+                break;
+            }
+        }
+        let xml = xml.expect("the object server never answered Introspect");
+        let start = xml
+            .find("<interface name=\"org.dasbackup.Helper1\">")
+            .expect("interface org.dasbackup.Helper1 missing");
+        let rest = &xml[start..];
+        let rest = &rest[..rest.find("</interface>").unwrap()];
+        rest.lines()
+            .map(str::trim)
+            .filter(|l| {
+                ["<method", "<signal", "<arg", "<property"]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_interface_names_methods_signals_and_signatures_the_gui_calls() {
+        // Recorded from the zbus 5 helper before the move to zbus 6: every
+        // signal and method, its argument names and D-Bus types, in order.
+        // The GUI (`gui/src/dbusclient.cpp`) depends on exactly these.
+        const EXPECTED: &str = r#"<signal name="JobProgress">
+<arg name="job_id" type="s"/>
+<arg name="stage" type="s"/>
+<arg name="percent" type="i"/>
+<arg name="message" type="s"/>
+<signal name="JobLog">
+<arg name="job_id" type="s"/>
+<arg name="level" type="s"/>
+<arg name="message" type="s"/>
+<signal name="JobFinished">
+<arg name="job_id" type="s"/>
+<arg name="success" type="b"/>
+<arg name="summary" type="s"/>
+<method name="BackupRun">
+<arg name="mode" type="s" direction="in"/>
+<arg name="sources" type="as" direction="in"/>
+<arg name="targets" type="as" direction="in"/>
+<arg name="dry_run" type="b" direction="in"/>
+<arg name="steps" type="a{sv}" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="IndexWalk">
+<arg name="target_path" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="IndexStats">
+<arg type="s" direction="out"/>
+<method name="IndexListSnapshots">
+<arg type="s" direction="out"/>
+<method name="IndexListFiles">
+<arg name="snapshot_id" type="x" direction="in"/>
+<arg name="limit" type="x" direction="in"/>
+<arg name="offset" type="x" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="IndexSearch">
+<arg name="query" type="s" direction="in"/>
+<arg name="limit" type="x" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="IndexBackupHistory">
+<arg name="limit" type="x" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="IndexSnapshotPath">
+<arg name="snapshot_id" type="x" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="RestoreFiles">
+<arg name="snapshot" type="s" direction="in"/>
+<arg name="dest" type="s" direction="in"/>
+<arg name="files" type="as" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="RestoreSnapshot">
+<arg name="snapshot" type="s" direction="in"/>
+<arg name="dest" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="ConfigGet">
+<arg type="s" direction="out"/>
+<method name="PanelConfigGet">
+<arg type="s" direction="out"/>
+<method name="ConfigCheck">
+<arg name="toml_content" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="ConfigSet">
+<arg name="toml_content" type="s" direction="in"/>
+<method name="ScheduleGet">
+<arg type="s" direction="out"/>
+<method name="ScheduleSet">
+<arg name="incremental" type="s" direction="in"/>
+<arg name="full" type="s" direction="in"/>
+<arg name="delay" type="u" direction="in"/>
+<method name="ScheduleEnable">
+<arg name="enabled" type="b" direction="in"/>
+<method name="SubvolAdd">
+<arg name="source" type="s" direction="in"/>
+<arg name="name" type="s" direction="in"/>
+<method name="SubvolRemove">
+<arg name="source" type="s" direction="in"/>
+<arg name="name" type="s" direction="in"/>
+<method name="CoverageList">
+<arg type="s" direction="out"/>
+<method name="CoverageAccept">
+<arg name="volume" type="s" direction="in"/>
+<arg name="subvolume" type="s" direction="in"/>
+<arg name="target" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="HealthQuery">
+<arg type="s" direction="out"/>
+<method name="RecoveryOsStatus">
+<arg type="s" direction="out"/>
+<method name="RecoveryOsSession">
+<arg name="labels" type="as" direction="in"/>
+<arg name="unattended" type="b" direction="in"/>
+<arg name="mode" type="s" direction="in"/>
+<arg name="accept_boot_record_risk" type="b" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="RecoveryOsSessionEnd">
+<arg name="label" type="s" direction="in"/>
+<arg type="b" direction="out"/>
+<arg type="s" direction="out"/>
+<method name="RecoveryOsScheduleSet">
+<arg name="labels" type="as" direction="in"/>
+<arg name="at_epoch" type="x" direction="in"/>
+<arg name="mode" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="RecoveryOsConsole">
+<arg name="label" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="JobCancel">
+<arg name="job_id" type="s" direction="in"/>
+<arg type="b" direction="out"/>"#;
+        let members = introspected_members().await;
+        assert_eq!(members.join("\n"), EXPECTED);
     }
 
     #[test]

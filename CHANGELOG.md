@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`btrdasd-helper` moved to `zbus` 6** (bd `DAS-Backup-Manager-o3zk`): `zbus` 5.19.0 to 6.2.1, which folds `zvariant`, `zbus_names` and `zvariant_derive` into itself, so the three RustSec "unmaintained" ignores in `indexer/deny.toml` (`RUSTSEC-2026-0370`, `-0371`, `-0372`) are gone and `cargo deny` passes without them
+  - Source changes are the renames only: `zvariant::Value` / `OwnedValue` are `zbus::Variant` / `OwnedVariant`, and `Builder::system()` no longer returns a `Result` (its error comes out of `build()`)
+  - The bus name, object path, interface, method names, signatures and signals are unchanged: a new helper test serves the interface over a socket pair, never a bus, and pins every member and its D-Bus signature, recorded from the `zbus` 5 helper before the move
+
 - **`nodev,nosuid,noexec` are recommended for the backup targets' mounts** (bd `DAS-Backup-Manager-20q`): `docs/INSTALL.md` now says so for `[das].mount_opts`. A target holds copies of every device node and setuid binary of the backed-up system; with the options, `btrfs receive` and a restore still keep them intact, while opening a device node or running anything from the mounted target is refused. Proven on a loop device and on a full backup run, a restore and a walk
 
 - **The systemd units `btrdasd setup` generates live in a directory of their own, linked into systemd** (bd `DAS-Backup-Manager-5237.7`, operator decision 2026-11-09): the eight `das-*.{service,timer}` units sat loose in `/etc/systemd/system` among everything else there, so they could not be versioned as one directory
