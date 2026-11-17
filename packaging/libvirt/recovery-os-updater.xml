@@ -86,8 +86,11 @@
     <!-- virtio NIC on the NAT network `default`, for the pacman mirrors. The
          guest loads virtio_net from its own module tree once its root is
          mounted; nothing earlier needs the network. -->
-    <!-- Boot order 2: the network only after the disk. It is here even more
-         for what it prevents: libvirt gives a domain defined with no boot
+    <!-- Boot order 9: the network after every device a session or provision
+         attaches. libvirt refuses an attach whose boot order another device
+         already holds, and provision attaches orders 1 to 3 (bd eg4j.2), so
+         this number stays clear of them. It is here even more for what it
+         prevents: libvirt gives a domain defined with no boot
          element at all an os-level boot device (hd), and an os-level boot
          device refuses the disk's per-device boot order when a session
          attaches it ("per-device boot elements cannot be used together with
@@ -101,7 +104,7 @@
       <mac address='52:54:00:8a:60:e1'/>
       <source network='default'/>
       <model type='virtio'/>
-      <boot order='2'/>
+      <boot order='9'/>
     </interface>
     <serial type='pty'>
       <target type='isa-serial' port='0'>

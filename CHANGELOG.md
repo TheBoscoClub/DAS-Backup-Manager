@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`RecoveryOsSession` is refused while a `RecoveryOsSessionEnd` is in flight** (bd `DAS-Backup-Manager-1ley`): the session end releases the job map's lock before its script runs, so a session started in that window was not refused by the helper (the script's own lock backstopped only the case with a disk to give back; a session end with nothing attached could remove the new session's console bridge or egress rule)
   - The session method now asks the same check as `RecoveryOsRecord` (`record_busy`: a session or record job, a scheduled session service, or a session end counted by its in-flight guard), made under the lock that then inserts the session's job; the refusal reads "a recovery-OS session is being ended"
 
+- **`provision` no longer stops at its first attach with `boot order 2 is already used by another device`** (bd `DAS-Backup-Manager-eg4j.2`): the domain template gave its NIC boot order 2, and provision attaches the drive at 2 for the install boot and the payload at 2 for the first boot; libvirt refuses a second device with one order, and the suite's `virsh` stub never did
+  - The NIC carries boot order 9, clear of the 1 to 3 that a session and provision attach; it still keeps a per-device boot element, so libvirt never fills in an os-level boot device
+  - `tests/test_recovery_os_vm.sh` reads the NIC's order from the template and fails when any provision or session attach uses it
+
 ## [0.7.24.0] - 2026-11-12
 
 ### Added

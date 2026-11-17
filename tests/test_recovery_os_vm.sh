@@ -1503,8 +1503,8 @@ lacks "no disk of its own" "$(cat "$xml")" "<disk"
 # when a session attaches it ("per-device boot elements cannot be used
 # together with os/boot elements") -- found on the real host.
 lacks "no boot device under <os>" "$(sed -n '/<os>/,/<\/os>/p' "$xml")" "<boot dev="
-has "the NIC carries a per-device boot order, after the disk" \
-    "$(sed -n '/<interface /,/<\/interface>/p' "$xml")" "<boot order='2'/>"
+matches "the NIC carries a per-device boot order" \
+    "$(sed -n '/<interface /,/<\/interface>/p' "$xml")" "<boot order='[0-9][0-9]*'/>"
 lacks "boot order 1 is left for the disk" "$(cat "$xml")" "<boot order='1'/>"
 # Every session defines the domain anew (with the guard, then without): the
 # guest's network card must keep one address.
@@ -1853,6 +1853,8 @@ has "session: whole disk by id" "$attached" "<source dev='$DISK_A'/>"
 has "session: block device, raw, no host cache, native AIO" "$attached" "<driver name='qemu' type='raw' cache='none' io='native'/>"
 has "session: SATA" "$attached" "<target dev='sda' bus='sata'/>"
 has "session: first in the boot order" "$attached" "<boot order='1'/>"
+lacks "session: the disk's boot order is not the NIC's" "$attached" \
+    "<boot order='$(sed -n "/<interface /,/<\/interface>/s/.*<boot order='\([0-9]*\)'\/>.*/\1/p" "$REPO/packaging/libvirt/recovery-os-updater.xml")'/>"
 has "session: attached to the persistent definition" "$(file "$S/virsh.calls")" "attach-device recovery-os-updater-system-recovery-A-2tb"
 check "session: events in order" "$(events)" \
     "holder in its own session|holder started (lock held)|virsh define|virsh attach|virsh start|virsh resume|virsh detach|virsh define|holder released|btrfs scan (lock held)|"
@@ -4496,7 +4498,7 @@ has "define over a stored os-level boot: says it updates" "$OUT" "updating recov
 has "define over a stored os-level boot: redefined from the template" "$(file "$S/virsh.calls")" \
     "define --validate $STATE/system-recovery-A-2tb.plain.xml"
 lacks "define over a stored os-level boot: what libvirt is handed has none" "$(file "$S/defined.xml")" "<boot dev="
-has "define over a stored os-level boot: what libvirt is handed boots per device" "$(file "$S/defined.xml")" "<boot order='2'/>"
+has "define over a stored os-level boot: what libvirt is handed boots per device" "$(file "$S/defined.xml")" "<boot order='9'/>"
 
 fixture
 printf 'running\n' >"$S/states"
@@ -6154,6 +6156,13 @@ has "provision: the disk at boot order 2 for the install" "$(file "$S/attach.log
   <boot order='2'/>"
 has "provision: the disk at boot order 1 for the first boot" "$(file "$S/attach.log")" "<target dev='sda' bus='sata'/>
   <boot order='1'/>"
+# libvirt refuses an attach whose boot order another device of the domain
+# already holds ("boot order 2 is already used by another device") -- found
+# on a scratch drive (bd eg4j.2): the NIC's order must be one no attach uses,
+# at the install boot or at the first boot.
+nic_order="$(sed -n "/<interface /,/<\/interface>/s/.*<boot order='\([0-9]*\)'\/>.*/\1/p" "$REPO/packaging/libvirt/recovery-os-updater.xml")"
+matches "provision: the template's NIC has a boot order to compare" "$nic_order" "^[0-9][0-9]*$"
+lacks "provision: no attach takes the NIC's boot order" "$(file "$S/attach.log")" "<boot order='$nic_order'/>"
 matches "provision: the live ISO detached between the two starts" "$(prov_events)" "virsh start\|.*virsh detach cdrom $ISO\|.*virsh start\|"
 matches "provision: started twice" "$(grep -c '^virsh start' "$S/events")" "^2$"
 has "provision: replace-os gets the UUID" "$(file "$S/stage.replace-os.sh")" "DAS_INSTALL_UUID=5eed0008-0000-4000-8000-000000000008"
