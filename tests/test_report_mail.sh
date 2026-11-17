@@ -186,7 +186,7 @@ derive SENDS "the send's error" "$REPORT_RS" \
 # The job the helper's BackupRun hands SystemBackupHost::new, which mails the
 # GUI's reports: the helper carries it, btrdasd does not.
 derive HELPER_JOB "the helper's job" "$HELPER_RS" \
-    "                    &backup::SystemBackupHost::new(" "                    )," after
+    "                            &backup::SystemBackupHost::new(" "                            )," after
 ran() { if [[ -f "$REC/args" ]]; then echo yes; else echo no; fi; }
 
 # The PATH the run gets resolves mailx to the stub.
