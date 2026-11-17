@@ -523,7 +523,8 @@ step_boot() {
         [[ -f "$p" ]] || continue
         found=1
         grep -q "^PRESETS=(.*'fallback'" "$p" && continue
-        if ! grep -qx "PRESETS=('default')" "$p" || grep -q '^fallback_' "$p"; then
+        grep -qx "PRESETS=('default')" "$p" || cannot "${p##*/} has no fallback image and is not of the shape this edits"
+        if grep -q '^fallback_' "$p"; then
             cannot "${p##*/} has no fallback image and is not of the shape this edits"
         fi
         def=$(sed -n 's/^default_image="\(.*\)\.img"$/\1/p' "$p")
