@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The suite's fixture carried an old busybox `HOOKS` line; the new cases use mkinitcpio 42's own
 
 - **`provision` builds the initramfs image its Fallback entry boots** (bd `DAS-Backup-Manager-eg4j.4`): `linux-cachyos`'s preset lists the default image only, so `mkinitcpio -P` never built `initramfs-linux-cachyos-fallback.img` and `verify` would have stopped the provision; the boot step adds `'fallback'`, `fallback_image` and `fallback_options="-S autodetect"` to a preset of that stock shape, as a session already does, and refuses any other shape, or no preset, before `bootctl install`
+- **`provision`'s `verify` can read the config it copies into the new OS** (bd `DAS-Backup-Manager-eg4j.6`): `recovery-os-install.sh` (1.5.4) put the copy in the target's `/tmp`, which `arch-chroot` covers with a fresh tmpfs, so `btrdasd recovery-os inspect` found nothing and the provision stopped at `verify`; the copy now goes to the target's `/root` and is removed after, as before
 
 ## [0.7.24.0] - 2026-11-12
 

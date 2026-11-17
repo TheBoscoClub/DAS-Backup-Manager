@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.3
+# Version: 1.5.4
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -585,12 +585,14 @@ step_verify() {
     ((missing == 0)) || refuse "verify: a file or device is missing (above)"
     # btrdasd is installed in the TARGET, not in the live system. inspect needs
     # a config.toml (a fresh target has none until its first boot derives one),
-    # so the payload's is copied in for the call and removed after. Exit 1 is
-    # "needs attention" (a reading was made); only 2 is "could not read".
-    mkdir -p "$TARGET/tmp"
-    cp "$CONFIG" "$TARGET/tmp/das-install-inspect.toml" || cannot "cannot copy $CONFIG into the target"
-    rec=$("$CHROOT" "$TARGET" btrdasd recovery-os inspect --root / --label "system-recovery-$LETTER-2tb" --config /tmp/das-install-inspect.toml 2>&1) || rc=$?
-    rm -f "${TARGET:?}/tmp/das-install-inspect.toml"
+    # so the payload's is copied in for the call and removed after. Not into
+    # /tmp: arch-chroot mounts a fresh tmpfs there (and on /run, /dev, /proc,
+    # /sys), so a copy put there from outside is not seen inside (bd eg4j.6).
+    # Exit 1 is "needs attention" (a reading was made); only 2 is "could not read".
+    mkdir -p "$TARGET/root"
+    cp "$CONFIG" "$TARGET/root/das-install-inspect.toml" || cannot "cannot copy $CONFIG into the target"
+    rec=$("$CHROOT" "$TARGET" btrdasd recovery-os inspect --root / --label "system-recovery-$LETTER-2tb" --config /root/das-install-inspect.toml 2>&1) || rc=$?
+    rm -f "${TARGET:?}/root/das-install-inspect.toml"
     ((rc <= 1)) || cannot "btrdasd recovery-os inspect failed ($rc): $rec"
     say "$rec"
     grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+no([[:space:]]|$)' <<<"$rec" || refuse "the new root's boot record is not 'no'"

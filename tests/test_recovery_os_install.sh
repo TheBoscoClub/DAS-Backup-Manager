@@ -60,7 +60,17 @@ cat >"$BIN/arch-chroot" <<'EOF'
 #!/bin/bash
 echo "arch-chroot $*" >>"$STUB_LOG"
 [[ -z "${STUB_arch_chroot_FAILS:-}" ]] || exit 1
-if [[ "$2" == btrdasd ]]; then cat "$STUB_INSPECT"; exit "${STUB_INSPECT_RC:-0}"; fi
+if [[ "$2" == btrdasd ]]; then
+    # The real arch-chroot mounts fresh /tmp, /run, /dev, /proc and /sys over the
+    # target's (bd eg4j.6): a file put there from outside is not seen inside.
+    root=$1 cfg=""
+    while (($#)); do [[ "$1" == --config ]] && cfg=$2; shift; done
+    case "$cfg" in
+        /tmp/* | /run/* | /dev/* | /proc/* | /sys/*) echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2 ;;
+    esac
+    [[ -f "$root$cfg" ]] || { echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2; }
+    cat "$STUB_INSPECT"; exit "${STUB_INSPECT_RC:-0}"
+fi
 EOF
 cat >"$BIN/blkid" <<'EOF'
 #!/bin/bash
@@ -548,8 +558,8 @@ vfix() { # a complete target tree
 }
 vfix; run verify
 check "verify: exit 0" test "$RC" -eq 0
-check "verify: btrdasd runs in the target's chroot, root /, a copied config" has "$LOG" "arch-chroot $R/mnt/target btrdasd recovery-os inspect --root / --label system-recovery-A-2tb --config /tmp/das-install-inspect.toml"
-check "verify: the config copy is removed again" test ! -e "$R/mnt/target/tmp/das-install-inspect.toml"
+check "verify: btrdasd runs in the target's chroot, root /, a copied config" has "$LOG" "arch-chroot $R/mnt/target btrdasd recovery-os inspect --root / --label system-recovery-A-2tb --config /root/das-install-inspect.toml"
+check "verify: the config copy is removed again" test ! -e "$R/mnt/target/root/das-install-inspect.toml"
 check "verify: the record is quoted" out_has "btrbk at boot       no"
 vfix; rm "${R:?}/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
 check "verify, a missing initramfs: exit 3" test "$RC" -eq 3
