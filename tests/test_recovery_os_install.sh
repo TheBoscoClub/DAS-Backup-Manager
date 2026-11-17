@@ -336,8 +336,24 @@ check "configure: the home chowned to the account (its own group, by name)" has 
 check "configure: units enabled" has "$LOG" "systemctl enable sshd NetworkManager sddm qemu-guest-agent"
 check "configure: plymouth hook after udev (D9)" grep -q '^HOOKS=(base udev plymouth ' "$R/mnt/target/etc/mkinitcpio.conf"
 check "configure: plymouth theme set (D9)" has "$LOG" "plymouth-set-default-theme"
+
 check "configure: Flathub remote, no apps (D6)" has "$LOG" "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
 check "configure: no fstab entry for a host filesystem" test "$(grep -c '5eed0011\|5eed0020\|5eed0003\|5eed0004' "$R/mnt/target/etc/fstab" 2>/dev/null || :)" -eq 0
+
+# mkinitcpio 42's own default (the line of etc/mkinitcpio.conf in its
+# package): a systemd initramfs, no udev hook. Provision stopped at configure
+# on it (bd eg4j.3).
+fixture; mkdir -p "$R/mnt/target/etc"
+printf 'HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block filesystems fsck)\n' >"$R/mnt/target/etc/mkinitcpio.conf"
+run configure
+check "configure, systemd initramfs: exit 0" test "$RC" -eq 0
+check "configure, systemd initramfs: plymouth right after systemd (D9)" grep -qx 'HOOKS=(base systemd plymouth autodetect microcode modconf kms keyboard sd-vconsole block filesystems fsck)' "$R/mnt/target/etc/mkinitcpio.conf"
+fixture; mkdir -p "$R/mnt/target/etc"
+printf 'HOOKS=(base autodetect block filesystems)\n' >"$R/mnt/target/etc/mkinitcpio.conf"
+run configure
+check "configure, neither udev nor systemd: refused (exit 2)" test "$RC" -eq 2
+check "configure, neither udev nor systemd: says which hooks it looked for" out_has "no 'udev' or 'systemd' in HOOKS"
+check "configure, neither udev nor systemd: HOOKS left as it was" grep -qx 'HOOKS=(base autodetect block filesystems)' "$R/mnt/target/etc/mkinitcpio.conf"
 
 echo "== the account: required, no built-in name; refused before anything changes"
 configure_fixture() {
@@ -475,7 +491,25 @@ check "package, the package shipped no unit: exit 2" test "$RC" -eq 2
 check "package, no unit: named" out_has "the package shipped no das-recovery-state-sync.service"
 
 echo "== boot: loader.conf and the two entries, no previous-root entry yet (D1)"
-fixture; run boot
+# linux-cachyos's own preset, as pacstrap leaves it: the default image only
+# (bd eg4j.4), so the Fallback entry's image is never built unless the boot
+# step adds it.
+stock_preset() {
+    mkdir -p "$R/mnt/target/etc/mkinitcpio.d"
+    cat >"$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset" <<'PRESET'
+# mkinitcpio preset file for the 'linux-cachyos' package
+
+ALL_kver="/boot/vmlinuz-linux-cachyos"
+
+PRESETS=('default')
+
+default_image="/boot/initramfs-linux-cachyos.img"
+PRESET
+}
+fixture; stock_preset; run boot
+check "boot: the stock preset gains the fallback image" grep -qx "PRESETS=('default' 'fallback')" "$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset"
+check "boot: the fallback image is the one the Fallback entry names" grep -qx 'fallback_image="/boot/initramfs-linux-cachyos-fallback.img"' "$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset"
+check "boot: the fallback image without autodetect" grep -qx 'fallback_options="-S autodetect"' "$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset"
 check "boot: exit 0" test "$RC" -eq 0
 check "boot: bootctl install in the chroot" has "$LOG" "arch-chroot $R/mnt/target bootctl install"
 check "boot: loader.conf default" has "$R/mnt/target/boot/loader/loader.conf" "default cachyos-recovery.conf"
@@ -488,6 +522,17 @@ check "boot: fallback entry" has "$R/mnt/target/boot/loader/entries/cachyos-reco
 check "boot: fallback image" has "$R/mnt/target/boot/loader/entries/cachyos-recovery-fallback.conf" "initrd /initramfs-linux-cachyos-fallback.img"
 check "boot: no previous-root entry on a fresh install" test ! -e "$R/mnt/target/boot/loader/entries/cachyos-recovery-previous.conf"
 check "boot: mkinitcpio -P in the chroot" has "$LOG" "arch-chroot $R/mnt/target mkinitcpio -P"
+fixture; stock_preset; run boot; run boot
+check "boot twice: the fallback image added once" test "$(grep -c '^fallback_image=' "$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset")" -eq 1
+fixture; stock_preset
+printf "PRESETS=('default' 'custom')\ndefault_image=\"/boot/initramfs-linux-cachyos.img\"\n" >"$R/mnt/target/etc/mkinitcpio.d/linux-cachyos.preset"
+run boot
+check "boot, a preset of another shape: refused (exit 2)" test "$RC" -eq 2
+check "boot, a preset of another shape: named" out_has "linux-cachyos.preset"
+check "boot, a preset of another shape: before bootctl" test "$(calls 'bootctl install')" -eq 0
+fixture; run boot
+check "boot, no preset at all: refused (exit 2)" test "$RC" -eq 2
+check "boot, no preset at all: said" out_has "no mkinitcpio preset"
 
 echo "== verify: the loader files, every file the entries name, every fstab device, btrbk at boot: no (G)"
 vfix() { # a complete target tree
@@ -797,7 +842,7 @@ fixture; run replace-os; : >"$LOG"; run undo STUB_mount_RO_FAILS=1
 check "undo, the read-only remount fails: exit 2" test "$RC" -eq 2
 check "undo, the read-only remount fails: says so, not a misleading unmount error" out_has "remount"
 check "undo, the read-only remount fails: no umount of a p1 that is not mounted" test -z "$(after "$(ln1 "^mount -o ro /dev/sdz1 $R/mnt/esp-old\$")" "^umount $R/mnt/esp-old\$")"
-fixture; run boot
+fixture; stock_preset; run boot
 check "boot: p1 flushed after the images are built" test "$(ln1 'mkinitcpio -P')" -lt "$(ln1 "^sync -f $R/mnt/target/boot\$")"
 
 echo "== every find has a guard (round 4, 4)"

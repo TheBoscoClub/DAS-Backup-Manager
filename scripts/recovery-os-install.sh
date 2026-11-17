@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.2
+# Version: 1.5.3
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -418,11 +418,13 @@ step_configure() {
     "$CHROOT" "$TARGET" chown -R "$ACCOUNT:$ACCOUNT" "$home" || cannot "chown of $home failed"
     "$CHROOT" "$TARGET" systemctl enable sshd NetworkManager sddm qemu-guest-agent || cannot "systemctl enable failed"
     # D9: plymouth renders the sync unit's messages. The hook goes right
-    # after udev (plymouth's own documented place); the theme is set here, and
-    # plan 3's screenshot is the proof that the one chosen renders text.
+    # after udev in a busybox initramfs, or right after systemd in a systemd
+    # one (mkinitcpio 42's default, bd eg4j.3): plymouth's own documented
+    # places. The theme is set here, and plan 3's screenshot is the proof
+    # that the one chosen renders text.
     [[ -f "$etc/mkinitcpio.conf" ]] || cannot "no $etc/mkinitcpio.conf after pacstrap"
-    grep -q '^HOOKS=.*plymouth' "$etc/mkinitcpio.conf" || sed -i 's/^HOOKS=(\(.*\)udev /HOOKS=(\1udev plymouth /' "$etc/mkinitcpio.conf"
-    grep -q '^HOOKS=.*plymouth' "$etc/mkinitcpio.conf" || cannot "could not add the plymouth hook to mkinitcpio.conf (no 'udev' in HOOKS)"
+    grep -q '^HOOKS=.*plymouth' "$etc/mkinitcpio.conf" || sed -i -E 's/^HOOKS=\(((.* )?)(udev|systemd) /HOOKS=(\1\3 plymouth /' "$etc/mkinitcpio.conf"
+    grep -q '^HOOKS=.*plymouth' "$etc/mkinitcpio.conf" || cannot "could not add the plymouth hook to mkinitcpio.conf (no 'udev' or 'systemd' in HOOKS)"
     "$CHROOT" "$TARGET" plymouth-set-default-theme cachyos || "$CHROOT" "$TARGET" plymouth-set-default-theme script || cannot "no plymouth theme that renders text"
     "$CHROOT" "$TARGET" flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || cannot "flatpak remote-add failed"
     say "configure: $HOST_NAME, $ACCOUNT (uid $ACCOUNT_UID, NOPASSWD, autologin), sshd key-only, plymouth, Flathub"
@@ -512,7 +514,24 @@ EOF
 
 step_boot() {
     need UUID BAY
-    local boot="$TARGET/boot" opts
+    local boot="$TARGET/boot" opts p def found=0
+    # The Fallback entry needs its image, and linux-cachyos ships a preset
+    # with the default image only (bd eg4j.4): add the fallback image to a
+    # preset of that stock shape, as a session does (recovery-os-vm.sh);
+    # refuse any other shape before anything on the ESP is written.
+    for p in "$TARGET"/etc/mkinitcpio.d/*.preset; do
+        [[ -f "$p" ]] || continue
+        found=1
+        grep -q "^PRESETS=(.*'fallback'" "$p" && continue
+        if ! grep -qx "PRESETS=('default')" "$p" || grep -q '^fallback_' "$p"; then
+            cannot "${p##*/} has no fallback image and is not of the shape this edits"
+        fi
+        def=$(sed -n 's/^default_image="\(.*\)\.img"$/\1/p' "$p")
+        [[ -n "$def" ]] || cannot "${p##*/}: no default_image line to derive the fallback image from"
+        sed -i "s/^PRESETS=('default')\$/PRESETS=('default' 'fallback')/" "$p"
+        printf '\nfallback_image="%s-fallback.img"\nfallback_options="-S autodetect"\n' "$def" >>"$p"
+    done
+    ((found)) || cannot "no mkinitcpio preset in $TARGET/etc/mkinitcpio.d"
     "$CHROOT" "$TARGET" bootctl install || cannot "bootctl install failed"
     mkdir -p "$boot/loader/entries"
     printf 'default cachyos-recovery.conf\ntimeout 10\nconsole-mode max\neditor no\n' >"$boot/loader/loader.conf"

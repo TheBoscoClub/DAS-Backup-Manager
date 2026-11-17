@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The NIC carries boot order 9, clear of the 1 to 3 that a session and provision attach; it still keeps a per-device boot element, so libvirt never fills in an os-level boot device
   - `tests/test_recovery_os_vm.sh` reads the NIC's order from the template and fails when any provision or session attach uses it
 
+- **`provision` no longer stops at `configure` on a current CachyOS install** (bd `DAS-Backup-Manager-eg4j.3`): mkinitcpio 42's default `HOOKS` is a systemd initramfs (`base systemd autodetect … sd-vconsole …`) with no `udev`, and `recovery-os-install.sh` (1.5.3) placed the `plymouth` hook only after `udev`; it now goes right after `systemd` too, and a `HOOKS` with neither is still refused, unchanged
+  - The suite's fixture carried an old busybox `HOOKS` line; the new cases use mkinitcpio 42's own
+
+- **`provision` builds the initramfs image its Fallback entry boots** (bd `DAS-Backup-Manager-eg4j.4`): `linux-cachyos`'s preset lists the default image only, so `mkinitcpio -P` never built `initramfs-linux-cachyos-fallback.img` and `verify` would have stopped the provision; the boot step adds `'fallback'`, `fallback_image` and `fallback_options="-S autodetect"` to a preset of that stock shape, as a session already does, and refuses any other shape, or no preset, before `bootctl install`
+
 ## [0.7.24.0] - 2026-11-12
 
 ### Added
