@@ -4470,7 +4470,11 @@ mirrorlist=${V3_MIRRORLIST:-/etc/pacman.d/cachyos-v3-mirrorlist}
 [ "$level" = v3 ] || { echo "repository level $level: not one this step knows -- refused"; exit 3; }
 [ -r "$conf" ] || { echo "cannot read $conf"; exit 2; }
 if grep -qx '\[cachyos-v3\]' "$conf"; then echo "repository level v3: [cachyos-v3] is already in $conf"; exit 0; fi
-"$ldso" --help 2>/dev/null | grep -q 'x86-64-v3 (supported' || { echo "this CPU does not support x86-64-v3 ($ldso --help): the v3 packages would not run here -- refused"; exit 3; }
+levels=$("$ldso" --help 2>/dev/null) || levels=
+case "$levels" in
+    *"x86-64-v3 (supported"*) ;;
+    *) echo "this CPU does not support x86-64-v3 ($ldso --help): the v3 packages would not run here -- refused"; exit 3 ;;
+esac
 [ -r "$mirrorlist" ] || { echo "$mirrorlist is missing: install cachyos-v3-mirrorlist, then run the session again -- refused"; exit 3; }
 grep -qx '\[cachyos\]' "$conf" || { echo "no [cachyos] section in $conf to put the -v3 repositories above -- refused"; exit 3; }
 new="$conf.repo-level.new"
