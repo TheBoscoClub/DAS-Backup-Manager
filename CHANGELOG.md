@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Disaster Recovery Guide explains a recovery drive's kernel, CPU level and hardware** (bd `DAS-Backup-Manager-54f0`): a provisioned drive takes the live system's `pacman.conf`, so it runs CachyOS's generic x86-64 builds and boots any 64-bit x86 machine; its kernel can trail a host on the `-v3`, `-v4` or `znver4` repositories by a patch level without being `STALE` (the rule compares the major.minor series)
+  - New section "Kernel, CPU level and hardware" under "Building a recovery drive": why the gap is expected, why the update VM passes the host CPU through, and how an installation whose drives only boot capable machines can opt in to a newer level, at the cost of portability
+  - `docs/INSTALL.md` no longer says CachyOS's packages need x86-64-v3/v4 for the updater VM's CPU passthrough
+
 ### Fixed
 
 - **A helper job that ends at once no longer leaves a stale entry in the job map, and two calls cannot both start** (bd `DAS-Backup-Manager-oz7w`): `BackupRun`, `IndexWalk`, `RestoreFiles` and `RestoreSnapshot` spawned the job and inserted its entry afterwards, outside the lock, so a job that finished first removed nothing and the entry stayed for good (a later `JobCancel` found a dead job, and shutdown aborted it)
