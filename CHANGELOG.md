@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Clear schedule no longer reports `Schedule written: <unit>`** (bd `DAS-Backup-Manager-eg4j.9`): the Recovery drives panel sends both Schedule and Clear schedule through `RecoveryOsScheduleSet` (time 0 clears) and showed the one result as written; it now remembers which it sent and says `Schedule cleared: <unit>` after a clear
+  - Seen on the host: a cleared schedule left no timer and the card read `Schedule: none`, while the status line said written
+  - `gui/tests/smoketest.cpp` `aClearedScheduleIsSaidClearedNotWritten` clicks Clear schedule and answers it as the helper would
+
 - **A helper job that ends at once no longer leaves a stale entry in the job map, and two calls cannot both start** (bd `DAS-Backup-Manager-oz7w`): `BackupRun`, `IndexWalk`, `RestoreFiles` and `RestoreSnapshot` spawned the job and inserted its entry afterwards, outside the lock, so a job that finished first removed nothing and the entry stayed for good (a later `JobCancel` found a dead job, and shutdown aborted it)
   - Every job method, the two recovery-OS ones included, now starts through one function, `start_job`: it takes the job map's lock, asks its refusal check, spawns and inserts under that one guard, and the spawned task removes its entry through the same lock; method names, signatures, polkit actions (still the first step) and refusal texts are unchanged
   - Tested by behaviour: a job whose body ends at once leaves an empty map, the job is started while the lock is held, and a refused start runs and inserts nothing

@@ -520,14 +520,17 @@ void RecoveryPanel::onSchedule()
             != QMessageBox::Yes)
             return;
     }
+    m_scheduleClearing = false;
     m_client->recoveryOsScheduleSet(labels, at, chosenMode());
 }
 
 void RecoveryPanel::onClearSchedule()
 {
     const QStringList labels = selectedLabels();
-    if (!labels.isEmpty())
-        m_client->recoveryOsScheduleSet(labels, 0, QString());
+    if (labels.isEmpty())
+        return;
+    m_scheduleClearing = true;
+    m_client->recoveryOsScheduleSet(labels, 0, QString());
 }
 
 void RecoveryPanel::onConsole()
@@ -578,7 +581,8 @@ void RecoveryPanel::onSessionEndResult(const QString &label, bool ok, const QStr
 
 void RecoveryPanel::onScheduleResult(const QString &unit)
 {
-    m_status->setText(i18n("Schedule written: %1", unit));
+    // One method sets and clears (time 0 clears); say which this answer was for.
+    m_status->setText(m_scheduleClearing ? i18n("Schedule cleared: %1", unit) : i18n("Schedule written: %1", unit));
     refresh();
 }
 

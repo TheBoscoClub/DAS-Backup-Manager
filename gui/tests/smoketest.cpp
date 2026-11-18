@@ -2051,6 +2051,28 @@ private Q_SLOTS:
         QVERIFY(!panel.statusLine().contains(QStringLiteral("polkit denied")));
     }
 
+    // Clear schedule and Schedule share RecoveryOsScheduleSet (time 0 clears) and
+    // its one result; the status line says which it was (bd eg4j.9).
+    void aClearedScheduleIsSaidClearedNotWritten()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        panel.applyDocument(fixture());
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        const QString unit = QStringLiteral("das-recovery-os-update-system-recovery-A-2tb.timer");
+
+        Q_EMIT client.recoveryOsScheduleResult(unit); // a schedule written
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Schedule written")), qPrintable(panel.statusLine()));
+
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.clear->isEnabled()); // the fixture's drive A has a missed schedule
+        p.clear->click();
+        Q_EMIT client.recoveryOsScheduleResult(unit); // the helper's answer to the clear
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Schedule cleared")), qPrintable(panel.statusLine()));
+        QVERIFY(panel.statusLine().contains(unit));
+    }
+
     // --- A failed background health refresh is not a modal (bd amsg) --------
     //
     // The status bar and the dashboard ask for health on their own; on

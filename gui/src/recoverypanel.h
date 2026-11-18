@@ -93,6 +93,7 @@ private:
     QLabel *m_status = nullptr;
     QTimer *m_timer = nullptr;
     bool m_refreshInFlight = false;
+    bool m_scheduleClearing = false; // the last RecoveryOsScheduleSet sent was a clear (time 0)
     QString m_ownJobId;          // this panel's running session job; empty until jobStarted names it
     bool m_ownJobAttended = false;
     bool m_jobRequested = false; // Upgrade clicked, jobStarted not yet seen
