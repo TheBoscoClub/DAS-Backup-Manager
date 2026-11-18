@@ -8,7 +8,7 @@
 //! into a success.
 
 /// The session's steps in the order the script runs them.
-pub const STEPS: [&str; 21] = [
+pub const STEPS: [&str; 22] = [
     "preflight",
     "start",
     "wait",
@@ -17,6 +17,7 @@ pub const STEPS: [&str; 21] = [
     "repos",
     "snapshot",
     "slot",
+    "repo-level",
     "guard-lift",
     "keyrings",
     "upgrade",
@@ -231,9 +232,10 @@ mod tests {
         assert_eq!(step_percent("newstep"), None);
         assert_eq!(step_percent("preflight"), Some(0));
         assert_eq!(step_percent("giveback"), Some(100));
-        assert_eq!(step_percent("upgrade"), Some(10 * 100 / 20));
-        // the slot step and the desktop proof are steps the GUI knows
+        assert_eq!(step_percent("upgrade"), Some(11 * 100 / 21));
+        // the slot and repo-level steps and the desktop proof are steps the GUI knows
         assert!(step_percent("slot").is_some());
+        assert!(step_percent("repo-level").is_some());
         assert!(step_percent("desktop").is_some());
     }
 }

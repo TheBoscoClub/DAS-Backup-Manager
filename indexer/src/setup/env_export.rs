@@ -106,6 +106,10 @@ pub fn dump_env(config: &Config) -> String {
     if let Some(user) = &config.recovery_os.install_user {
         out.push_str(&kv("DAS_RECOVERY_OS_INSTALL_USER", user));
     }
+    // The recovery OS's repository level; absent when unset (generic x86-64).
+    if let Some(level) = &config.recovery_os.repo_level {
+        out.push_str(&kv("DAS_RECOVERY_OS_REPO_LEVEL", level));
+    }
 
     // Sources (indexed)
     out.push_str(&format!("DAS_SOURCE_COUNT={}\n", config.sources.len()));
@@ -411,6 +415,16 @@ mod tests {
         assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER"));
         config.recovery_os.install_user = Some("recovery".into());
         assert!(dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER='recovery'\n"));
+    }
+
+    /// The recovery OS's repository level: exported only when set, so the
+    /// session can tell "generic" from a level (bd 54f0).
+    #[test]
+    fn dump_env_exports_the_recovery_os_repo_level_only_when_set() {
+        let mut config = test_config();
+        assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_REPO_LEVEL"));
+        config.recovery_os.repo_level = Some("v3".into());
+        assert!(dump_env(&config).contains("DAS_RECOVERY_OS_REPO_LEVEL='v3'\n"));
     }
 
     /// The local recovery documents' directory, resolved once here for the

@@ -318,6 +318,7 @@ DAS_TARGET_2_ROLE='mirror'
 DAS_TARGET_2_DISPLAY_NAME='2TB Recovery B (Bay 4, SERIAL02)'
 DAS_RECOVERY_OS_EGRESS_ORG='${EGRESS_CFG-AS64500}'
 DAS_RECOVERY_OS_INSTALL_USER='${INSTALL_USER_CFG-recovery}'
+${REPO_LEVEL_CFG+DAS_RECOVERY_OS_REPO_LEVEL='$REPO_LEVEL_CFG'}
 ${LOCAL_DOCS_ENV-DAS_RECOVERY_OS_LOCAL_DOCS_DIR='$T/local-docs'}
 EOF
 }
@@ -4734,7 +4735,7 @@ unattended_fixture() {
     printf 'running\n' >"$S/states.running"
     printf 'running\n' >"$S/domB/states.running"
 }
-STEPS="egress repos snapshot slot guard-lift keyrings upgrade packages initramfs verify-btrbk verify-boot guard-engage"
+STEPS="egress repos snapshot slot repo-level guard-lift keyrings upgrade packages initramfs verify-btrbk verify-boot guard-engage"
 for how in schema3 not-installed not-enabled unreadable; do
     fixture
     case "$how" in
@@ -5474,6 +5475,69 @@ has "repos, another family: goes into the step" "$(file "$S/stage.repos.sh")" "f
 run_repos_script "$GOOD"
 check "repos, another family, absent: exit 3" "$RC" "3"
 has "repos, another family, absent: says so" "$OUT" "no [manjaro*] repository"
+
+echo "--- the repo-level step: [recovery_os].repo_level puts the -v3 repositories above [cachyos] (bd 54f0)"
+# A recovery OS is built on the generic x86-64 repositories; an installation
+# whose drives only boot x86-64-v3 machines may follow a host on the -v3 ones.
+GENERIC=$'[options]\nArchitecture = auto\n\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n\n[core]\nInclude = /etc/pacman.d/mirrorlist\n[extra]\nInclude = /etc/pacman.d/mirrorlist'
+run_level_script() { # <pacman.conf body> <ld.so stub> [mirrorlist]: the captured step script against them
+    # In $T, which each fixture makes afresh: an ld.so --help that lists
+    # x86-64-v3 as supported, one that lists it unsupported, the v3 mirrorlist.
+    mkdir -p "$T/rl"
+    printf '#!/bin/sh\necho "  x86-64-v3 (supported, searched)"\necho "  x86-64-v2 (supported, searched)"\n' >"$T/rl/ld-v3"
+    printf '#!/bin/sh\necho "  x86-64-v3"\necho "  x86-64-v2 (supported, searched)"\n' >"$T/rl/ld-v2"
+    chmod +x "$T/rl/ld-v3" "$T/rl/ld-v2"
+    : >"$T/rl/cachyos-v3-mirrorlist"
+    printf '%s\n' "$1" >"$T/pacman.conf"
+    RC=0
+    OUT="$(PACMAN_CONF="$T/pacman.conf" LDSO="$T/rl/$2" V3_MIRRORLIST="${3-$T/rl/cachyos-v3-mirrorlist}" sh "$S/stage.repo-level.sh" 2>&1)" || RC=$?
+}
+sections() { sed -n 's/^\[\(.*\)\]$/\1/p' "$T/pacman.conf" | tr '\n' ' '; }
+unattended_fixture
+run_driver session A --unattended
+check "repo-level: a step of its own, after slot, before the guard is lifted" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS "
+has "repo-level, unset: the step is given no level" "$(file "$S/stage.repo-level.sh")" "level="$'\n'
+run_level_script "$GENERIC" ld-v3
+check "repo-level, unset: exit 0" "$RC" "0"
+has "repo-level, unset: says the repositories stay generic" "$OUT" "repository level: not set ([recovery_os].repo_level): the generic x86-64 repositories stay"
+check "repo-level, unset: pacman.conf untouched" "$(cat "$T/pacman.conf")" "$GENERIC"
+REPO_LEVEL_CFG=v3
+unattended_fixture
+run_driver session A --unattended
+has "repo-level v3: the level goes into the step" "$(file "$S/stage.repo-level.sh")" "level=v3"
+run_level_script "$GENERIC" ld-v3
+check "repo-level v3: exit 0" "$RC" "0"
+check "repo-level v3: the three -v3 sections above [cachyos], in the host's order" "$(sections)" "options cachyos-v3 cachyos-core-v3 cachyos-extra-v3 cachyos core extra "
+check "repo-level v3: each section takes the v3 mirrorlist" "$(grep -c '^Include = /etc/pacman.d/cachyos-v3-mirrorlist$' "$T/pacman.conf")" "3"
+has "repo-level v3: Architecture = auto is left as it is" "$(cat "$T/pacman.conf")" $'Architecture = auto\n'
+has "repo-level v3: says what it did" "$OUT" "repository level v3: [cachyos-v3] [cachyos-core-v3] [cachyos-extra-v3] put above [cachyos]"
+check "repo-level v3: the old file kept beside it" "$(cat "$T/pacman.conf.pre-repo-level")" "$GENERIC"
+first=$(cat "$T/pacman.conf")
+RC=0; OUT="$(PACMAN_CONF="$T/pacman.conf" LDSO="$T/rl/ld-v3" V3_MIRRORLIST="$T/rl/cachyos-v3-mirrorlist" sh "$S/stage.repo-level.sh" 2>&1)" || RC=$?
+check "repo-level v3, run again: exit 0" "$RC" "0"
+has "repo-level v3, run again: says it is already so" "$OUT" "repository level v3: [cachyos-v3] is already in"
+check "repo-level v3, run again: nothing changed" "$(cat "$T/pacman.conf")" "$first"
+run_level_script "${GENERIC/Architecture = auto/Architecture = x86_64}" ld-v3
+check "repo-level v3, Architecture x86_64: exit 0" "$RC" "0"
+has "repo-level v3, Architecture x86_64: x86_64_v3 added" "$(cat "$T/pacman.conf")" $'Architecture = x86_64 x86_64_v3\n'
+run_level_script "$GENERIC" ld-v2
+check "repo-level v3 on a CPU without x86-64-v3: exit 3" "$RC" "3"
+has "repo-level v3 on a CPU without x86-64-v3: says so" "$OUT" "this CPU does not support x86-64-v3"
+check "repo-level v3 on a CPU without x86-64-v3: pacman.conf untouched" "$(cat "$T/pacman.conf")" "$GENERIC"
+run_level_script "$GENERIC" ld-v3 "$T/rl/absent"
+check "repo-level v3, no v3 mirrorlist: exit 3" "$RC" "3"
+has "repo-level v3, no v3 mirrorlist: names the package" "$OUT" "install cachyos-v3-mirrorlist"
+check "repo-level v3, no v3 mirrorlist: pacman.conf untouched" "$(cat "$T/pacman.conf")" "$GENERIC"
+run_level_script "${GENERIC/\[cachyos\]/[cachyos-local]}" ld-v3
+check "repo-level v3, no [cachyos] section: exit 3" "$RC" "3"
+has "repo-level v3, no [cachyos] section: says so" "$OUT" "no [cachyos] section"
+REPO_LEVEL_CFG='v3;reboot'
+unattended_fixture
+run_driver session A --unattended
+check "repo-level from config.toml, not a level: refused (exit 1)" "$RC" "1"
+has "repo-level from config.toml, not a level: says which setting" "$OUT" "[recovery_os].repo_level in"
+lacks "repo-level from config.toml, not a level: nothing booted" "$(events)" "virsh start"
+unset REPO_LEVEL_CFG
 for knob in 'cachy os' 'a;b' '/x'; do
     DAS_RECOVERY_VM_REPOS_FIRST=$knob run_driver status
     check "repos knob '$knob': a usage error" "$RC" "2"

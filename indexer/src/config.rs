@@ -99,7 +99,20 @@ pub struct RecoveryOs {
     /// DAS-Backup-Manager-5237.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_docs_dir: Option<String>,
+    /// The CachyOS instruction-set level of the recovery OSes' repositories.
+    /// Unset, a drive keeps the generic x86-64 ones `provision` gives it and
+    /// boots any 64-bit x86 machine. `"v3"`: each unattended session puts
+    /// `[cachyos-v3]`, `[cachyos-core-v3]` and `[cachyos-extra-v3]` above
+    /// `[cachyos]` (refused on a CPU without x86-64-v3), so the drive follows
+    /// a host on those repositories — and no longer boots an older CPU.
+    /// An installation's choice, never a project default (bd 54f0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_level: Option<String>,
 }
+
+/// The values `recovery_os.repo_level` takes: the levels the unattended
+/// session's `repo-level` step knows how to set up.
+pub const RECOVERY_OS_REPO_LEVELS: &[&str] = &["v3"];
 
 fn default_recovery_os_max_age_days() -> u32 {
     60
@@ -135,6 +148,7 @@ impl Default for RecoveryOs {
             egress_org: None,
             install_user: None,
             local_docs_dir: None,
+            repo_level: None,
         }
     }
 }
@@ -3393,6 +3407,14 @@ impl Config {
                 "recovery_os.install_user {user:?} must be a user name: a lower-case letter or _, then up to 31 of a-z 0-9 _ -, and not root"
             ));
         }
+        if let Some(level) = &self.recovery_os.repo_level
+            && !RECOVERY_OS_REPO_LEVELS.contains(&level.as_str())
+        {
+            errors.push(format!(
+                "recovery_os.repo_level {level:?} must be one of {}, or unset for the generic x86-64 repositories",
+                RECOVERY_OS_REPO_LEVELS.join(", ")
+            ));
+        }
 
         // One volume under two spellings ('/vol' and '/vol/', '/vol/./x') is
         // two volumes to sync, which groups by the string: every subvolume was
@@ -4808,6 +4830,39 @@ mod tests {
                 .as_deref(),
             Some("recovery")
         );
+    }
+
+    /// Unset is the generic x86-64 repositories and stays out of the file;
+    /// a level round-trips (bd 54f0: the installation chooses, never the project).
+    #[test]
+    fn recovery_os_repo_level_is_unset_by_default_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.recovery_os.repo_level, None);
+        assert!(!cfg.to_toml().unwrap().contains("repo_level"));
+        let cfg = Config::from_toml(&minimal_toml("[recovery_os]\nrepo_level = \"v3\"\n")).unwrap();
+        assert_eq!(cfg.recovery_os.repo_level.as_deref(), Some("v3"));
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("repo_level = \"v3\""), "{text}");
+    }
+
+    #[test]
+    fn validate_accepts_only_a_repo_level_the_session_knows() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        cfg.recovery_os.repo_level = Some("v3".into());
+        assert!(
+            !cfg.validate().iter().any(|e| e.contains("repo_level")),
+            "{:?}",
+            cfg.validate()
+        );
+        for bad in ["", "V3", "v4", "znver4", "x86-64-v3", "v3 ", "v3;reboot"] {
+            cfg.recovery_os.repo_level = Some(bad.into());
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("recovery_os.repo_level")),
+                "{bad:?} was accepted"
+            );
+        }
     }
 
     #[test]

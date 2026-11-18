@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[recovery_os].repo_level = "v3"` puts a recovery OS on CachyOS's x86-64-v3 repositories** (bd `DAS-Backup-Manager-54f0`): a provisioned drive runs the generic x86-64 builds, so its kernel can trail a host on the v3 repositories; an installation whose drives only boot x86-64-v3 machines can now have them follow the host, kernel included
+  - New unattended step `repo-level` in `recovery-os-vm.sh` (2.3.0), after `snapshot` and `slot`: puts `[cachyos-v3]`, `[cachyos-core-v3]` and `[cachyos-extra-v3]` above `[cachyos]`, adds `x86_64_v3` to an `Architecture` line that is not `auto`, keeps the old file as `/etc/pacman.conf.pre-repo-level`; refused, changing nothing, on a CPU without x86-64-v3 or without `cachyos-v3-mirrorlist`; unset or already done, nothing changes
+  - `Config::validate` and `load_targets` accept only `v3`; `btrdasd config dump-env` exports `DAS_RECOVERY_OS_REPO_LEVEL` only when set
+  - Documented in `docs/INSTALL.md` (`[recovery_os]`) and the Disaster Recovery Guide ("Kernel, CPU level and hardware", step 5 of the unattended update)
+
 - **Recovery drives carry the tools of the XFCE rescue OS they replace** (bd `DAS-Backup-Manager-54f0`): drive B's old `@rescue` held `git`, `partclone`, `zip`, `gvfs`, `gvfs-smb` and `gvfs-mtp`, which the CachyOS install lacked; `recovery-os-install.sh` (1.5.6) puts them in the baseline, and `recovery-os-vm.sh` (2.2.5) installs them with `--needed` in an unattended session's `packages` step, so a drive provisioned before them gains them
 
 ### Changed

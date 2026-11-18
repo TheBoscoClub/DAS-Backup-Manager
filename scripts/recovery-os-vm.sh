@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.5
+# Version: 2.3.0
 # Date: 2026-11-18
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -153,7 +153,10 @@
 #     before any other, or [core] would shadow its builds (bd 1igg);
 #     snapshot -- the OS snapshots its own @ read-only to
 #     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
-#     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
+#     never the host's); repo-level -- with [recovery_os].repo_level = "v3",
+#     [cachyos-v3], [cachyos-core-v3] and [cachyos-extra-v3] put above
+#     [cachyos] (refused on a CPU without x86-64-v3; unset: nothing changes,
+#     bd 54f0); guard-lift (systemctl stop das-vm-guard); keyrings;
 #     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent and the
 #     rescue tools git partclone zip gvfs gvfs-smb gvfs-mtp, and amd-ucode
 #     intel-ucode reinstalled); initramfs (the fallback image added
@@ -639,6 +642,7 @@ GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
 P_ALSO=()             # provision: the @.archive.* names also set aside
 INSTALL_USER=""       # provision: the new OS's account, [recovery_os].install_user (load_targets)
+REPO_LEVEL=""         # unattended repo-level step: [recovery_os].repo_level (load_targets)
 P_DOCS=()             # provision: the installation's own documents, $LOCAL_DOCS_DIR/*.md
 LOCAL_DOCS_DIR=""     # provision: where they are, [recovery_os].local_docs_dir as dump-env resolved it (load_targets)
 LOCAL_DOCS_ERROR=""   # ...or why dump-env could not resolve it
@@ -1068,7 +1072,7 @@ load_targets() {
     fi
     # dump-env leaves a key out when it is unset: clear the names first, so an inherited
     # variable of the same name can never stand in for config.toml (review L2).
-    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER DAS_RECOVERY_OS_LOCAL_DOCS_DIR DAS_RECOVERY_OS_LOCAL_DOCS_ERROR
+    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER DAS_RECOVERY_OS_LOCAL_DOCS_DIR DAS_RECOVERY_OS_LOCAL_DOCS_ERROR DAS_RECOVERY_OS_REPO_LEVEL
     eval "$env_text"
     # The egress org from config.toml, when the environment gave none. Config::load
     # does not validate, so the characters are checked here as for the variable.
@@ -1086,6 +1090,14 @@ load_targets() {
         { [[ ! "$INSTALL_USER" =~ ^[abcdefghijklmnopqrstuvwxyz_][abcdefghijklmnopqrstuvwxyz0123456789_-]{0,31}$ ]] || [[ "$INSTALL_USER" == root ]]; }; then
         refuse "[recovery_os].install_user in $DAS_CONFIG is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -; not root)"
     fi
+    # The repository level the unattended repo-level step sets up: unset (the
+    # generic x86-64 repositories) or a level it knows (bd 54f0). Checked
+    # here as Config::validate checks it: it goes into a step script.
+    REPO_LEVEL="${DAS_RECOVERY_OS_REPO_LEVEL:-}"
+    case "$REPO_LEVEL" in
+        "" | v3) ;;
+        *) refuse "[recovery_os].repo_level in $DAS_CONFIG is not a level the session knows (v3, or unset for the generic x86-64 repositories)" ;;
+    esac
     # The local documents' directory, resolved once by btrdasd (bd
     # DAS-Backup-Manager-5237.6) and never derived here; only provision reads it.
     LOCAL_DOCS_DIR="${DAS_RECOVERY_OS_LOCAL_DOCS_DIR:-}"
@@ -4279,6 +4291,7 @@ UNATTENDED_STEPS=(
     "repos 120 step_repos"
     "snapshot 900 step_snapshot"
     "slot 600 step_slot"
+    "repo-level 120 step_repo_level"
     "guard-lift 120 step_guard_lift"
     "keyrings 1800 step_keyrings"
     "upgrade UPDATE step_upgrade"
@@ -4436,6 +4449,46 @@ done | sort | head -n -2 | while read -r old; do
     btrfs subvolume delete "$old"
     echo "removed the older snapshot ${old##*/}"
 done
+EOF
+}
+
+# [recovery_os].repo_level = "v3": the CachyOS x86-64-v3 repositories above
+# [cachyos], as a host on them has them, so the upgrade after takes their
+# builds -- the host's kernel among them (bd 54f0). Taken after the snapshot,
+# so @.pre-update.* holds the file as it was. Unset: nothing changes, the
+# generic x86-64 repositories provision gave the drive stay, and it boots any
+# 64-bit x86 machine. Refused, changing nothing, on a CPU without x86-64-v3
+# (its packages would not run) or without the v3 mirrorlist. PACMAN_CONF,
+# LDSO and V3_MIRRORLIST are for the test suite.
+step_repo_level() {
+    printf 'level=%s\n' "$REPO_LEVEL"
+    cat <<'EOF'
+conf=${PACMAN_CONF:-/etc/pacman.conf}
+ldso=${LDSO:-/lib/ld-linux-x86-64.so.2}
+mirrorlist=${V3_MIRRORLIST:-/etc/pacman.d/cachyos-v3-mirrorlist}
+[ -n "$level" ] || { echo "repository level: not set ([recovery_os].repo_level): the generic x86-64 repositories stay"; exit 0; }
+[ "$level" = v3 ] || { echo "repository level $level: not one this step knows -- refused"; exit 3; }
+[ -r "$conf" ] || { echo "cannot read $conf"; exit 2; }
+if grep -qx '\[cachyos-v3\]' "$conf"; then echo "repository level v3: [cachyos-v3] is already in $conf"; exit 0; fi
+"$ldso" --help 2>/dev/null | grep -q 'x86-64-v3 (supported' || { echo "this CPU does not support x86-64-v3 ($ldso --help): the v3 packages would not run here -- refused"; exit 3; }
+[ -r "$mirrorlist" ] || { echo "$mirrorlist is missing: install cachyos-v3-mirrorlist, then run the session again -- refused"; exit 3; }
+grep -qx '\[cachyos\]' "$conf" || { echo "no [cachyos] section in $conf to put the -v3 repositories above -- refused"; exit 3; }
+new="$conf.repo-level.new"
+awk -v ml=/etc/pacman.d/cachyos-v3-mirrorlist '
+    /^\[cachyos\]$/ && !done {
+        printf "[cachyos-v3]\nInclude = %s\n\n[cachyos-core-v3]\nInclude = %s\n\n[cachyos-extra-v3]\nInclude = %s\n\n", ml, ml, ml
+        done = 1
+    }
+    /^[[:space:]]*Architecture[[:space:]]*=/ && $0 !~ /auto/ && $0 !~ /x86_64_v3/ {
+        sub(/[[:space:]]*$/, "")
+        $0 = $0 " x86_64_v3"
+        print "Architecture: x86_64_v3 added" > "/dev/stderr"
+    }
+    { print }
+' "$conf" >"$new" || { rm -f "${new:?}"; echo "cannot write $new"; exit 2; }
+cp -p "$conf" "$conf.pre-repo-level" || { rm -f "${new:?}"; echo "cannot keep $conf as $conf.pre-repo-level"; exit 2; }
+mv "$new" "$conf" || { echo "cannot replace $conf"; exit 2; }
+echo "repository level v3: [cachyos-v3] [cachyos-core-v3] [cachyos-extra-v3] put above [cachyos] in $conf (the old file: $conf.pre-repo-level); the upgrade takes their builds"
 EOF
 }
 
