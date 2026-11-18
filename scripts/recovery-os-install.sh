@@ -20,7 +20,8 @@
 #   package          the project package; marker; sync unit; masks; desktop
 #   boot             bootctl install, loader.conf, the entries, mkinitcpio -P
 #   verify           the loader files and every file the entries name; fstab
-#                    devices; btrdasd (in the target) says btrbk at boot: no
+#                    devices; btrdasd (in the target) says btrbk at boot: no,
+#                    or may with btrbk config: none
 #   unmount          everything under $TARGET, then $TOP
 #   delete-replaced  (Phase 3, from the NEW OS) delete every set-aside name in
 #                    every manifest, nested subvolumes first, each by name
