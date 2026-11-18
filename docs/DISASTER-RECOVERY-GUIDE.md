@@ -1634,7 +1634,7 @@ The usage lines, verbatim from `recovery-os-vm.sh`:
 | 2 | `package` | the project package, the marker with `bay=`, the sync unit enabled, the backup and scrub timers and `btrbk` masked |
 | 2 | `boot` | the bootloader and the entries |
 | 2 | `repos` | the CachyOS-before-Arch order check, against the new root |
-| 2 | `verify` | every file the entries name is on the ESP, every fstab device resolves, and `btrdasd recovery-os inspect` reads `btrbk at boot: no` |
+| 2 | `verify` | every file the entries name is on the ESP, every fstab device resolves, and `btrdasd recovery-os inspect` reads `btrbk at boot: no`, or `may` with `btrbk config: none` (every mkinitcpio OS reads `may`: its shutdown-ramfs unit is handed paths under `/boot` and `/run`; btrbk with no config runs nothing; bd `DAS-Backup-Manager-eg4j.8`) |
 | 2 | `unmount` | everything is unmounted, then the live system powers off |
 | 3 | `first-boot` | the new OS boots and is proven (below) |
 | 3 | `delete-replaced` | only after the proof: the set-aside names are deleted, each by name |
@@ -1659,7 +1659,7 @@ sudo recovery-os-vm.sh provision <A|B|label> --undo --iso <path>
 
 `--undo` takes the stamp and the `--also-replace` list from the **newest `provision` row in the history**, or from the newest capture directory when there is none (`recovery-os-vm.sh history <label>`; the row carries `stamp` and `also_replace`). Inside the live system the installer walks the manifests newest first: the current original is set aside (`<name>.undone.<stamp>` for a provision whose root booted, `<name>.unbooted.<stamp>` if not, every subvolume of one provision named alike), the set-aside name comes back, and partition 1 is restored from the oldest `@esp.replaced` copy with its old volume ID. It is allowed until `delete-replaced` has started, whether or not the new OS booted (a first boot that failed its proof is exactly when it is wanted): the new root is never deleted, only set aside, as `<name>.undone.<stamp>` if it had booted and `<name>.unbooted.<stamp>` if not. Once `delete-replaced` has begun, `--undo` refuses and names what is still there. If the driver stopped without writing its history row (a power loss), `--undo` takes the stamp from the newest capture directory instead (`/var/lib/das-backup/recovery-os-provision/<label>/<stamp>/`, made before anything booted). After a partial `delete-replaced`, the names still listed as not deleted in the manifest are the ones that remain; the capture directory on the host says what was there.
 
-**Back in service.** The last line `provision` prints says the drive is back in service only after the next backup run records it: that run sends ordinary incrementals to the untouched received subvolumes and records a `btrbk at boot: no` boot record with the agent installed, and only then is the next session admitted. Rebuild the second drive only after the first one's record reads `no`.
+**Back in service.** The last line `provision` prints says the drive is back in service only after the next backup run records it: that run sends ordinary incrementals to the untouched received subvolumes and records a boot record of `btrbk at boot: no`, or `may` with `btrbk config: none`, with the agent installed, and only then is the next session admitted. Rebuild the second drive only after the first one's record reads that.
 
 ### Proving a restore
 

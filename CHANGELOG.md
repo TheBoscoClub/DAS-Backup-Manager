@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`provision` builds the initramfs image its Fallback entry boots** (bd `DAS-Backup-Manager-eg4j.4`): `linux-cachyos`'s preset lists the default image only, so `mkinitcpio -P` never built `initramfs-linux-cachyos-fallback.img` and `verify` would have stopped the provision; the boot step adds `'fallback'`, `fallback_image` and `fallback_options="-S autodetect"` to a preset of that stock shape, as a session already does, and refuses any other shape, or no preset, before `bootctl install`
 - **`provision`'s `verify` can read the config it copies into the new OS** (bd `DAS-Backup-Manager-eg4j.6`): `recovery-os-install.sh` (1.5.4) put the copy in the target's `/tmp`, which `arch-chroot` covers with a fresh tmpfs, so `btrdasd recovery-os inspect` found nothing and the provision stopped at `verify`; the copy now goes to the target's `/root` and is removed after, as before
+- **`provision`'s `verify` passes a CachyOS root with no btrbk config** (bd `DAS-Backup-Manager-eg4j.8`): `recovery-os-install.sh` (1.5.5) required `btrbk at boot: no`, but every mkinitcpio OS reads `may` — `mkinitcpio-generate-shutdown-ramfs.service` is handed paths under `/boot` and `/run`, the tracer rule kept in bd `DAS-Backup-Manager-12k8` — so every rebuild stopped at `verify`; `may` now passes only beside `btrbk config: none` (btrbk with no config runs nothing), and `yes`, or `may` beside a config, is still refused
 
 ## [0.7.24.0] - 2026-11-12
 

@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.4
+# Version: 1.5.5
 # Date: 2026-10-13
 #
 # Steps, in the order the driver runs them:
@@ -596,8 +596,19 @@ step_verify() {
     rm -f "${TARGET:?}/root/das-install-inspect.toml"
     ((rc <= 1)) || cannot "btrdasd recovery-os inspect failed ($rc): $rec"
     say "$rec"
-    grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+no([[:space:]]|$)' <<<"$rec" || refuse "the new root's boot record is not 'no'"
-    say "verify: the loader files and every file the entries name are on the ESP; every fstab device resolves; btrbk at boot: no"
+    # 'no' passes. 'may' passes only with no btrbk config at all: every
+    # mkinitcpio OS reads 'may' (its shutdown-ramfs unit is handed paths under
+    # /boot and /run, the tracer rule kept in bd 12k8), and btrbk with no
+    # config runs nothing. 'yes', or 'may' beside a config, is refused (bd eg4j.8).
+    local atboot=
+    if grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+no([[:space:]]|$)' <<<"$rec"; then
+        atboot="no"
+    elif grep -Eq '^[[:space:]]+btrbk at boot[[:space:]]+may([[:space:]]|$)' <<<"$rec" &&
+        grep -Eq '^[[:space:]]+btrbk config[[:space:]]+none(:|[[:space:]]|$)' <<<"$rec"; then
+        atboot="may, and the new OS has no btrbk config, so btrbk runs nothing"
+    fi
+    [[ -n "$atboot" ]] || refuse "the new root's boot record is not 'no'"
+    say "verify: the loader files and every file the entries name are on the ESP; every fstab device resolves; btrbk at boot: $atboot"
 }
 
 step_unmount() {

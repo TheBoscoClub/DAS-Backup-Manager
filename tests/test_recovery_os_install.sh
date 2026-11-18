@@ -565,8 +565,17 @@ vfix; rm "${R:?}/mnt/target/boot/initramfs-linux-cachyos.img"; run verify
 check "verify, a missing initramfs: exit 3" test "$RC" -eq 3
 check "verify, a missing initramfs: named" out_has "initramfs-linux-cachyos.img named by cachyos-recovery.conf is not on the ESP"
 vfix; printf '    btrbk at boot       may\n' >"$WORK/inspect.out"; run verify
-check "verify, btrbk may run: exit 3" test "$RC" -eq 3
+check "verify, btrbk may run, no config row: exit 3" test "$RC" -eq 3
 check "verify, btrbk may run: the record is quoted" out_has "btrbk at boot       may"
+# bd eg4j.8: every mkinitcpio OS reads 'may' (12k8's kept rule); btrbk with no config runs nothing.
+vfix; printf '    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n    btrbk at boot       may\n' >"$WORK/inspect.out"; run verify
+check "verify, may with no btrbk config: exit 0" test "$RC" -eq 0
+check "verify, may with no btrbk config: says why it passes" out_has "btrbk at boot: may, and the new OS has no btrbk config"
+vfix; printf '    btrbk config        /etc/btrbk/btrbk.conf (1 byte)\n    btrbk at boot       may\n' >"$WORK/inspect.out"; run verify
+check "verify, may with a btrbk config: exit 3" test "$RC" -eq 3
+check "verify, may with a btrbk config: refused" out_has "the new root's boot record is not 'no'"
+vfix; printf '    btrbk config        none: /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent\n    btrbk at boot       yes\n' >"$WORK/inspect.out"; run verify
+check "verify, yes even with no btrbk config: exit 3" test "$RC" -eq 3
 vfix; rm -f "${R:?}/mnt/target/boot/loader/entries"/*.conf; run verify
 check "verify, no loader entries at all: exit 2" test "$RC" -eq 2
 check "verify, no loader entries at all: said" out_has "no loader entries"
