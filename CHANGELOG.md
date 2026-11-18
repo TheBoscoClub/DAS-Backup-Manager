@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recovery drives carry the tools of the XFCE rescue OS they replace** (bd `DAS-Backup-Manager-54f0`): drive B's old `@rescue` held `git`, `partclone`, `zip`, `gvfs`, `gvfs-smb` and `gvfs-mtp`, which the CachyOS install lacked; `recovery-os-install.sh` (1.5.6) puts them in the baseline, and `recovery-os-vm.sh` (2.2.5) installs them with `--needed` in an unattended session's `packages` step, so a drive provisioned before them gains them
+
 ### Changed
 
 ### Fixed

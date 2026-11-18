@@ -3,8 +3,8 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.5
-# Date: 2026-10-13
+# Version: 1.5.6
+# Date: 2026-11-18
 #
 # Steps, in the order the driver runs them:
 #   replace-os       p2 (by UUID) at $TOP: refuse a wrong UUID, a wrong p1
@@ -382,11 +382,11 @@ step_replace_os() {
 BASELINE="base base-devel linux-cachyos linux-cachyos-headers linux-firmware amd-ucode intel-ucode mkinitcpio efibootmgr efitools sbctl sudo plymouth
 btrfs-progs compsize duperemove snapper e2fsprogs xfsprogs f2fs-tools exfatprogs ntfs-3g dosfstools squashfs-tools lvm2 mdadm cryptsetup nfs-utils cifs-utils smbclient
 smartmontools nvme-cli hdparm hwinfo lshw dmidecode i2c-tools pciutils usbutils memtester stress iotop-c btop htop lsof strace tcpdump nmap traceroute bind
-gparted partitionmanager parted gptfdisk testdisk ddrescue arch-install-scripts btrbk rsync pacman-contrib reflector flatpak
+gparted partitionmanager parted gptfdisk testdisk ddrescue partclone arch-install-scripts btrbk rsync git pacman-contrib reflector flatpak
 networkmanager iwd wpa_supplicant openssh openvpn wireguard-tools iproute2 curl wget
 vim nano micro kate mc tmux screen bat fd ripgrep fzf jq tree python python-pip man-db man-pages texinfo util-linux
-7zip tar gzip bzip2 xz zstd unzip unrar
-plasma-meta sddm dolphin konsole ark filelight gwenview okular spectacle kcalc kinfocenter ksystemlog bluedevil bluez bluez-utils firefox mpv ffmpeg
+7zip tar gzip bzip2 xz zstd zip unzip unrar
+plasma-meta sddm dolphin gvfs gvfs-smb gvfs-mtp konsole ark filelight gwenview okular spectacle kcalc kinfocenter ksystemlog bluedevil bluez bluez-utils firefox mpv ffmpeg
 cups cups-pdf print-manager system-config-printer gutenprint hplip ghostscript
 qemu-guest-agent cachyos-settings cachyos-hooks cachyos-mirrorlist cachyos-v3-mirrorlist cachyos-keyring"
 

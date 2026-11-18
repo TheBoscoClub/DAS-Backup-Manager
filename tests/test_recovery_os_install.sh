@@ -320,6 +320,9 @@ check "pacstrap: gparted in the baseline" has "$LOG" " gparted "
 check "pacstrap: plymouth in the baseline (D9)" has "$LOG" " plymouth "
 check "pacstrap: flatpak in the baseline (D6)" has "$LOG" " flatpak "
 check "pacstrap: the CachyOS meta packages" has "$LOG" " cachyos-settings cachyos-hooks cachyos-mirrorlist cachyos-v3-mirrorlist cachyos-keyring"
+for p in git partclone zip gvfs gvfs-smb gvfs-mtp; do
+    check "pacstrap: $p, a tool of the rescue OS it replaces (bd 54f0)" has "$LOG" " $p "
+done
 check "pacstrap: no AUR helper" test "$(grep -c 'paru\|yay' "$LOG")" -eq 0
 fixture; run pacstrap STUB_pacstrap_FAILS=1
 check "pacstrap fails: exit 2" test "$RC" -eq 2

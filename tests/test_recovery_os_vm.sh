@@ -4776,7 +4776,7 @@ has "unattended: the egress step checks for the org it was given" "$(file "$S/st
 has "unattended: the snapshot is the guest's own, of its @" "$(file "$S/stage.snapshot.sh")" 'btrfs subvolume snapshot -r "$top/@" "$top/$name"'
 has "unattended: keeps the newest two" "$(file "$S/stage.snapshot.sh")" "head -n -2"
 has "unattended: the full upgrade" "$(file "$S/stage.upgrade.sh")" "pacman -Syu --noconfirm"
-has "unattended: the agent and the microcode" "$(file "$S/stage.packages.sh")" "pacman -S --needed --noconfirm qemu-guest-agent && pacman -S --noconfirm amd-ucode intel-ucode"
+has "unattended: the agent, the rescue tools and the microcode" "$(file "$S/stage.packages.sh")" "pacman -S --needed --noconfirm qemu-guest-agent git partclone zip gvfs gvfs-smb gvfs-mtp && pacman -S --noconfirm amd-ucode intel-ucode"
 has "unattended: the fallback preset, then every image" "$(file "$S/stage.initramfs.sh")" "mkinitcpio -P"
 has "unattended: btrbk as packaged" "$(file "$S/stage.verify-btrbk.sh")" "0 altered files"
 # shellcheck disable=SC2016 # the step's script, matched as written

@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.2.4
-# Date: 2026-11-12
+# Version: 2.2.5
+# Date: 2026-11-18
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -154,8 +154,9 @@
 #     snapshot -- the OS snapshots its own @ read-only to
 #     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
 #     never the host's); guard-lift (systemctl stop das-vm-guard); keyrings;
-#     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent, and
-#     amd-ucode intel-ucode reinstalled); initramfs (the fallback image added
+#     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent and the
+#     rescue tools git partclone zip gvfs gvfs-smb gvfs-mtp, and amd-ucode
+#     intel-ucode reinstalled); initramfs (the fallback image added
 #     to a preset that lacks it, then mkinitcpio -P); loader
 #     (cachyos-recovery-previous.conf rewritten to boot the newest
 #     @.pre-update.* read-only, removed when there is none); verify-btrbk
@@ -4454,11 +4455,14 @@ step_upgrade() {
     printf '%s\n' 'pacman -Syu --noconfirm'
 }
 
-# The agent with --needed; the microcode images always reinstalled: on
+# The agent and the rescue tools the installer's baseline carries (those of
+# the XFCE rescue OS the CachyOS install replaced, bd 54f0) with --needed, so
+# a drive provisioned before they joined the baseline gains them; the
+# microcode images always reinstalled: on
 # 2026-10-07 drive B's packages were installed and their images were not on
 # its ESP (bd DAS-Backup-Manager-ac82), which --needed would have left so.
 step_packages() {
-    printf '%s\n' 'pacman -S --needed --noconfirm qemu-guest-agent && pacman -S --noconfirm amd-ucode intel-ucode'
+    printf '%s\n' 'pacman -S --needed --noconfirm qemu-guest-agent git partclone zip gvfs gvfs-smb gvfs-mtp && pacman -S --noconfirm amd-ucode intel-ucode'
 }
 
 # Every mkinitcpio preset carries the fallback image (decision 8: drive A's

@@ -1464,7 +1464,7 @@ Everything an attended session does still applies — the checks, the lock, the 
 5. **guard-lift** — `systemctl stop das-vm-guard`: pacman cannot replace a file something is mounted on. The masks hold.
 6. **keyrings** — `pacman -Sy --noconfirm --needed archlinux-keyring cachyos-keyring`.
 7. **upgrade** — `pacman -Syu --noconfirm`, at most 2 hours (`DAS_RECOVERY_VM_UPDATE_SECS`).
-8. **packages** — `pacman -S --needed --noconfirm qemu-guest-agent`, then `pacman -S --noconfirm amd-ucode intel-ucode`, reinstalled whatever is installed: a drive can have both packages installed and neither image on its ESP, which every loader entry names.
+8. **packages** — `pacman -S --needed --noconfirm qemu-guest-agent git partclone zip gvfs gvfs-smb gvfs-mtp` (the agent, and the rescue tools the installer's baseline carries, so a drive provisioned before they joined it gains them), then `pacman -S --noconfirm amd-ucode intel-ucode`, reinstalled whatever is installed: a drive can have both packages installed and neither image on its ESP, which every loader entry names.
 9. **initramfs** — every preset in `/etc/mkinitcpio.d/` must build the fallback image its Fallback entry boots: one with only `PRESETS=('default')` (an older drive's, say) gets `'fallback'`, `fallback_image` (its `default_image` with `-fallback`) and `fallback_options="-S autodetect"`; one of any other shape without it stops the update. Then `mkinitcpio -P`.
 10. **verify-btrbk** — `pacman -Qkk btrbk` must report `0 altered files`.
 11. **verify-boot** — inside the recovery OS: every `linux`, `initrd` and `efi` file each `loader/entries/*.conf` names must be on its ESP, and every `LABEL=`, `UUID=`, `PARTUUID=` and `PARTLABEL=` in `/etc/fstab` must resolve to a device — drive B's named its ESP by the label of before the relabel, which stopped its boot in emergency mode (bd `DAS-Backup-Manager-ac82`).
@@ -1785,6 +1785,10 @@ Fill in from `blkid` or your storage architecture document:
 | `smartctl` | Drive health checking |
 | `btrfs` | BTRFS filesystem tools |
 | `rsync` | File synchronization |
+| `partclone` | Image or clone a partition, copying only used blocks |
+| `git` | Fetch a repository or a fix onto a machine being repaired |
+| `zip` | Pack files for a system that reads only zip |
+| `gvfs`, `gvfs-smb`, `gvfs-mtp` | Dolphin reaching SMB shares and phones (MTP) |
 
 ### Useful Commands
 
