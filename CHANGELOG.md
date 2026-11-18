@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`config validate` no longer warns that `recovery_os.local_docs_dir` and `recovery_os.repo_level` are not keys this version reads** (bd `DAS-Backup-Manager-54f0`): the unknown-key check builds its list from a config with every optional key set, and `key_schema` left those two unset, so setting either drew the warning; seen on the host after setting `repo_level = "v3"`
+  - `every_recovery_os_key_is_one_this_version_reads` sets every `[recovery_os]` key and expects no warning; seen failing first, naming both keys
+
 - **Clear schedule no longer reports `Schedule written: <unit>`** (bd `DAS-Backup-Manager-eg4j.9`): the Recovery drives panel sends both Schedule and Clear schedule through `RecoveryOsScheduleSet` (time 0 clears) and showed the one result as written; it now remembers which it sent and says `Schedule cleared: <unit>` after a clear
   - Seen on the host: a cleared schedule left no timer and the card read `Schedule: none`, while the status line said written
   - `gui/tests/smoketest.cpp` `aClearedScheduleIsSaidClearedNotWritten` clicks Clear schedule and answers it as the helper would

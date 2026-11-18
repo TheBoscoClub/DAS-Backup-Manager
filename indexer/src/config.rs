@@ -885,6 +885,8 @@ fn key_schema() -> toml::Table {
     let mut c = Config::default();
     c.recovery_os.egress_org = Some(String::new());
     c.recovery_os.install_user = Some(String::new());
+    c.recovery_os.local_docs_dir = Some(String::new());
+    c.recovery_os.repo_level = Some(String::new());
     c.sources.push(Source {
         label: String::new(),
         volume: String::new(),
@@ -6608,6 +6610,19 @@ enabled = false
             text.contains("{ name = \"@\", snapshot_name = \"root\" }"),
             "{text}"
         );
+    }
+
+    /// Every `[recovery_os]` key, each optional one set, is one this version
+    /// reads. Seen on the host 2026-11-18: repo_level set, `config validate`
+    /// warned it "is not a key this version reads", and local_docs_dir too
+    /// (bd 54f0): key_schema leaves out an optional key it does not set.
+    #[test]
+    fn every_recovery_os_key_is_one_this_version_reads() {
+        let text = minimal_toml(
+            "[recovery_os]\nmax_age_days = 60\negress_org = \"AS64500\"\ninstall_user = \"recovery\"\n\
+             local_docs_dir = \"/srv/recovery-docs\"\nrepo_level = \"v3\"\n",
+        );
+        assert_eq!(unknown_key_warnings(&text).unwrap(), Vec::<String>::new());
     }
 
     /// A key a known table does not have is warned about, with the nearest
