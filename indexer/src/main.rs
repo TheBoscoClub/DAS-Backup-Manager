@@ -3028,7 +3028,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(d) => d,
                     None => buttered_dasd::config::local_docs_dir(&cfg, &config)?,
                 };
-                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check)?;
+                let runner = buttered_dasd::fsutil::SystemRunner;
+                let mounts = buttered_dasd::local_docs::Mounts::probed(&runner);
+                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check, &mounts)?;
                 for r in &reports {
                     use buttered_dasd::local_docs::DocOutcome;
                     let p = r.path.display();

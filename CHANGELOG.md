@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tables of a volume's subvolumes in your own recovery documents, generated** (bd `DAS-Backup-Manager-riwa.1`): hand-kept tables of mount points and backup names drifted like the lists did, and their per-subvolume compression said what fstab asks, not what runs
+  - `btrdasd docs refresh` also fills `<!-- btrdasd:subvolume-table volume=<path> [under=<path>] [level=top] -->` … `<!-- /btrdasd:subvolume-table -->` blocks: one row per non-retired entry of every source on the volume (subvolume, mount point, source, `<target dir>/<snapshot name>.<TS>`, targets), the filesystem's live compression once, and the patterns never backed up
+  - Mount points from one read-only `findmnt -P -t btrfs` per refresh, run only when a document has a table, matched by the source's `UUID=` and the entry's path; nested entries inside their nearest mounted ancestor; byte-stable from run to run, so a current document is not rewritten
+  - A close marker must name its own block's kind; the mounts unreadable, a source device not `UUID=…`, or a volume selecting nothing refuses the document as before
+  - Documented in the Disaster Recovery Guide ("Tables the configuration and the live mounts keep current")
+
 - **Lists in your own recovery documents that the configuration keeps current** (bd `DAS-Backup-Manager-o77b`): a hand-kept list of a source's subvolumes fell behind every time sync adopted or retired one
   - `btrdasd docs refresh [--check] [--dir DIR]` fills each block between `<!-- btrdasd:subvolumes source=<label> [under=<path>] -->` and `<!-- /btrdasd:subvolumes -->` in the regular top-level `*.md` files of `[recovery_os].local_docs_dir` with that source's non-retired entries, sorted; a file whose markers do not pair, or name an unknown attribute or source, is left byte for byte and named; markers in fenced code are text; a current file is not rewritten
   - `backup-run.sh` runs it after the subvolume sync and before btrbk (`--check` in a dry run), so each root snapshot carries the current text; a refusal is a WARN in the new `Local documents` report row, never a failed run

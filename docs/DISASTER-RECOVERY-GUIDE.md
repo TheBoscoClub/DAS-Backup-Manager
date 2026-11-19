@@ -1612,6 +1612,15 @@ Alpha, beta
 
 `btrdasd docs refresh` replaces what stands between them with that source's current entries, retired ones left out, sorted and comma-separated: with `under=`, only the entries directly under that path, by their last component (a nested subvolume is not listed); without it, every entry by its full name. Every backup run (`backup-run.sh`, the scheduled one) runs it after its subvolume sync and before btrbk, so each night's root snapshot carries the current text and the recovery drives take it at their next boot (above). A dry run only checks (`--check`). It fails closed: a file whose markers do not pair, or that names an unknown attribute or source, or selects no entry, is left exactly as it was, named in the report's `Local documents` row as a WARN; a document never fails a backup. Markers inside fenced code, as here, are text. Only regular top-level `*.md` files are read; a symlink is refused. Exit status: 0 done (with `--check`, all current), 1 `--check` found one that would change, 2 a document was refused or the refresh could not run.
 
+**Tables the configuration and the live mounts keep current.** A table of the subvolumes on one volume is marked the same way, with its own pair:
+
+```text
+<!-- btrdasd:subvolume-table volume=<source volume> [under=<path>] [level=top] -->
+<!-- /btrdasd:subvolume-table -->
+```
+
+The refresh writes one row for every non-retired entry of every source on that volume (`volume =` as `config.toml` spells it), sorted by name: the subvolume, where it is mounted, its source, the snapshot name it is sent under (`<target directory>/<snapshot name>.<TS>`, from the same helpers that write `btrbk.conf`; the state subvolume says `after indexing`) and its targets (`all`, or the labels it is limited to). `under=` keeps the entries under that path; `level=top` keeps the ones at the top of the volume. Under the table it writes the filesystem's compression, once, and the patterns never backed up (`[subvolumes].exclude` and the built-in ones). The mount point comes from one read-only `findmnt -P -t btrfs` per refresh, matched by the source's `device = "UUID=…"` and the entry's path: an entry not mounted itself is shown inside its nearest mounted ancestor, the filesystem's top level last; reached by no mount, `not mounted`. Compression is a line, not a column, because btrfs applies `compress=` to the whole filesystem (the first mount's value wins), whatever fstab asks per subvolume. A table needs a source whose device is `UUID=…`; when the mounts cannot be read, or the volume selects no entry, the document is refused like any other. There is no hand-written column: every cell is something the configuration or the running system says.
+
 The usage lines, verbatim from `recovery-os-vm.sh`:
 
 ```text
