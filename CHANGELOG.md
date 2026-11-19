@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A test can no longer signal its own process group when a child's pid reads 0** (bd `DAS-Backup-Manager-2kb1.12`): `dropping_a_running_child_never_kills_it` sent `kill(pid, SIGKILL)` to `SystemChild::pid` unchecked, and `kill(0, …)` is the caller's whole group; the weekly mutation run's `pid -> 0` mutant killed the test binary (`Signalled(9)`), so shard 5 counted 361 of 362 mutants and its gate refused the run
+  - The test now takes the pid through `signalable_pid`, the cancel's own check, which refuses 0; replayed, the mutant is caught as an ordinary test failure
+
 - **The Mutants gate fails a sizeable run whose mutants were mostly unviable, and a linker SIGBUS counts as resource exhaustion** (bd `DAS-Backup-Manager-sh1m`): `.github/scripts/mutants-gate.py` was an older copy of the house template; a run of 20 or more mutants with over half unviable (a tree that stopped compiling mid-run) tested almost nothing yet passed
   - Reinstalled from the template, keeping the instantiation header; the template's suite run against the old copy failed 6 checks (four rule-1d cases, two SIGBUS cases) and passes all 51 against the new one
   - The last weekly full-scope run had 6–11% unviable per shard, so the new rule does not fire on this project's ordinary runs

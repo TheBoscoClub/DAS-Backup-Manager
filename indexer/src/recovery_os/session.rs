@@ -1269,8 +1269,14 @@ exit 7"#,
         drop(child);
         std::thread::sleep(std::time::Duration::from_millis(150));
         let state = proc_state(pid);
-        // SAFETY: kill(2) with a pid this test spawned and a valid signal.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // Through the same check as the cancel: a pid of 0 (or one past
+        // pid_t) would make kill(2) signal this test's own process group, as
+        // a mutant returning 0 from `pid` did in CI (bd 2kb1.12: the test
+        // binary died of SIGKILL); refused, the test fails instead.
+        let target = signalable_pid(pid).expect("the spawned child has a signalable pid");
+        // SAFETY: kill(2) with a pid above 0 that this test spawned, and a
+        // valid signal.
+        unsafe { libc::kill(target, libc::SIGKILL) };
         assert!(
             matches!(state, Some(c) if c != 'Z'),
             "the dropped child stopped running: {state:?}"
