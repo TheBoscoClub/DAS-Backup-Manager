@@ -365,6 +365,11 @@ enum Commands {
         #[command(subcommand)]
         action: SubvolAction,
     },
+    /// The installation's own recovery documents ([recovery_os].local_docs_dir)
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
     /// Show backup system health — drive status, SMART, disk usage, growth trends
     Health {
         /// Path to config.toml
@@ -671,6 +676,28 @@ enum ScheduleAction {
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Fill each marked subvolume list in the local documents from config.toml
+    ///
+    /// A list is the text between `<!-- btrdasd:subvolumes source=<label>
+    /// [under=<path>] -->` and `<!-- /btrdasd:subvolumes -->`, each on a line
+    /// of its own. Exit 0: done (or, with --check, all current); 1: --check
+    /// found a document that would change; 2: a document was refused (left as
+    /// it was) or the refresh could not run.
+    Refresh {
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// The documents' directory (default: [recovery_os].local_docs_dir, as resolved for provision)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Say what would change, write nothing
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -2992,6 +3019,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
 
         // ----- Subvol commands -----
+        Commands::Docs {
+            action: DocsAction::Refresh { config, dir, check },
+        } => {
+            let run = || -> Result<i32, String> {
+                let cfg = Config::load(&config).map_err(|e| e.to_string())?;
+                let dir = match dir {
+                    Some(d) => d,
+                    None => buttered_dasd::config::local_docs_dir(&cfg, &config)?,
+                };
+                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check)?;
+                for r in &reports {
+                    use buttered_dasd::local_docs::DocOutcome;
+                    let p = r.path.display();
+                    match &r.outcome {
+                        DocOutcome::Current => println!("current      {p}"),
+                        DocOutcome::Updated if check => println!("would update {p}"),
+                        DocOutcome::Updated => println!("updated      {p}"),
+                        DocOutcome::Refused(why) => println!("REFUSED      {p}: {why}"),
+                    }
+                }
+                Ok(buttered_dasd::local_docs::exit_code(&reports, !check))
+            };
+            match run() {
+                Ok(0) => {}
+                Ok(code) => std::process::exit(code),
+                Err(why) => {
+                    eprintln!("btrdasd docs refresh: {why}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Commands::Subvol { action } => match action {
             SubvolAction::List { config } => {
                 let cfg = Config::load(&config)?;

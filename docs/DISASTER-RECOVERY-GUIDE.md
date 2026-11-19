@@ -1570,10 +1570,11 @@ grep -A8 'label = "recovery-A"' /etc/das-backup/config.toml | grep mount_uuid
 
 ### What the recovery OS knows at boot
 
-A recovery drive's OS is its own install, so by itself it knows nothing of your sources, your targets or your backup index. Two things bring it up to date at every boot, run by `das-recovery-state-sync.service` (script `/usr/lib/das-backup/das-recovery-state-sync.sh`), and both come from what the backup runs already sent to the drive's own backup partition (partition 2):
+A recovery drive's OS is its own install, so by itself it knows nothing of your sources, your targets or your backup index. Three things bring it up to date at every boot, run by `das-recovery-state-sync.service` (script `/usr/lib/das-backup/das-recovery-state-sync.sh`), and both come from what the backup runs already sent to the drive's own backup partition (partition 2):
 
 - **The state.** `/var/lib/das-backup` (the search index, the run records, the history) is replaced by a reflink copy of the newest received `das-state.<stamp>` snapshot — the same btrfs, so it is instant and costs no space. Search and the restore browser in the GUI work on the host's index, as of the last backup run.
 - **The configuration.** The host's `config.toml` is read from the newest received `root-.<stamp>` snapshot (`etc/das-backup/config.toml`) and derived into this OS's `/etc/das-backup/config.toml` by `btrdasd config derive-recovery --from <file> --booted-uuid <uuid>`. Every target is kept, the one this drive booted from first, so the GUI resolves a snapshot to the drive's own copy; no sources are kept; email, scrub and the boot step are off; `[general] recovery_drive = true`. Restores are allowed only under **`/mnt/restore`** and **`/home/restore-test`** — nowhere else (system paths stay refused whatever the file says). Create the destination first (`sudo mkdir -p /mnt/restore`).
+- **Your own recovery documents.** Every regular `*.md` in the host's local documents directory (`[recovery_os].local_docs_dir`, `/etc/das-backup-docs` unless set), read from the same `root-.<stamp>` snapshot, replaces this OS's copy at the same path, so the Desktop links open text as current as the last backup run, with no network. Nothing is deleted and no symlink is followed; a document that cannot be copied keeps its previous copy and the sync goes on.
 
 Only a *complete* receive counts: a snapshot that is not read-only, or has no Received UUID (an interrupted `btrfs receive`), is skipped, with a line in the journal. Nothing is replaced until both the state copy and the derived configuration are ready; each is swapped in whole (`mv --exchange` where coreutils has it, else set aside and restored on failure), so a failure leaves what was there — never an empty database.
 
@@ -1600,6 +1601,16 @@ Only a *complete* receive counts: a snapshot that is not read-only, or has no Re
 `recovery-os-vm.sh provision` rebuilds a recovery drive's own OS from the host in one command. The host writes nothing to the drive: the installer runs as root **inside the drive's own VM**, from the CachyOS live ISO, and the host only drives it through the guest agent. No partition table is written and no btrfs filesystem is made: partition 2 keeps every received backup, so the first backup run afterwards is an ordinary incremental, not a full send. The old OS is set aside by renaming and is deleted only after the new one has booted and been proven.
 
 **Your own recovery documents.** The documents shipped with the package are generic templates. Put your filled-in copies of `EMERGENCY-QUICK-REFERENCE.md`, `DISASTER-RECOVERY-GUIDE.md` and `STORAGE-ARCHITECTURE-AND-RECOVERY.md` in `/etc/das-backup-docs/`, the directory beside `/etc/das-backup/` (`[recovery_os].local_docs_dir` names another). `provision` carries every regular `*.md` file there to the recovery drive, installs it at the same path, and points the Desktop links at your copies; a document you have not filled in keeps the generic version. A symlink or other non-regular file there is a refusal. Keep the directory flat: only its top-level `*.md` files are carried. Earlier versions kept them in `/etc/das-backup/docs/`: `sudo btrdasd setup --upgrade` moves that directory once (it refuses, changing nothing, when both exist), and `provision` refuses while the old one is still there.
+
+**Lists the configuration keeps current.** A list in your documents that the configuration already holds, such as the subvolumes of one source, can be marked so it never drifts. Put the two marker lines around it, each on a line of its own:
+
+```text
+<!-- btrdasd:subvolumes source=<source label> under=<path> -->
+Alpha, beta
+<!-- /btrdasd:subvolumes -->
+```
+
+`btrdasd docs refresh` replaces what stands between them with that source's current entries, retired ones left out, sorted and comma-separated: with `under=`, only the entries directly under that path, by their last component (a nested subvolume is not listed); without it, every entry by its full name. Every backup run (`backup-run.sh`, the scheduled one) runs it after its subvolume sync and before btrbk, so each night's root snapshot carries the current text and the recovery drives take it at their next boot (above). A dry run only checks (`--check`). It fails closed: a file whose markers do not pair, or that names an unknown attribute or source, or selects no entry, is left exactly as it was, named in the report's `Local documents` row as a WARN; a document never fails a backup. Markers inside fenced code, as here, are text. Only regular top-level `*.md` files are read; a symlink is refused. Exit status: 0 done (with `--check`, all current), 1 `--check` found one that would change, 2 a document was refused or the refresh could not run.
 
 The usage lines, verbatim from `recovery-os-vm.sh`:
 

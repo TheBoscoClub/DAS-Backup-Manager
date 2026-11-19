@@ -248,6 +248,11 @@ case "$1 ${2:-}" in
     printf 'RETIRED SUBVOLUMES\n  None.\n'
     exit "$(knob expire_rc 0)"
     ;;
+"docs refresh")
+    # bd o77b: the local documents' lists, refreshed before btrbk.
+    printf 'current      /etc/das-backup-docs/a.md\n'
+    exit "$(knob docs_rc 0)"
+    ;;
 "backup static")
     exit "$(knob static_rc 0)"
     ;;
@@ -1093,6 +1098,15 @@ fresh
 knob recovery_rc 1 # a recovery OS behind the host: WARN
 run_backup
 expect_completed "warnings only (a stale recovery OS)" 0 "COMPLETED WITH WARNINGS" success
+
+# bd o77b: a refused local document is a WARN; documents never fail a backup.
+fresh
+knob docs_rc 2
+run_backup
+expect_completed "warnings only (a local document refused)" 0 "COMPLETED WITH WARNINGS" success
+check "refused document: btrbk still ran" "$(ran_btrbk)" "yes"
+check "refused document: the report row" \
+    "$(grep -c '^  Local documents       WARN' "$WORK/lib/last-report.txt")" "1"
 
 fresh
 run_backup --dryrun

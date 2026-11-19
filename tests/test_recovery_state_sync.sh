@@ -66,6 +66,7 @@ if [[ "\$1 \$2" == "config derive-recovery" ]]; then
 elif [[ "\$1 \$2" == "config dump-env" && -z "\${STUB_DUMPENV_EMPTY:-}" ]]; then
     echo "DAS_TARGET_COUNT=2"
     echo "DAS_TARGET_0_MOUNT='$WALK_MOUNT'"
+    [[ -z "\${STUB_DOCS_DIR:-}" ]] || echo "DAS_RECOVERY_OS_LOCAL_DOCS_DIR='\$STUB_DOCS_DIR'"
 fi
 S
 cat >"$BIN/systemd-run" <<'S'
@@ -436,6 +437,40 @@ UNIT="$(dirname "$SCRIPT")/../systemd/das-recovery-state-sync.service"
 check "unit: After plymouth-start" grep -qE '^After=.*plymouth-start\.service' "$UNIT"
 check "unit: Before plymouth-quit.service" grep -qE '^Before=.*plymouth-quit\.service' "$UNIT"
 check "unit: Before plymouth-quit-wait.service" grep -qE '^Before=.*plymouth-quit-wait\.service' "$UNIT"
+
+echo "== local documents: the host's copies, from the same root snapshot (bd o77b)"
+DOCS=/etc/das-backup-docs
+fixture
+SNAPDOCS="$R/nvme/root-.20261012T0348$DOCS"
+mkdir -p "$SNAPDOCS" "$R$DOCS" "$WORK/outside"
+echo "list: Alpha, beta" >"$SNAPDOCS/ref.md"
+echo "guide" >"$SNAPDOCS/guide.md"
+echo "not a document" >"$SNAPDOCS/notes.txt"
+echo "outside the snapshot" >"$WORK/outside/target.md"
+ln -s "$WORK/outside/target.md" "$SNAPDOCS/link.md"
+echo "list: stale" >"$R$DOCS/ref.md"
+echo "kept" >"$R$DOCS/only-on-the-drive.md"
+run STUB_DOCS_DIR="$DOCS"
+check "docs: sync still exit 0" test "$RC" -eq 0
+check "docs: a stale copy replaced" has "$R$DOCS/ref.md" "list: Alpha, beta"
+check "docs: a new one copied" has "$R$DOCS/guide.md" "guide"
+check "docs: only *.md" test ! -e "$R$DOCS/notes.txt"
+check "docs: a symlink is never followed or copied" test ! -e "$R$DOCS/link.md" -a ! -L "$R$DOCS/link.md"
+check "docs: nothing is deleted" has "$R$DOCS/only-on-the-drive.md" "kept"
+check "docs: no temporary file left" test -z "$(find "$R$DOCS" -name '.*.new')"
+check "docs: says how many" out_has "local documents: 2 copied from root-.20261012T0348"
+
+fixture
+run STUB_DOCS_DIR="$DOCS"
+check "no documents in the snapshot: exit 0" test "$RC" -eq 0
+check "no documents in the snapshot: nothing made" test ! -e "$R$DOCS"
+
+fixture
+mkdir -p "$R/nvme/root-.20261012T0348/etc/x"
+echo "x" >"$R/nvme/root-.20261012T0348/etc/x/a.md"
+run STUB_DOCS_DIR="/etc/../etc/x"
+check "a docs path with .. : not copied" test ! -e "$R/etc/x/a.md"
+check "a docs path with .. : sync still exit 0" test "$RC" -eq 0
 
 if ((FAILS > 0)); then
     printf '%d check(s) FAILED\n' "$FAILS"

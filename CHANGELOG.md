@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Lists in your own recovery documents that the configuration keeps current** (bd `DAS-Backup-Manager-o77b`): a hand-kept list of a source's subvolumes fell behind every time sync adopted or retired one
+  - `btrdasd docs refresh [--check] [--dir DIR]` fills each block between `<!-- btrdasd:subvolumes source=<label> [under=<path>] -->` and `<!-- /btrdasd:subvolumes -->` in the regular top-level `*.md` files of `[recovery_os].local_docs_dir` with that source's non-retired entries, sorted; a file whose markers do not pair, or name an unknown attribute or source, is left byte for byte and named; markers in fenced code are text; a current file is not rewritten
+  - `backup-run.sh` runs it after the subvolume sync and before btrbk (`--check` in a dry run), so each root snapshot carries the current text; a refusal is a WARN in the new `Local documents` report row, never a failed run
+  - `das-recovery-state-sync.sh` (1.2.0) copies those documents from the newest received root snapshot into the recovery OS at every boot, so a drive's Desktop links open text as current as the last backup, offline; nothing is deleted, no symlink followed, and a copy that fails keeps the previous one without failing the sync
+  - Documented in the Disaster Recovery Guide ("Lists the configuration keeps current", and the boot-time sync), `docs/INSTALL.md` and `docs/ARCHITECTURE.md`
+
 - **`[recovery_os].repo_level = "v3"` puts a recovery OS on CachyOS's x86-64-v3 repositories** (bd `DAS-Backup-Manager-54f0`): a provisioned drive runs the generic x86-64 builds, so its kernel can trail a host on the v3 repositories; an installation whose drives only boot x86-64-v3 machines can now have them follow the host, kernel included
   - New unattended step `repo-level` in `recovery-os-vm.sh` (2.3.0), after `snapshot` and `slot`: puts `[cachyos-v3]`, `[cachyos-core-v3]` and `[cachyos-extra-v3]` above `[cachyos]`, adds `x86_64_v3` to an `Architecture` line that is not `auto`, keeps the old file as `/etc/pacman.conf.pre-repo-level`; refused, changing nothing, on a CPU without x86-64-v3 or without `cachyos-v3-mirrorlist`; unset or already done, nothing changes
   - `Config::validate` and `load_targets` accept only `v3`; `btrdasd config dump-env` exports `DAS_RECOVERY_OS_REPO_LEVEL` only when set

@@ -6,8 +6,8 @@
 # (btrdasd config derive-recovery). Same btrfs: the copy is instant and costs
 # no space. Then, only when the state is older than the data (a night the
 # state pass failed), an incremental index catch-up in the background.
-# Version: 1.1.4
-# Date: 2026-10-13
+# Version: 1.2.0
+# Date: 2026-11-18
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
 # in the unit, and the marker is written only by provisioning. A failure
@@ -248,6 +248,52 @@ fi
     cleanup_new
     die "installing the derived configuration failed: state is new, configuration is the previous one"
 }
+
+# The installation's own recovery documents ([recovery_os].local_docs_dir),
+# from the same root snapshot as the configuration (bd DAS-Backup-Manager-o77b):
+# the host refreshes their lists before each backup's snapshots, so this copy
+# is as current as the newest backup, offline. Each regular, plainly named *.md
+# replaces this OS's copy (written beside it, then renamed); nothing is
+# deleted, no symlink is followed. Documents never fail the sync: any problem
+# is one line on stderr and the previous copies stay.
+copy_local_docs() {
+    # Spelled out, never a bracket range: a range follows the locale's collation.
+    local ascii_alnum=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+    local env_text rc dir src dest f n tmp copied=0
+    env_text=$("$BTRDASD" config dump-env --config "$CONFIG_OUT" 2>/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")
+    rc=${env_text##*$'\n'status=}
+    [[ "$env_text" == *$'\n'status=* && "$rc" == 0 ]] || {
+        say "das-recovery-state-sync: local documents not copied: dump-env exited ${rc:-unknown}" >&2
+        return 0
+    }
+    dir=$(sed -n "s/^DAS_RECOVERY_OS_LOCAL_DOCS_DIR='\(.*\)'\$/\1/p" <<<"$env_text")
+    [[ -n "$dir" ]] || return 0
+    # As config.rs local_docs_dir_is_valid: absolute, plain, no . or .. component.
+    [[ "$dir" =~ ^(/[${ascii_alnum}._-]+)+$ && ! "$dir" =~ (^|/)\.\.?(/|$) ]] || {
+        say "das-recovery-state-sync: local documents not copied: '$dir' is not a plain absolute path" >&2
+        return 0
+    }
+    src="$root_snap$dir"
+    dest="$ROOT$dir"
+    [[ -d "$src" && ! -L "$src" ]] || return 0
+    mkdir -p "$dest" || {
+        say "das-recovery-state-sync: local documents not copied: cannot create $dest" >&2
+        return 0
+    }
+    for f in "$src"/*.md; do
+        n=${f##*/}
+        [[ -f "$f" && ! -L "$f" && "$n" =~ ^[${ascii_alnum}._-]+$ ]] || continue
+        tmp="$dest/.$n.new"
+        if cp -- "$f" "$tmp" && "$MV" -f -- "$tmp" "$dest/$n"; then
+            copied=$((copied + 1))
+        else
+            rm -f -- "${tmp:?}"
+            say "das-recovery-state-sync: local document $n not copied: the previous copy stays" >&2
+        fi
+    done
+    say "local documents: $copied copied from ${root_snap##*/}"
+}
+copy_local_docs
 
 # top_level_of <mountpoint>: "UUID FSROOT" of what is mounted there; empty and
 # nonzero when nothing is.

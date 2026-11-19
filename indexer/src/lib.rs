@@ -11,6 +11,7 @@ pub mod forget;
 pub mod fsutil;
 pub mod health;
 pub mod indexer;
+pub mod local_docs;
 pub mod maintenance;
 pub mod mount;
 pub mod progress;

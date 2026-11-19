@@ -1818,6 +1818,46 @@ sync_subvolumes() {
     return 0
 }
 
+# Fill the marked subvolume lists in the installation's own recovery documents
+# ([recovery_os].local_docs_dir) from the config sync just wrote (bd
+# DAS-Backup-Manager-o77b): `btrdasd docs refresh`. Before btrbk, so tonight's
+# root snapshot carries the current text, and each recovery drive takes it from
+# there at its next boot (das-recovery-state-sync). It takes no lock and needs
+# none: it reads config.toml and replaces each changed document atomically. A
+# dry run only checks. A refused document (markers that do not pair, an unknown
+# source) is left as it was and is a WARN: documents never fail a backup.
+refresh_local_docs() {
+    local mode="$1" out rc
+    local args=(docs refresh --config "$DAS_CONFIG")
+    [[ "$mode" != "dryrun" ]] || args+=(--check)
+    log_info "Refreshing the lists in the local recovery documents..."
+    out=$("$BTRDASD_BIN" "${args[@]}" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")
+    if [[ "$out" != *$'\n'status=* ]]; then
+        rc="unknown"
+    else
+        rc=${out##*$'\n'status=}
+        out=${out%$'\n'status=*}
+    fi
+    local updated=0 line
+    if [[ -n "$out" ]]; then
+        while IFS= read -r line; do log_info "  $line"; done <<<"$out"
+    fi
+    while IFS= read -r line; do
+        [[ "$line" == "updated "* || "$line" == "would update "* ]] && updated=$((updated + 1))
+    done <<<"$out"
+    # Only a check exits 1 (a document would change); in a real run it is as
+    # unexpected as any other status.
+    case "$mode:$rc" in
+    dryrun:0 | dryrun:1) record_op "local_docs" "OK" "dry run: $updated would be updated" ;;
+    *:0) record_op "local_docs" "OK" "$updated updated" ;;
+    *)
+        record_op "local_docs" "WARN" "local document refresh exited $rc — a list in the local recovery documents may be stale"
+        log_warn "Local recovery documents not refreshed (exit $rc)"
+        ;;
+    esac
+    return 0
+}
+
 # Delete the backups of retired subvolumes that are past their window.
 # Runs after btrbk, while the targets are still mounted. Like the sync, it is
 # handed this run's singleton on fd 9 (DAS_BACKUP_LOCK_FD, bd
@@ -3985,6 +4025,7 @@ BACKUP OPERATIONS
   State index pass      ${OP_STATUS[state]:-N/A}  (${OP_STATUS[state_detail]:-n/a})
   Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
   Subvolume coverage    ${OP_STATUS[subvol_coverage]:-N/A}  (${OP_STATUS[subvol_coverage_detail]:-n/a})
+  Local documents       ${OP_STATUS[local_docs]:-N/A}  (${OP_STATUS[local_docs_detail]:-n/a})
   Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
   Static subvolumes     ${OP_STATUS[static_subvolumes]:-N/A}  (${OP_STATUS[static_subvolumes_detail]:-n/a})
   Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})${target_rows}
@@ -4932,6 +4973,7 @@ main() {
     # source mounted and verified, and it reloads the config, so a source it
     # adds gets its snapshot and target directories created below.
     sync_subvolumes "$mode"
+    refresh_local_docs "$mode"
     create_snapshot_dirs
     mount_targets
     # Directories only after verification: never under a path not proven to

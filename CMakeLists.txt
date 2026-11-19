@@ -322,6 +322,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_subvol_sync.sh
     )
     add_test(
+        NAME shell-local-docs-refresh
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_local_docs_refresh.sh
+    )
+    add_test(
         NAME shell-unmount-all
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_unmount_all.sh
     )
