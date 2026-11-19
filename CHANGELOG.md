@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A recovery drive no longer spends 4 to 10 minutes of every boot copying the backup index** (bd `DAS-Backup-Manager-eg4j.10`): `das-recovery-state-sync.sh` reflink-copied the newest received state into `/var/lib/das-backup` before the desktop; on a 15 GB index of 2.6 million extents that is minutes of metadata writes over the USB link, on both drives, and the slower boots missed the unattended session's `desktop` check
+  - `das-recovery-state-sync.sh` (2.0.0) makes the live state a writable snapshot of the received one, `.das-recovery-state/current` at the drive's top level (constant time, whatever the extent count), swapped in by `mv --exchange` and mounted at `/var/lib/das-backup` `nodev,nosuid,noexec`, each mount read back by UUID and subvolume before it is believed; the top level is now mounted read-write, so it is read back as this drive's first
+  - Outside every OS root, so provision, undo, delete-replaced and the `@` snapshots of an upgrade session never meet it; two levels down under a name that is not `<name>.<stamp>`, so the host's index walk of the target never reads it as a backup
+  - Deletes only `.das-recovery-state/next` and `.das-recovery-state/previous`, each only when btrfs reads it as writable with no Received UUID; a failure mounts the previous boot's live state again, never an empty state directory; a second run in one boot refuses and changes nothing
+  - A plain state directory from before 2.0.0 (and a crash's `.new`/`.old`) is renamed aside into `/var/lib/das-backup.migrating` and removed after "ready" by `das-recovery-state-sync.sh --remove-set-aside` in the transient unit `das-recovery-state-cleanup`, at idle I/O priority and on its own filesystem only; a boot that finds it still there starts it again
+  - The splash header now says the disk "prepares" the index; the phase reads "preparing the backup index"; the Disaster Recovery Guide ("What the recovery OS knows at boot") describes the live state and the one-time migration
+
 - **A test can no longer signal its own process group when a child's pid reads 0** (bd `DAS-Backup-Manager-2kb1.12`): `dropping_a_running_child_never_kills_it` sent `kill(pid, SIGKILL)` to `SystemChild::pid` unchecked, and `kill(0, …)` is the caller's whole group; the weekly mutation run's `pid -> 0` mutant killed the test binary (`Signalled(9)`), so shard 5 counted 361 of 362 mutants and its gate refused the run
   - The test now takes the pid through `signalable_pid`, the cancel's own check, which refuses 0; replayed, the mutant is caught as an ordinary test failure
 
