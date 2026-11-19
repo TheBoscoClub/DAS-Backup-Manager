@@ -284,7 +284,10 @@ copy_local_docs() {
         n=${f##*/}
         [[ -f "$f" && ! -L "$f" && "$n" =~ ^[${ascii_alnum}._-]+$ ]] || continue
         tmp="$dest/.$n.new"
-        if cp -- "$f" "$tmp" && "$MV" -f -- "$tmp" "$dest/$n"; then
+        # Whatever a crash left there, a symlink included, is removed first:
+        # cp would write through a link.
+        rm -f -- "${tmp:?}"
+        if cp -- "$f" "$tmp" &&"$MV" -f -- "$tmp" "$dest/$n"; then
             copied=$((copied + 1))
         else
             rm -f -- "${tmp:?}"
