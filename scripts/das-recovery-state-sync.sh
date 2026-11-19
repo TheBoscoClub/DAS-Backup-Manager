@@ -214,7 +214,7 @@ restore_previous() {
         mkdir -p "$STATE_DIR" || return 0
     fi
     if mount_live; then
-        say "das-recovery-state-sync: the previous live state is mounted at $STATE_DIR" >&2
+        say "das-recovery-state-sync: the live state in $LIVE_REL/current (whichever this run left there) is mounted at $STATE_DIR" >&2
     else
         say "das-recovery-state-sync: could not mount the previous live state: $STATE_DIR is empty" >&2
     fi
