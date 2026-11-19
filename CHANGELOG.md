@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A filesystem's devices and usage in your own recovery documents, generated** (bd `DAS-Backup-Manager-riwa.2`): the hand-kept device lines and "Current usage (date)" figures went stale the day they were written
+  - `btrdasd docs refresh` fills `<!-- btrdasd:filesystem volume=<path> -->` … `<!-- /btrdasd:filesystem -->` from `btrfs filesystem show --raw`, `btrfs filesystem df -b` and `lsblk -P`: each device by disk serial and model with its device name now, size and allocation; label and UUID; Data, Metadata and System profiles with used and allocated
+  - Whole GiB, no date (operator, 2026-11-19): the text changes only when a figure moves by a GiB, so a nightly refresh does not rewrite a current document
+  - The filesystem's UUID must be the configured one for that volume, else the document is refused; every probe runs at most once per refresh and only when a block needs it
+
 - **Tables of a volume's subvolumes in your own recovery documents, generated** (bd `DAS-Backup-Manager-riwa.1`): hand-kept tables of mount points and backup names drifted like the lists did, and their per-subvolume compression said what fstab asks, not what runs
   - `btrdasd docs refresh` also fills `<!-- btrdasd:subvolume-table volume=<path> [under=<path>] [level=top] -->` … `<!-- /btrdasd:subvolume-table -->` blocks: one row per non-retired entry of every source on the volume (subvolume, mount point, source, `<target dir>/<snapshot name>.<TS>`, targets), the filesystem's live compression once, and the patterns never backed up
   - Mount points from one read-only `findmnt -P -t btrfs` per refresh, run only when a document has a table, matched by the source's `UUID=` and the entry's path; nested entries inside their nearest mounted ancestor; byte-stable from run to run, so a current document is not rewritten

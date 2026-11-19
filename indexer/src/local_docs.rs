@@ -19,7 +19,10 @@
 //! [under=<path>] [level=top]`, holds a Markdown table of every entry of every
 //! source on that volume, with its live mount point (bd
 //! DAS-Backup-Manager-riwa.1): see [`render_table`]. A close marker names its
-//! block's kind (`<!-- /btrdasd:subvolume-table -->`).
+//! block's kind (`<!-- /btrdasd:subvolume-table -->`). A third,
+//! `btrdasd:filesystem volume=<path>`, holds that filesystem's devices,
+//! profiles and usage in whole GiB (bd DAS-Backup-Manager-riwa.2): see
+//! [`render_filesystem`].
 //!
 //! Fails closed: a file whose markers do not pair (an open with no close, an
 //! open inside another, a close with no open), name an unknown attribute or
@@ -28,7 +31,7 @@
 //! guide can show the syntax. Only regular `*.md` files directly in the
 //! directory are read; a symlink is refused, never followed.
 
-use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +55,8 @@ enum Kind {
     List,
     /// A Markdown table of every entry on a volume (bd DAS-Backup-Manager-riwa.1).
     Table,
+    /// A volume's devices, profiles and usage (bd DAS-Backup-Manager-riwa.2).
+    Filesystem,
 }
 
 impl Kind {
@@ -59,6 +64,7 @@ impl Kind {
         match word {
             "subvolumes" => Some(Kind::List),
             "subvolume-table" => Some(Kind::Table),
+            "filesystem" => Some(Kind::Filesystem),
             _ => None,
         }
     }
@@ -66,6 +72,7 @@ impl Kind {
         match self {
             Kind::List => "subvolumes",
             Kind::Table => "subvolume-table",
+            Kind::Filesystem => "filesystem",
         }
     }
     /// The attributes it takes, the required one first.
@@ -73,6 +80,7 @@ impl Kind {
         match self {
             Kind::List => &["source", "under"],
             Kind::Table => &["volume", "under", "level"],
+            Kind::Filesystem => &["volume"],
         }
     }
     fn close(self) -> String {
@@ -90,73 +98,96 @@ pub struct Mount {
     pub options: String,
 }
 
-/// The live mounts, read at most once and only when a document has a table.
-pub struct Mounts<'a> {
-    probe: Box<dyn Fn() -> Result<Vec<Mount>, String> + 'a>,
-    got: OnceCell<Result<Vec<Mount>, String>>,
+/// The read-only commands a refresh may run, each run at most once and
+/// only when a document needs what it prints. The one seam: tests answer
+/// each command line with fixture text.
+/// What a probe runs: a command line to its stdout, or why not.
+type Runner<'a> = Box<dyn Fn(&[&str]) -> Result<String, String> + 'a>;
+
+pub struct Probe<'a> {
+    run: Runner<'a>,
+    got: RefCell<BTreeMap<Vec<String>, Result<String, String>>>,
 }
 
-impl<'a> Mounts<'a> {
-    pub fn new(probe: impl Fn() -> Result<Vec<Mount>, String> + 'a) -> Self {
-        Mounts {
-            probe: Box::new(probe),
-            got: OnceCell::new(),
+const FINDMNT: &[&str] = &[
+    "findmnt",
+    "-P",
+    "-t",
+    "btrfs",
+    "-o",
+    "TARGET,UUID,FSROOT,OPTIONS",
+];
+const LSBLK: &[&str] = &["lsblk", "-P", "-b", "-o", "PATH,SERIAL,PKNAME,MODEL"];
+
+impl<'a> Probe<'a> {
+    pub fn new(run: impl Fn(&[&str]) -> Result<String, String> + 'a) -> Self {
+        Probe {
+            run: Box::new(run),
+            got: RefCell::new(BTreeMap::new()),
         }
     }
-    /// This host's mounts, through `runner`.
-    pub fn probed(runner: &'a dyn CommandRunner) -> Self {
-        Mounts::new(move || probe_mounts(runner))
+    /// This host, through `runner`: the command's stdout when it exits 0.
+    pub fn system(runner: &'a dyn CommandRunner) -> Self {
+        Probe::new(move |argv: &[&str]| {
+            let out = runner
+                .output(Command::new(argv[0]).args(&argv[1..]))
+                .map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{} exited {}: {}",
+                    argv.join(" "),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        })
     }
-    fn get(&self) -> Result<&[Mount], String> {
-        match self.got.get_or_init(|| (self.probe)()) {
-            Ok(m) => Ok(m),
-            Err(e) => Err(e.clone()),
+    fn output(&self, argv: &[&str]) -> Result<String, String> {
+        let key: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        if let Some(got) = self.got.borrow().get(&key) {
+            return got.clone();
         }
+        let got = (self.run)(argv);
+        self.got.borrow_mut().insert(key, got.clone());
+        got
+    }
+    /// Every btrfs mount on this host.
+    fn mounts(&self) -> Result<Vec<Mount>, String> {
+        parse_mounts(&self.output(FINDMNT)?)
     }
 }
 
-/// Every btrfs mount on this host: `findmnt -P -t btrfs`. Read only.
-pub fn probe_mounts(runner: &dyn CommandRunner) -> Result<Vec<Mount>, String> {
-    let out = runner
-        .output(Command::new("findmnt").args([
-            "-P",
-            "-t",
-            "btrfs",
-            "-o",
-            "TARGET,UUID,FSROOT,OPTIONS",
-        ]))
-        .map_err(|e| format!("cannot run findmnt: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "findmnt exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    parse_mounts(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// `findmnt -P` output: one mount a line, `KEY="value"` pairs, a value's
-/// awkward bytes written `\xHH`. A line missing a column is an error.
-fn parse_mounts(text: &str) -> Result<Vec<Mount>, String> {
-    let mut mounts = Vec::new();
+/// `KEY="value"` pair lines (`findmnt -P`, `lsblk -P`), a value's awkward
+/// bytes written `\xHH`; `what` names the command in an error.
+fn parse_pairs(what: &str, text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let mut rows = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let mut pairs: BTreeMap<&str, String> = BTreeMap::new();
+        let mut pairs = BTreeMap::new();
         let mut rest = line.trim();
         while !rest.is_empty() {
             let (key, after) = rest
                 .split_once("=\"")
-                .ok_or_else(|| format!("findmnt line {line:?}: not KEY=\"value\" pairs"))?;
+                .ok_or_else(|| format!("{what} line {line:?}: not KEY=\"value\" pairs"))?;
             let end = after
                 .find('"')
-                .ok_or_else(|| format!("findmnt line {line:?}: a value never closes"))?;
-            pairs.insert(key.trim(), unescape(&after[..end]));
+                .ok_or_else(|| format!("{what} line {line:?}: a value never closes"))?;
+            pairs.insert(key.trim().to_string(), unescape(&after[..end]));
             rest = after[end + 1..].trim_start();
         }
+        rows.push(pairs);
+    }
+    Ok(rows)
+}
+
+/// `findmnt -P` output, one mount a line; a line missing a column is an error.
+fn parse_mounts(text: &str) -> Result<Vec<Mount>, String> {
+    let mut mounts = Vec::new();
+    for mut pairs in parse_pairs("findmnt", text)? {
         let mut take = |k: &str| {
             pairs
                 .remove(k)
-                .ok_or_else(|| format!("findmnt line {line:?}: no {k}"))
+                .ok_or_else(|| format!("findmnt: a line has no {k}"))
         };
         mounts.push(Mount {
             target: take("TARGET")?,
@@ -247,7 +278,7 @@ fn marker(line: &str) -> Result<(Kind, BTreeMap<String, String>), String> {
     let mut words = inner.split_whitespace();
     let first = words.next().unwrap_or_default();
     let kind = Kind::from_word(first).ok_or_else(|| {
-        format!("{line:?}: {first:?} is not a block (subvolumes, subvolume-table)")
+        format!("{line:?}: {first:?} is not a block (subvolumes, subvolume-table, filesystem)")
     })?;
     let allowed = kind.attributes();
     let mut attrs = BTreeMap::new();
@@ -279,7 +310,7 @@ fn fill(
     config: &Config,
     kind: Kind,
     attrs: &BTreeMap<String, String>,
-    mounts: &Mounts,
+    probe: &Probe,
 ) -> Result<String, String> {
     let under = attrs.get("under").map(String::as_str);
     match kind {
@@ -290,14 +321,15 @@ fn fill(
                 Some("top") => true,
                 Some(other) => return Err(format!("level={other:?}: only level=top")),
             };
-            render_table(config, &attrs["volume"], under, top, mounts.get()?)
+            render_table(config, &attrs["volume"], under, top, &probe.mounts()?)
         }
+        Kind::Filesystem => render_filesystem(config, &attrs["volume"], probe),
     }
 }
 
 /// `text` with every marked block filled from `config` (and, for a table,
 /// `mounts`); `Ok(None)` when nothing would change.
-pub fn refreshed(config: &Config, text: &str, mounts: &Mounts) -> Result<Option<String>, String> {
+pub fn refreshed(config: &Config, text: &str, probe: &Probe) -> Result<Option<String>, String> {
     let mut out = String::with_capacity(text.len());
     let mut fence: Option<char> = None;
     // The open line's number, its kind and the block's new text, while inside one.
@@ -335,7 +367,7 @@ pub fn refreshed(config: &Config, text: &str, mounts: &Mounts) -> Result<Option<
             fence = t.chars().next();
         } else if t.starts_with(PREFIX) {
             let (kind, attrs) = marker(t).map_err(|e| format!("line {n}: {e}"))?;
-            let body = fill(config, kind, &attrs, mounts).map_err(|e| format!("line {n}: {e}"))?;
+            let body = fill(config, kind, &attrs, probe).map_err(|e| format!("line {n}: {e}"))?;
             let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
             let body: String = body.lines().map(|l| format!("{l}{eol}")).collect();
             block = Some((n, kind, body));
@@ -465,6 +497,205 @@ fn render_table(
     Ok(out)
 }
 
+/// A volume's devices, profiles and usage, read from `btrfs filesystem show`
+/// and `df` on that volume and `lsblk` for each device's disk serial and model.
+/// The filesystem must be the one the configuration names for the volume (its
+/// sources' `device = "UUID=…"`); anything else is refused, never described.
+/// Sizes are whole GiB with no date, so a refresh rewrites the text only when
+/// a figure moves (operator, 2026-11-19).
+fn render_filesystem(config: &Config, volume: &str, probe: &Probe) -> Result<String, String> {
+    let want = crate::btrbk_conf::normalise_dir(volume);
+    let mut uuids: Vec<&str> = Vec::new();
+    for src in config
+        .sources
+        .iter()
+        .filter(|s| crate::btrbk_conf::normalise_dir(&s.volume) == want)
+    {
+        let u = src.device.strip_prefix("UUID=").ok_or_else(|| {
+            format!(
+                "source {:?}: device {:?} is not UUID=…, so the filesystem cannot be checked",
+                src.label, src.device
+            )
+        })?;
+        if !uuids.contains(&u) {
+            uuids.push(u);
+        }
+    }
+    let uuid = match uuids.as_slice() {
+        [] => {
+            return Err(format!(
+                "the configuration has no source on volume {volume:?}"
+            ));
+        }
+        [u] => *u,
+        _ => {
+            return Err(format!(
+                "the sources on volume {volume:?} name different filesystems: {}",
+                uuids.join(", ")
+            ));
+        }
+    };
+    let show = probe.output(&["btrfs", "filesystem", "show", "--raw", volume])?;
+    let (label, found, devices) = parse_show(&show)?;
+    if found != uuid {
+        return Err(format!(
+            "{volume} is filesystem {found}, but the configuration names {uuid}"
+        ));
+    }
+    let df = probe.output(&["btrfs", "filesystem", "df", "-b", volume])?;
+    let blocks = parse_pairs("lsblk", &probe.output(LSBLK)?)?;
+    let row = |path: &str| {
+        blocks
+            .iter()
+            .find(|b| b.get("PATH").is_some_and(|p| p == path))
+    };
+    let field = |b: Option<&BTreeMap<String, String>>, k: &str| {
+        b.and_then(|b| b.get(k))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let mut out = String::from(
+        "| devid | Disk serial | Model | Device now | Size | Allocated |\n\
+         | --- | --- | --- | --- | --- | --- |\n",
+    );
+    for d in &devices {
+        let own = row(&d.path);
+        let disk = field(own, "PKNAME").and_then(|k| row(&format!("/dev/{k}")));
+        let serial = field(own, "SERIAL").or_else(|| field(disk, "SERIAL"));
+        let model = field(own, "MODEL").or_else(|| field(disk, "MODEL"));
+        let now = if disk.is_some() {
+            format!("{} (a partition)", d.path)
+        } else {
+            d.path.clone()
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            d.devid,
+            serial.map_or("unknown".into(), |s| format!("`{}`", cell(&s))),
+            cell(&model.unwrap_or_else(|| "unknown".into())),
+            cell(&now),
+            gib(d.size),
+            gib(d.used)
+        ));
+    }
+    out.push_str(&format!(
+        "\n{}, filesystem UUID `{found}`, {} device{}.\n\n\
+         | Kind | Profile | Used | Allocated |\n| --- | --- | --- | --- |\n",
+        label.map_or("No label".into(), |l| format!("Label `{}`", cell(&l))),
+        devices.len(),
+        if devices.len() == 1 { "" } else { "s" }
+    ));
+    // Data, Metadata, System, whatever order df prints them in.
+    let mut kinds: Vec<(usize, String)> = Vec::new();
+    for line in df.lines() {
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((kind, profile)) = head.split_once(',') else {
+            continue;
+        };
+        let kind = kind.trim();
+        let Some(rank) = ["Data", "Metadata", "System"]
+            .iter()
+            .position(|k| *k == kind)
+        else {
+            continue;
+        };
+        let num = |k: &str| -> Result<u64, String> {
+            rest.split(',')
+                .find_map(|kv| kv.trim().strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.trim().parse().ok())
+                .ok_or_else(|| format!("btrfs filesystem df line {line:?}: no {k}= in bytes"))
+        };
+        kinds.push((
+            rank,
+            format!(
+                "| {kind} | {} | {} | {} |\n",
+                cell(profile.trim()),
+                gib(num("used")?),
+                gib(num("total")?)
+            ),
+        ));
+    }
+    kinds.sort();
+    if kinds.is_empty() {
+        return Err(format!(
+            "btrfs filesystem df {volume}: no Data, Metadata or System line"
+        ));
+    }
+    for (_, row) in kinds {
+        out.push_str(&row);
+    }
+    out.push_str(
+        "\nSizes in GiB (2^30 bytes), rounded to the nearest whole GiB, \
+         so the text changes only when a figure moves by one.\n",
+    );
+    Ok(out)
+}
+
+/// One device of `btrfs filesystem show --raw`.
+struct ShowDevice {
+    devid: u64,
+    size: u64,
+    used: u64,
+    path: String,
+}
+
+/// `btrfs filesystem show --raw`: the label (`none` → `None`), the UUID and
+/// the devices; a device line that does not parse is an error.
+fn parse_show(text: &str) -> Result<(Option<String>, String, Vec<ShowDevice>), String> {
+    let first = text.lines().next().unwrap_or_default();
+    let (label, uuid) = first
+        .strip_prefix("Label: ")
+        .and_then(|r| r.rsplit_once("uuid: "))
+        .ok_or_else(|| {
+            format!("btrfs filesystem show: first line {first:?} has no label and uuid")
+        })?;
+    let label = label.trim();
+    let label = (label != "none").then(|| label.trim_matches('\'').to_string());
+    let mut devices = Vec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("devid "))
+    {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let at = |k: &str| w.iter().position(|x| *x == k).and_then(|i| w.get(i + 1));
+        let n = |k: &str| at(k).and_then(|v| v.parse::<u64>().ok());
+        match (n("devid"), n("size"), n("used"), at("path")) {
+            (Some(devid), Some(size), Some(used), Some(path)) => devices.push(ShowDevice {
+                devid,
+                size,
+                used,
+                path: path.to_string(),
+            }),
+            _ => {
+                return Err(format!(
+                    "btrfs filesystem show: device line {line:?} does not parse"
+                ));
+            }
+        }
+    }
+    if devices.is_empty() {
+        return Err("btrfs filesystem show: no device lines".into());
+    }
+    Ok((label, uuid.trim().to_string(), devices))
+}
+
+/// `bytes` as whole GiB, rounded half up, with thousands separators.
+fn gib(bytes: u64) -> String {
+    let g = (bytes + (1 << 29)) >> 30;
+    let digits = g.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{out} GiB")
+}
+
 /// Where entry `name` is reached: its own mount, else its nearest mounted
 /// ancestor's plus the rest of the path, the filesystem's top level last
 /// (preferring a mount other than the backup's own `volume`). Several
@@ -537,7 +768,7 @@ pub fn refresh_dir(
     config: &Config,
     dir: &Path,
     write: bool,
-    mounts: &Mounts,
+    probe: &Probe,
 ) -> Result<Vec<DocReport>, String> {
     let listing = match fs::read_dir(dir) {
         Ok(l) => l,
@@ -556,7 +787,7 @@ pub fn refresh_dir(
     Ok(paths
         .into_iter()
         .map(|path| {
-            let outcome = refresh_one(config, &path, write, mounts);
+            let outcome = refresh_one(config, &path, write, probe);
             DocReport { path, outcome }
         })
         .collect())
@@ -577,7 +808,7 @@ pub fn exit_code(reports: &[DocReport], write: bool) -> i32 {
     }
 }
 
-fn refresh_one(config: &Config, path: &Path, write: bool, mounts: &Mounts) -> DocOutcome {
+fn refresh_one(config: &Config, path: &Path, write: bool, probe: &Probe) -> DocOutcome {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
             return DocOutcome::Refused("a symlink, never followed".into());
@@ -590,7 +821,7 @@ fn refresh_one(config: &Config, path: &Path, write: bool, mounts: &Mounts) -> Do
         Ok(t) => t,
         Err(e) => return DocOutcome::Refused(format!("cannot read it: {e}")),
     };
-    match refreshed(config, &text, mounts) {
+    match refreshed(config, &text, probe) {
         Err(why) => DocOutcome::Refused(why),
         Ok(None) => DocOutcome::Current,
         Ok(Some(new)) => match write.then(|| crate::fsutil::write_atomic(path, &new)) {
@@ -606,8 +837,8 @@ mod tests {
     use crate::config::{Config, Retention, Source, SubvolConfig, Target, TargetRole};
 
     /// A probe a list block must never call.
-    fn no_mounts() -> Mounts<'static> {
-        Mounts::new(|| panic!("only a table reads the mounts"))
+    fn no_mounts() -> Probe<'static> {
+        Probe::new(|argv: &[&str]| panic!("a list runs nothing, not {argv:?}"))
     }
 
     fn entry(name: &str, retired: Option<&str>) -> SubvolConfig {
@@ -874,8 +1105,11 @@ mod tests {
             + "\n"
     }
 
-    fn mounts() -> Mounts<'static> {
-        Mounts::new(|| parse_mounts(&findmnt()))
+    fn mounts() -> Probe<'static> {
+        Probe::new(|argv: &[&str]| {
+            assert_eq!(argv, FINDMNT);
+            Ok(findmnt())
+        })
     }
 
     const TABLE: &str = "\
@@ -928,7 +1162,7 @@ Never backed up (`[subvolumes].exclude` and the built-in exclusions): `@cache`, 
 
     #[test]
     fn a_table_is_refused_when_the_mounts_cannot_be_read_or_nothing_matches() {
-        let failing = Mounts::new(|| Err("findmnt exited 1: boom".to_string()));
+        let failing = Probe::new(|_: &[&str]| Err("findmnt exited 1: boom".to_string()));
         let open = "<!-- btrdasd:subvolume-table volume=/srv/vol -->";
         let err = refreshed(&table_config(), &table_doc(open, ""), &failing).unwrap_err();
         assert!(err.contains("boom"), "{err}");
@@ -947,10 +1181,8 @@ Never backed up (`[subvolumes].exclude` and the built-in exclusions): `@cache`, 
             assert!(err.contains(want), "{open}: {err}");
         }
         // Only another filesystem is mounted: nothing here is reached.
-        let elsewhere = Mounts::new(|| {
-            parse_mounts(
-                r#"TARGET="/elsewhere/vm" UUID="5eed0002-0000-4000-8000-000000000002" FSROOT="/@vm" OPTIONS="rw""#,
-            )
+        let elsewhere = Probe::new(|_: &[&str]| {
+            Ok(r#"TARGET="/elsewhere/vm" UUID="5eed0002-0000-4000-8000-000000000002" FSROOT="/@vm" OPTIONS="rw""#.to_string())
         });
         let open = "<!-- btrdasd:subvolume-table volume=/srv/vol -->";
         let out = refreshed(&table_config(), &table_doc(open, ""), &elsewhere)
@@ -979,5 +1211,71 @@ Never backed up (`[subvolumes].exclude` and the built-in exclusions): `@cache`, 
                 .contains("OPTIONS")
         );
         assert!(parse_mounts("garbage").is_err());
+    }
+
+    /// `btrfs filesystem show --raw`, `df -b` and `lsblk -P` for the fixture
+    /// volume `/srv/vol`: two devices, one a partition of a disk, one a disk.
+    fn fs_probe(show_uuid: &'static str) -> Probe<'static> {
+        Probe::new(move |argv: &[&str]| match argv {
+            ["btrfs", "filesystem", "show", "--raw", "/srv/vol"] => Ok(format!(
+                "Label: 'pool'  uuid: {show_uuid}\n\tTotal devices 2 FS bytes used 1\n\
+                 \tdevid    1 size 1073741824000 used 536870912000 path /dev/sdx\n\
+                 \tdevid    2 size 1099511627776 used 537470912000 path /dev/nvme9n1p2\n"
+            )),
+            ["btrfs", "filesystem", "df", "-b", "/srv/vol"] => {
+                Ok("Data, RAID1: total=1932735283200, used=1932091038106\n\
+                 System, RAID1: total=33554432, used=16384\n\
+                 Metadata, RAID1: total=4294967296, used=3758096384\n\
+                 GlobalReserve, single: total=536870912, used=0\n"
+                    .into())
+            }
+            a if a == LSBLK => Ok(
+                r#"PATH="/dev/sdx" SERIAL="SERIAL01" PKNAME="" MODEL="Disk Model A  "
+PATH="/dev/nvme9n1" SERIAL="NVMESERIAL01" PKNAME="" MODEL="NVMe Model B"
+PATH="/dev/nvme9n1p2" SERIAL="" PKNAME="nvme9n1" MODEL=""
+"#
+                .into(),
+            ),
+            other => Err(format!("unexpected {other:?}")),
+        })
+    }
+
+    const FS: &str = "\
+| devid | Disk serial | Model | Device now | Size | Allocated |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `SERIAL01` | Disk Model A | /dev/sdx | 1,000 GiB | 500 GiB |
+| 2 | `NVMESERIAL01` | NVMe Model B | /dev/nvme9n1p2 (a partition) | 1,024 GiB | 501 GiB |
+
+Label `pool`, filesystem UUID `5eed0001-0000-4000-8000-000000000001`, 2 devices.
+
+| Kind | Profile | Used | Allocated |
+| --- | --- | --- | --- |
+| Data | RAID1 | 1,799 GiB | 1,800 GiB |
+| Metadata | RAID1 | 4 GiB | 4 GiB |
+| System | RAID1 | 0 GiB | 0 GiB |
+
+Sizes in GiB (2^30 bytes), rounded to the nearest whole GiB, so the text changes only when a figure moves by one.
+";
+
+    #[test]
+    fn a_filesystem_block_names_its_devices_by_serial_and_its_usage_in_whole_gib() {
+        let open = "<!-- btrdasd:filesystem volume=/srv/vol -->";
+        let text = format!("{open}\nold\n<!-- /btrdasd:filesystem -->\n");
+        let probe = fs_probe(UUID);
+        let out = refreshed(&table_config(), &text, &probe).unwrap().unwrap();
+        assert_eq!(out, format!("{open}\n{FS}<!-- /btrdasd:filesystem -->\n"));
+        assert_eq!(refreshed(&table_config(), &out, &probe).unwrap(), None);
+    }
+
+    #[test]
+    fn a_filesystem_that_is_not_the_configured_one_is_refused() {
+        let open = "<!-- btrdasd:filesystem volume=/srv/vol -->";
+        let text = format!("{open}\n<!-- /btrdasd:filesystem -->\n");
+        let probe = fs_probe("5eed0009-0000-4000-8000-000000000009");
+        let err = refreshed(&table_config(), &text, &probe).unwrap_err();
+        assert!(err.contains("5eed0009") && err.contains(UUID), "{err}");
+        let failing = Probe::new(|_: &[&str]| Err("btrfs exited 1: not root".to_string()));
+        let err = refreshed(&table_config(), &text, &failing).unwrap_err();
+        assert!(err.contains("not root"), "{err}");
     }
 }

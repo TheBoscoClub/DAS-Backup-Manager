@@ -688,7 +688,9 @@ enum DocsAction {
     /// of its own, filled from config.toml. A table is the text between
     /// `<!-- btrdasd:subvolume-table volume=<path> [under=<path>] [level=top]
     /// -->` and `<!-- /btrdasd:subvolume-table -->`, filled from config.toml
-    /// and the live btrfs mounts (findmnt, read only). Exit 0: done (or, with --check, all current); 1: --check
+    /// and the live btrfs mounts (findmnt, read only). A filesystem block
+    /// (`btrdasd:filesystem volume=<path>`) holds that volume's devices and
+    /// usage in whole GiB (btrfs filesystem show/df, lsblk; needs root). Exit 0: done (or, with --check, all current); 1: --check
     /// found a document that would change; 2: a document was refused (left as
     /// it was) or the refresh could not run.
     Refresh {
@@ -3032,8 +3034,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => buttered_dasd::config::local_docs_dir(&cfg, &config)?,
                 };
                 let runner = buttered_dasd::fsutil::SystemRunner;
-                let mounts = buttered_dasd::local_docs::Mounts::probed(&runner);
-                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check, &mounts)?;
+                let probe = buttered_dasd::local_docs::Probe::system(&runner);
+                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check, &probe)?;
                 for r in &reports {
                     use buttered_dasd::local_docs::DocOutcome;
                     let p = r.path.display();
