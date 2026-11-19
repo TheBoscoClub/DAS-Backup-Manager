@@ -98,12 +98,12 @@ pub struct Mount {
     pub options: String,
 }
 
-/// The read-only commands a refresh may run, each run at most once and
-/// only when a document needs what it prints. The one seam: tests answer
-/// each command line with fixture text.
 /// What a probe runs: a command line to its stdout, or why not.
 type Runner<'a> = Box<dyn Fn(&[&str]) -> Result<String, String> + 'a>;
 
+/// The read-only commands a refresh may run, each run at most once and
+/// only when a document needs what it prints. The one seam: tests answer
+/// each command line with fixture text.
 pub struct Probe<'a> {
     run: Runner<'a>,
     got: RefCell<BTreeMap<Vec<String>, Result<String, String>>>,
@@ -537,7 +537,7 @@ fn render_filesystem(config: &Config, volume: &str, probe: &Probe) -> Result<Str
     };
     let show = probe.output(&["btrfs", "filesystem", "show", "--raw", volume])?;
     let (label, found, devices) = parse_show(&show)?;
-    if found != uuid {
+    if !found.eq_ignore_ascii_case(uuid) {
         return Err(format!(
             "{volume} is filesystem {found}, but the configuration names {uuid}"
         ));
@@ -662,7 +662,13 @@ fn parse_show(text: &str) -> Result<(Option<String>, String, Vec<ShowDevice>), S
         let w: Vec<&str> = line.split_whitespace().collect();
         let at = |k: &str| w.iter().position(|x| *x == k).and_then(|i| w.get(i + 1));
         let n = |k: &str| at(k).and_then(|v| v.parse::<u64>().ok());
-        match (n("devid"), n("size"), n("used"), at("path")) {
+        // A degraded filesystem's absent device: `path <missing disk> MISSING`.
+        let path = if line.contains("<missing disk>") {
+            Some(&"missing")
+        } else {
+            at("path")
+        };
+        match (n("devid"), n("size"), n("used"), path) {
             (Some(devid), Some(size), Some(used), Some(path)) => devices.push(ShowDevice {
                 devid,
                 size,
@@ -1277,5 +1283,46 @@ Sizes in GiB (2^30 bytes), rounded to the nearest whole GiB, so the text changes
         let failing = Probe::new(|_: &[&str]| Err("btrfs exited 1: not root".to_string()));
         let err = refreshed(&table_config(), &text, &failing).unwrap_err();
         assert!(err.contains("not root"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_device_of_a_degraded_filesystem_says_so() {
+        let show = "Label: none  uuid: 5EED0001-0000-4000-8000-000000000001\n\
+                    \tTotal devices 2 FS bytes used 1\n\
+                    \tdevid    1 size 1073741824000 used 536870912000 path /dev/sdx\n\
+                    \tdevid    2 size 1073741824000 used 536870912000 path <missing disk> MISSING\n";
+        let (label, uuid, devices) = parse_show(show).unwrap();
+        assert_eq!(label, None);
+        assert_eq!(devices[1].path, "missing");
+        let probe = Probe::new(move |argv: &[&str]| match argv {
+            ["btrfs", "filesystem", "show", ..] => Ok(show.to_string()),
+            ["btrfs", "filesystem", "df", ..] => {
+                Ok("Data, RAID1: total=1073741824, used=0\n".into())
+            }
+            _ => Ok(r#"PATH="/dev/sdx" SERIAL="SERIAL01" PKNAME="" MODEL="M""#.into()),
+        });
+        let text = "<!-- btrdasd:filesystem volume=/srv/vol -->\n<!-- /btrdasd:filesystem -->\n";
+        let out = refreshed(&table_config(), text, &probe).unwrap().unwrap();
+        assert!(
+            out.contains("| 2 | unknown | unknown | missing | 1,000 GiB | 500 GiB |"),
+            "{out}"
+        );
+        assert!(
+            uuid.starts_with("5EED"),
+            "the case is the tool's; the comparison ignores it"
+        );
+    }
+
+    #[test]
+    fn under_keeps_a_table_to_the_entries_below_that_path() {
+        let open = "<!-- btrdasd:subvolume-table volume=/srv/vol under=@data -->";
+        let out = refreshed(&table_config(), &table_doc(open, ""), &mounts())
+            .unwrap()
+            .unwrap();
+        let rows: Vec<&str> = out.lines().filter(|l| l.starts_with("| `")).collect();
+        assert_eq!(
+            rows,
+            ["| `@data/inner` | /data set/inner | base | `base/data-inner.<TS>` | all |"]
+        );
     }
 }
