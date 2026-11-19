@@ -681,11 +681,14 @@ enum ScheduleAction {
 
 #[derive(Subcommand)]
 enum DocsAction {
-    /// Fill each marked subvolume list in the local documents from config.toml
+    /// Fill each marked subvolume list and table in the local documents
     ///
     /// A list is the text between `<!-- btrdasd:subvolumes source=<label>
     /// [under=<path>] -->` and `<!-- /btrdasd:subvolumes -->`, each on a line
-    /// of its own. Exit 0: done (or, with --check, all current); 1: --check
+    /// of its own, filled from config.toml. A table is the text between
+    /// `<!-- btrdasd:subvolume-table volume=<path> [under=<path>] [level=top]
+    /// -->` and `<!-- /btrdasd:subvolume-table -->`, filled from config.toml
+    /// and the live btrfs mounts (findmnt, read only). Exit 0: done (or, with --check, all current); 1: --check
     /// found a document that would change; 2: a document was refused (left as
     /// it was) or the refresh could not run.
     Refresh {
