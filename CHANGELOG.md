@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Mutants gate fails a sizeable run whose mutants were mostly unviable, and a linker SIGBUS counts as resource exhaustion** (bd `DAS-Backup-Manager-sh1m`): `.github/scripts/mutants-gate.py` was an older copy of the house template; a run of 20 or more mutants with over half unviable (a tree that stopped compiling mid-run) tested almost nothing yet passed
+  - Reinstalled from the template, keeping the instantiation header; the template's suite run against the old copy failed 6 checks (four rule-1d cases, two SIGBUS cases) and passes all 51 against the new one
+  - The last weekly full-scope run had 6–11% unviable per shard, so the new rule does not fire on this project's ordinary runs
+
 - **`config validate` no longer warns that `recovery_os.local_docs_dir` and `recovery_os.repo_level` are not keys this version reads** (bd `DAS-Backup-Manager-54f0`): the unknown-key check builds its list from a config with every optional key set, and `key_schema` left those two unset, so setting either drew the warning; seen on the host after setting `repo_level = "v3"`
   - `every_recovery_os_key_is_one_this_version_reads` sets every `[recovery_os]` key and expects no warning; seen failing first, naming both keys
 

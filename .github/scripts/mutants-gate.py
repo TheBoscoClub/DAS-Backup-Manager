@@ -27,6 +27,8 @@ WHAT IT ENFORCES
     3. The check itself ran      (a missing/!unreadable outcomes.json is a
                                   FAILURE, never a pass — a check that cannot
                                   report failure is not a check)
+    1d. Not most of a sizeable run unviable (unviable * 2 > total, total >= 20):
+       a tree broken mid-run (v3dr, 2026-10-15)
     3b. Every generated mutant has an outcome (caught + missed + timeout +
        unviable == total_mutants): a run stopped early is not scored
     1b reads debug.log, unviable mutants' logs and logs no outcome names;
@@ -97,9 +99,16 @@ EXHAUSTION_RE = re.compile(
     r"No space left on device|os error 28|StorageFull"
     r"|memory allocation of \d+ bytes failed"
     r"|Cannot allocate memory|os error 12\b|LLVM ERROR: out of memory"
-    r"|signal: 9, SIGKILL",
+    r"|signal: 9, SIGKILL"
+    # b0d0: lld writes its output through an mmap; a full tmpfs faults it
+    # with SIGBUS, not ENOSPC, so the log holds only the linker's SIGBUS lines.
+    r"|terminated with signal 7|signal: 7, SIGBUS|\[Bus error\]",
     re.IGNORECASE,
 )
+
+# Rule 1d: refuse a run of at least this many mutants with more than half unviable.
+MIN_TOTAL_FOR_RATIO = 20
+MAX_UNVIABLE_PERCENT = 50
 
 # A mutant log opens with the mutation diff: the mutated source itself, which
 # can contain any words at all. It ends at the next "*** " section header.
@@ -286,6 +295,24 @@ def main() -> int:
             "files such a build death under 'unviable', so real mutants were "
             "silently dropped from the verified set. Free space (scope TMPDIR "
             "per job, lower -j) and re-run; this result is not evidence."
+        )
+
+    # Rule 1d — a tree broken mid-run makes the mutant copies stop compiling,
+    # and every one is filed as unviable (cachyos-sentinel v3dr, 2026-10-15: a
+    # parallel agent edited sources during the run; "303 tested: 17 caught, 286
+    # unviable" passed). The baseline had already passed, so rule 1c cannot see
+    # it. More than half unviable over a run large enough to mean something is
+    # refused. Below MIN_TOTAL_FOR_RATIO a diff-scoped run is legitimately
+    # mostly unviable (rich return types); rule 2 still catches all-unviable.
+    # A rustc panic/ICE under load is also filed as unviable, and the counters
+    # cannot tell it from a type error; only this ratio can notice a bad run.
+    if total >= MIN_TOTAL_FOR_RATIO and unviable * 2 > total:
+        return fail(
+            f"{tag}{unviable} of {total} mutants were unviable (over "
+            f"{MAX_UNVIABLE_PERCENT}%). The tree probably stopped compiling "
+            "during the run (sources edited mid-run, a rustc crash, a broken "
+            "dependency), so most mutants never ran a test. This run is not "
+            "evidence: re-run it from a clean, untouched checkout."
         )
 
     # Rule 1 — a surviving mutant is a test that cannot fail.
