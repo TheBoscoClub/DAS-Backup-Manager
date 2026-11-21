@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: TheBoscoClub <theboscoclub@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13), cmake (>= 3.25), cargo, rustc,
  extra-cmake-modules, qt6-base-dev, libkf6coreaddons-dev, libkf6i18n-dev,
- libkf6xmlgui-dev, libkf6configwidgets-dev, libkf6iconthemes-dev,
+ libkf6xmlgui-dev, libkf6colorscheme-dev, libkf6configwidgets-dev, libkf6iconthemes-dev,
  libkf6crash-dev, libkf6kio-dev, libkf6notifications-dev,
  libkf6statusnotifieritem-dev, libqt6charts6-dev
 Standards-Version: 4.7.0
@@ -16,7 +16,7 @@ Depends: ${shlibs:Depends}, ${misc:Depends}, btrbk, btrfs-progs,
  smartmontools, bash, util-linux,
  libqt6charts6t64,
  libkf6coreaddons6, libkf6i18n6, libkf6xmlgui6,
- libkf6configwidgets6, libkf6iconthemes6, libkf6crash6, libkf6kio6,
+ libkf6colorscheme6, libkf6configwidgets6, libkf6iconthemes6, libkf6crash6, libkf6kio6,
  libkf6notifications6, libkf6statusnotifieritem6
 Recommends: s-nail, tigervnc-viewer, xorriso
 Suggests: virt-viewer, mbuffer,

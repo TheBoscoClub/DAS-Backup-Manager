@@ -25,6 +25,9 @@ parts:
     cmake-parameters:
       - -DCMAKE_INSTALL_PREFIX=/usr
       - -DBUILD_INDEXER=OFF
+      # The helper is a root D-Bus service the host installs; the Flatpak and
+      # the AppImage leave it out as well, and this part has no Rust toolchain.
+      - -DBUILD_HELPER=OFF
     build-packages:
       - extra-cmake-modules
       - g++
@@ -32,6 +35,7 @@ parts:
       - libkf6coreaddons-dev
       - libkf6i18n-dev
       - libkf6xmlgui-dev
+      - libkf6colorscheme-dev
       - libkf6configwidgets-dev
       - libkf6iconthemes-dev
       - libkf6crash-dev
@@ -46,11 +50,12 @@ parts:
       - bash
       - libqt6core6t64
       - libqt6widgets6t64
-      - libqt6sql6t64
+      - libqt6dbus6t64
       - libqt6charts6t64
       - libkf6coreaddons6t64
       - libkf6i18n6t64
       - libkf6xmlgui6t64
+      - libkf6colorscheme6t64
       - libkf6configwidgets6t64
       - libkf6iconthemes6t64
       - libkf6crash6t64
@@ -62,7 +67,9 @@ parts:
 
 apps:
   btrdasd:
-    command: usr/bin/btrdasd
+    # The rust plugin runs cargo install --root, which puts binaries in bin/;
+    # only the cmake part (the GUI) installs under usr/.
+    command: bin/btrdasd
   # The recovery-drive console opens TigerVNC's vncviewer on the host; inside this
   # sandbox the GUI shows the console socket's path instead (8249 stage 3).
   btrdasd-gui:

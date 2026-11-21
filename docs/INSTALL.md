@@ -254,7 +254,7 @@ match your volumes and drives; every other key is in the
 <!-- tests/test_install_doc_config.sh validates the block below with the btrdasd the build makes -->
 ```toml
 [general]
-version = "0.7.24.0"                 # the four-part version `btrdasd --version` prints
+version = "0.0.0.0"                  # set to the four-part version `btrdasd --version` prints
 install_prefix = "/usr"              # the prefix btrdasd is installed under
 db_path = "/var/lib/das-backup/backup-index.db"
 
@@ -350,9 +350,13 @@ Native packaging recipes are included under `packaging/`. The release workflow (
 | Debian 13+ / Ubuntu 24.10+ | dpkg (`dpkg-buildpackage`) | `packaging/debian/` | Full (KF6 required) |
 | Fedora 43+ | RPM (`rpmbuild`) | `packaging/fedora/` | Full |
 | AppImage | `build-appimage.sh` | `packaging/appimage/` | GUI only |
-| Flatpak | Flatpak manifest | `packaging/flatpak/` | Full |
+| Flatpak | Flatpak manifest | `packaging/flatpak/` | GUI only |
 | Snap (not built by the release workflow) | snapcraft | `packaging/snap/` | Recipe only, untested |
 | Ubuntu 24.04 LTS | cmake (CLI-only) | — | No (KF6 unavailable) |
+
+The Arch, Debian and Fedora packages install `btrdasd`, `btrdasd-helper` and the GUI, with the shell completions (bash, zsh and fish) and the man page. The Flatpak and the AppImage hold the GUI alone: no `btrdasd`, no helper and none of its D-Bus, polkit or unit files (the GUI talks to the helper the host's package or `cmake --install` put on the system bus); the helper-free builds still carry the backup scripts and the man page. The Flatpak is built on the KDE runtime named by `runtime-version` in its manifest, and the release workflow's container image (`kde-<version>`) is kept at the same version.
+
+The helper starts on its first D-Bus call and needs no enabling, so the Debian package, like the others, enables and starts nothing when it is installed or upgraded; `btrdasd setup --upgrade` restarts it after an update.
 
 **Arch Linux example:**
 

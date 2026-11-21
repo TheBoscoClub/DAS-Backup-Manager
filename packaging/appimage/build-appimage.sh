@@ -11,12 +11,16 @@ APPDIR="ButteredDASD.AppDir"
 # Clean previous build
 rm -rf "${APPDIR:?}" "${PWD:?}/build-appimage"
 
-# Build GUI with /usr prefix (AppImage convention)
+# Build GUI with /usr prefix (AppImage convention). GUI only: no btrdasd
+# and no btrdasd-helper, so no helper binary, D-Bus, polkit or unit files
+# (they only work installed on the host; the GUI reaches the host's helper
+# over the system bus).
 cmake -B build-appimage \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_GUI=ON \
-    -DBUILD_INDEXER=OFF
+    -DBUILD_INDEXER=OFF \
+    -DBUILD_HELPER=OFF
 cmake --build build-appimage
 
 # Install into AppDir

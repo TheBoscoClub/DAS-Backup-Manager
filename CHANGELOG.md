@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Flatpak builds on the current KDE runtime, 6.11** (bd `DAS-Backup-Manager-jeaq`): the manifest named KDE 6.7, which Flathub marks end-of-life, so a bundle got no runtime security fixes
+  - `runtime-version` is `6.11` (Qt 6.11.3, freedesktop 25.08 base); the release workflow's container image is `ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11` — the `bilelmoussaoui` images stop at `kde-6.7`
+  - The Rust SDK extension and the `qtcharts` module are gone: the GUI is built alone (`BUILD_INDEXER` and `BUILD_HELPER` off), so nothing runs cargo, and the runtime ships Qt Charts at its own Qt version, which a copy built from source at 6.7.3 would not match
+  - The GUI builds with `-Werror` against the 6.11 SDK, starts (`btrdasd-gui --version`) and resolves every library from the runtime; the "Free runner disk" step stays, the runtime and SDK still being about 4 GB
+
 - **The Disaster Recovery Guide explains a recovery drive's kernel, CPU level and hardware** (bd `DAS-Backup-Manager-54f0`): a provisioned drive takes the live system's `pacman.conf`, so it runs CachyOS's generic x86-64 builds and boots any 64-bit x86 machine; its kernel can trail a host on the `-v3`, `-v4` or `znver4` repositories by a patch level without being `STALE` (the rule compares the major.minor series)
   - New section "Kernel, CPU level and hardware" under "Building a recovery drive": why the gap is expected, why the update VM passes the host CPU through, and how an installation whose drives only boot capable machines can opt in to a newer level, at the cost of portability
   - `docs/INSTALL.md` no longer says CachyOS's packages need x86-64-v3/v4 for the updater VM's CPU passthrough
@@ -45,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An attended session's progress panel keeps the operator's instruction while it waits** (bd `DAS-Backup-Manager-343p`): the helper sent every percentage under the fixed stage name "progress", so the wait stage the GUI acts on was replaced as soon as it arrived and the panel read only "progress 9%"
   - A `JobProgress` signal for a percentage now names the stage the job is in (`progress::SignalStage`)
 - **A recovery-OS session cancelled from the GUI reads "Cancelled, recovery OS still running", not a red "Failed"** (bd `DAS-Backup-Manager-z5od`): the helper puts "cancelled — " in front of the script's `kept (exit 3)` summary, which the GUI did not recognise
+- **Packaging follow-ups across the formats** (bd `DAS-Backup-Manager-w49m`)
+  - The Arch and Fedora packages ship the bash, zsh and fish completions (they build `btrdasd` with a bare `cargo build`, which generated none), made by the build's own `cmake/GenerateCompletions.cmake` from the `btrdasd` just built
+  - The Debian package no longer enables and starts `btrdasd-helper.service` at install and upgrade (`dh_installsystemd --no-enable --no-start`): it is D-Bus activated, and `btrdasd setup --upgrade` restarts it; the maintainer scripts `dh_installsystemd` writes were read before and after in a `debian:trixie` container
+  - The AppImage is built without the helper (`-DBUILD_HELPER=OFF`), so it no longer carries the helper binary or its D-Bus, polkit and unit files; the Snap recipe does the same
+  - Every format names the KF6 ColorScheme component the GUI links (`kcolorscheme`, `libkf6colorscheme-dev` and `libkf6colorscheme6`, `kf6-kcolorscheme`), and the release workflow installs it
+  - The Snap stages the Qt D-Bus library the GUI uses instead of the Qt SQL library it does not, and runs `btrdasd` from `bin/`, where the rust plugin puts it
+  - `docs/INSTALL.md`'s example config no longer pins a release's version, and its package table calls the Flatpak GUI only
+
 - **An Upgrade refused for an out-of-date boot record reads "Not started", not "Failed"** (bd `DAS-Backup-Manager-eg4j.14`): the Recovery drives panel already named the remedy, but the progress panel painted the refusal as a red Failed and the desktop notification said "Recovery Drive Update Failed", though nothing had touched a drive
   - The progress panel shows **Not started** with the panel's words (press **Record** beside Upgrade, then start again, and the script's reasons whole); the notification is titled "Recovery Drive Update Not Started"
   - All three places use the one rule that recognises the refusal; any other failed session is still a red Failed

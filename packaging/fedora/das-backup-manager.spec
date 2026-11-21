@@ -11,7 +11,7 @@ BuildRequires:  rust cargo cmake >= 3.25 extra-cmake-modules gcc-c++
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  cmake(Qt6Core) cmake(Qt6Widgets) cmake(Qt6DBus)
 BuildRequires:  cmake(KF6CoreAddons) cmake(KF6I18n) cmake(KF6XmlGui)
-BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6IconThemes) cmake(KF6Crash) cmake(KF6KIO)
+BuildRequires:  cmake(KF6ConfigWidgets) cmake(KF6ColorScheme) cmake(KF6IconThemes) cmake(KF6Crash) cmake(KF6KIO)
 BuildRequires:  cmake(KF6Notifications) cmake(KF6StatusNotifierItem)
 BuildRequires:  cmake(Qt6Charts)
 Requires:       btrbk btrfs-progs smartmontools bash util-linux
@@ -23,7 +23,7 @@ Recommends:     xorriso
 # The recovery-os-updater VM (recovery-os-vm.sh): optional, and heavy.
 Suggests:       libvirt-daemon-kvm libvirt-client qemu-kvm edk2-ovmf virt-viewer ImageMagick jq
 Requires:       qt6-qtbase qt6-qtcharts kf6-kcoreaddons kf6-ki18n kf6-kxmlgui
-Requires:       kf6-kconfigwidgets kf6-kiconthemes kf6-kcrash kf6-kio
+Requires:       kf6-kconfigwidgets kf6-kcolorscheme kf6-kiconthemes kf6-kcrash kf6-kio
 Requires:       kf6-knotifications kf6-kstatusnotifieritem
 
 %description
@@ -45,6 +45,12 @@ cargo build --release --bin btrdasd --manifest-path indexer/Cargo.toml
 %install
 %cmake_install
 install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
+# Shell completions: the build's own script prints them from the btrdasd just built
+cmake -DBTRDASD=indexer/target/release/btrdasd -DOUT_DIR=%{_vpath_builddir}/completions \
+    -P cmake/GenerateCompletions.cmake
+install -Dm644 %{_vpath_builddir}/completions/btrdasd.bash %{buildroot}%{_datadir}/bash-completion/completions/btrdasd
+install -Dm644 %{_vpath_builddir}/completions/_btrdasd %{buildroot}%{_datadir}/zsh/site-functions/_btrdasd
+install -Dm644 %{_vpath_builddir}/completions/btrdasd.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/btrdasd.fish
 
 %files
 %license LICENSE
@@ -61,6 +67,9 @@ install -Dm755 indexer/target/release/btrdasd %{buildroot}%{_bindir}/btrdasd
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
 %{_datadir}/knotifications6/btrdasd-gui.notifyrc
 %{_mandir}/man1/btrdasd.1*
+%{_datadir}/bash-completion/completions/btrdasd
+%{_datadir}/zsh/site-functions/_btrdasd
+%{_datadir}/fish/vendor_completions.d/btrdasd.fish
 
 %changelog
 * Thu Nov 12 2026 TheBoscoClub <theboscoclub@users.noreply.github.com> - 0.7.24.0-1

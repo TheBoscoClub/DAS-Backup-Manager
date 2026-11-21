@@ -8,7 +8,7 @@ url='https://github.com/TheBoscoClub/DAS-Backup-Manager'
 license=('MIT')
 depends=('btrbk' 'btrfs-progs' 'smartmontools' 'bash' 'util-linux'
          'qt6-base' 'qt6-charts' 'kcoreaddons' 'ki18n' 'kxmlgui'
-         'kconfigwidgets' 'kiconthemes' 'kcrash' 'kio'
+         'kconfigwidgets' 'kcolorscheme' 'kiconthemes' 'kcrash' 'kio'
          'knotifications' 'kstatusnotifieritem' 'hicolor-icon-theme')
 # The last six are for recovery-os-vm.sh; its VM names edk2-ovmf's Arch paths.
 optdepends=('s-nail: email backup reports (mailx)'
@@ -56,6 +56,17 @@ package() {
 
     # btrdasd, from the cargo build above
     install -Dm755 "indexer/target/release/btrdasd" "$pkgdir/usr/bin/btrdasd"
+
+    # Shell completions: the build's own script prints them from the btrdasd
+    # just built (what CMake does when it builds the indexer itself)
+    cmake -DBTRDASD="indexer/target/release/btrdasd" -DOUT_DIR="$srcdir/completions" \
+        -P cmake/GenerateCompletions.cmake
+    install -Dm644 "$srcdir/completions/btrdasd.bash" \
+        "$pkgdir/usr/share/bash-completion/completions/btrdasd"
+    install -Dm644 "$srcdir/completions/_btrdasd" \
+        "$pkgdir/usr/share/zsh/site-functions/_btrdasd"
+    install -Dm644 "$srcdir/completions/btrdasd.fish" \
+        "$pkgdir/usr/share/fish/vendor_completions.d/btrdasd.fish"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

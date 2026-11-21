@@ -1,9 +1,9 @@
 app-id: org.theboscoclub.btrdasd-gui
 runtime: org.kde.Platform
-runtime-version: '6.7'
+runtime-version: '6.11'
 sdk: org.kde.Sdk
-sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
+# No Rust SDK extension: the GUI is built alone (BUILD_INDEXER and BUILD_HELPER
+# are OFF below), so nothing here runs cargo, and the extension is 2 GB of disk.
 command: btrdasd-gui
 # The recovery-drive console opens TigerVNC's vncviewer on the host; inside this
 # sandbox the GUI shows the console socket's path instead (8249 stage 3).
@@ -20,15 +20,9 @@ finish-args:
   - --filesystem=/var/lib/das-backup:ro
 
 modules:
-  - name: qtcharts
-    buildsystem: cmake-ninja
-    config-opts:
-      - -DCMAKE_BUILD_TYPE=Release
-    sources:
-      - type: git
-        url: https://code.qt.io/qt/qtcharts.git
-        tag: v6.7.3
-
+  # Qt Charts comes with the KDE runtime and SDK (the same Qt as the rest), so
+  # it is no module here; a copy built from source at another version would
+  # not match the Qt it links.
   - name: btrdasd-gui
     buildsystem: cmake-ninja
     config-opts:

@@ -34,7 +34,7 @@ jobs:
         run: |
           .github/scripts/pacman-install.sh \
             base-devel rust cmake extra-cmake-modules \
-            qt6-base qt6-charts kcoreaddons ki18n kxmlgui kconfigwidgets \
+            qt6-base qt6-charts kcoreaddons ki18n kxmlgui kcolorscheme kconfigwidgets \
             kiconthemes kcrash kio knotifications kstatusnotifieritem \
             qt6-tools \
             btrbk btrfs-progs smartmontools
@@ -77,7 +77,7 @@ jobs:
           apt-get install -y \
             curl build-essential cargo rustc cmake extra-cmake-modules debhelper \
             qt6-base-dev qt6-charts-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
-            libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
+            libkf6colorscheme-dev libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
 
       # A pinned, checksummed rustup-init, not `curl | sh`: the installer is
@@ -142,7 +142,7 @@ jobs:
           dnf install -y rust cargo cmake extra-cmake-modules gcc-c++ rpm-build \
             systemd-rpm-macros \
             qt6-qtbase-devel qt6-qtcharts-devel kf6-kcoreaddons-devel kf6-ki18n-devel kf6-kxmlgui-devel \
-            kf6-kconfigwidgets-devel kf6-kiconthemes-devel kf6-kcrash-devel kf6-kio-devel \
+            kf6-kcolorscheme-devel kf6-kconfigwidgets-devel kf6-kiconthemes-devel kf6-kcrash-devel kf6-kio-devel \
             kf6-knotifications-devel kf6-kstatusnotifieritem-devel
 
       - name: Build RPM
@@ -186,25 +186,8 @@ jobs:
             build-essential g++ curl \
             cmake extra-cmake-modules fuse3 libfuse3-dev file wget desktop-file-utils \
             qt6-base-dev qt6-charts-dev libkf6coreaddons-dev libkf6i18n-dev libkf6xmlgui-dev \
-            libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
+            libkf6colorscheme-dev libkf6configwidgets-dev libkf6iconthemes-dev libkf6crash-dev libkf6kio-dev \
             libkf6notifications-dev libkf6statusnotifieritem-dev
-
-      # A pinned, checksummed rustup-init, not `curl | sh`: the installer is
-      # fetched from the versioned archive and run only if it matches the digest
-      # committed here. Bump RUSTUP_VERSION and the digest together
-      # (<archive>/x86_64-unknown-linux-gnu/rustup-init.sha256).
-      - name: Install rustup (trixie's rustc 1.85 is too old for let-chains and zbus 5.14)
-        env:
-          RUSTUP_VERSION: 1.29.3
-          RUSTUP_INIT_SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init \
-            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
-          echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c -
-          chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y --default-toolchain stable --profile minimal
-          rm -f /tmp/rustup-init
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build AppImage
         env:
@@ -231,14 +214,18 @@ jobs:
   # ===========================================================================
   flatpak:
     runs-on: ubuntu-latest
-    # The KDE runtime, its SDK and the rust-stable extension no longer fit the
-    # runner's free disk: 0.7.23.0's run (2026-10-22) and a re-run both failed
-    # "Not enough disk space" installing rust-stable. A container job cannot free
+    # The KDE runtime and its SDK (about 4 GB installed) do not fit the
+    # runner's free disk as it comes: 0.7.23.0's run (2026-10-22) and a re-run
+    # both failed "Not enough disk space" (then installing the rust-stable
+    # extension, since dropped from the manifest). A container job cannot free
     # host disk from a step, so the runner's largest preinstalled toolchains are
     # bind-mounted in and emptied first; the container's layers live on the
     # same host filesystem, so that is the space flatpak installs into.
+    # The image tag names the KDE runtime of the manifest: change both together.
+    # (bilelmoussaoui/flatpak-github-actions stops at kde-6.7; Flathub's
+    # flathub-infra images carry the current runtimes.)
     container:
-      image: bilelmoussaoui/flatpak-github-actions:kde-6.7
+      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11
       options: >-
         --privileged
         -v /usr/share/dotnet:/hostfree/dotnet
