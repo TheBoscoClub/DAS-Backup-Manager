@@ -1219,6 +1219,59 @@ Never backed up (`[subvolumes].exclude` and the built-in exclusions): `@cache`, 
         assert!(parse_mounts("garbage").is_err());
     }
 
+    fn mount(target: &str, uuid: &str, fsroot: &str) -> Mount {
+        Mount {
+            target: target.into(),
+            uuid: uuid.into(),
+            fsroot: fsroot.into(),
+            options: "rw".into(),
+        }
+    }
+
+    #[test]
+    fn a_bind_mount_of_a_subdirectory_places_what_lies_inside_it() {
+        // FSROOT /@/dir is a directory of subvolume `@`, bound at /mnt/b.
+        let top = mount("/top", UUID, "/");
+        let bind = mount("/mnt/b", UUID, "/@/dir");
+        let on_fs = [&top, &bind];
+        // An entry that is the bound directory itself, one inside it, and one
+        // beside it (reached only through the top-level mount).
+        assert_eq!(
+            placed("@/dir", &on_fs, "/srv/vol").as_deref(),
+            Some("/mnt/b")
+        );
+        assert_eq!(
+            placed("@/dir/x", &on_fs, "/srv/vol").as_deref(),
+            Some("/mnt/b/x")
+        );
+        assert_eq!(
+            placed("@/dirx", &on_fs, "/srv/vol").as_deref(),
+            Some("/top/@/dirx"),
+            "a name that only starts like the bound directory is not inside it"
+        );
+    }
+
+    #[test]
+    fn a_findmnt_line_with_an_empty_uuid_parses_and_matches_no_source() {
+        let text = format!(
+            "TARGET=\"/odd\" UUID=\"\" FSROOT=\"/\" OPTIONS=\"rw\"\n{}",
+            findmnt()
+        );
+        let m = parse_mounts(&text).unwrap();
+        assert_eq!(m.len(), 8);
+        assert_eq!(m[0].uuid, "");
+        let probe = Probe::new(move |_: &[&str]| Ok(text.clone()));
+        let open = "<!-- btrdasd:subvolume-table volume=/srv/vol -->";
+        let out = refreshed(&table_config(), &table_doc(open, ""), &probe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            table_doc(open, TABLE),
+            "the empty-UUID mount changes nothing"
+        );
+    }
+
     /// `btrfs filesystem show --raw`, `df -b` and `lsblk -P` for the fixture
     /// volume `/srv/vol`: two devices, one a partition of a disk, one a disk.
     fn fs_probe(show_uuid: &'static str) -> Probe<'static> {
