@@ -6,7 +6,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-      timezone: "America/Chicago"
+      timezone: "UTC"
     cooldown:
       default-days: 7
     groups:
@@ -20,7 +20,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-      timezone: "America/Chicago"
+      timezone: "UTC"
     cooldown:
       default-days: 7
     groups:

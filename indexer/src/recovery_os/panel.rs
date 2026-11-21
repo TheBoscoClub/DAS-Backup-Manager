@@ -1639,8 +1639,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_timer_is_one_shot_local_time_and_not_persistent() {
-        let t = render_timer(&["system-recovery-A-2tb".into()], 1791500000); // 2026-10-08 17:53:20 CDT
-        // The brief pinned "2026-10-08 17:53:20", true only in America/Chicago;
+        let t = render_timer(&["system-recovery-A-2tb".into()], 1791500000); // 2026-10-08 17:53:20 at UTC-5
+        // The brief pinned "2026-10-08 17:53:20", true only at UTC-5;
         // the system `date` is the oracle for the zone the test runs in.
         let out = std::process::Command::new("date")
             .args(["-d", "@1791500000", "+%F %T"])
