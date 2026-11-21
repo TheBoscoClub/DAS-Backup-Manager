@@ -350,6 +350,46 @@ private Q_SLOTS:
         QVERIFY(bar->styleSheet().contains(QStringLiteral("#cc0000")));
     }
 
+    // bd DAS-Backup-Manager-eg4j.14: a session the script refused for a stale
+    // boot record never started; one Record press is the remedy. The progress
+    // panel and the notification said "Failed" for it (2026-11-21 field case).
+    void theProgressPanelShowsARecordRefusalAsNotStartedNotFailed()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        const QString refused = QStringLiteral(
+            "failed (exit 1): stderr: [system-recovery-B-2tb] REFUSED: the record was made before this drive's last VM "
+            "session ended (2026-11-21 14:53 UTC): the OS may have changed in it -- let the next backup run, with this "
+            "drive attached, record it again, or record it now, without a backup: sudo btrdasd recovery-os record "
+            "system-recovery-B-2tb; stderr: WARNING: system-recovery-A-2tb is not started");
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, refused);
+        QLabel *op = panel.findChild<QLabel *>(QStringLiteral("operationLabel"));
+        QLabel *stage = panel.findChild<QLabel *>(QStringLiteral("stageLabel"));
+        auto *bar = panel.findChild<QProgressBar *>();
+        QVERIFY(op && stage && bar);
+        QCOMPARE(op->text(), QStringLiteral("Not started"));
+        QCOMPARE(stage->text(), recordRefusalWords(refused));
+        QVERIFY(!bar->styleSheet().contains(QStringLiteral("#cc0000"))); // no red bar
+
+        // A real failure after it is still a red Failed.
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-2"), false, QStringLiteral("stopped at upgrade (exit 7): x"));
+        QCOMPARE(op->text(), QStringLiteral("Failed"));
+        QVERIFY(bar->styleSheet().contains(QStringLiteral("#cc0000")));
+        // ... and the field case's whole summary is one the shared rule (which
+        // the notification title also asks) recognises.
+        QVERIFY(sessionRefusedForRecord(refused));
+
+        // Only a session job: a backup declined while a record job holds the
+        // lock names that holder, and is not a record refusal.
+        panel.onJobStarted(QStringLiteral("job-3"), QStringLiteral("Backup"));
+        panel.onJobFinished(QStringLiteral("job-3"), false,
+                            QStringLiteral("A backup is already running -- declining (held by btrdasd recovery-os "
+                                           "record pid 42)"));
+        QCOMPARE(op->text(), QStringLiteral("Failed"));
+    }
+
     void anAttendedSessionAtItsOperatorPhaseSaysWhatTheOperatorDoes()
     {
         QVERIFY(isOperatorWaitStage(QStringLiteral("system-recovery-B-2tb:wait")));

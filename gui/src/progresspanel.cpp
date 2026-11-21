@@ -148,6 +148,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
 void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     m_currentJobId = jobId;
+    m_currentOperation = operation;
     m_cancelRequested = false;
     m_operatorHint->setVisible(false);
     m_operationLabel->setText(operation);
@@ -282,6 +283,17 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
                                                     : tr("Kept, recovery OS still running"));
         m_stageLabel->setText(words);
         m_stageLabel->setToolTip(words);
+    } else if (m_currentOperation == QLatin1String("Recovery OS session") && sessionRefusedForRecord(summary)) {
+        // The script refused before touching a drive: the boot record is
+        // missing or out of date, and the Record button is the remedy. Not a
+        // failure of anything (bd DAS-Backup-Manager-eg4j.14). Only a session
+        // job: a backup's text can name a record job holding the lock.
+        // DBusClient::recoveryOsSession starts its job under this operation.
+        const QString words = recordRefusalWords(summary);
+        m_progressBar->setValue(0);
+        m_operationLabel->setText(tr("Not started"));
+        m_stageLabel->setText(words);
+        m_stageLabel->setToolTip(words);
     } else {
         // Error styling: red text on the progress bar
         m_progressBar->setStyleSheet(
@@ -354,6 +366,7 @@ void ProgressPanel::toggleLog()
 void ProgressPanel::resetPanel()
 {
     m_currentJobId.clear();
+    m_currentOperation.clear();
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(QString());  // reset any error styling

@@ -643,9 +643,14 @@ void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QSt
         if (record)
             notification->setTitle(success ? i18n("Recovery Drive Record Finished")
                                            : i18n("Recovery Drive Record Failed"));
+        else if (success)
+            notification->setTitle(i18n("Recovery Drive Update Finished"));
+        // Refused before touching a drive: the Record button is the remedy
+        // (bd DAS-Backup-Manager-eg4j.14).
+        else if (sessionRefusedForRecord(summary))
+            notification->setTitle(i18n("Recovery Drive Update Not Started"));
         else
-            notification->setTitle(success ? i18n("Recovery Drive Update Finished")
-                                           : i18n("Recovery Drive Update Failed"));
+            notification->setTitle(i18n("Recovery Drive Update Failed"));
     } else {
         notification->setTitle(success ? i18n("Backup Complete") : i18n("Backup Failed"));
     }

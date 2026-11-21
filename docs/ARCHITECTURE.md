@@ -777,7 +777,7 @@ QSqlDatabase wrapper was removed when the GUI's models were rewired to go throug
 | MainWindow | `mainwindow.h/cpp` | KXmlGuiWindow with sidebar + QStackedWidget, rich status bar, keyboard shortcuts |
 | Sidebar | `sidebar.h/cpp` | QTreeWidget navigation (Browse, Backup, Config, Health, Recovery drives sections) |
 | DBusClient | `dbusclient.h/cpp` | QDBusInterface wrapper; async method calls, JobProgress/JobLog/JobFinished signals |
-| ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, a Review Coverage button after a summary carrying the coverage warning, resizable raw log (native dock resize), smart auto-scroll |
+| ProgressPanel | `progresspanel.h/cpp` | QDockWidget with progress bar, throughput, ETA, cancel, a Review Coverage button after a summary carrying the coverage warning, a recovery-OS session refused for its boot record shown as Not started with the Record remedy (not a red Failed), resizable raw log (native dock resize), smart auto-scroll |
 | SnapshotModel | `snapshotmodel.h/cpp` | QAbstractItemModel tree (date groups → snapshots) |
 | FileModel | `filemodel.h/cpp` | QAbstractTableModel with paginated loading (10k per page via D-Bus) |
 | SearchModel | `searchmodel.h/cpp` | QAbstractTableModel for FTS5 search results |

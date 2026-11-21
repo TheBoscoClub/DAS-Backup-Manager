@@ -46,6 +46,7 @@ private:
 
     DBusClient *m_client;
     QString m_currentJobId;
+    QString m_currentOperation; // onJobStarted's operation: which kind of job the panel shows
     bool m_userScrolledUp = false;
 
     QLabel *m_operationLabel = nullptr;

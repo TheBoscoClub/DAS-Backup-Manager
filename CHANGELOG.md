@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An Upgrade refused for an out-of-date boot record reads "Not started", not "Failed"** (bd `DAS-Backup-Manager-eg4j.14`): the Recovery drives panel already named the remedy, but the progress panel painted the refusal as a red Failed and the desktop notification said "Recovery Drive Update Failed", though nothing had touched a drive
+  - The progress panel shows **Not started** with the panel's words (press **Record** beside Upgrade, then start again, and the script's reasons whole); the notification is titled "Recovery Drive Update Not Started"
+  - All three places use the one rule that recognises the refusal; any other failed session is still a red Failed
+
 - **A recovery drive no longer spends 4 to 10 minutes of every boot copying the backup index** (bd `DAS-Backup-Manager-eg4j.10`): `das-recovery-state-sync.sh` reflink-copied the newest received state into `/var/lib/das-backup` before the desktop; on a 15 GB index of 2.6 million extents that is minutes of metadata writes over the USB link, on both drives, and the slower boots missed the unattended session's `desktop` check
   - `das-recovery-state-sync.sh` (2.0.0) makes the live state a writable snapshot of the received one, `.das-recovery-state/current` at the drive's top level (constant time, whatever the extent count), swapped in by `mv --exchange` and mounted at `/var/lib/das-backup` `nodev,nosuid,noexec`, each mount read back by UUID and subvolume before it is believed; the top level is now mounted read-write, so it is read back as this drive's first
   - Outside every OS root, so provision, undo, delete-replaced and the `@` snapshots of an upgrade session never meet it; two levels down under a name that is not `<name>.<stamp>`, so the host's index walk of the target never reads it as a backup
