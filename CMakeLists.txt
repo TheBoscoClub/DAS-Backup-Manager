@@ -396,6 +396,10 @@ if(BUILD_TESTING)
         NAME shell-verify-rewrite
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_rewrite.sh
     )
+    add_test(
+        NAME shell-verify-enclosure
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_enclosure.sh
+    )
     # parent_disk: the disk under a partition comes from lsblk, and an answer
     # lsblk cannot give is "unknown" (bd DAS-Backup-Manager-b1s).
     add_test(

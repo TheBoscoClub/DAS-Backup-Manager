@@ -52,7 +52,7 @@ for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_h
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
 done
-for fn in take_maintenance_lock clear_maintenance_record check_btrbk_status; do
+for fn in maintenance_lock_holder take_maintenance_lock clear_maintenance_record check_btrbk_status; do
     body="$(extract "$VERIFY" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-verify.sh"; exit 1; }
     eval "$body"
@@ -292,6 +292,47 @@ check "verify, held lock: skips the mount" "$(cat "$WORK/verify")" "skipped"
 check "verify, held lock: says why" "$(grep -c 'maintenance lock held' "$WORK/log")" "1"
 check "verify, held lock: the holder's record is intact" "$(record)" "$browse"
 release_lock
+
+# The skip line names the holder, as the holder recorded itself (bd 3wc), and
+# says plainly when there is nothing to name.
+skip_line() { grep 'maintenance lock held' "$WORK/log" || true; }
+: >"$WORK/log"
+hold_lock "btrdasd restore browse"
+browse="$(holder_record "btrdasd restore browse")"
+(take_maintenance_lock "$LOCK" || true)
+check "verify, held lock: the skip line names the holder" "$(skip_line)" \
+    "WARN: DAS maintenance lock held by $browse — skipping btrbk/usage inspection"
+release_lock
+
+: >"$WORK/log"
+rm -f "${WORK:?}/release" "${WORK:?}/held"
+bash -c 'exec 7<>"$1"; flock 7; : >"$1"; echo "$$" >"$2"; until [[ -e "$3" ]]; do sleep 0.05; done' \
+    _ "$LOCK" "$WORK/held" "$WORK/release" &
+HOLDER_PID=$!
+wait_for_file "$WORK/held"
+(take_maintenance_lock "$LOCK" || true)
+check "verify, held lock with an empty record: says so, names no one" "$(skip_line)" \
+    "WARN: DAS maintenance lock held by an unknown holder (its record in $LOCK is empty) — skipping btrbk/usage inspection"
+release_lock
+
+: >"$WORK/log"
+hold_lock "recovery-os VM session A"
+printf 'recovery-os VM session A\n' >"$LOCK"
+(take_maintenance_lock "$LOCK" || true)
+check "verify, held lock, record without a pid: shown as the last recorded" "$(skip_line)" \
+    "WARN: DAS maintenance lock held by an unknown holder (last recorded: recovery-os VM session A) — skipping btrbk/usage inspection"
+release_lock
+
+: >"$WORK/log"
+hold_lock "backup-run.sh"
+printf 'backup-run.sh pid 4194304999\n' >"$LOCK"
+(take_maintenance_lock "$LOCK" || true)
+check "verify, held lock, recorded pid gone: says it is no longer running" "$(skip_line)" \
+    "WARN: DAS maintenance lock held by an unknown holder (the last recorded holder, backup-run.sh pid 4194304999, is no longer running) — skipping btrbk/usage inspection"
+release_lock
+
+check "verify, record that cannot be read: says so" "$(maintenance_lock_holder "$WORK/no-such-lock")" \
+    "an unknown holder (its record in $WORK/no-such-lock cannot be read)"
 
 # --- backup-verify.sh: a deliberate skip is not a failed mount (bd 0oi) ------
 # check_btrbk_status only tries the primary when its partition is a block

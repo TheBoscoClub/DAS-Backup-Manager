@@ -1,7 +1,11 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.2.0
-# Date: 2026-11-10
+# Version: 3.2.1
+# Date: 2026-11-21
+#
+# 3.2.1: the skip line for a held maintenance lock names the holder from its
+# record in the lock file, or says plainly that the record is empty or cannot
+# be read (maintenance_lock_holder(); bd DAS-Backup-Manager-3wc).
 #
 # 3.2.0: no command runs at the top level any more. The configuration load,
 # the drive map and the globals ran there, before main(), so a copy over this
@@ -351,6 +355,38 @@ check_smart_health() {
     fi
 }
 
+# Who holds the lock, as the holder recorded itself in the lock file: its first
+# line, `<who> pid <pid>`. Said plainly when there is nothing to name: an empty
+# or unreadable record, a record without a pid (shown as the last one recorded),
+# or a pid that no longer runs (a holder that did not record itself, such as a
+# plain `flock`, holds it after one that did). The same reading as
+# backup-run.sh's maintenance_holder() and the indexer's maintenance::holder_of,
+# in the words of a line that is only displayed (bd DAS-Backup-Manager-3wc).
+maintenance_lock_holder() {
+    local lock="$1" line="" pid
+    if [[ ! -r "$lock" ]]; then
+        echo "an unknown holder (its record in $lock cannot be read)"
+        return
+    fi
+    IFS= read -r line <"$lock" || true # a last line without a newline still fills $line
+    line="${line//[[:cntrl:]]/}"
+    line="${line:0:200}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -z "$line" ]]; then
+        echo "an unknown holder (its record in $lock is empty)"
+        return
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
+        echo "an unknown holder (last recorded: $line)"
+    elif [[ -d "/proc/$pid" ]]; then
+        echo "$line"
+    else
+        echo "an unknown holder (the last recorded holder, $line, is no longer running)"
+    fi
+}
+
 # Take the DAS maintenance lock without waiting, on fd 8 (held until this
 # script exits), and record this script as its holder — in the lock file, as
 # every holder does, so a job that finds the lock held can say what it waits
@@ -370,7 +406,7 @@ take_maintenance_lock() {
     fi
     if ! flock -n 8; then
         # Not "backup or scrub": every job that mounts the targets holds it.
-        log_warn "DAS maintenance lock held by another job — skipping btrbk/usage inspection"
+        log_warn "DAS maintenance lock held by $(maintenance_lock_holder "$lock") — skipping btrbk/usage inspection"
         log_warn "  Re-run when it finishes; this section mounts the array read-only."
         return 1
     fi

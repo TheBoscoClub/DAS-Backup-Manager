@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`backup-verify.sh` names who holds the maintenance lock when it skips the btrbk/usage inspection** (bd `DAS-Backup-Manager-3wc`): the skip line said only "held by another job"
+  - It now reads the holder's own record from the lock file (`<who> pid <pid>`) and says it: `DAS maintenance lock held by backup-run.sh pid 4242 — skipping btrbk/usage inspection`
+  - An empty record, one that cannot be read, one without a pid and a pid that no longer runs each say so plainly instead of naming a holder, in the words `backup-run.sh` uses
+  - Script 3.2.1; `tests/test_maintenance_lock.sh` pins each line
+
+- **The enclosure filter of `backup-verify.sh` is pinned by a test** (bd `DAS-Backup-Manager-zk89`): since `[das].model_pattern` became a substring match (empty: every USB disk), nothing covered it
+  - `tests/test_verify_enclosure.sh` (CTest `shell-verify-enclosure`): a substring or the whole model picks the enclosure's disk, a pattern in no model picks nothing and fails, an empty or unset pattern lists every USB disk and nothing on another transport; run against the exact-match script from before bd `DAS-Backup-Manager-yi8m` it fails
+  - Substring stays: it agrees with `backup-run.sh`, which reads the same key, and a pick is only a candidate, every drive being named by its serial afterwards
+
 - **An attended session's progress panel keeps the operator's instruction while it waits** (bd `DAS-Backup-Manager-343p`): the helper sent every percentage under the fixed stage name "progress", so the wait stage the GUI acts on was replaced as soon as it arrived and the panel read only "progress 9%"
   - A `JobProgress` signal for a percentage now names the stage the job is in (`progress::SignalStage`)
 - **Open console stays available for a session this window started after its job ends "kept"** (bd `DAS-Backup-Manager-uk3v.10`): the cancel's own words say to open the console, but the button was greyed "cannot tell whether this session is attended", because the window forgot its session once the job ended
