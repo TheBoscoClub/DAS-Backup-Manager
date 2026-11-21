@@ -66,7 +66,7 @@ impl Rig {
     }
 
     /// Like [`Rig::new`] but with a caller-chosen image size in GiB, for tests
-    /// that need more data than the 1 GiB default so a throttled scrub can be
+    /// that need more data than the 1 GiB default so a slowed scrub can be
     /// cancelled mid-pass and leave a genuine resumable position.
     fn new_sized(tag: &str, image_gib: u32) -> Self {
         let dir = PathBuf::from(format!(
@@ -260,7 +260,7 @@ t_resumed:0|duration:0|canceled:0|finished:0\n",
     }
 
     /// Write `gib` GiB of incompressible data into the (temporarily mounted)
-    /// filesystem, so a throttled scrub has enough to verify that it cannot
+    /// filesystem, so a delayed scrub has enough to verify that it cannot
     /// finish before being cancelled.
     fn fill_incompressible_gib(&self, gib: u32) {
         self.with_temporary_mount(|mnt| {
@@ -278,27 +278,6 @@ t_resumed:0|duration:0|canceled:0|finished:0\n",
             }
             must("sync", &[]);
         });
-    }
-
-    /// Cap (or, with 0, uncap) scrub read bandwidth via the per-device sysfs
-    /// knob, so a scrub can be reliably cancelled mid-pass. The filesystem must
-    /// be mounted. devid 1 is the sole device on this single-disk rig.
-    fn throttle_scrub(&self, bytes_per_sec: u64) {
-        let knob = format!("/sys/fs/btrfs/{}/devinfo/1/scrub_speed_max", self.uuid);
-        std::fs::write(&knob, format!("{bytes_per_sec}\n"))
-            .unwrap_or_else(|e| panic!("cannot set {knob}: {e}"));
-        // Read back: a silently-ignored write would let an unthrottled scrub
-        // finish before we can cancel it, and the test would then "pass" a
-        // resume it never actually exercised — verify the knob took.
-        let got: u64 = std::fs::read_to_string(&knob)
-            .unwrap_or_else(|e| panic!("cannot read {knob}: {e}"))
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        assert_eq!(
-            got, bytes_per_sec,
-            "scrub_speed_max did not take: wrote {bytes_per_sec}, read {got}"
-        );
     }
 
     /// `data_bytes_scrubbed` from the saved status record, summed is unnecessary
@@ -570,17 +549,16 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
 #[ignore = "requires root; creates loop devices and issues real scrubs"]
 fn interrupted_scrub_resumes_across_unmount() {
     assert!(is_root(), "must run as root");
-    // A 12 GiB image leaves room for 8 GiB of data plus btrfs overhead.
-    let rig = Rig::new_sized("resume", 12);
-
-    // Fill with enough incompressible data that a throttled scrub cannot finish
-    // before we cancel it, so there is a genuine mid-pass position to resume.
-    rig.fill_incompressible_gib(8);
+    // 3 GiB image, 2 GiB of incompressible data. The pass is made slow by a
+    // dm-delay device, NOT by `scrub_speed_max`: on kernel 7.3.5 that knob
+    // reads back the value written yet does not throttle (2.6 GB scrubbed in
+    // under 1 s), so the scrub finished before the cancel and the final
+    // assertion passed or failed by luck (bd DAS-Backup-Manager-uk3v.9).
+    let mut rig = Rig::new_sized("resume", 3);
+    rig.fill_incompressible_gib(2);
+    let slow_dev = rig.attach_slow_device(RESUME_READ_DELAY_MS);
     let mnt = rig.mount_point.to_string_lossy().to_string();
-    must("mount", &[&format!("UUID={}", rig.uuid), &mnt]);
-
-    // Throttle so the pass lasts long enough to cancel deterministically.
-    rig.throttle_scrub(200 * 1024 * 1024); // 200 MiB/s
+    must("mount", &[&slow_dev, &mnt]);
 
     // Start a real scrub, let it make progress, then stop it to freeze a real
     // partial position. A clean `btrfs scrub cancel` records `canceled:1
@@ -591,7 +569,7 @@ fn interrupted_scrub_resumes_across_unmount() {
     // produces only unreliably).
     // NOT `must`/`Command::output()`: `btrfs scrub start` (without -B) forks a
     // daemon that inherits stdout/stderr, so reading them to EOF blocks until
-    // the whole scrub finishes — which would defeat the throttle and leave
+    // the whole scrub finishes — which would defeat the delay and leave
     // nothing to cancel mid-flight. Null the descriptors, wait only for the
     // direct child. (Same trap and remedy as `live_scrub_is_never_force_restarted`.)
     let start = Command::new("btrfs")
@@ -602,12 +580,27 @@ fn interrupted_scrub_resumes_across_unmount() {
         .expect("spawn btrfs scrub start");
     assert!(start.success(), "background scrub failed to start");
     // Sleep well past the metadata/system-chunk phase (data_bytes stays 0 for
-    // the first few seconds) but far short of the ~40s a throttled 8 GiB pass
-    // needs, so the cancel lands genuinely mid-data with committed progress.
-    std::thread::sleep(std::time::Duration::from_secs(12));
+    // the first few seconds), then require the scrub to still be running: the
+    // cancel must land mid-data or the test proves nothing about a resume.
+    std::thread::sleep(std::time::Duration::from_secs(RESUME_RUN_SECS));
+    let live = live_scrub_state(&mnt, &rig.uuid);
     // Settle, not just cancel: the daemon writes the record and exits after
     // the kernel stops the scrub, and the reads and the unmount below need both.
     rig.cancel_scrub_and_settle();
+    assert_eq!(
+        live,
+        LiveScrubState::Running,
+        "the scrub was not running {RESUME_RUN_SECS} s in (state {live:?}), so the cancel \
+         would not interrupt it and a resume would prove nothing; the scrub finished or \
+         failed before the cancel (slow device {slow_dev}, {RESUME_READ_DELAY_MS} ms/read); \
+         record:\n{}",
+        rig.read_record()
+    );
+    assert!(
+        rig.read_record().contains("canceled:1"),
+        "the cancel did not catch a running scrub (record lacks canceled:1):\n{}",
+        rig.read_record()
+    );
     let bytes_at_cancel = rig.bytes_scrubbed();
     assert!(
         bytes_at_cancel > 0,
@@ -625,7 +618,7 @@ fn interrupted_scrub_resumes_across_unmount() {
         "scrub.status.<uuid> must persist on the host root while unmounted"
     );
     rig.mark_record_aborted();
-    must("mount", &[&format!("UUID={}", rig.uuid), &mnt]);
+    must("mount", &[&slow_dev, &mnt]);
     assert!(
         rig.read_record().contains("finished:0") && rig.read_record().contains("canceled:0"),
         "the interrupted record must read as aborted after remount"
@@ -640,7 +633,6 @@ fn interrupted_scrub_resumes_across_unmount() {
         ScrubStartMode::Resume { .. } => println!("  decision: RESUME (correct)"),
         ScrubStartMode::Normal => panic!("a genuine interrupted scrub must resume"),
     }
-    rig.throttle_scrub(0); // unthrottle so the resume finishes promptly
     must("btrfs", &["scrub", "resume", "-B", &mnt]);
 
     let rec = rig.read_record();
@@ -668,6 +660,11 @@ fn interrupted_scrub_resumes_across_unmount() {
     let _ = run("btrfs", &["scrub", "cancel", &mnt]); // tidy; already finished, so ignore
     println!("== resume-across-unmount verified ==");
 }
+
+/// Per-read delay of the dm-delay device the resume test scrubs through.
+const RESUME_READ_DELAY_MS: u32 = 100;
+/// Seconds the resume test lets the scrub run before cancelling it.
+const RESUME_RUN_SECS: u64 = 8;
 
 /// A scrub started by somebody else must never be resumed or restarted over:
 /// hours of work would be thrown away. The engine must return `Normal` and let
