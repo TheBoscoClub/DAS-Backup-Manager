@@ -2359,6 +2359,30 @@ enabled = false
         assert!(recovery_series(&cfg).is_none());
     }
 
+    /// Only a LIVE entry named exactly `@` makes a source the root's: another
+    /// source with other live entries and a retired `@` beside them is not a
+    /// second candidate (CI Mutants on 0e67e3da: `&&` -> `||` and `==` -> `!=`
+    /// in the filter survived; bd DAS-Backup-Manager-pzj6).
+    #[test]
+    fn recovery_series_ignores_a_source_whose_only_at_entry_is_retired() {
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(state_entry());
+        let mut other = cfg.sources[0].clone();
+        other.label = "other".into();
+        other.target_subdirs = vec!["otherdir".into()];
+        for sv in &mut other.subvolumes {
+            if sv.name == "@" {
+                sv.retired = Some("2026-01-01".into());
+            }
+        }
+        cfg.sources.push(other);
+        let got = recovery_series(&cfg).expect("one live @: the first source");
+        assert_eq!(
+            got.subdir, "nvme",
+            "the source with the live @, not otherdir"
+        );
+    }
+
     #[test]
     fn state_conf_path_sits_beside_the_main_conf() {
         let mut cfg = test_config();
