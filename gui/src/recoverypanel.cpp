@@ -226,6 +226,10 @@ void RecoveryPanel::applyDocument(const QByteArray &json)
         m_staleReason.clear();
         const int keep = m_selector->currentIndex();
         m_doc = std::move(doc);
+        // A kept session of this window's is over once its drive shows none.
+        for (const DriveView &d : m_doc->drives)
+            if (!d.session && !d.sessionError)
+                m_keptOwnLabels.removeAll(d.label);
         m_selector->blockSignals(true);
         m_selector->clear();
         for (const DriveView &d : m_doc->drives)
@@ -352,6 +356,8 @@ GuiFacts RecoveryPanel::facts() const
     GuiFacts g;
     g.ownJobId = m_ownJobId;
     g.ownJobAttended = m_ownJobAttended;
+    g.keptOwnLabels = m_keptOwnLabels;
+    g.keptOwnAttended = m_keptOwnAttended;
     g.ownRecordJobId = m_ownRecordJobId;
     g.viewerInstalled = !QStandardPaths::findExecutable(QStringLiteral("vncviewer")).isEmpty();
     g.nowEpoch = QDateTime::currentSecsSinceEpoch();
@@ -484,6 +490,8 @@ void RecoveryPanel::onUpgrade()
     }
     m_jobRequested = true;
     m_ownJobAttended = !unattended;
+    m_ownJobLabels = labels;
+    m_keptOwnLabels.clear();
     rederive();
     // accept_boot_record_risk is never passed from the GUI (the client hard-codes false).
     m_client->recoveryOsSession(labels, unattended, chosenMode());
@@ -642,8 +650,13 @@ void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QStr
     m_ownJobId.clear();
     if (success)
         m_status->setText(i18n("Done: %1", summary));
-    else if (sessionKept(summary))
+    else if (sessionKept(summary)) {
+        // Its session runs on until session-end; this window still knows how
+        // it started it, which the document cannot say (uk3v.10).
+        m_keptOwnLabels = m_ownJobLabels;
+        m_keptOwnAttended = m_ownJobAttended;
         m_status->setText(keptWords(summary, false));
+    }
     else if (summary.startsWith(QLatin1String("warnings:")))
         m_status->setText(i18n("Needs a look: %1", summary));
     else if (sessionRefusedForRecord(summary))

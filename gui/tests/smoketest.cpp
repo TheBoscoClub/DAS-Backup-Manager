@@ -1583,6 +1583,26 @@ private Q_SLOTS:
         s.facts.ownJobAttended = true;
         QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
 
+        // This window's attended session ended "kept" (a cancel): its job is
+        // over and the holder now holds the session, attended unknown; the
+        // window still knows it started it attended (bd uk3v.10, seen live
+        // 2026-11-21: greyed while the words said to open the console).
+        s.facts.ownJobId.clear();
+        s.a().session = SessionView{QStringLiteral("other:recovery-os VM session holder"), std::nullopt,
+                                    QStringLiteral("running"), std::nullopt};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.why.contains(QStringLiteral("cannot tell")));
+        s.facts.keptOwnLabels = {s.a().label};
+        s.facts.keptOwnAttended = true;
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.facts.keptOwnAttended = false;
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.facts.keptOwnAttended = true;
+        s.facts.keptOwnLabels = {QStringLiteral("some-other-drive")};
+        QVERIFY(!deriveActions(s.a(), s.doc.pair, s.facts).console.enabled);
+        s.facts.keptOwnLabels.clear();
+        s.facts.ownJobId = QStringLiteral("job-7");
+        s.a().session = SessionView{QStringLiteral("job:job-7"), std::nullopt, QStringLiteral("running"), std::nullopt};
+
         // The viewer missing keeps the button enabled (the click shows the path)
         s.facts.viewerInstalled = false;
         a = deriveActions(s.a(), s.doc.pair, s.facts);

@@ -110,6 +110,11 @@ struct GuiFacts {
     QString ownJobId;             // this window's running session job, empty if none
     QString ownRecordJobId;       // this window's running record job, empty if none
     bool ownJobAttended = false;  // how this window started that job
+    // The drives of this window's session job that ended "kept": the job is
+    // over, but the session it started runs on until session-end, and only
+    // this window knows how it was started (bd DAS-Backup-Manager-uk3v.10).
+    QStringList keptOwnLabels;
+    bool keptOwnAttended = false;
     bool viewerInstalled = false; // TigerVNC's vncviewer found on PATH
     qint64 nowEpoch = 0;
     bool chosenNow = true;        // the Now checkbox

@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **An attended session's progress panel keeps the operator's instruction while it waits** (bd `DAS-Backup-Manager-343p`): the helper sent every percentage under the fixed stage name "progress", so the wait stage the GUI acts on was replaced as soon as it arrived and the panel read only "progress 9%"
   - A `JobProgress` signal for a percentage now names the stage the job is in (`progress::SignalStage`)
+- **Open console stays available for a session this window started after its job ends "kept"** (bd `DAS-Backup-Manager-uk3v.10`): the cancel's own words say to open the console, but the button was greyed "cannot tell whether this session is attended", because the window forgot its session once the job ended
 - **A recovery-OS session cancelled from the GUI reads "Cancelled, recovery OS still running", not a red "Failed"** (bd `DAS-Backup-Manager-z5od`): the helper puts "cancelled — " in front of the script's `kept (exit 3)` summary, which the GUI did not recognise
 - **Packaging follow-ups across the formats** (bd `DAS-Backup-Manager-w49m`)
   - The Arch and Fedora packages ship the bash, zsh and fish completions (they build `btrdasd` with a bare `cargo build`, which generated none), made by the build's own `cmake/GenerateCompletions.cmake` from the `btrdasd` just built

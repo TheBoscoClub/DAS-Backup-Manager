@@ -368,8 +368,11 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
                                                                        : d.session->domainState));
     } else {
         const bool ownJob = !g.ownJobId.isEmpty() && d.session->by == QStringLiteral("job:") + g.ownJobId;
-        const bool attended = d.session->attended.value_or(false) || (ownJob && g.ownJobAttended);
-        if (!attended && !d.session->attended.has_value() && !ownJob)
+        // A session this window started whose job ended "kept" (uk3v.10).
+        const bool keptOwn = !ownJob && g.keptOwnLabels.contains(d.label);
+        const bool attended = d.session->attended.value_or(false) || (ownJob && g.ownJobAttended)
+                              || (keptOwn && g.keptOwnAttended);
+        if (!attended && !d.session->attended.has_value() && !ownJob && !keptOwn)
             a.console = refused(QStringLiteral("cannot tell whether this session is attended "
                                                "(it was not started by this window)"));
         else if (!attended)

@@ -96,6 +96,9 @@ private:
     bool m_scheduleClearing = false; // the last RecoveryOsScheduleSet sent was a clear (time 0)
     QString m_ownJobId;          // this panel's running session job; empty until jobStarted names it
     bool m_ownJobAttended = false;
+    QStringList m_ownJobLabels;  // the drives this panel's session job was started for
+    QStringList m_keptOwnLabels; // of a job that ended "kept": its session runs on (uk3v.10)
+    bool m_keptOwnAttended = false;
     bool m_jobRequested = false; // Upgrade clicked, jobStarted not yet seen
     QSet<QString> m_earlyFinished; // JobFinished ids seen before jobStarted named the job
     bool m_endInFlight = false;
