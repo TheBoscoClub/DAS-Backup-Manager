@@ -3190,6 +3190,17 @@ failed, of another filesystem, or more than 14 days old) is listed under
 with the reason, is never counted current, and is not a failure (exit 0).
 A configuration with no mirror target has no such item.
 .PP
+.B SCRUB TOOL
+(exit 1): every scrub start passes the I/O priority options
+.B \-c
+and
+.BR \-n ,
+which btrfs\-progs documents as deprecated. When
+.B btrfs scrub start \-\-help
+no longer lists both, or cannot be read, the doctor names the btrfs\-progs
+version and says the next scrub pass will fail on an unknown option (the
+scrub unit itself still exits 0: its findings travel by email).
+.PP
 .B btrdasd doctor
 .RB [ \-\-check\-drift ]
 .RB [ \-\-email ]
