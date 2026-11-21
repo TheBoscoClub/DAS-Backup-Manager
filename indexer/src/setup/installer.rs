@@ -1621,7 +1621,6 @@ fn restart_helper_by_signal(
 /// when the `btrbk.conf` renderer refuses it (bd xtnq) — why. A refused
 /// config was not saved; the upgrade still retires old units and restarts
 /// the helper, then fails with the refusal.
-#[derive(Default)]
 struct Prepared {
     config: Config,
     refused: Option<String>,
@@ -1651,44 +1650,7 @@ fn prepare_upgrade(
 
     let migrations = migrate_config(&mut config);
 
-    // A config the btrbk.conf renderer refuses (bd xtnq), or one `validate`
-    // rejects — as the nightly sync does before it regenerates btrbk.conf
-    // (bd DAS-Backup-Manager-31q) — is refused here, before the version stamp
-    // or a migration is saved: no file changes.
-    let errors = config.validate();
-    let refused = if errors.is_empty() {
-        GeneratedFiles::generate(&config).err()
-    } else {
-        Some(format!("config.toml is not valid: {}", errors.join("; ")))
-    };
-    // The documents move out of the config's directory (bd
-    // DAS-Backup-Manager-5237.6) is judged with the other refusals, before
-    // anything is written; made only when none applies.
-    let (refused, docs_move) = match refused {
-        Some(why) => (Some(why), None),
-        None => match plan_docs_move(&config, config_path) {
-            Ok(m) => (None, m),
-            Err(why) => (Some(why), None),
-        },
-    };
-    // The move is made first of all the changes, and one that fails is a
-    // refusal like the others: nothing is said as migrated, and the upgrade
-    // still retires old units and restarts the helper (bd
-    // DAS-Backup-Manager-5237.13).
-    let (refused, moved) = match (refused, docs_move) {
-        (None, Some((from, to))) => match std::fs::rename(&from, &to) {
-            Ok(()) => (None, Some((from, to))),
-            Err(e) => (
-                Some(format!(
-                    "cannot move {} to {} ({e}) — nothing was changed; move it by hand (a different filesystem needs a copy) and run the upgrade again",
-                    from.display(),
-                    to.display()
-                )),
-                None,
-            ),
-        },
-        (refused, _) => (refused, None),
-    };
+    let (refused, moved) = judge_upgrade(&config, config_path);
     if let Some(why) = refused {
         for change in &migrations {
             say(format!(
@@ -1711,7 +1673,7 @@ fn prepare_upgrade(
         ));
     }
 
-    if old_version != config.general.version || !migrations.is_empty() {
+    if needs_save(&old_version, &config.general.version, &migrations) {
         if old_version != config.general.version {
             say(format!(
                 "Updating config version: {} -> {}",
@@ -1724,18 +1686,78 @@ fn prepare_upgrade(
     // The relay is a hard dependency of email reporting now. Warn rather than
     // fail: a backup whose report cannot be sent is still a completed backup,
     // and the report is always written to disk regardless.
-    if config.email.enabled && !relay_up(&config) {
-        say(format!(
-            "Warning: email is enabled but nothing is listening on {}:{}",
-            config.email.smtp_host, config.email.smtp_port
-        ));
-        say("  Reports will be saved to disk but not delivered.".to_string());
-        say("  Check the local mail relay: systemctl status postfix".to_string());
+    for line in relay_warning(&config, relay_up) {
+        say(line);
     }
     Ok(Prepared {
         config,
         refused: None,
     })
+}
+
+/// Whether the upgrade has anything to write back: the version stamp moved,
+/// or a migration changed the config.
+fn needs_save(old_version: &str, new_version: &str, migrations: &[String]) -> bool {
+    old_version != new_version || !migrations.is_empty()
+}
+
+/// The lines warning that email is enabled but nothing listens at the relay;
+/// none when email is off or the relay answers. A warning, never a failure.
+fn relay_warning(config: &Config, relay_up: RelayProbe) -> Vec<String> {
+    if !config.email.enabled || relay_up(config) {
+        return Vec::new();
+    }
+    vec![
+        format!(
+            "Warning: email is enabled but nothing is listening on {}:{}",
+            config.email.smtp_host, config.email.smtp_port
+        ),
+        "  Reports will be saved to disk but not delivered.".to_string(),
+        "  Check the local mail relay: systemctl status postfix".to_string(),
+    ]
+}
+
+/// The upgrade's refusals, judged before anything is saved, and the move of
+/// the local recovery documents made when none applies: `(refusal, moved)`.
+/// A config the btrbk.conf renderer refuses (bd xtnq), or one `validate`
+/// rejects — as the nightly sync does before it regenerates btrbk.conf (bd
+/// DAS-Backup-Manager-31q) — is refused before the version stamp or a
+/// migration is saved. The documents move out of the config's directory (bd
+/// DAS-Backup-Manager-5237.6) is made first of all the changes, and one that
+/// fails is a refusal like the others: nothing is said as migrated, and the
+/// upgrade still retires old units and restarts the helper (bd
+/// DAS-Backup-Manager-5237.13).
+fn judge_upgrade(
+    config: &Config,
+    config_path: &Path,
+) -> (Option<String>, Option<(PathBuf, PathBuf)>) {
+    let errors = config.validate();
+    let refused = if errors.is_empty() {
+        GeneratedFiles::generate(config).err()
+    } else {
+        Some(format!("config.toml is not valid: {}", errors.join("; ")))
+    };
+    let (refused, docs_move) = match refused {
+        Some(why) => (Some(why), None),
+        None => match plan_docs_move(config, config_path) {
+            Ok(m) => (None, m),
+            Err(why) => (Some(why), None),
+        },
+    };
+    match (refused, docs_move) {
+        (None, Some((from, to))) => match std::fs::rename(&from, &to) {
+            Ok(()) => (None, Some((from, to))),
+            Err(e) => (
+                Some(format!(
+                    "cannot move {} to {} ({e}) — nothing was changed; move it by hand (a different filesystem needs a copy) and run the upgrade again",
+                    from.display(),
+                    to.display()
+                )),
+                None,
+            ),
+        },
+        (refused, _) => (refused, None),
+    }
 }
 
 /// The move of the local recovery documents out of the config's directory,
@@ -3771,6 +3793,55 @@ auth = "starttls""#,
         let closed = client.local_addr().unwrap().port();
         assert_ne!(closed, port);
         assert!(!relay_reachable(&relay_config(closed)));
+    }
+
+    /// The upgrade saves only when the version moved or a migration ran.
+    #[test]
+    fn needs_save_is_a_moved_version_or_a_migration() {
+        let ran = vec!["moved a key".to_string()];
+        assert!(!needs_save("1.0", "1.0", &[]));
+        assert!(needs_save("1.0", "1.1", &[]));
+        assert!(needs_save("1.0", "1.0", &ran));
+    }
+
+    /// The relay warning is three lines, and only for email on with no relay.
+    #[test]
+    fn relay_warning_is_for_enabled_email_with_no_relay_only() {
+        let mut config = relay_config(2525);
+        config.email.enabled = true;
+        let lines = relay_warning(&config, &|_| false);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("127.0.0.1:2525") || lines[0].contains(":2525"));
+        assert!(relay_warning(&config, &|_| true).is_empty());
+        config.email.enabled = false;
+        assert!(relay_warning(&config, &|_| false).is_empty());
+    }
+
+    /// A config the renderer refuses is refused with its reason, and the
+    /// legacy documents are not moved.
+    #[test]
+    fn judge_upgrade_refuses_a_bad_config_and_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, legacy, _) = legacy_docs_site(dir.path());
+        let mut config = Config::load(&config_path).unwrap();
+        config.sources[0].subvolumes[0].snapshot_name = Some("data/one".to_string());
+        let (refused, moved) = judge_upgrade(&config, &config_path);
+        assert!(refused.unwrap().contains("data/one"));
+        assert!(moved.is_none());
+        assert!(legacy.join("quick.md").exists());
+    }
+
+    /// A valid config with legacy documents is not refused, and the move is
+    /// made and reported.
+    #[test]
+    fn judge_upgrade_makes_the_documents_move_for_a_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, legacy, dest) = legacy_docs_site(dir.path());
+        let config = Config::load(&config_path).unwrap();
+        let (refused, moved) = judge_upgrade(&config, &config_path);
+        assert_eq!(refused, None);
+        assert_eq!(moved, Some((legacy.clone(), dest.clone())));
+        assert!(dest.join("quick.md").exists() && !legacy.exists());
     }
 
     /// Run `prepare_upgrade`, returning its result and the lines it reported.
