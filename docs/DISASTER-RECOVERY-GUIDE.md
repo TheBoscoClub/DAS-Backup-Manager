@@ -239,7 +239,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 **Symptoms**:
 
 - The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.16.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target {{primary_target}}  WARN  (RAID-1 degraded: … absent; …)` row under BACKUP OPERATIONS, and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
-- `sudo btrfs filesystem show {{primary_uuid}}` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show {{primary_mount}}` then answers only `not a valid btrfs filesystem`
+- `sudo btrfs filesystem show {{primary_uuid}}` says `*** Some devices missing` — ask by filesystem UUID: between backups the array is not mounted, and `btrfs filesystem show {{primary_mount}}` then answers only `not a valid btrfs filesystem`
 - Once it is mounted (Step 2), `sudo btrfs device stats {{primary_mount}}` shows non-zero error counters on one leg
 
 **Why this is a separate scenario**: This array is not in `/etc/fstab` and has nothing to do with system boot. The system continues booting and running normally on its NVMe RAID-1. What needs recovery is the *backup target itself* — so that incremental backups, restores, and disaster-recovery procedures keep working during the days it takes to replace a drive.
