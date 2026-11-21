@@ -133,6 +133,89 @@ impl Rig {
         must("umount", &[self.mount_point.to_str().unwrap()]);
     }
 
+    /// True when some other process still has the mount in use: an open file
+    /// under it, or its working directory or root there. `btrfs scrub start`
+    /// forks a daemon that holds the mount until it has written the status
+    /// record and exited, and `btrfs scrub cancel` returns as soon as the
+    /// kernel stops the scrub, which can be before that. A starved daemon is
+    /// the CI flake `umount: target is busy` (bd DAS-Backup-Manager-uk3v.4).
+    fn mount_in_use(&self) -> bool {
+        let me = std::process::id().to_string();
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return true; // cannot look: assume busy, never a false "idle"
+        };
+        for entry in procs.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let base = entry.path();
+            let mut links = vec![base.join("cwd"), base.join("root")];
+            if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
+                links.extend(fds.flatten().map(|f| f.path()));
+            }
+            if links
+                .iter()
+                .filter_map(|l| std::fs::read_link(l).ok())
+                .any(|t| t.starts_with(&self.mount_point))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Wait until nothing but this test uses the mount, so `umount` cannot
+    /// meet a scrub daemon still on its way out. Returns whether it went idle
+    /// within `timeout`.
+    fn wait_mount_idle(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.mount_in_use() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        true
+    }
+
+    /// Unmount the rig, retrying while the mount is busy. This host also runs
+    /// the CI runners and other jobs, and any of them may briefly look into a
+    /// new mount (a scanner, a mount-table watcher); `umount` then says "target
+    /// is busy" though nothing the test did holds it. Waits for idle first.
+    fn umount_when_idle(&self) {
+        let mnt = self.mount_point.to_str().unwrap();
+        let mut last = String::new();
+        for _ in 0..40 {
+            let _ = self.wait_mount_idle(std::time::Duration::from_secs(60));
+            let (ok, text) = run("umount", &[mnt]);
+            if ok {
+                return;
+            }
+            last = text;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        panic!("umount {mnt} still failing after 10 s of retries: {last}");
+    }
+
+    /// Cancel a running scrub and wait for the scrub daemon to finish with the
+    /// mount, which is also when it has written the status record. The cancel
+    /// itself may fail (nothing running), so its result is ignored.
+    fn cancel_scrub_and_settle(&self) {
+        let mnt = self.mount_point.to_str().unwrap();
+        let _ = run("btrfs", &["scrub", "cancel", mnt]);
+        assert!(
+            self.wait_mount_idle(std::time::Duration::from_secs(60)),
+            "something still holds {mnt} 60 s after `btrfs scrub cancel`"
+        );
+    }
+
     fn status_record(&self) -> PathBuf {
         PathBuf::from(format!("/var/lib/btrfs/scrub.status.{}", self.uuid))
     }
@@ -270,11 +353,16 @@ impl Drop for Rig {
         // Cancel anything still scrubbing, then unmount (possibly twice —
         // a test may have mounted it itself).
         let _ = run("btrfs", &["scrub", "cancel", &mnt]);
-        for _ in 0..3 {
+        // Let a dying scrub daemon let go first, then retry: one `umount` that
+        // meets it fails with "target is busy" and, with the mount still
+        // there, so would `losetup -d` and the cleanup after it.
+        let _ = self.wait_mount_idle(std::time::Duration::from_secs(60));
+        for _ in 0..20 {
             if !run("mountpoint", &["-q", &mnt]).0 {
                 break;
             }
             let _ = run("umount", &[&mnt]);
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
         if let Some(name) = &self.dm_name {
             let _ = run("dmsetup", &["remove", name]);
@@ -517,7 +605,9 @@ fn interrupted_scrub_resumes_across_unmount() {
     // the first few seconds) but far short of the ~40s a throttled 8 GiB pass
     // needs, so the cancel lands genuinely mid-data with committed progress.
     std::thread::sleep(std::time::Duration::from_secs(12));
-    let _ = run("btrfs", &["scrub", "cancel", &mnt]);
+    // Settle, not just cancel: the daemon writes the record and exits after
+    // the kernel stops the scrub, and the reads and the unmount below need both.
+    rig.cancel_scrub_and_settle();
     let bytes_at_cancel = rig.bytes_scrubbed();
     assert!(
         bytes_at_cancel > 0,
@@ -529,7 +619,7 @@ fn interrupted_scrub_resumes_across_unmount() {
     // The DAS case: the filesystem is unmounted between runs. Prove the saved
     // position (host-side, keyed by FS UUID) survives an unmount/remount, and
     // stamp the crash signature onto it while it is unmounted.
-    must("umount", &[&mnt]);
+    rig.umount_when_idle();
     assert!(
         rig.status_record().exists(),
         "scrub.status.<uuid> must persist on the host root while unmounted"
