@@ -226,14 +226,14 @@ void RecoveryPanel::applyDocument(const QByteArray &json)
         m_staleReason.clear();
         const int keep = m_selector->currentIndex();
         m_doc = std::move(doc);
-        // A kept session of this window's is over once its drive shows none.
-        for (const DriveView &d : m_doc->drives)
-            if (!d.session && !d.sessionError)
-                m_keptOwnLabels.removeAll(d.label);
         m_selector->blockSignals(true);
         m_selector->clear();
-        for (const DriveView &d : m_doc->drives)
+        for (const DriveView &d : m_doc->drives) {
             m_selector->addItem(orWords(d.displayName, d.label), d.label);
+            // A kept session of this window's is over once its drive shows none.
+            if (!d.session && !d.sessionError)
+                m_keptOwnLabels.removeAll(d.label);
+        }
         if (m_doc->drives.size() == 2)
             m_selector->addItem(i18n("Both drives"), Both);
         m_selector->setCurrentIndex(keep >= 0 && keep < m_selector->count() ? keep : 0);
