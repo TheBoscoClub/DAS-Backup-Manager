@@ -106,6 +106,11 @@ pub fn dump_env(config: &Config) -> String {
     if let Some(user) = &config.recovery_os.install_user {
         out.push_str(&kv("DAS_RECOVERY_OS_INSTALL_USER", user));
     }
+    // The time zone provision gives a rebuilt drive; absent when unset, so the
+    // installer's own default (UTC) applies (bd cnjc).
+    if let Some(tz) = &config.recovery_os.timezone {
+        out.push_str(&kv("DAS_RECOVERY_OS_TIMEZONE", tz));
+    }
     // The recovery OS's repository level; absent when unset (generic x86-64).
     if let Some(level) = &config.recovery_os.repo_level {
         out.push_str(&kv("DAS_RECOVERY_OS_REPO_LEVEL", level));
@@ -415,6 +420,16 @@ mod tests {
         assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER"));
         config.recovery_os.install_user = Some("recovery".into());
         assert!(dump_env(&config).contains("DAS_RECOVERY_OS_INSTALL_USER='recovery'\n"));
+    }
+
+    /// The recovery OS's time zone: exported only when set, so provision can
+    /// tell "not configured" (the installer uses UTC) from a zone (bd cnjc).
+    #[test]
+    fn dump_env_exports_the_recovery_os_timezone_only_when_set() {
+        let mut config = test_config();
+        assert!(!dump_env(&config).contains("DAS_RECOVERY_OS_TIMEZONE"));
+        config.recovery_os.timezone = Some("Europe/Berlin".into());
+        assert!(dump_env(&config).contains("DAS_RECOVERY_OS_TIMEZONE='Europe/Berlin'\n"));
     }
 
     /// The recovery OS's repository level: exported only when set, so the

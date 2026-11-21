@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[recovery_os].timezone` — the time zone of a rebuilt recovery OS** (bd `DAS-Backup-Manager-cnjc`): `recovery-os-install.sh` linked the author's zone into every drive it built
+  - An IANA name such as `Europe/Berlin`; `Config::validate` refuses a name that is not letters, digits, `_` `+` `-` and `/` or not a zone file under `/usr/share/zoneinfo` on the machine that validates, and `config validate` no longer warns the key is unknown
+  - `btrdasd config dump-env` exports `DAS_RECOVERY_OS_TIMEZONE` only when set; `provision` passes it as `DAS_INSTALL_TIMEZONE`, and `configure` refuses, before writing anything, a name that is not a zone file in the new OS
+  - Unset, the new OS is on UTC — no built-in zone; a drive that should keep local time needs the key in `config.toml`
+  - Documented in `docs/INSTALL.md`, `docs/ARCHITECTURE.md` and the Disaster Recovery Guide
+
 - **A filesystem's devices and usage in your own recovery documents, generated** (bd `DAS-Backup-Manager-riwa.2`): the hand-kept device lines and "Current usage (date)" figures went stale the day they were written
   - `btrdasd docs refresh` fills `<!-- btrdasd:filesystem volume=<path> -->` … `<!-- /btrdasd:filesystem -->` from `btrfs filesystem show --raw`, `btrfs filesystem df -b` and `lsblk -P`: each device by disk serial and model with its device name now, size and allocation; label and UUID; Data, Metadata and System profiles with used and allocated
   - Whole GiB, no date (operator, 2026-11-19): the text changes only when a figure moves by a GiB, so a nightly refresh does not rewrite a current document

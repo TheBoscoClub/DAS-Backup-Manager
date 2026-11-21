@@ -90,6 +90,13 @@ pub struct RecoveryOs {
     /// built-in account name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_user: Option<String>,
+    /// The time zone `recovery-os-vm.sh provision` gives a rebuilt recovery
+    /// drive: an IANA name (`Europe/Berlin`) that is a zone file under
+    /// `/usr/share/zoneinfo` on the machine that validates, and again in the
+    /// new OS before it is linked. Unset, the drive is on UTC — there is no
+    /// built-in zone (bd DAS-Backup-Manager-cnjc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     /// The directory of this installation's own filled-in recovery documents
     /// (`*.md`), which `recovery-os-vm.sh provision` carries to a rebuilt
     /// drive. Unset, the directory beside the config's own:
@@ -141,12 +148,48 @@ pub fn install_user_is_valid(user: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// Where the zone files live on the machine that validates.
+pub const ZONEINFO_DIR: &str = "/usr/share/zoneinfo";
+
+/// Why `tz` is not a time zone the installer can link, or `None`. The name
+/// reaches a shell (`eval` of `dump-env`) and a symlink target, so it is a
+/// relative path of ASCII letters, digits, `_`, `+`, `-` and `/` with no empty
+/// component (no `.`, so no `..` and no `zone.tab`); and it must be a regular
+/// file under `zoneinfo_dir` that starts with the TZif magic.
+pub fn timezone_error(tz: &str, zoneinfo_dir: &Path) -> Option<String> {
+    use std::io::Read;
+    let shaped = !tz.is_empty()
+        && tz.split('/').all(|p| !p.is_empty())
+        && tz
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '/'));
+    if !shaped {
+        return Some(format!(
+            "recovery_os.timezone {tz:?} must be an IANA zone name such as Europe/Berlin or UTC: letters, digits, _ + - and / only, no empty part"
+        ));
+    }
+    let mut magic = [0u8; 4];
+    let is_zone = std::fs::File::open(zoneinfo_dir.join(tz))
+        .and_then(|mut f| {
+            let meta = f.metadata()?;
+            f.read_exact(&mut magic).map(|()| meta.is_file())
+        })
+        .unwrap_or(false);
+    (!(is_zone && &magic == b"TZif")).then(|| {
+        format!(
+            "recovery_os.timezone {tz:?} is not a zone file under {} on this machine",
+            zoneinfo_dir.display()
+        )
+    })
+}
+
 impl Default for RecoveryOs {
     fn default() -> Self {
         Self {
             max_age_days: default_recovery_os_max_age_days(),
             egress_org: None,
             install_user: None,
+            timezone: None,
             local_docs_dir: None,
             repo_level: None,
         }
@@ -885,6 +928,7 @@ fn key_schema() -> toml::Table {
     let mut c = Config::default();
     c.recovery_os.egress_org = Some(String::new());
     c.recovery_os.install_user = Some(String::new());
+    c.recovery_os.timezone = Some(String::new());
     c.recovery_os.local_docs_dir = Some(String::new());
     c.recovery_os.repo_level = Some(String::new());
     c.sources.push(Source {
@@ -3409,6 +3453,11 @@ impl Config {
                 "recovery_os.install_user {user:?} must be a user name: a lower-case letter or _, then up to 31 of a-z 0-9 _ -, and not root"
             ));
         }
+        if let Some(tz) = &self.recovery_os.timezone
+            && let Some(why) = timezone_error(tz, Path::new(ZONEINFO_DIR))
+        {
+            errors.push(why);
+        }
         if let Some(level) = &self.recovery_os.repo_level
             && !RECOVERY_OS_REPO_LEVELS.contains(&level.as_str())
         {
@@ -4863,6 +4912,74 @@ mod tests {
                     .iter()
                     .any(|e| e.contains("recovery_os.repo_level")),
                 "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// Unset is "not configured" (the installer uses UTC) and stays out of the
+    /// file; a value round-trips. There is no built-in zone (bd cnjc).
+    #[test]
+    fn recovery_os_timezone_is_unset_by_default_and_round_trips() {
+        let cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert_eq!(cfg.recovery_os.timezone, None);
+        assert!(!cfg.to_toml().unwrap().contains("timezone"));
+        let cfg = Config::from_toml(&minimal_toml(
+            "[recovery_os]\ntimezone = \"Europe/Berlin\"\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.recovery_os.timezone.as_deref(), Some("Europe/Berlin"));
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("timezone = \"Europe/Berlin\""), "{text}");
+    }
+
+    /// The name is a relative path of letters, digits, `_`, `+`, `-` and `/`
+    /// (no dot, so no `..` and no `zone.tab`), no empty component; and it
+    /// must be a zone file in the zoneinfo directory of the machine that
+    /// validates.
+    #[test]
+    fn timezone_names_are_checked_by_shape_and_against_the_zoneinfo_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let zdir = dir.path();
+        std::fs::create_dir_all(zdir.join("Europe")).unwrap();
+        std::fs::create_dir_all(zdir.join("Etc")).unwrap();
+        std::fs::write(zdir.join("Europe/Berlin"), b"TZif2....").unwrap();
+        std::fs::write(zdir.join("UTC"), b"TZif2....").unwrap();
+        std::fs::write(zdir.join("Etc/GMT+5"), b"TZif2....").unwrap();
+        std::fs::write(zdir.join("leapseconds"), b"# not a zone\n").unwrap();
+        for good in ["UTC", "Europe/Berlin", "Etc/GMT+5"] {
+            assert_eq!(timezone_error(good, zdir), None, "{good}");
+        }
+        for bad in [
+            "",
+            "Europe",
+            "Europe/",
+            "/Europe/Berlin",
+            "Europe//Berlin",
+            "../Europe/Berlin",
+            "Europe/Berlin/..",
+            "Europe/Berlin\n",
+            "Europe/Ber lin",
+            "UTC;reboot",
+            "Europe/Paris",
+            "leapseconds",
+            "r\u{e9}union",
+        ] {
+            assert!(timezone_error(bad, zdir).is_some(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_timezone_no_installer_could_use() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        assert!(!cfg.validate().iter().any(|e| e.contains("timezone")));
+        for bad in ["", "../../etc/passwd", "Nowhere/Atlantis", "UTC;reboot"] {
+            cfg.recovery_os.timezone = Some(bad.into());
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("recovery_os.timezone")),
+                "{bad:?} accepted: {:?}",
+                cfg.validate()
             );
         }
     }
@@ -6619,7 +6736,7 @@ enabled = false
     #[test]
     fn every_recovery_os_key_is_one_this_version_reads() {
         let text = minimal_toml(
-            "[recovery_os]\nmax_age_days = 60\negress_org = \"AS64500\"\ninstall_user = \"recovery\"\n\
+            "[recovery_os]\nmax_age_days = 60\negress_org = \"AS64500\"\ninstall_user = \"recovery\"\ntimezone = \"Europe/Berlin\"\n\
              local_docs_dir = \"/srv/recovery-docs\"\nrepo_level = \"v3\"\n",
         );
         assert_eq!(unknown_key_warnings(&text).unwrap(), Vec::<String>::new());

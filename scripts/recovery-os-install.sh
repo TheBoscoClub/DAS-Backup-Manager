@@ -40,6 +40,10 @@
 # [recovery_os].install_user: no built-in name; replace-os, configure and
 # package refuse without a valid one before they change anything) and
 # DAS_INSTALL_UID (its uid, 1000 unless set; 1000-60000) and
+# DAS_INSTALL_TIMEZONE (optional: the recovery OS's IANA time zone, from
+# [recovery_os].timezone; unset = UTC, never a zone of the project's choosing;
+# configure refuses a name that is not a zone file in the new OS before it
+# changes anything; bd DAS-Backup-Manager-cnjc) and
 # DAS_INSTALL_LOCAL_DOCS (optional: a directory of the installation's own
 # filled-in recovery documents, *.md, carried from the host's
 # [recovery_os].local_docs_dir) with DAS_INSTALL_LOCAL_DOCS_DEST (required
@@ -85,6 +89,9 @@ SYNC="${DAS_INSTALL_SYNC:-sync}"
 # separation: the account is the installation's, not the project's).
 ACCOUNT="${DAS_INSTALL_USER:-}"
 ACCOUNT_UID="${DAS_INSTALL_UID:-1000}"
+# The recovery OS's time zone: optional, UTC when unset (production
+# separation: a zone is the installation's choice, never the project's).
+TIMEZONE="${DAS_INSTALL_TIMEZONE-UTC}"
 LOCAL_DOCS="${DAS_INSTALL_LOCAL_DOCS:-}"
 LOCAL_DOCS_DEST="${DAS_INSTALL_LOCAL_DOCS_DEST:-}"
 
@@ -115,6 +122,19 @@ check_account() {
     if [[ ! "$ACCOUNT_UID" =~ ^[123456789][[:digit:]]{3,4}$ ]] || ((ACCOUNT_UID < 1000 || ACCOUNT_UID > 60000)); then
         refuse "DAS_INSTALL_UID '$ACCOUNT_UID' is not a uid of 1000-60000"
     fi
+}
+
+# The time zone configure links, checked before configure changes anything: a
+# relative IANA name of ASCII letters, digits, _ + - and /, no empty part (no
+# dot, so no .. and no zone.tab), and a zone file in the NEW OS (pacstrap's
+# tzdata), where the link will resolve. An empty value is a refusal, not UTC:
+# only an unset variable means UTC.
+ZONE_CHARS=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-
+check_timezone() {
+    [[ "$TIMEZONE" =~ ^[${ZONE_CHARS}]+(/[${ZONE_CHARS}]+)*$ ]] ||
+        refuse "DAS_INSTALL_TIMEZONE '$TIMEZONE' is not a time zone name (an IANA name such as Europe/Berlin, or UTC)"
+    [[ -f "$TARGET/usr/share/zoneinfo/$TIMEZONE" ]] ||
+        refuse "DAS_INSTALL_TIMEZONE '$TIMEZONE' is not a zone file in the new OS ($TARGET/usr/share/zoneinfo)"
 }
 
 # ---- the allowlist -------------------------------------------------------
@@ -400,6 +420,7 @@ step_configure() {
     need HOST_NAME KEYS
     local etc="$TARGET/etc"
     check_account
+    check_timezone
     local home="/home/$ACCOUNT"
     mkdir -p "$etc/sudoers.d" "$etc/sddm.conf.d" "$etc/ssh/sshd_config.d" "$TARGET$home/.ssh"
     "$GENFSTAB" -U "$TARGET" >"$etc/fstab" || cannot "genfstab failed"
@@ -407,7 +428,7 @@ step_configure() {
     printf 'LANG=en_US.UTF-8\n' >"$etc/locale.conf"
     printf 'KEYMAP=us\n' >"$etc/vconsole.conf"
     [[ ! -f "$etc/locale.gen" ]] || sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/' "$etc/locale.gen"
-    ln -sfn /usr/share/zoneinfo/America/Chicago "$etc/localtime"
+    ln -sfn "/usr/share/zoneinfo/$TIMEZONE" "$etc/localtime"
     cp "$ROOT/etc/pacman.conf" "$etc/pacman.conf" || cannot "cannot copy the live system's pacman.conf"
     "$CHROOT" "$TARGET" locale-gen >/dev/null || cannot "locale-gen failed"
     "$CHROOT" "$TARGET" useradd -m -u "$ACCOUNT_UID" -G wheel -s /bin/bash "$ACCOUNT" || cannot "useradd failed"

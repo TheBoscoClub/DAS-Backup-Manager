@@ -116,6 +116,9 @@ fixture() {
     for s in @ @home @rescue @.pre-update.20261011-1016 @.half-upgraded.20261011-1017; do
         mkdir -p "$R/mnt/top/$s"; echo rw >"$R/mnt/top/$s/.subvol"; echo "old-$s" >"$R/mnt/top/$s/sentinel"
     done
+    # tzdata as pacstrap leaves it in the new OS (configure links a zone from here)
+    mkdir -p "$R/mnt/target/usr/share/zoneinfo/Europe"
+    printf 'TZif2\n' | tee "$R/mnt/target/usr/share/zoneinfo/UTC" "$R/mnt/target/usr/share/zoneinfo/Europe/Berlin" >/dev/null
     mkdir -p "$R/mnt/esp-old"; echo "old esp" >"$R/mnt/esp-old/old-esp-file"
     printf 'aaaaaaaa-01\n' >"$WORK/partuuid.out"
     printf 'ABCD-0003\n' >"$WORK/p1uuid.out"
@@ -337,7 +340,7 @@ check "configure: fstab written by genfstab -U" has "$LOG" "genfstab -U $R/mnt/t
 check "configure: pacman.conf copied from the live system" has "$R/mnt/target/etc/pacman.conf" "[cachyos]"
 check "configure: locale" has "$R/mnt/target/etc/locale.conf" "LANG=en_US.UTF-8"
 check "configure: keymap" has "$R/mnt/target/etc/vconsole.conf" "KEYMAP=us"
-check "configure: timezone link" test "$(readlink "$R/mnt/target/etc/localtime")" = /usr/share/zoneinfo/America/Chicago
+check "configure: timezone unset links UTC, no built-in zone (bd cnjc)" test "$(readlink "$R/mnt/target/etc/localtime")" = /usr/share/zoneinfo/UTC
 check "configure: user recovery uid 1000 in the chroot" has "$LOG" "arch-chroot $R/mnt/target useradd -m -u 1000 -G wheel -s /bin/bash recovery"
 check "configure: NOPASSWD drop-in" has "$R/mnt/target/etc/sudoers.d/10-recovery" "recovery ALL=(ALL:ALL) NOPASSWD: ALL"
 check "configure: sddm autologin" has "$R/mnt/target/etc/sddm.conf.d/autologin.conf" "User=recovery"
@@ -391,6 +394,21 @@ for bad in "" Recovery 1user -user "a;reboot" "a b" root "$(printf 'a%.0s' {1..3
 done
 configure_fixture; run configure DAS_INSTALL_USER=
 check "account unset: the refusal says where to set it" out_has "set install_user under [recovery_os] in config.toml"
+echo "== the time zone: optional, UTC when unset, refused before anything changes (bd cnjc)"
+configure_fixture; run configure DAS_INSTALL_TIMEZONE=Europe/Berlin
+check "timezone Europe/Berlin: exit 0" test "$RC" -eq 0
+check "timezone Europe/Berlin: linked" test "$(readlink "$R/mnt/target/etc/localtime")" = /usr/share/zoneinfo/Europe/Berlin
+check "timezone Europe/Berlin: not the unset default" test "$(readlink "$R/mnt/target/etc/localtime")" != /usr/share/zoneinfo/UTC
+for bad in "" ../../etc/passwd /Europe/Berlin Europe//Berlin Europe/ Europe "a b" "UTC;reboot" Europe/Paris UTC.tab; do
+    configure_fixture; run configure DAS_INSTALL_TIMEZONE="$bad"
+    check "timezone '$bad': refused (exit 3)" test "$RC" -eq 3
+    check "timezone '$bad': says which setting" out_has "DAS_INSTALL_TIMEZONE"
+    check "timezone '$bad': no tool ran" test ! -s "$LOG"
+    check "timezone '$bad': nothing written" test ! -e "$R/mnt/target/etc/hostname" -a ! -e "$R/mnt/target/etc/localtime" -a ! -d "$R/mnt/target/etc/sudoers.d"
+done
+configure_fixture; rm -f "$R/mnt/target/usr/share/zoneinfo/UTC"; run configure
+check "timezone unset, the new OS has no UTC zone file: refused (exit 3)" test "$RC" -eq 3
+check "timezone unset, the new OS has no UTC zone file: names the setting and the UTC it asked for" out_has "DAS_INSTALL_TIMEZONE 'UTC'"
 for bad in 999 0 60001 01000 abc "1000 " -5; do
     configure_fixture; run configure DAS_INSTALL_UID="$bad"
     check "uid '$bad': refused (exit 3)" test "$RC" -eq 3

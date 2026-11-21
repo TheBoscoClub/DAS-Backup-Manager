@@ -642,6 +642,7 @@ GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
 P_ALSO=()             # provision: the @.archive.* names also set aside
 INSTALL_USER=""       # provision: the new OS's account, [recovery_os].install_user (load_targets)
+INSTALL_TIMEZONE=""   # provision: the new OS's time zone, [recovery_os].timezone; empty = the installer's UTC (load_targets)
 REPO_LEVEL=""         # unattended repo-level step: [recovery_os].repo_level (load_targets)
 P_DOCS=()             # provision: the installation's own documents, $LOCAL_DOCS_DIR/*.md
 LOCAL_DOCS_DIR=""     # provision: where they are, [recovery_os].local_docs_dir as dump-env resolved it (load_targets)
@@ -1072,7 +1073,7 @@ load_targets() {
     fi
     # dump-env leaves a key out when it is unset: clear the names first, so an inherited
     # variable of the same name can never stand in for config.toml (review L2).
-    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER DAS_RECOVERY_OS_LOCAL_DOCS_DIR DAS_RECOVERY_OS_LOCAL_DOCS_ERROR DAS_RECOVERY_OS_REPO_LEVEL
+    unset DAS_RECOVERY_OS_EGRESS_ORG DAS_RECOVERY_OS_INSTALL_USER DAS_RECOVERY_OS_LOCAL_DOCS_DIR DAS_RECOVERY_OS_LOCAL_DOCS_ERROR DAS_RECOVERY_OS_REPO_LEVEL DAS_RECOVERY_OS_TIMEZONE
     eval "$env_text"
     # The egress org from config.toml, when the environment gave none. Config::load
     # does not validate, so the characters are checked here as for the variable.
@@ -1089,6 +1090,14 @@ load_targets() {
     if [[ -n "$INSTALL_USER" ]] &&
         { [[ ! "$INSTALL_USER" =~ ^[abcdefghijklmnopqrstuvwxyz_][abcdefghijklmnopqrstuvwxyz0123456789_-]{0,31}$ ]] || [[ "$INSTALL_USER" == root ]]; }; then
         refuse "[recovery_os].install_user in $DAS_CONFIG is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -; not root)"
+    fi
+    # The new OS's time zone: config.toml only, no built-in zone; unset means
+    # the installer's UTC. Checked here by shape as Config::validate checks it
+    # (one unquoted word in the step script); the installer checks the zone
+    # file in the new OS (bd cnjc).
+    INSTALL_TIMEZONE="${DAS_RECOVERY_OS_TIMEZONE:-}"
+    if [[ -n "$INSTALL_TIMEZONE" && ! "$INSTALL_TIMEZONE" =~ ^[${ASCII_LETTERS}[:digit:]_+-]+(/[${ASCII_LETTERS}[:digit:]_+-]+)*$ ]]; then
+        refuse "[recovery_os].timezone in $DAS_CONFIG is not a time zone name (an IANA name such as Europe/Berlin, or UTC)"
     fi
     # The repository level the unattended repo-level step sets up: unset (the
     # generic x86-64 repositories) or a level it knows (bd 54f0). Checked
@@ -6487,6 +6496,9 @@ prov_env_lines() {
             "$PAYLOAD_MNT" "$(basename -- "$P_PKG")" "$PAYLOAD_MNT" "$P_PKG_SHA"
         # A user name (load_targets checked it), so one unquoted word.
         printf 'export DAS_INSTALL_USER=%s\n' "$INSTALL_USER"
+        # A zone name (load_targets checked its shape), so one unquoted word;
+        # left out when unset, so the installer's own UTC applies.
+        [[ -z "$INSTALL_TIMEZONE" ]] || printf 'export DAS_INSTALL_TIMEZONE=%s\n' "$INSTALL_TIMEZONE"
         if ((${#P_DOCS[@]} > 0)); then
             printf 'export DAS_INSTALL_LOCAL_DOCS=%s/docs\n' "$PAYLOAD_MNT"
             # A plain absolute path (provision_local_docs checked it), so one word.
