@@ -2,7 +2,7 @@
 
 #include "recoverystatus.h"
 
-#include <QSet>
+#include <QHash>
 #include <QWidget>
 
 #include <functional>
@@ -36,6 +36,8 @@ public:
     void applyDocument(const QByteArray &json);
     [[nodiscard]] QString statusLine() const;
     [[nodiscard]] GuiFacts facts() const;
+    // JobFinished results held until the method's reply names their job.
+    [[nodiscard]] int earlyFinishedCount() const;
     // The confirmation a `will` banner asks for: (title, text) -> yes. A
     // QMessageBox by default; tests replace it, since a modal cannot be
     // answered headlessly.
@@ -100,7 +102,15 @@ private:
     QStringList m_keptOwnLabels; // of a job that ended "kept": its session runs on (uk3v.10)
     bool m_keptOwnAttended = false;
     bool m_jobRequested = false; // Upgrade clicked, jobStarted not yet seen
-    QSet<QString> m_earlyFinished; // JobFinished ids seen before jobStarted named the job
+    struct EarlyFinish {
+        bool success = false;
+        QString summary;
+    };
+    // JobFinished seen while a call's reply is pending, by job id, until the reply
+    // names the job; emptied when the request resolves (reply, refusal, drop).
+    QHash<QString, EarlyFinish> m_earlyFinished;
+    void showRecordOutcome(bool success, const QString &summary);
+    void showSessionOutcome(bool success, const QString &summary);
     bool m_endInFlight = false;
     QString m_ownRecordJobId;       // this panel's running record job; empty until jobStarted names it
     bool m_recordRequested = false; // Record clicked, jobStarted not yet seen

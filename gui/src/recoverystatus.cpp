@@ -372,7 +372,9 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
         const bool keptOwn = !ownJob && g.keptOwnLabels.contains(d.label);
         const bool attended = d.session->attended.value_or(false) || (ownJob && g.ownJobAttended)
                               || (keptOwn && g.keptOwnAttended);
-        if (!attended && !d.session->attended.has_value() && !ownJob && !keptOwn)
+        if (d.session->by.startsWith(QLatin1String("unit:")))
+            a.console = refused(QStringLiteral("a scheduled session is always unattended: it has no console to attend"));
+        else if (!attended && !d.session->attended.has_value() && !ownJob && !keptOwn)
             a.console = refused(QStringLiteral("cannot tell whether this session is attended "
                                                "(it was not started by this window)"));
         else if (!attended)
@@ -393,6 +395,10 @@ DriveActions deriveActionsWith(const DriveView &d, const PairView &p, const GuiF
         a.endSession = refused(QStringLiteral("the session is a running job — use Cancel in the progress panel"));
     else if (d.session->by.startsWith(QLatin1String("unit:")))
         a.endSession = refused(QStringLiteral("a scheduled session is running; it gives the drive back itself"));
+    else if (!d.session->by.startsWith(QLatin1String("other:")))
+        a.endSession = refused(QStringLiteral("only a session held by another process (other:) can be ended here; "
+                                              "this holder is not recognised: %1")
+                                   .arg(d.session->by));
     else
         a.endSession = allowed(QStringLiteral("Give %1 back: shut down its VM if it still runs, remove the "
                                               "guard and the console bridge, release the lock")
@@ -452,17 +458,50 @@ PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g)
     return p;
 }
 
+namespace {
+// The reasons of every `REFUSED:` line of a script summary, in order. The helper
+// joins the script's stderr lines with "; ", so a segment holding the marker is
+// one line (a `[label] ` or `stderr: ` prefix may stand before it).
+QStringList refusedReasons(const QString &summary)
+{
+    static const QLatin1String marker("REFUSED:");
+    QStringList reasons;
+    for (const QString &segment : summary.split(QStringLiteral("; "))) {
+        const qsizetype at = segment.indexOf(marker);
+        if (at >= 0)
+            reasons << segment.mid(at + marker.size()).trimmed();
+    }
+    return reasons;
+}
+} // namespace
+
 bool sessionRefusedForRecord(const QString &summary)
 {
-    return summary.contains(QLatin1String("recovery-os record"));
+    // A refusal is a record refusal only when the script's own REFUSED line
+    // offers the record command: a holder's name in a backup's text, or a
+    // refusal that does not offer it (no inspected OS, a schema), is not one.
+    for (const QString &reason : refusedReasons(summary))
+        if (reason.contains(QLatin1String("recovery-os record")))
+            return true;
+    return false;
+}
+
+bool recordDeferred(const QString &summary)
+{
+    return summary.startsWith(QLatin1String("Deferred:"));
 }
 
 QString recordRefusalWords(const QString &summary)
 {
-    return QStringLiteral("Not started: the drive's boot record is missing or out of date. Press the Record button "
-                          "beside Upgrade (it does what `sudo btrdasd recovery-os record <label>` does in a "
-                          "terminal), then start the update again.\n%1")
-        .arg(summary);
+    // The script's REFUSED reason leads; the rest of its output (the boot-record
+    // dump, warnings) follows whole.
+    const QStringList reasons = refusedReasons(summary);
+    const QString lead = reasons.isEmpty() ? QStringLiteral("the drive's boot record is missing or out of date.")
+                                           : reasons.join(QStringLiteral("; "));
+    return QStringLiteral("Not started: %1\nPress the Record button beside Upgrade (it does what `sudo btrdasd "
+                          "recovery-os record <label>` does in a terminal), then start the update again.\n"
+                          "The script's output: %2")
+        .arg(lead, summary);
 }
 
 QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch)

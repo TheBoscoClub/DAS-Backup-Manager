@@ -1173,6 +1173,14 @@ private Q_SLOTS:
         client.recoveryOsSessionEnd(QStringLiteral("system-recovery-A-2tb"));
         QCOMPARE(end.count(), 1);
         QVERIFY(!end.at(0).at(1).toBool());
+        // Schedule and console say so at once, naming their method (bd v173 item 8)
+        QSignalSpy err(&client, &DBusClient::errorOccurred);
+        client.recoveryOsScheduleSet({QStringLiteral("a")}, 4102444800, QString());
+        client.recoveryOsConsole(QStringLiteral("a"));
+        QCOMPARE(err.count(), 2);
+        QCOMPARE(err.at(0).at(0).toString(), QStringLiteral("RecoveryOsScheduleSet"));
+        QCOMPARE(err.at(1).at(0).toString(), QStringLiteral("RecoveryOsConsole"));
+        QVERIFY(!err.at(0).at(1).toString().isEmpty());
     }
 
     // --- Recovery drives: the status document (8249 stage 3) ----------------
@@ -1480,7 +1488,7 @@ private Q_SLOTS:
     {
         // The script's own refusals, as a failed session job carries them.
         const QString after = QStringLiteral(
-            "the record was made before this drive's last VM session ended (2026-11-08 17:35:35 UTC): the OS may have "
+            "[system-recovery-B-2tb] REFUSED: the record was made before this drive's last VM session ended (2026-11-08 17:35:35 UTC): the OS may have "
             "changed in it (the record was checked 2026-11-08 10:08:00 UTC, 1 day ago) -- let the next backup run, with "
             "this drive attached, record it again, or record it now, without a backup: sudo btrdasd recovery-os record system-recovery-B-2tb");
         QVERIFY(sessionRefusedForRecord(after));
@@ -1490,7 +1498,7 @@ private Q_SLOTS:
         QVERIFY(words.contains(after)); // the script's reasons are kept whole
 
         QVERIFY(sessionRefusedForRecord(QStringLiteral(
-            "no boot record: /var/lib/das-backup/recovery-os.json does not exist -- (sudo btrdasd recovery-os record a), then start again")));
+            "[a] REFUSED: no boot record: /var/lib/das-backup/recovery-os.json does not exist -- (sudo btrdasd recovery-os record a), then start again")));
         // Other failures are not about the record.
         QVERIFY(!sessionRefusedForRecord(QStringLiteral("exit 7 at upgrade")));
         QVERIFY(!sessionRefusedForRecord(QStringLiteral("a session is already running as job job-3")));
@@ -1960,12 +1968,181 @@ private Q_SLOTS:
         p.record->click();
         panel.onJobStarted(QStringLiteral("job-22"), QStringLiteral("Recovery OS record"));
         panel.onJobFinished(QStringLiteral("job-22"), false, QStringLiteral("Deferred: a backup is running; nothing was mounted"));
-        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Recording failed")), qPrintable(panel.statusLine()));
+        // A deferral changed nothing: "Not started", not a failure (bd 3gzs.5 item 4)
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Not started")), qPrintable(panel.statusLine()));
         QVERIFY(panel.statusLine().contains(QStringLiteral("a backup is running")));
+        p.record->click();
+        panel.onJobStarted(QStringLiteral("job-24"), QStringLiteral("Recovery OS record"));
+        panel.onJobFinished(QStringLiteral("job-24"), false, QStringLiteral("could not take the locks: boom"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Recording failed")), qPrintable(panel.statusLine()));
 
         // A record job nothing here asked for is not this panel's.
         panel.onJobStarted(QStringLiteral("job-23"), QStringLiteral("Recovery OS record"));
         QVERIFY(panel.facts().ownRecordJobId.isEmpty());
+    }
+
+    // --- GUI polish (bd v173, 3gzs.5) ----------------------------------------
+
+    void endSessionIsEnabledOnlyForAHolderNamedOther()
+    {
+        Scenario s = idleA();
+        for (const char *by : {"", "weird:x", "holder pid 1", "OTHER:x", "other"}) {
+            s.a().session = SessionView{QString::fromLatin1(by), std::nullopt, QString(), std::nullopt};
+            const DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+            QVERIFY2(!a.endSession.enabled, by);
+            QVERIFY2(!a.endSession.why.isEmpty(), by);
+        }
+        s.a().session = SessionView{QStringLiteral("other:x"), std::nullopt, QString(), std::nullopt};
+        QVERIFY(deriveActions(s.a(), s.doc.pair, s.facts).endSession.enabled);
+    }
+
+    void aScheduledSessionConsoleRefusalSaysUnattended()
+    {
+        Scenario s = idleA();
+        s.a().session = SessionView{QStringLiteral("unit:das-recovery-os-update-x.service"), std::nullopt,
+                                    QStringLiteral("running"), std::nullopt};
+        const DriveActions a = deriveActions(s.a(), s.doc.pair, s.facts);
+        QVERIFY(!a.console.enabled);
+        QVERIFY2(a.console.why.contains(QStringLiteral("unattended")), qPrintable(a.console.why));
+        QVERIFY2(!a.console.why.contains(QStringLiteral("cannot tell")), qPrintable(a.console.why));
+    }
+
+    void aDocumentWithNoDrivesDisablesEveryAction()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        panel.applyDocument(recordStaleOnA());
+        p.selector->setCurrentIndex(0);
+        QVERIFY(p.record->isEnabled());
+        QJsonObject o = QJsonDocument::fromJson(recordStaleOnA()).object();
+        o[QStringLiteral("drives")] = QJsonArray();
+        panel.applyDocument(QJsonDocument(o).toJson());
+        for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record})
+            QVERIFY2(!b->isEnabled(), qPrintable(b->objectName()));
+    }
+
+    void theStatusLineIsPlainText()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        QLabel *line = panel.findChild<QLabel *>(QStringLiteral("statusLine"));
+        QVERIFY(line);
+        QCOMPARE(line->textFormat(), Qt::PlainText);
+        ProgressPanel progress(&client);
+        QLabel *stage = progress.findChild<QLabel *>(QStringLiteral("stageLabel"));
+        QVERIFY(stage);
+        QCOMPARE(stage->textFormat(), Qt::PlainText);
+    }
+
+    void aOneDayAssessmentAgeIsSingular()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        QJsonObject o = QJsonDocument::fromJson(fixture()).object();
+        QJsonArray drives = o[QStringLiteral("drives")].toArray();
+        QJsonObject a = drives[0].toObject();
+        QJsonObject as = a[QStringLiteral("assessment")].toObject();
+        as[QStringLiteral("age_days")] = 1;
+        a[QStringLiteral("assessment")] = as;
+        drives[0] = a;
+        o[QStringLiteral("drives")] = drives;
+        panel.applyDocument(QJsonDocument(o).toJson());
+        QStringList texts;
+        for (QLabel *l : panel.findChildren<QLabel *>())
+            texts << l->text();
+        const QString all = texts.join(QLatin1Char('\n'));
+        QVERIFY2(all.contains(QStringLiteral("(1 day)")), qPrintable(all));
+        QVERIFY2(!all.contains(QStringLiteral("1 days")), qPrintable(all));
+    }
+
+    void aFinishBeforeTheReplyIsShownWhenTheReplyNamesTheJob()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        requestSession(panel, p);
+        panel.onJobFinished(QStringLiteral("job-1"), false,
+                            QStringLiteral("failed (exit 1): stderr: [a] REFUSED: no boot record -- sudo btrdasd recovery-os record a"));
+        QCOMPARE(panel.earlyFinishedCount(), 1);
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Not started")), qPrintable(panel.statusLine()));
+        QCOMPARE(panel.earlyFinishedCount(), 0);
+        QVERIFY(p.upgrade->isEnabled());
+    }
+
+    void anEarlyRecordDeferralIsShownAsNotStarted()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        panel.applyDocument(recordStaleOnA());
+        p.selector->setCurrentIndex(0);
+        p.record->click();
+        panel.onJobFinished(QStringLiteral("job-5"), false, QStringLiteral("Deferred: a backup is running; nothing was mounted"));
+        panel.onJobStarted(QStringLiteral("job-5"), QStringLiteral("Recovery OS record"));
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Not started")), qPrintable(panel.statusLine()));
+        QVERIFY(panel.statusLine().contains(QStringLiteral("a backup is running")));
+        QCOMPARE(panel.earlyFinishedCount(), 0);
+    }
+
+    void unrelatedFinishesDoNotAccumulateWhileARequestIsPending()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        requestSession(panel, p);
+        panel.onJobFinished(QStringLiteral("job-90"), true, QStringLiteral("backup done"));
+        panel.onJobFinished(QStringLiteral("job-91"), true, QStringLiteral("backup done"));
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        QCOMPARE(panel.facts().ownJobId, QStringLiteral("job-1"));
+        QCOMPARE(panel.earlyFinishedCount(), 0);
+        // A refused call ends the request and drops what was held for it.
+        panel.onJobFinished(QStringLiteral("job-1"), true, QStringLiteral("clean"));
+        requestSession(panel, p);
+        panel.onJobFinished(QStringLiteral("job-92"), true, QStringLiteral("x"));
+        QCOMPARE(panel.earlyFinishedCount(), 1);
+        Q_EMIT client.errorOccurred(QStringLiteral("Recovery OS session"), QStringLiteral("refused"));
+        QCOMPARE(panel.earlyFinishedCount(), 0);
+    }
+
+    void aRecordDeferralIsNotStartedInTheProgressPanel()
+    {
+        DBusClient client;
+        ProgressPanel panel(&client);
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS record"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("Deferred: a backup is running; nothing was mounted"));
+        QLabel *op = panel.findChild<QLabel *>(QStringLiteral("operationLabel"));
+        auto *bar = panel.findChild<QProgressBar *>();
+        QVERIFY(op && bar);
+        QCOMPARE(op->text(), QStringLiteral("Not started"));
+        QVERIFY(!bar->styleSheet().contains(QStringLiteral("#cc0000")));
+    }
+
+    void onlyARefusalThatOffersTheRecordCommandIsARecordRefusal()
+    {
+        // A REFUSED line that offers the command, in the script's wording
+        QVERIFY(sessionRefusedForRecord(QStringLiteral(
+            "failed (exit 1): stderr: [a] REFUSED: the boot record for 'a' has no entry -- or record it now, without a backup: sudo btrdasd recovery-os record a")));
+        // Script refusals that do not offer it stay failures (no inspected OS, schema)
+        QVERIFY(!sessionRefusedForRecord(QStringLiteral(
+            "failed (exit 1): stderr: [a] REFUSED: the boot record for 'a' (checked x, 1 day ago) has no inspected OS (boom)")));
+        // A holder's name is not an offer
+        QVERIFY(!sessionRefusedForRecord(QStringLiteral("a session is held by btrdasd recovery-os record pid 42")));
+    }
+
+    void theRefusedReasonLeadsTheRecordRefusalWords()
+    {
+        const QString dump = QStringLiteral("boot record for a (/x, schema 3): enabled units  u1, u2, u3 (3); btrbk at boot  may");
+        const QString summary = QStringLiteral("failed (exit 1): stderr: ") + dump
+            + QStringLiteral("; [a] REFUSED: the record was made before the last session ended; sudo btrdasd recovery-os record a");
+        const QString words = recordRefusalWords(summary);
+        const qsizetype reason = words.indexOf(QStringLiteral("the record was made before the last session ended"));
+        const qsizetype dumpAt = words.indexOf(QStringLiteral("enabled units"));
+        QVERIFY2(reason >= 0 && dumpAt >= 0, qPrintable(words));
+        QVERIFY2(reason < dumpAt, qPrintable(words));
+        QVERIFY(words.startsWith(QStringLiteral("Not started")));
+        QVERIFY(words.contains(QStringLiteral("Record button")));
     }
 
     void anUpgradeRefusedForAStaleRecordSaysSoAndPointsAtRecord()
@@ -1977,7 +2154,7 @@ private Q_SLOTS:
         requestSession(panel, p);
         panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
         panel.onJobFinished(QStringLiteral("job-1"), false,
-                            QStringLiteral("the record was made before this drive's last VM session ended: the OS may have changed in it "
+                            QStringLiteral("[a] REFUSED: the record was made before this drive's last VM session ended: the OS may have changed in it "
                                            "-- record it now, without a backup: sudo btrdasd recovery-os record system-recovery-A-2tb"));
         const QString line = panel.statusLine();
         QVERIFY2(line.startsWith(QStringLiteral("Not started")), qPrintable(line));

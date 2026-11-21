@@ -69,6 +69,8 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     m_status = new QLabel(this);
     m_status->setObjectName(QStringLiteral("statusLine"));
     m_status->setWordWrap(true);
+    // Helper and script text, shown as typed: never markup (bd v173 item 4).
+    m_status->setTextFormat(Qt::PlainText);
     layout->addWidget(m_status);
 
     m_timer = new QTimer(this);
@@ -88,12 +90,15 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     };
     connect(m_client, &DBusClient::errorOccurred, this, [this](const QString &op, const QString &error) {
         // A refused RecoveryOsSession call: the request is over, nothing runs.
-        if (op == Operation)
+        if (op == Operation) {
             m_jobRequested = false;
+            m_earlyFinished.clear();
+        }
         // A refused RecoveryOsRecord call: over too, and the panel says why
         // (the helper's words name what is in the way).
         if (op == RecordOperation) {
             m_recordRequested = false;
+            m_earlyFinished.clear();
             m_status->setText(i18n("Record refused: %1", error));
         }
         if (op == QLatin1String("RecoveryOsScheduleSet") || op == QLatin1String("RecoveryOsConsole"))
@@ -105,6 +110,7 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
     connect(m_client, &DBusClient::callDropped, this, [this](const QString &op) {
         if (op == Operation || op == RecordOperation) {
             (op == Operation ? m_jobRequested : m_recordRequested) = false;
+            m_earlyFinished.clear();
             rederive();
         }
     });
@@ -294,7 +300,7 @@ void RecoveryPanel::rebuildCards()
         }
         if (d.assessment) {
             const AssessmentView &a = *d.assessment;
-            const QString age = a.ageDays ? i18n("%1 days", *a.ageDays) : i18n("unknown age");
+            const QString age = a.ageDays ? i18np("%1 day", "%1 days", *a.ageDays) : i18n("unknown age");
             lines << (a.stale ? QStringLiteral("<b>%1</b>").arg(i18n("STALE (%1): %2", age, esc(a.reasons.join(QStringLiteral("; ")))))
                               : i18n("Current (%1)", age));
             if (!a.warnings.isEmpty())
@@ -349,6 +355,11 @@ void RecoveryPanel::rebuildCards()
             lines << i18n("Session: none");
         addCard(i18n("Both drives"), lines, errors);
     }
+}
+
+int RecoveryPanel::earlyFinishedCount() const
+{
+    return static_cast<int>(m_earlyFinished.size());
 }
 
 GuiFacts RecoveryPanel::facts() const
@@ -427,6 +438,13 @@ void RecoveryPanel::rederive()
         for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
             bind(b, stale);
         m_status->setText(m_staleReason);
+        return;
+    }
+    // A document naming no drive: nothing to act on, whatever the buttons said before.
+    if (m_doc->drives.isEmpty()) {
+        const Action none{false, i18n("the status document lists no recovery drive")};
+        for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
+            bind(b, none);
         return;
     }
     const GuiFacts g = facts();
@@ -603,42 +621,81 @@ void RecoveryPanel::onJobStarted(const QString &jobId, const QString &operation)
 {
     // Any job may be a session another window started: the document says.
     refresh();
+    // A finish that beat this reply: over already, and said now.
+    const bool early = m_earlyFinished.contains(jobId);
+    const EarlyFinish finished = m_earlyFinished.value(jobId);
     if (operation == RecordOperation) {
-        if (m_earlyFinished.remove(jobId)) {
-            // Finished before its reply arrived: over already.
+        if (early) {
             m_recordRequested = false;
+            m_earlyFinished.clear();
+            showRecordOutcome(finished.success, finished.summary);
             rederive();
             return;
         }
         if (!m_recordRequested)
             return; // another window's record: the helper refuses what overlaps it
         m_recordRequested = false;
+        m_earlyFinished.clear();
         m_ownRecordJobId = jobId;
         rederive();
         return;
     }
-    if (operation != Operation)
+    if (operation != Operation) {
+        m_earlyFinished.remove(jobId);
         return;
-    if (m_earlyFinished.remove(jobId)) {
+    }
+    if (early) {
         // Finished before its reply arrived (a helper refusal): over already.
         m_jobRequested = false;
+        m_earlyFinished.clear();
+        showSessionOutcome(finished.success, finished.summary);
         rederive();
         return;
     }
     if (!m_jobRequested)
         return; // another window's session: the document will show it
     m_jobRequested = false;
+    m_earlyFinished.clear();
     m_ownJobId = jobId;
     rederive();
 }
 
+void RecoveryPanel::showRecordOutcome(bool success, const QString &summary)
+{
+    if (success)
+        m_status->setText(i18n("Recorded: %1", summary));
+    else if (recordDeferred(summary))
+        m_status->setText(i18n("Not started: %1", summary)); // a lock was held; nothing changed
+    else
+        m_status->setText(i18n("Recording failed: %1", summary));
+}
+
+void RecoveryPanel::showSessionOutcome(bool success, const QString &summary)
+{
+    if (success)
+        m_status->setText(i18n("Done: %1", summary));
+    else if (sessionKept(summary)) {
+        // Its session runs on until session-end; this window still knows how
+        // it started it, which the document cannot say (uk3v.10).
+        m_keptOwnLabels = m_ownJobLabels;
+        m_keptOwnAttended = m_ownJobAttended;
+        m_status->setText(keptWords(summary, false));
+    } else if (summary.startsWith(QLatin1String("warnings:")))
+        m_status->setText(i18n("Needs a look: %1", summary));
+    else if (sessionRefusedForRecord(summary))
+        m_status->setText(recordRefusalWords(summary));
+    else
+        m_status->setText(i18n("Failed: %1", summary));
+}
+
 void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QString &summary)
 {
+    // The reply naming this job may not have arrived: keep what it will need.
     if ((m_ownJobId.isEmpty() && m_jobRequested) || m_recordRequested)
-        m_earlyFinished.insert(jobId);
+        m_earlyFinished.insert(jobId, EarlyFinish{success, summary});
     if (!m_ownRecordJobId.isEmpty() && jobId == m_ownRecordJobId) {
         m_ownRecordJobId.clear();
-        m_status->setText(success ? i18n("Recorded: %1", summary) : i18n("Recording failed: %1", summary));
+        showRecordOutcome(success, summary);
         rederive();
         refresh();
         return;
@@ -648,21 +705,7 @@ void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QStr
         return;
     }
     m_ownJobId.clear();
-    if (success)
-        m_status->setText(i18n("Done: %1", summary));
-    else if (sessionKept(summary)) {
-        // Its session runs on until session-end; this window still knows how
-        // it started it, which the document cannot say (uk3v.10).
-        m_keptOwnLabels = m_ownJobLabels;
-        m_keptOwnAttended = m_ownJobAttended;
-        m_status->setText(keptWords(summary, false));
-    }
-    else if (summary.startsWith(QLatin1String("warnings:")))
-        m_status->setText(i18n("Needs a look: %1", summary));
-    else if (sessionRefusedForRecord(summary))
-        m_status->setText(recordRefusalWords(summary));
-    else
-        m_status->setText(i18n("Failed: %1", summary));
+    showSessionOutcome(success, summary);
     rederive();
     refresh();
 }

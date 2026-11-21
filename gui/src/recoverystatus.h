@@ -163,9 +163,15 @@ PairActions derivePairActions(const RecoveryDocument &doc, const GuiFacts &g);
 // ended: every one of them offers `recovery-os record`, which the Record button
 // does (bd DAS-Backup-Manager-5j2x).
 bool sessionRefusedForRecord(const QString &summary);
-// What the panel says for it: the session did not start, the Record button is the
-// remedy, then the script's reasons whole.
+// Only a `REFUSED:` line of the script that offers `recovery-os record` counts: its
+// "has no inspected OS" and schema refusals do not offer it, so they stay failures.
+// What the panel says for it: "Not started" and the script's REFUSED reason first,
+// the Record button as the remedy, then the script's whole output.
 QString recordRefusalWords(const QString &summary);
+// A record job's summary that is its deferral (a backup, a scrub or a session holds
+// a lock): it changed nothing, so it is "Not started", never a failure
+// (RecordOutcome::finish_line, bd DAS-Backup-Manager-3gzs.5).
+bool recordDeferred(const QString &summary);
 
 // Words for the cards.
 QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch); // "3 days ago" | "today" | "unknown"

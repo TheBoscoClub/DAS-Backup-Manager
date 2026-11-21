@@ -642,7 +642,8 @@ void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QSt
     if (recovery) {
         if (record)
             notification->setTitle(success ? i18n("Recovery Drive Record Finished")
-                                           : i18n("Recovery Drive Record Failed"));
+                                           : recordDeferred(summary) ? i18n("Recovery Drive Record Not Started")
+                                                                     : i18n("Recovery Drive Record Failed"));
         else if (success)
             notification->setTitle(i18n("Recovery Drive Update Finished"));
         // Refused before touching a drive: the Record button is the remedy
@@ -665,7 +666,8 @@ void MainWindow::notifyJobFinished(const QString &jobId, bool success, const QSt
         if (record) {
             m_trayIcon->setToolTipSubTitle(
                 success ? i18n("Last recovery drive record: success")
-                        : i18n("Last recovery drive record: FAILED"));
+                        : recordDeferred(summary) ? i18n("Last recovery drive record: not started")
+                                                  : i18n("Last recovery drive record: FAILED"));
         } else if (recovery) {
             m_trayIcon->setToolTipSubTitle(
                 success ? i18n("Last recovery drive update: success")

@@ -44,6 +44,7 @@ ProgressPanel::ProgressPanel(DBusClient *client, QWidget *parent)
     m_stageLabel = new QLabel(this);
     m_stageLabel->setObjectName(QStringLiteral("stageLabel"));
     m_stageLabel->setWordWrap(true);
+    m_stageLabel->setTextFormat(Qt::PlainText); // helper and script text, never markup
     m_stageLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
     m_cancelButton = new QPushButton(
@@ -283,6 +284,13 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
                                                     : tr("Kept, recovery OS still running"));
         m_stageLabel->setText(words);
         m_stageLabel->setToolTip(words);
+    } else if (m_currentOperation == QLatin1String("Recovery OS record") && recordDeferred(summary)) {
+        // A lock was held (a backup, a scrub, a session): nothing was mounted or
+        // written, so it is not a failure (bd DAS-Backup-Manager-3gzs.5).
+        m_progressBar->setValue(0);
+        m_operationLabel->setText(tr("Not started"));
+        m_stageLabel->setText(summary);
+        m_stageLabel->setToolTip(summary);
     } else if (m_currentOperation == QLatin1String("Recovery OS session") && sessionRefusedForRecord(summary)) {
         // The script refused before touching a drive: the boot record is
         // missing or out of date, and the Record button is the remedy. Not a

@@ -64,6 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Recovery panel polish** (bd `DAS-Backup-Manager-v173`, `DAS-Backup-Manager-3gzs.5`): small honesty fixes in the GUI's recovery drive panel and notifications
+  - End session is enabled only for a holder named `other:`; any other holder is refused with the reason, and a document with no drives disables every action
+  - A `JobFinished` that arrives before the method's reply is kept with its summary (by job id) and shown when the reply names the job; the held entries are dropped when the request resolves, so unrelated finishes no longer pile up
+  - The status line and the progress panel's stage line render helper and script text as plain text; `%1 day` / `%1 days` is a plural form
+  - The console refusal for a scheduled (`unit:`) session says it is unattended instead of "cannot tell"
+  - A deferred record (a lock held) reads "Not started" in the panel, the progress panel, the notification and the tray tooltip, not "Recording failed"
+  - A session refusal counts as a record refusal only when a `REFUSED:` line of the script offers `recovery-os record`, so a holder's name in other text no longer does; its REFUSED reason now leads the panel text, the boot-record output follows
 - **A recovery-OS session refuses a boot record that names a key twice** (bd `DAS-Backup-Manager-pc0`): plain `jq` keeps the last of two same-named keys, so a drive entered twice, `will` first and `no` last, read as `no`; the preflight now reads every key with `jq --stream` after the one-document check and refuses a repeated one, naming it, with no override
 - **`btrdasd restore snapshot` no longer says "Restored 0 files" for a send/receive restore that restored a whole subvolume** (bd `DAS-Backup-Manager-eg4j.16`): the fast path counts no files, and 0 read as a measurement
   - `RestoreResult.files_restored` is now an `Option`: the text report reads `Restored whole snapshot (file count not taken) (<size>) in <n>s`, the helper's summary says "the whole snapshot (file count not taken)", and `--json` prints `"files_restored":null`; a recursive copy and `restore file` still print their real count
