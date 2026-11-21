@@ -1220,6 +1220,16 @@ As for
 .SS restore snapshot
 Restore an entire snapshot using btrfs send/receive or recursive copy.
 .PP
+A send/receive restore counts no files: the report reads
+.I Restored whole snapshot (file count not taken)
+and the
+.B \-\-json
+field
+.I files_restored
+is
+.IR null ;
+a recursive copy reports the number of files it copied.
+.PP
 .B btrdasd restore snapshot
 .I SNAPSHOT DEST
 .RB [ \-\-config

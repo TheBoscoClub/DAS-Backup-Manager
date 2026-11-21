@@ -2026,18 +2026,27 @@ fn walk_report(
 /// lines for stderr (text output only, as before).
 fn restored_report(json: bool, result: &restore::RestoreResult) -> (String, Vec<String>) {
     if json {
+        // `files_restored` is null when the restore counted no files (a
+        // btrfs send/receive restores a whole subvolume); never 0 for that.
+        let files = result
+            .files_restored
+            .map_or_else(|| "null".to_string(), |n| n.to_string());
         let out = format!(
             "{{\"files_restored\":{},\"bytes_restored\":{},\"errors\":{},\"duration_secs\":{}}}\n",
-            result.files_restored,
+            files,
             result.bytes_restored,
             result.errors.len(),
             result.duration_secs
         );
         return (out, Vec::new());
     }
+    let what = result.files_restored.map_or_else(
+        || "whole snapshot (file count not taken)".to_string(),
+        |n| format!("{n} files"),
+    );
     let out = format!(
-        "Restored {} files ({}) in {}s\n",
-        result.files_restored,
+        "Restored {} ({}) in {}s\n",
+        what,
         report::format_bytes(result.bytes_restored),
         result.duration_secs
     );
@@ -5163,7 +5172,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     #[test]
     fn restore_prints_a_summary_and_each_error() {
         let result = restore::RestoreResult {
-            files_restored: 2,
+            files_restored: Some(2),
             bytes_restored: 2048,
             errors: vec!["a: gone".into(), "b: denied".into()],
             duration_secs: 3,
@@ -5182,6 +5191,35 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             restored_report(true, &result),
             (
                 "{\"files_restored\":2,\"bytes_restored\":2048,\"errors\":2,\"duration_secs\":3}\n"
+                    .to_string(),
+                Vec::<String>::new()
+            )
+        );
+    }
+
+    #[test]
+    fn a_restore_that_counted_no_files_never_prints_zero() {
+        // bd DAS-Backup-Manager-eg4j.16: a send/receive restore.
+        let result = restore::RestoreResult {
+            files_restored: None,
+            bytes_restored: 2048,
+            errors: Vec::new(),
+            duration_secs: 3,
+        };
+        assert_eq!(
+            restored_report(false, &result),
+            (
+                format!(
+                    "Restored whole snapshot (file count not taken) ({}) in 3s\n",
+                    report::format_bytes(2048)
+                ),
+                Vec::<String>::new()
+            )
+        );
+        assert_eq!(
+            restored_report(true, &result),
+            (
+                "{\"files_restored\":null,\"bytes_restored\":2048,\"errors\":0,\"duration_secs\":3}\n"
                     .to_string(),
                 Vec::<String>::new()
             )
@@ -5252,7 +5290,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
     fn restore_result(errors: &[&str]) -> restore::RestoreResult {
         restore::RestoreResult {
-            files_restored: 4,
+            files_restored: Some(4),
             bytes_restored: 43_181_600,
             errors: errors.iter().map(|e| e.to_string()).collect(),
             duration_secs: 0,

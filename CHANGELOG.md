@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd restore snapshot` no longer says "Restored 0 files" for a send/receive restore that restored a whole subvolume** (bd `DAS-Backup-Manager-eg4j.16`): the fast path counts no files, and 0 read as a measurement
+  - `RestoreResult.files_restored` is now an `Option`: the text report reads `Restored whole snapshot (file count not taken) (<size>) in <n>s`, the helper's summary says "the whole snapshot (file count not taken)", and `--json` prints `"files_restored":null`; a recursive copy and `restore file` still print their real count
+  - `files_restored` in `--json` can now be `null`: a consumer that read it as a number must accept null
 - **`recovery-os-vm.sh define` takes the backup lock and the maintenance lock** (bd `DAS-Backup-Manager-o1re`): it rewrote the recovery drives' VM definitions with no lock, so it could run beside a backup or a session; it now takes the singleton, then the maintenance lock, before its first check, names itself in both, refuses naming a holder, and empties both records on every way out (`recovery-os-vm.sh` 2.4.0)
 - **`backup-verify.sh` names who holds the maintenance lock when it skips the btrbk/usage inspection** (bd `DAS-Backup-Manager-3wc`): the skip line said only "held by another job"
   - It now reads the holder's own record from the lock file (`<who> pid <pid>`) and says it: `DAS maintenance lock held by backup-run.sh pid 4242 — skipping btrbk/usage inspection`

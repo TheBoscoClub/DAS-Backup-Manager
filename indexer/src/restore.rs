@@ -7,7 +7,10 @@ use walkdir::WalkDir;
 /// Result of a restore operation.
 #[derive(Debug)]
 pub struct RestoreResult {
-    pub files_restored: usize,
+    /// Regular files restored; `None` when the restore did not count them
+    /// (a btrfs send/receive restores a whole subvolume and counts nothing).
+    /// Never 0 for "not counted" (`fail-silent.md`).
+    pub files_restored: Option<usize>,
     pub bytes_restored: u64,
     pub errors: Vec<String>,
     pub duration_secs: u64,
@@ -972,7 +975,7 @@ pub fn restore_files(
     progress.on_log(LogLevel::Info, &summary);
 
     Ok(RestoreResult {
-        files_restored,
+        files_restored: Some(files_restored),
         bytes_restored,
         errors,
         duration_secs,
@@ -1108,12 +1111,19 @@ fn try_btrfs_send_receive(
     // Count bytes from the restored subvolume (best-effort)
     let bytes_restored = count_dir_bytes(dest);
 
-    Ok(RestoreResult {
-        files_restored: 0, // not easily countable via send/receive
+    Ok(send_receive_result(bytes_restored))
+}
+
+/// The result of a finished send/receive: it restored a whole subvolume and
+/// counted no files, so the count is unknown, never 0 (bd
+/// DAS-Backup-Manager-eg4j.16).
+fn send_receive_result(bytes_restored: u64) -> RestoreResult {
+    RestoreResult {
+        files_restored: None,
         bytes_restored,
         errors: Vec::new(),
         duration_secs: 0, // caller fills in
-    })
+    }
 }
 
 /// Judge a finished `btrfs send | btrfs receive` pipeline: BOTH halves must
@@ -1270,7 +1280,7 @@ fn restore_snapshot_recursive(
     progress.on_log(LogLevel::Info, &summary);
 
     Ok(RestoreResult {
-        files_restored,
+        files_restored: Some(files_restored),
         bytes_restored,
         errors,
         duration_secs,
@@ -1425,7 +1435,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 1, "only the safe member restores");
+        assert_eq!(
+            result.files_restored,
+            Some(1),
+            "only the safe member restores"
+        );
         assert!(
             result.errors.iter().any(|e| e.contains("traversal")),
             "{:?}",
@@ -1601,7 +1615,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.files_restored, Some(1));
         assert!(dest.path().join("a.txt").exists());
     }
 
@@ -1746,7 +1760,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 2);
+        assert_eq!(result.files_restored, Some(2));
         assert!(result.errors.is_empty());
 
         let restored_hello = fs::read_to_string(dest.path().join("hello.txt")).unwrap();
@@ -1776,7 +1790,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 3);
+        assert_eq!(result.files_restored, Some(3));
         assert!(result.errors.is_empty());
 
         // Verify nested structure preserved
@@ -1811,7 +1825,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 3);
+        assert_eq!(result.files_restored, Some(3));
         assert!(result.errors.is_empty());
 
         // Verify on_stage was called with the right total
@@ -1982,7 +1996,7 @@ mod tests {
         .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.files_restored, 3);
+        assert_eq!(result.files_restored, Some(3));
         // 5 + 7: the symlink is restored as a link and carries no payload.
         assert_eq!(result.bytes_restored, 12);
         assert_eq!(
@@ -2024,7 +2038,7 @@ mod tests {
         .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.files_restored, 2);
+        assert_eq!(result.files_restored, Some(2));
         assert_eq!(result.bytes_restored, 0);
         for (name, want) in [("link", "a.txt"), ("dangling", "gone")] {
             let restored = dest.path().join(name);
@@ -2350,7 +2364,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read_to_string(&victim).unwrap(), "original");
-        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.files_restored, Some(1));
         assert_eq!(result.bytes_restored, 4);
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
@@ -2392,7 +2406,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.files_restored, Some(1));
         assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
         assert!(result.errors.iter().all(|e| e.contains("traversal")));
         let restored: Vec<_> = fs::read_dir(dest.path())
@@ -2425,7 +2439,7 @@ mod tests {
         .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.files_restored, Some(1));
         assert_eq!(
             result.bytes_restored, 0,
             "the target's content is never copied"
@@ -2458,7 +2472,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.files_restored, Some(0));
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
             result.errors[0].starts_with("Cannot resolve the parent of 'nodir/x.txt'"),
@@ -2491,7 +2505,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.files_restored, Some(0));
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
             result.errors[0].contains(": not followed"),
@@ -2649,7 +2663,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files_restored, 0);
+        assert_eq!(result.files_restored, Some(0));
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
             result.errors[0].contains("traversal"),
@@ -2702,7 +2716,7 @@ mod tests {
             &Recorder::default(),
         )
         .unwrap();
-        assert_eq!(result.files_restored, 1);
+        assert_eq!(result.files_restored, Some(1));
         assert_eq!(
             fs::read_to_string(allowed.join("fresh/new/a.txt")).unwrap(),
             "a"
@@ -2750,7 +2764,7 @@ mod tests {
         .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.files_restored, 3, "two files and the symlink");
+        assert_eq!(result.files_restored, Some(3), "two files and the symlink");
         assert_eq!(result.bytes_restored, 8, "3 + 5; the link has no payload");
         assert_tree_restored(dest.path());
 
@@ -2792,7 +2806,7 @@ mod tests {
             started,
             |_, _, _| {
                 Ok(RestoreResult {
-                    files_restored: 0,
+                    files_restored: None,
                     bytes_restored: 4096,
                     errors: Vec::new(),
                     duration_secs: 0,
@@ -2837,7 +2851,7 @@ mod tests {
             |_, given, _| {
                 *seen.lock().unwrap() = Some((given.to_path_buf(), given.canonicalize().ok()));
                 Ok(RestoreResult {
-                    files_restored: 0,
+                    files_restored: None,
                     bytes_restored: 0,
                     errors: Vec::new(),
                     duration_secs: 0,
@@ -2869,7 +2883,7 @@ mod tests {
         .unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.files_restored, 3);
+        assert_eq!(result.files_restored, Some(3));
         assert_eq!(result.bytes_restored, 8);
         assert_tree_restored(&dest);
         // The reason for the fallback must reach the operator.
@@ -2936,6 +2950,34 @@ mod tests {
         // Both failed: the send is the cause, the receive only its consequence.
         let err = send_receive_outcome(failed, failed).unwrap_err();
         assert!(err.starts_with("btrfs send exited with"), "{err}");
+    }
+
+    #[test]
+    fn a_send_receive_restore_never_reports_zero_files() {
+        // bd DAS-Backup-Manager-eg4j.16: send/receive counts no files, and a
+        // count not taken is unknown, never 0.
+        let r = send_receive_result(7_181_255_627);
+        assert_eq!(r.files_restored, None);
+        assert_eq!(r.bytes_restored, 7_181_255_627);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn a_fast_path_restore_keeps_its_count_unknown_through_restore_snapshot() {
+        let snap = snapshot_tree();
+        let dest = TempDir::new().unwrap();
+        let result = restore_snapshot_with(
+            snap.path(),
+            dest.path(),
+            &test_roots(),
+            &test_sources(snap.path()),
+            &crate::progress::NullProgress,
+            Instant::now(),
+            |_, _, _| Ok(send_receive_result(4096)),
+        )
+        .unwrap();
+        assert_eq!(result.files_restored, None);
+        assert_eq!(result.bytes_restored, 4096);
     }
 
     #[test]

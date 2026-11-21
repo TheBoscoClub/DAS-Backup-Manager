@@ -2770,8 +2770,8 @@ fn restore_files_job(
             Ok(r) => Ok((
                 r.errors.is_empty(),
                 format!(
-                    "Restored {} files ({} bytes), {} errors",
-                    r.files_restored,
+                    "Restored {} ({} bytes), {} errors",
+                    files_phrase(r.files_restored),
                     r.bytes_restored,
                     r.errors.len()
                 ),
@@ -2782,6 +2782,15 @@ fn restore_files_job(
 
     let still_mounted = guard.unmount(progress);
     mount::fail_if_still_mounted(res, &still_mounted)
+}
+
+/// "N files", or "the whole snapshot (file count not taken)" when the restore
+/// counted none (a send/receive); never "0 files" for a count not taken.
+fn files_phrase(files: Option<usize>) -> String {
+    files.map_or_else(
+        || "the whole snapshot (file count not taken)".to_string(),
+        |n| format!("{n} files"),
+    )
 }
 
 /// `RestoreSnapshot`: restore all of `snapshot` into `dest`.
@@ -2810,8 +2819,8 @@ fn restore_snapshot_job(
             Ok(r) => Ok((
                 r.errors.is_empty(),
                 format!(
-                    "Snapshot restored: {} files ({} bytes), {} errors",
-                    r.files_restored,
+                    "Snapshot restored: {} ({} bytes), {} errors",
+                    files_phrase(r.files_restored),
                     r.bytes_restored,
                     r.errors.len()
                 ),
