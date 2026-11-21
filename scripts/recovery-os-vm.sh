@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.3.0
-# Date: 2026-11-18
+# Version: 2.4.0
+# Date: 2026-11-21
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -462,6 +462,10 @@ readonly DOMAIN_TEMPLATE="$SCRIPT_DIR/libvirt/$DOMAIN_BASE.xml"
 DOMAIN_XML=""
 # Must match indexer/src/scrub.rs MAINTENANCE_LOCK_PATH and backup-run.sh.
 readonly MAINTENANCE_LOCK="$TEST_ROOT/run/das-maintenance.lock"
+# The backup singleton (backup.md "Maintenance Interlock"): define rewrites
+# what a backup run reads, so it takes this first, then the maintenance lock
+# -- always that order, never the reverse (bd DAS-Backup-Manager-o1re).
+readonly BACKUP_LOCK="$TEST_ROOT/run/das-backup.lock"
 readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
 # The egress rule's subnet, while a rule this script put in place is there.
 readonly EGRESS_FILE="$STATE_DIR/egress.rule"
@@ -599,6 +603,9 @@ HOLDER_OUT=""  # the holder's stdout (its one `held` line)
 HOLDER_ERR=""  # the holder's stderr
 DISK_XML_FILE=""
 LOCK_FD="" # set while THIS process holds the maintenance lock's descriptor
+SLOCK_FD="" # set while THIS process holds the backup singleton (define only)
+# The job a lock record names when it is not a drive's session ("define").
+LOCK_JOB=""
 HOLDER_PID=""
 HOLDER_STARTING=false
 HOLDER_SIGNALLED=false                                         # stop_holder found it running and sent SIGTERM
@@ -3179,7 +3186,44 @@ take_lock() {
         refuse "the DAS maintenance lock $MAINTENANCE_LOCK is held by: ${holder:-(no holder line)} -- try again when it is free"
     fi
     write_lock_record "$$"
-    log "took the DAS maintenance lock $MAINTENANCE_LOCK: backups and scrubs now wait for this session"
+    log "took the DAS maintenance lock $MAINTENANCE_LOCK: backups and scrubs now wait for this ${LOCK_JOB:-session}"
+}
+
+# The backup singleton, as take_lock takes the maintenance lock: opened <>
+# (a job that does not get it must not empty the holder's record), root's
+# alone, non-blocking; held -> refused naming the holder. Its record names
+# this job ("<who> pid <pid>", as every holder writes it). define only.
+take_singleton_lock() {
+    local holder
+    if ! exec {SLOCK_FD}<>"$BACKUP_LOCK"; then
+        SLOCK_FD=""
+        refuse "cannot open $BACKUP_LOCK"
+    fi
+    if [[ -f "$BACKUP_LOCK" && ! -L "$BACKUP_LOCK" ]] && ! chmod 600 -- "$BACKUP_LOCK"; then
+        warn "cannot make $BACKUP_LOCK root's alone (0600): any local user can hold it"
+    fi
+    if ! flock -n "$SLOCK_FD"; then
+        holder="$(head -n 1 -- "$BACKUP_LOCK" 2>/dev/null)" || holder=""
+        exec {SLOCK_FD}>&-
+        SLOCK_FD=""
+        refuse "the DAS backup lock $BACKUP_LOCK is held by: ${holder:-(no holder line)} -- try again when it is free"
+    fi
+    if ! printf 'recovery-os VM %s pid %s\n' "${LOCK_JOB:-define}" "$$" >"$BACKUP_LOCK"; then
+        warn "could not record pid $$ as the holder of $BACKUP_LOCK"
+    fi
+    log "took the DAS backup lock $BACKUP_LOCK: no backup starts while this ${LOCK_JOB:-define} runs"
+}
+
+# Its record emptied while still held (the next holder may write its own the
+# moment it is let go), then the descriptor closed.
+release_singleton_lock() {
+    [[ -n "$SLOCK_FD" ]] || return 0
+    if ! : >"$BACKUP_LOCK"; then
+        warn "could not empty the holder record in $BACKUP_LOCK"
+    fi
+    exec {SLOCK_FD}>&-
+    SLOCK_FD=""
+    log "released the DAS backup lock"
 }
 
 # The lock's record: one line naming the session and the process that holds
@@ -3190,8 +3234,11 @@ take_lock() {
 write_lock_record() {
     # A two-drive run's record is the run's.
     [[ "$LOCK_INHERITED" != true ]] || return 0
-    # $2: the session named, when it is another drive's (hand_on_lock_record).
-    if ! printf 'recovery-os VM session %s pid %s\n' "${2:-$LABEL}" "$1" >"$MAINTENANCE_LOCK"; then
+    # $2: the session named, when it is another drive's (hand_on_lock_record);
+    # a job that is no drive's session (define) names itself.
+    local who="session ${2:-$LABEL}"
+    [[ -n "${2:-}" || -z "$LOCK_JOB" ]] || who=$LOCK_JOB
+    if ! printf 'recovery-os VM %s pid %s\n' "$who" "$1" >"$MAINTENANCE_LOCK"; then
         warn "could not record pid $1 as the holder of $MAINTENANCE_LOCK"
     fi
 }
@@ -5930,6 +5977,14 @@ check_redefinable() {
 cmd_define() {
     local label loader template labels=() name out ids=() id legacy=false
     require_root
+    # Both locks before the first check, the singleton first; given back on
+    # every way out, refusals included (bd DAS-Backup-Manager-o1re). define
+    # is never part of a two-drive run: no inherited descriptor counts here.
+    unset DAS_RECOVERY_VM_LOCK_FD
+    LOCK_JOB=define
+    trap 'release_lock; release_singleton_lock' EXIT
+    take_singleton_lock
+    take_lock
     [[ -r "$DOMAIN_TEMPLATE" ]] || refuse "the domain template $DOMAIN_TEMPLATE is missing -- install the project (cmake --install) first"
     name="$(xml_value "$NAME_RE" "$DOMAIN_TEMPLATE")" || refuse "$DOMAIN_TEMPLATE names no domain"
     if [[ "$name" != "$DOMAIN_BASE" ]]; then

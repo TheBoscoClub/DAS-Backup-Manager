@@ -737,6 +737,7 @@ case "$cmd" in
         echo "virsh define" >>"$S/events"
         # Who holds the maintenance lock while the definition changes.
         { head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" 2>/dev/null || echo "(no lock file)"; } >>"$S/lock.at_define"
+        { head -n 1 "$DAS_RECOVERY_VM_TEST_ROOT/run/das-backup.lock" 2>/dev/null || echo "(no lock file)"; } >>"$S/singleton.at_define"
         touch "$S/defined"
         if [[ -f "$S/define_keeps_guard" ]] && ! grep -q 'org.dasbackup.guard' "${!#}"; then
             echo "Domain 'recovery-os-updater' defined from ${!#}"
@@ -1292,6 +1293,20 @@ blocker_holds() {
 stop_blocker() {
     kill "$blocker" 2>/dev/null || :
     wait "$blocker" 2>/dev/null || :
+}
+# The same blocker on another lock file ($1), for the singleton.
+start_blocker_at() {
+    (
+        exec 9<>"$1"
+        if "$REAL_FLOCK" -n 9; then : >"$S/blocker.locked"; fi
+        exec sleep 30
+    ) &
+    blocker=$!
+    for ((i = 0; i < 200; i++)); do [[ -e "$S/blocker.locked" ]] && break; sleep 0.05; done
+}
+# free or held, as a fresh process sees the lock file $1 (a missing file: free).
+lock_at() {
+    if [[ ! -e "$1" ]] || "$REAL_FLOCK" -n "$1" true; then echo free; else echo held; fi
 }
 events() { tr '\n' '|' <"$S/events"; }
 holder_pid() { head -n 1 "$STATE/system-recovery-$1-2tb.holder" 2>/dev/null || :; }
@@ -4593,6 +4608,59 @@ sed -i 's|^  <uuid>.*</uuid>$||' "$T/usr/lib/das-backup/libvirt/recovery-os-upda
 run_driver define
 check "a template without a uuid line: refused" "$RC" "1"
 has "a template without a uuid line: says which line" "$OUT" "is not of the shape this script renders each drive's domain from"
+
+echo "--- define takes the backup singleton, then the maintenance lock (bd o1re)"
+SLOCK_NAME=das-backup.lock
+fixture
+SLOCK="$T/run/$SLOCK_NAME"
+rm -f "${S:?}/defined" "${S:?}/domB/defined"
+run_driver define
+check "define, both locks free: exit 0" "$RC" "0"
+has "define, both locks free: defined" "$(file "$S/virsh.calls")" "define --validate $STATE/system-recovery-A-2tb.plain.xml"
+matches "define, both locks free: the singleton named define while it defined" "$(head -n 1 "$S/singleton.at_define")" '^recovery-os VM define pid [0-9]+$'
+matches "define, both locks free: the maintenance lock named define while it defined" "$(head -n 1 "$S/lock.at_define")" '^recovery-os VM define pid [0-9]+$'
+check "define, both locks free: the singleton free afterwards" "$(lock_at "$SLOCK")" "free"
+check "define, both locks free: the maintenance lock free afterwards" "$(lock_at "$LOCK")" "free"
+check "define, both locks free: the singleton's record emptied, not removed" "$([[ -f "$SLOCK" ]] && wc -c <"$SLOCK")" "0"
+check "define, both locks free: the maintenance record emptied, not removed" "$([[ -f "$LOCK" ]] && wc -c <"$LOCK")" "0"
+run_driver define
+check "define, run again after it: exit 0 (the locks were let go)" "$RC" "0"
+
+fixture
+SLOCK="$T/run/$SLOCK_NAME"
+printf 'backup-run.sh pid 4242\n' >"$SLOCK"
+start_blocker_at "$SLOCK"
+check "define, singleton held: precondition" "$(lock_at "$SLOCK")" "held"
+run_driver define
+check "define, singleton held: refused" "$RC" "1"
+has "define, singleton held: names the holder" "$OUT" "held by: backup-run.sh pid 4242"
+lacks "define, singleton held: nothing defined" "$(file "$S/virsh.calls")" "define --validate"
+check "define, singleton held: no domain file written" "$(find "$STATE" -mindepth 1 -maxdepth 1 -name '*.xml*' 2>/dev/null | wc -l)" "0"
+check "define, singleton held: the holder's record left alone" "$(head -n 1 "$SLOCK")" "backup-run.sh pid 4242"
+check "define, singleton held: the maintenance lock not taken" "$(lock_at "$LOCK")" "free"
+stop_blocker
+
+fixture
+SLOCK="$T/run/$SLOCK_NAME"
+printf 'backup-run.sh pid 4243\n' >"$LOCK"
+start_blocker_at "$LOCK"
+check "define, maintenance lock held: precondition" "$(lock_at "$LOCK")" "held"
+run_driver define
+check "define, maintenance lock held: refused" "$RC" "1"
+has "define, maintenance lock held: names the holder" "$OUT" "held by: backup-run.sh pid 4243"
+lacks "define, maintenance lock held: nothing defined" "$(file "$S/virsh.calls")" "define --validate"
+check "define, maintenance lock held: the holder's record left alone" "$(head -n 1 "$LOCK")" "backup-run.sh pid 4243"
+check "define, maintenance lock held: the singleton given back" "$(lock_at "$SLOCK")" "free"
+check "define, maintenance lock held: the singleton's record emptied" "$([[ -f "$SLOCK" ]] && wc -c <"$SLOCK")" "0"
+stop_blocker
+
+fixture
+SLOCK="$T/run/$SLOCK_NAME"
+printf 'running\n' >"$S/states"
+run_driver define
+check "define refused after the locks: exit 1" "$RC" "1"
+check "define refused after the locks: both let go" "$(lock_at "$SLOCK") $(lock_at "$LOCK")" "free free"
+check "define refused after the locks: the records emptied" "$(wc -c <"$SLOCK") $(wc -c <"$LOCK")" "0 0"
 
 echo "--- each drive's session uses its own domain"
 fixture

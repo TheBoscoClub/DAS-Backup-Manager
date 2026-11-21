@@ -1267,6 +1267,8 @@ As root. The script is in `/usr/lib/das-backup/` on a `/usr` install, `${prefix}
 sudo /usr/lib/das-backup/recovery-os-vm.sh define
 ```
 
+`define` takes the backup lock (`/run/das-backup.lock`), then the DAS maintenance lock, before its first check, names itself in both (`recovery-os VM define pid <pid>`) and gives both back however it ends; while a backup, a scrub or a session holds either, it refuses at once, naming the holder, and changes nothing.
+
 Then for each drive in turn — `A` and `B` stand for the `role = "mirror"` targets whose labels contain that letter (`recovery-A`, `recovery-B`):
 
 ```bash
