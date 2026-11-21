@@ -1,7 +1,7 @@
 #!/bin/bash
 # das-wipe-all-drives-and-partition-from-scratch.sh - WIPE EVERY DAS DRIVE THE CONFIG NAMES AND PARTITION THEM FROM SCRATCH
-# Version: 2.3.5
-# Date: 2026-10-12
+# Version: 2.4.0
+# Date: 2026-11-21
 #
 # WARNING: --run DESTROYS ALL DATA ON EVERY DRIVE config.toml NAMES -- the
 #     primary backup drives AND the recovery drives, backups included -- and
@@ -21,6 +21,12 @@
 #     an invalid SMART checksum (read with -b exit): refused, the drive named
 #     by serial with what to do next. --check shows the same; --force skips
 #     the check.
+#     Drives are found only by serial: among the /dev/sd* disks, the one
+#     whose `smartctl -i` prints exactly one "Serial Number:" (ATA, NVMe) or
+#     "Serial number:" (SCSI, SAS) line equal to a config.toml serial
+#     (padding trimmed, case kept). A disk whose serial cannot be read, or
+#     reads more than once, is never used; if a configured serial is among
+#     what it printed, or one is on two disks, the run is refused.
 #     All configuration loaded from config.toml via btrdasd.
 #
 # Drive Layout (from config):
@@ -107,18 +113,116 @@ check_root() {
 # Discover devices by serial number (returns associative array in DISCOVERED_DEVICES)
 declare -A DISCOVERED_DEVICES=()
 
+# The device nodes discovery reads: every whole SCSI-disk node, which is how
+# the kernel names SATA, SAS and USB-attached drives alike. Being listed here
+# selects nothing: a node is used only when its drive's serial, read by
+# smartctl, is one config.toml names exactly (discover_devices).
+list_candidate_disks() {
+    CANDIDATE_DISKS=()
+    local dev
+    for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
+        if [[ -b "$dev" ]]; then
+            CANDIDATE_DISKS+=("$dev")
+        fi
+    done
+}
+
+# parse_drive_serial <smartctl -i output> <its exit status>
+# Returns 0 only when the output carries exactly one drive serial: one line
+# that starts "Serial Number:" (ATA, NVMe) or "Serial number:" (SCSI, SAS),
+# smartctl 7.5's own labels, with a non-empty value. Sets DRIVE_SERIAL to it
+# and, on a refusal, DRIVE_SERIAL_PROBLEM to why. DRIVE_SERIALS_SEEN holds
+# every non-empty value found either way, so a refusal can tell whether a
+# listed drive was among them (bd DAS-Backup-Manager-tjph).
+#
+# The identity rule: the whole value, with the blanks smartctl pads it with
+# trimmed from both ends, compared byte for byte and case-sensitively. Up to
+# 2.3.5 the match was awk's third field of "Serial Number:" only: a SAS
+# drive's "Serial number:" never matched, so it could not be found, and a
+# value with a blank in it matched on its first word alone.
+parse_drive_serial() {
+    local out="$1" rc="$2" nl=$'\n' rest line value count=0
+    DRIVE_SERIAL="" DRIVE_SERIAL_PROBLEM="" DRIVE_SERIALS_SEEN=()
+
+    # Line by line in bash itself: no pipe, no file, no subshell.
+    rest="$out"
+    while [[ -n $rest ]]; do
+        line="${rest%%"$nl"*}"
+        if [[ $rest == *"$nl"* ]]; then rest="${rest#*"$nl"}"; else rest=""; fi
+        [[ $line == "Serial Number:"* || $line == "Serial number:"* ]] || continue
+        value="${line#Serial [Nn]umber:}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        count=$((count + 1))
+        [[ -z $value ]] || DRIVE_SERIALS_SEEN+=("$value")
+    done
+
+    # smartctl's exit status is a bitmask (smartctl(8), EXIT STATUS). Bits
+    # 0-1: it could not parse its command line or open the drive, so nothing
+    # it printed is the drive's identity. 127 (no smartctl) sets both. Other
+    # bits are SMART findings, which leave the identity readable; the SMART
+    # gate judges those.
+    if ((rc & 3)); then
+        DRIVE_SERIAL_PROBLEM="smartctl could not read its identity (exit $rc)"
+        return 1
+    fi
+    if ((count > 1)); then
+        DRIVE_SERIAL_PROBLEM="more than one serial line in smartctl's output (${DRIVE_SERIALS_SEEN[*]})"
+        return 1
+    fi
+    if ((${#DRIVE_SERIALS_SEEN[@]} != 1)); then
+        DRIVE_SERIAL_PROBLEM="no serial in smartctl's output"
+        return 1
+    fi
+    DRIVE_SERIAL="${DRIVE_SERIALS_SEEN[0]}"
+    return 0
+}
+
+# A drive is discovered only by its own serial, exactly as config.toml names
+# it. A node whose serial cannot be read, or reads ambiguously, is never used
+# and is named; if a listed serial is among what it printed, or a listed
+# serial is on two nodes (a dual-ported SAS drive on two paths, a bridge
+# that reports its own serial for every bay), discovery refuses the run:
+# which node is that drive cannot be told.
 discover_devices() {
     log_header "Discovering DAS Drives by Serial Number"
 
-    for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
-        if [[ -b "$dev" ]]; then
-            local serial
-            serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
-            if [[ -n "$serial" && -n "${EXPECTED_SERIALS[$serial]:-}" ]]; then
-                DISCOVERED_DEVICES[$serial]="$dev"
-            fi
+    local dev out rc seen refuse=false
+    local -A duplicated=()
+    local DRIVE_SERIAL DRIVE_SERIAL_PROBLEM DRIVE_SERIALS_SEEN
+    list_candidate_disks
+    for dev in "${CANDIDATE_DISKS[@]}"; do
+        # The output and the exit status, apart, as check_smart_tests reads
+        # them. A capture bash cannot make prints nothing: no serial, refused.
+        rc=0
+        out="$(smartctl -i "$dev" 2>&1)" || rc=$?
+        if ! parse_drive_serial "$out" "$rc"; then
+            for seen in "${DRIVE_SERIALS_SEEN[@]}"; do
+                if [[ -n "${EXPECTED_SERIALS[$seen]:-}" ]]; then
+                    log_error "$dev: $DRIVE_SERIAL_PROBLEM, and serial $seen is one config.toml names: which device is that drive cannot be told."
+                    refuse=true
+                    break
+                fi
+            done
+            log_warn "$dev: $DRIVE_SERIAL_PROBLEM — not used."
+            continue
         fi
+        [[ -n "${EXPECTED_SERIALS[$DRIVE_SERIAL]:-}" ]] || continue
+        if [[ -n "${DISCOVERED_DEVICES[$DRIVE_SERIAL]:-}" || -n "${duplicated[$DRIVE_SERIAL]:-}" ]]; then
+            log_error "Serial $DRIVE_SERIAL is on more than one device (${DISCOVERED_DEVICES[$DRIVE_SERIAL]:-${duplicated[$DRIVE_SERIAL]:-}} and $dev): which one is that drive cannot be told."
+            # Neither node stays discovered, nor does a third with it.
+            duplicated[$DRIVE_SERIAL]="$dev"
+            unset 'DISCOVERED_DEVICES[$DRIVE_SERIAL]'
+            refuse=true
+            continue
+        fi
+        DISCOVERED_DEVICES[$DRIVE_SERIAL]="$dev"
     done
+
+    if $refuse; then
+        log_error "Drive discovery refused: nothing is checked or written. Run 'smartctl -i' on the devices named above."
+        exit 1
+    fi
 }
 
 verify_serials() {

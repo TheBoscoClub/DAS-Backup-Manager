@@ -286,6 +286,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_esp_label_derivation.sh
     )
     add_test(
+        NAME shell-partition-discovery
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_partition_discovery.sh
+    )
+    add_test(
         NAME shell-backup-exit-semantics
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backup_exit_semantics.sh
     )

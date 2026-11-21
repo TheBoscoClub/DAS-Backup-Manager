@@ -36,9 +36,17 @@ For each drive, confirm the serial number:
 # SATA drives
 sudo smartctl -i /dev/disk/by-id/ata-<model>_<serial> | grep "Serial Number"
 
+# SAS / SCSI drives: smartctl prints "Serial number" (lowercase n)
+sudo smartctl -i /dev/disk/by-id/scsi-<id> | grep "Serial number"
+
 # NVMe drives (if your DAS supports NVMe)
 sudo smartctl -i /dev/disk/by-id/nvme-<model>_<serial> | grep "Serial Number"
 ```
+
+The serial in `config.toml` must be exactly what `smartctl -i` prints after `Serial Number:` / `Serial number:` — the
+whole value, case included (leading and trailing blanks are padding). `das-wipe-all-drives-and-partition-from-scratch.sh`
+finds its drives this way only, among the `/dev/sd*` disks: a drive whose serial smartctl cannot read, or reads more
+than once, is never used, and a configured serial on two devices refuses the run.
 
 You can also use `btrdasd config show` to display the target serials in your configuration.
 
