@@ -135,6 +135,9 @@ discover() {
         export FIXTURE_DIR="$FIX/$case"
         PATH="$STUB:$PATH"
         source "$LIB"
+        # The script's own shell options: an error-exit inside discovery
+        # must show up here as it would in a real run.
+        set -euo pipefail
         declare -A EXPECTED_SERIALS=()
         local s d
         for s in $allowed; do EXPECTED_SERIALS[$s]="label-$s"; done
