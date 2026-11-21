@@ -30,7 +30,7 @@ use buttered_dasd::indexer;
 use buttered_dasd::maintenance::{self, LockSite};
 use buttered_dasd::mount;
 use buttered_dasd::progress::{
-    self, LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink,
+    self, LogLevel, OrderedProgress, ProgressCallback, ProgressEvent, ProgressSink, SignalStage,
 };
 use buttered_dasd::recovery_os::{self, panel, session};
 use buttered_dasd::restore;
@@ -102,6 +102,7 @@ struct DbusSink {
     conn: Connection,
     job_id: String,
     runtime: tokio::runtime::Handle,
+    stage: SignalStage,
 }
 
 impl ProgressSink for DbusSink {
@@ -114,6 +115,7 @@ impl ProgressSink for DbusSink {
     fn emit(&mut self, event: ProgressEvent) {
         let conn = &self.conn;
         let job_id = self.job_id.as_str();
+        let stage_name = self.stage.name_for(&event);
         let sent = self.runtime.block_on(async move {
             let iface = conn
                 .object_server()
@@ -121,11 +123,11 @@ impl ProgressSink for DbusSink {
                 .await?;
             let ctxt = iface.signal_emitter();
             match event {
-                ProgressEvent::Stage { stage, total_steps } => {
+                ProgressEvent::Stage { total_steps, .. } => {
                     // A one-step stage has nothing to count: the GUI shows it
                     // busy instead of 0% (bd DAS-Backup-Manager-iic8).
                     let percent = ProgressEvent::stage_percent(total_steps);
-                    HelperInterface::job_progress(ctxt, job_id, &stage, percent, "").await
+                    HelperInterface::job_progress(ctxt, job_id, &stage_name, percent, "").await
                 }
                 ProgressEvent::Progress {
                     current,
@@ -133,7 +135,10 @@ impl ProgressSink for DbusSink {
                     message,
                 } => {
                     let percent = ProgressEvent::percent(current, total);
-                    HelperInterface::job_progress(ctxt, job_id, "progress", percent, &message).await
+                    // The stage the job is in, not a fixed word: an attended
+                    // session's wait stage must survive its percentage (bd 343p).
+                    HelperInterface::job_progress(ctxt, job_id, &stage_name, percent, &message)
+                        .await
                 }
                 ProgressEvent::Log { level, message } => {
                     HelperInterface::job_log(ctxt, job_id, level.word(), &message).await
@@ -155,6 +160,7 @@ fn job_progress(conn: &Connection, job_id: &str) -> Arc<OrderedProgress> {
         conn: conn.clone(),
         job_id: job_id.to_owned(),
         runtime: tokio::runtime::Handle::current(),
+        stage: SignalStage::default(),
     }))
 }
 

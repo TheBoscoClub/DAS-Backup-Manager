@@ -119,6 +119,25 @@ impl ProgressCallback for NullProgress {
     fn on_complete(&self, _: bool, _: &str) {}
 }
 
+/// The stage a job's `JobProgress` signals name. A progress event carries no
+/// stage of its own, so it names the last stage the job entered: a stage the
+/// GUI acts on (an attended session's `<label>:wait`, bd
+/// DAS-Backup-Manager-343p) stays on screen until the next stage, instead of
+/// being replaced by the next percentage. Before any stage: `"progress"`.
+#[derive(Debug, Default)]
+pub struct SignalStage(Option<String>);
+
+impl SignalStage {
+    /// The stage to name for `event`'s signal; a stage event becomes the
+    /// stage later progress events name.
+    pub fn name_for(&mut self, event: &ProgressEvent) -> String {
+        if let ProgressEvent::Stage { stage, .. } = event {
+            self.0 = Some(stage.clone());
+        }
+        self.0.clone().unwrap_or_else(|| "progress".to_owned())
+    }
+}
+
 /// One progress event, in the form a [`ProgressSink`] receives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
@@ -143,8 +162,6 @@ pub enum ProgressEvent {
 }
 
 impl ProgressEvent {
-    /// `current` as a whole percentage of `total`, capped at 100; 0 when
-    /// `total` is 0 (nothing to measure against).
     /// The percentage a stage starts at: 0 when it has steps to count, and
     /// [`Self::UNCOUNTED`] when it is one step (a single btrbk call, one
     /// snapshot restored) and nothing will be counted until it ends.
@@ -155,6 +172,8 @@ impl ProgressEvent {
     /// A stage's progress that cannot be measured: shown as busy, not as 0%.
     pub const UNCOUNTED: i32 = -1;
 
+    /// `current` as a whole percentage of `total`, capped at 100; 0 when
+    /// `total` is 0 (nothing to measure against).
     pub fn percent(current: u64, total: u64) -> i32 {
         (u128::from(current) * 100)
             .checked_div(u128::from(total))
@@ -624,6 +643,34 @@ mod tests {
         assert_eq!(ProgressEvent::stage_percent(0), -1);
         assert_eq!(ProgressEvent::stage_percent(2), 0);
         assert_eq!(ProgressEvent::stage_percent(469), 0);
+    }
+
+    /// An attended session's wait stage, then its percentage: the signal for
+    /// the percentage still names the wait stage (bd DAS-Backup-Manager-343p,
+    /// seen live 2026-11-21: the GUI read "progress" and lost the operator's
+    /// instruction).
+    #[test]
+    fn a_progress_signal_names_the_stage_the_job_is_in() {
+        let progress = |current| ProgressEvent::Progress {
+            current,
+            total: 100,
+            message: "x".into(),
+        };
+        let stage = |s: &str| ProgressEvent::Stage {
+            stage: s.into(),
+            total_steps: 9,
+        };
+        let mut names = SignalStage::default();
+        assert_eq!(names.name_for(&progress(1)), "progress");
+        assert_eq!(names.name_for(&stage("B:wait")), "B:wait");
+        assert_eq!(names.name_for(&progress(11)), "B:wait");
+        let log = ProgressEvent::Log {
+            level: LogLevel::Info,
+            message: "y".into(),
+        };
+        assert_eq!(names.name_for(&log), "B:wait");
+        assert_eq!(names.name_for(&stage("B:shutdown")), "B:shutdown");
+        assert_eq!(names.name_for(&progress(95)), "B:shutdown");
     }
 
     #[test]
