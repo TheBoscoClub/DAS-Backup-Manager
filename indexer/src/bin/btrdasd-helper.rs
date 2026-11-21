@@ -838,20 +838,30 @@ fn schedule_write_line(
     mode: Option<&str>,
     result: Result<&str, String>,
 ) -> String {
-    let drives = labels.join(" ");
+    // Every caller-supplied value is escaped: a label with a newline must not
+    // forge a second journal line (it is logged before validation, a
+    // refusal included).
+    let esc = |v: &str| v.escape_debug().to_string();
+    let drives = labels.iter().map(|l| esc(l)).collect::<Vec<_>>().join(" ");
+    let who = esc(who);
     let what = if at_epoch == 0 {
         "clear".to_string()
     } else {
         format!(
             "set for {at_epoch} (epoch seconds){}",
-            mode.map(|m| format!(", mode {m}")).unwrap_or_default()
+            mode.map(|m| format!(", mode {}", esc(m)))
+                .unwrap_or_default()
         )
     };
     match result {
-        Ok(unit) => {
-            format!("[info] recovery-OS schedule {what} of {drives} by {who}: done, {unit}")
-        }
-        Err(e) => format!("[warn] recovery-OS schedule {what} of {drives} by {who}: not done: {e}"),
+        Ok(unit) => format!(
+            "[info] recovery-OS schedule {what} of {drives} by {who}: done, {}",
+            esc(unit)
+        ),
+        Err(e) => format!(
+            "[warn] recovery-OS schedule {what} of {drives} by {who}: not done: {}",
+            esc(&e)
+        ),
     }
 }
 
@@ -3257,6 +3267,11 @@ mod tests {
         let refused = schedule_write_line(":1.7", &labels[..1], 5, None, Err("too soon".into()));
         assert!(refused.starts_with("[warn] "), "{refused}");
         assert!(refused.ends_with("not done: too soon"), "{refused}");
+        // A label carrying a newline stays on one line (no forged entry).
+        let forged = vec!["A\n[info] recovery-OS schedule clear of B by root: done".to_string()];
+        let line = schedule_write_line(":1.9", &forged, 0, Some("x\ny"), Err("bad\nlabel".into()));
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("A\\n[info]"), "{line}");
     }
 
     #[test]
