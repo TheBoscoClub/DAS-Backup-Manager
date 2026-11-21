@@ -1404,6 +1404,7 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
             recovery_os_current: usize,
             recovery_os_stale: Vec<StaleOs<'a>>,
             recovery_os_not_checked: Vec<NotChecked<'a>>,
+            scrub_tool_finding: bool,
         },
     }
     serde_json::to_string(&match outcome {
@@ -1432,6 +1433,7 @@ fn doctor_json(outcome: &doctor::DoctorOutcome) -> Result<String, serde_json::Er
                 .iter()
                 .map(|(drive, why)| NotChecked { drive, why })
                 .collect(),
+            scrub_tool_finding: dr.scrub_tool.is_some(),
         },
     })
 }
@@ -4617,7 +4619,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         }
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0,"targets_absent":0,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[]}"#
+            r#"{"status":"ran","volumes_checked":4,"volumes_failed":1,"missing":2,"stale":0,"undelivered":0,"targets_failed":0,"targets_absent":0,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[],"scrub_tool_finding":false}"#
         );
     }
 
@@ -4641,7 +4643,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         };
         assert_eq!(
             doctor_json(&doctor::DoctorOutcome::Ran(report)).unwrap(),
-            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1,"targets_absent":1,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[]}"#
+            r#"{"status":"ran","volumes_checked":1,"volumes_failed":0,"missing":0,"stale":0,"undelivered":1,"targets_failed":1,"targets_absent":1,"recovery_os_current":0,"recovery_os_stale":[],"recovery_os_not_checked":[],"scrub_tool_finding":false}"#
         );
     }
 

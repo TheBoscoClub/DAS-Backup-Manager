@@ -339,6 +339,19 @@ pub struct DriftReport {
     pub recovery_os_not_checked: Vec<(String, String)>,
     /// Recovery OSes the recorded reading judges current.
     pub recovery_os_current: usize,
+    /// The installed `btrfs` no longer lists the `-c`/`-n` options every scrub
+    /// argv carries, or could not be asked (bd DAS-Backup-Manager-su1b.3).
+    pub scrub_tool: Option<ScrubToolFinding>,
+}
+
+/// Why the scrub tool check is a finding: what was read, and the `btrfs-progs`
+/// version it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubToolFinding {
+    /// `btrfs-progs vX.Y`, or `unknown` when `btrfs --version` could not be read.
+    pub version: String,
+    /// What the probe found.
+    pub detail: String,
 }
 
 /// A recovery OS whose recorded reading is stale (bd DAS-Backup-Manager-xd3).
@@ -363,6 +376,7 @@ impl DriftReport {
             || !self.stale.is_empty()
             || !self.undelivered.is_empty()
             || !self.recovery_os_stale.is_empty()
+            || self.scrub_tool.is_some()
     }
 
     /// Record what [`crate::recovery_os::judge_records`] found. Only the
@@ -630,6 +644,77 @@ pub fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+/// Whether `btrfs scrub start --help` lists the `-c` and `-n` option lines
+/// (`-c CLASS`, `-n CDATA`) that `scrub::SCRUB_IOPRIO_ARGS` puts on every scrub
+/// argv; returns `(has_c, has_n)`. Matches option lines only (leading
+/// whitespace, then the option and a space), never a mention in prose.
+pub fn scrub_help_ioprio_options(help: &str) -> (bool, bool) {
+    let lists = |opt: &str| {
+        help.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix(opt)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+    };
+    (lists("-c"), lists("-n"))
+}
+
+/// Ask the installed `btrfs` whether it still accepts the ioprio options the
+/// scrub argv carries (bd DAS-Backup-Manager-su1b.3). Runs `btrfs scrub start
+/// --help` and `btrfs --version` only; no scrub starts. `None` = both options
+/// are listed. A probe that fails is a finding, never "fine".
+pub fn scrub_tool_check(runner: &dyn crate::fsutil::CommandRunner) -> Option<ScrubToolFinding> {
+    use std::process::Command;
+    let version = match runner.output(Command::new("btrfs").arg("--version")) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .next()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "unknown".to_string(),
+    };
+    let help = match runner.output(Command::new("btrfs").args(["scrub", "start", "--help"])) {
+        Ok(o) if o.status.success() => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        }
+        Ok(o) => {
+            return Some(ScrubToolFinding {
+                version,
+                detail: format!(
+                    "'btrfs scrub start --help' failed ({}); could not confirm that scrubs still accept -c and -n",
+                    o.status
+                ),
+            });
+        }
+        Err(e) => {
+            return Some(ScrubToolFinding {
+                version,
+                detail: format!(
+                    "'btrfs scrub start --help' could not be run ({e}); could not confirm that scrubs still accept -c and -n"
+                ),
+            });
+        }
+    };
+    let (has_c, has_n) = scrub_help_ioprio_options(&help);
+    if has_c && has_n {
+        return None;
+    }
+    let gone: Vec<&str> = [(!has_c).then_some("-c"), (!has_n).then_some("-n")]
+        .into_iter()
+        .flatten()
+        .collect();
+    Some(ScrubToolFinding {
+        version,
+        detail: format!(
+            "'btrfs scrub start --help' no longer lists {}; every scrub argv carries -c 2 -n 0, so scrubs will fail at the next pass",
+            gone.join(" and ")
+        ),
+    })
+}
+
 /// Outcome of a full `run_drift_check` invocation. One value per process run,
 /// so the size of the `Ran` report costs nothing worth boxing it for.
 #[allow(clippy::large_enum_variant)]
@@ -720,6 +805,7 @@ fn perform_drift_check(
     report.left_mounted = guard.unmount(progress);
     perform_delivery_check(config, progress, held, &mut report);
     perform_recovery_os_check(config, &mut report);
+    report.scrub_tool = scrub_tool_check(&crate::fsutil::SystemRunner);
     report
 }
 
@@ -842,12 +928,13 @@ pub fn run_drift_check(
             progress.on_complete(
                 !report.has_drift(),
                 &format!(
-                    "{} volume(s) checked, {} missing, {} stale, {} undelivered, {} stale recovery OS(es)",
+                    "{} volume(s) checked, {} missing, {} stale, {} undelivered, {} stale recovery OS(es), scrub tool {}",
                     report.volumes_checked,
                     report.missing.len(),
                     report.stale.len(),
                     report.undelivered.len(),
-                    report.recovery_os_stale.len()
+                    report.recovery_os_stale.len(),
+                    if report.scrub_tool.is_some() { "drift" } else { "ok" }
                 ),
             );
             Ok(DoctorOutcome::Ran(report))
@@ -1025,6 +1112,20 @@ pub fn format_report(report: &DriftReport) -> String {
         for (label, why) in &report.recovery_os_not_checked {
             r.push_str(&format!("  {label}: {why}\n"));
         }
+    }
+
+    if let Some(f) = &report.scrub_tool {
+        r.push_str(&format!(
+            "\nSCRUB TOOL — the installed btrfs may reject the scrub options\n{thin}\n"
+        ));
+        r.push_str(&format!("  {}: {}\n", f.version, f.detail));
+        r.push_str(
+            "\n  The monthly scrub passes -c 2 -n 0 (scrub.rs, SCRUB_IOPRIO_ARGS) to every\n  \
+             'btrfs scrub start'. If btrfs rejects them each target's scrub fails while\n  \
+             'btrdasd scrub run' still exits 0. Before the next 1st-of-month scrub, find\n  \
+             the replacement in 'man btrfs-scrub' and update SCRUB_IOPRIO_ARGS, or hold\n  \
+             btrfs-progs at the last version that lists them.\n",
+        );
     }
 
     if !report.left_mounted.is_empty() {
@@ -2564,5 +2665,115 @@ mod recovery_os_report_tests {
             "{text}"
         );
         assert!(!text.contains("STALE RECOVERY OSES"), "{text}");
+    }
+
+    // -- scrub tool probe (bd DAS-Backup-Manager-su1b.3) ---------------------
+
+    /// `btrfs scrub start --help` as btrfs-progs v7.3 prints it.
+    const HELP_V73: &str = "usage: btrfs scrub start [options] <path>|<device>\n\n\
+Start a new scrub on the filesystem or a device (can be started only once)\n\n\
+-B                        do not background \n\
+-d                        stats per device (-B only) \n\
+-r                        read only mode (no repairs done) \n\
+--limit SIZE              set the throughput limit for each device (0 for unlimited), restored afterwards \n\
+-q                        deprecated, alias for global -q option \n\n\
+Priority (requires IO scheduler support, not supported by mq-deadline):\n\
+-c CLASS                  set ioprio class (see ionice(1) manpage),  \n\
+-n CDATA                  set ioprio classdata (see ionice(1) manpage) \n\n\
+Global options:\n\
+-q, --quiet               print only errors\n";
+
+    /// The same help after a release dropped both options, with a prose line
+    /// that still mentions them.
+    const HELP_DROPPED: &str = "usage: btrfs scrub start [options] <path>|<device>\n\n\
+-B                        do not background \n\
+-r                        read only mode (no repairs done) \n\
+The old -c CLASS and -n CDATA options were removed, use ionice\n";
+
+    const START_HELP: &str = "btrfs scrub start --help";
+
+    #[test]
+    fn help_listing_both_ioprio_options_is_read_as_both() {
+        assert_eq!(scrub_help_ioprio_options(HELP_V73), (true, true));
+    }
+
+    #[test]
+    fn help_without_the_options_is_read_as_neither_even_when_prose_names_them() {
+        assert_eq!(scrub_help_ioprio_options(HELP_DROPPED), (false, false));
+    }
+
+    #[test]
+    fn help_dropping_only_one_option_is_read_as_that_one() {
+        let only_c = HELP_V73.replace("-n CDATA", "--nothing CDATA");
+        assert_eq!(scrub_help_ioprio_options(&only_c), (true, false));
+    }
+
+    #[test]
+    fn current_help_is_no_finding() {
+        let r = crate::fsutil::testing::Scripted::new(&[
+            (START_HELP, 0, HELP_V73),
+            ("btrfs --version", 0, "btrfs-progs v7.3\n-EXPERIMENTAL\n"),
+        ]);
+        assert_eq!(scrub_tool_check(&r), None);
+    }
+
+    #[test]
+    fn help_without_the_options_is_a_finding_naming_the_version() {
+        let r = crate::fsutil::testing::Scripted::new(&[
+            (START_HELP, 0, HELP_DROPPED),
+            ("btrfs --version", 0, "btrfs-progs v9.0\n-EXPERIMENTAL\n"),
+        ]);
+        let f = scrub_tool_check(&r).expect("a finding");
+        assert_eq!(f.version, "btrfs-progs v9.0");
+        assert!(
+            f.detail.contains("-c") && f.detail.contains("-n"),
+            "{}",
+            f.detail
+        );
+        assert!(f.detail.contains("fail"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_failed_help_probe_is_a_finding_not_fine() {
+        let r = crate::fsutil::testing::Scripted::new(&[(START_HELP, 1, "")]);
+        let f = scrub_tool_check(&r).expect("a finding");
+        assert_eq!(f.version, "unknown");
+        assert!(f.detail.contains("could not"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_probe_that_cannot_start_btrfs_is_a_finding() {
+        struct Missing;
+        impl crate::fsutil::CommandRunner for Missing {
+            fn output(
+                &self,
+                _: &mut std::process::Command,
+            ) -> std::io::Result<std::process::Output> {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+            fn stream(
+                &self,
+                _: &mut std::process::Command,
+                _: &mut dyn FnMut(&str),
+            ) -> std::io::Result<std::process::Output> {
+                unreachable!()
+            }
+        }
+        assert!(scrub_tool_check(&Missing).is_some());
+    }
+
+    #[test]
+    fn a_scrub_tool_finding_is_drift_with_its_own_section() {
+        let mut r = ran();
+        r.scrub_tool = Some(ScrubToolFinding {
+            version: "btrfs-progs v9.0".into(),
+            detail: "its help no longer lists -c, -n".into(),
+        });
+        assert!(r.has_drift() && r.not_clean() && !r.could_not_examine());
+        let text = format_report(&r);
+        assert!(text.contains("SCRUB TOOL"), "{text}");
+        assert!(text.contains("btrfs-progs v9.0"), "{text}");
+        assert!(text.contains("DRIFT DETECTED"), "{text}");
+        assert!(!format_report(&ran()).contains("SCRUB TOOL"));
     }
 }
