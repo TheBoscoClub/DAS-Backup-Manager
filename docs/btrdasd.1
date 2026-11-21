@@ -2547,24 +2547,26 @@ match it (any type but a plain
 for a parent), when a specifier, a quote, a backslash in a path field (systemd
 decodes C escapes there, so it may name any path) or
 \fB..\fR is in a line, or when any tmpfiles.d file, or a directory of them,
-cannot be read. Nothing is declared at all when a line could write into
+cannot be read. Nothing is declared at all when a line could reach
 .I /run
-by another way: any
+through a link: any
 .B L
-line under it (\fBw\fR and \fBC\fR write through a link), and any
-.BR w ,
-.B C
-or
-.B L
-line elsewhere whose path is, or has a parent that is, a link the image makes,
-is under
+line under it, and any line of any type elsewhere that has a parent which is a
+link the image makes
+.RB ( L ,
+a glob counts) or a link on the image's disk (each name a glob may stand for
+is looked at), or is under
 .I /proc
 (except
-.IR /proc/sys )
-or
-.IR /dev ,
-or is a link on the image's disk (a glob only in its last name; its directory
-is checked); paths under
+.IR /proc/sys );
+a line that writes
+.RB ( f ,
+.BR F ,
+.BR w ,
+.BR C )
+also when its own name is such a link, or it is under
+.IR /dev .
+Paths under
 .I /sys
 and
 .I /proc/sys

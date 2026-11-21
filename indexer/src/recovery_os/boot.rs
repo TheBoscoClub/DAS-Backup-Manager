@@ -11550,4 +11550,71 @@ mod tests {
         let (verdict, reasons) = verdict_of(root);
         assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
     }
+
+    #[test]
+    fn a_file_the_image_makes_through_a_link_on_its_path_leaves_everything_to_that_os() {
+        let make = "#!/bin/sh\\nbtrbk snapshot\\n";
+        let mut wrong = Vec::new();
+        // (line, whether the image's disk has /etc/x -> /run)
+        for (extra, on_disk) in [
+            (
+                format!("L /etc/d - - - - /run\nf+ /etc/d/job 0755 root root - {make}\n"),
+                false,
+            ),
+            (
+                format!("L /etc/d - - - - /run\nF /etc/d/job 0755 root root - {make}\n"),
+                false,
+            ),
+            (
+                format!("L /etc/d - - - - /run\nf /etc/d/job 0755 root root - {make}\n"),
+                false,
+            ),
+            (
+                format!("L+ /etc/d - - - - /run\nf+ /etc/d/job 0755 root root - {make}\n"),
+                false,
+            ),
+            (format!("f+ /etc/x/job 0755 root root - {make}\n"), true),
+            (format!("F /etc/x/job 0755 root root - {make}\n"), true),
+            (format!("f /etc/x/job 0755 root root - {make}\n"), true),
+            // A link made at a glob's place, or found by one on disk.
+            (
+                format!("L /etc/d - - - - /run\nf+ /etc/*/job 0755 root root - {make}\n"),
+                false,
+            ),
+            (format!("f+ /etc/*/job 0755 root root - {make}\n"), true),
+            // Any other type under a parent that is a link.
+            (
+                "L /etc/d - - - - /run\nd /etc/d/job 0755\n".to_string(),
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            declared_job_and(root, &extra);
+            if on_disk {
+                link(root, "etc/x", "/run");
+            }
+            if verdict_of(root).0 != BootVerdict::May {
+                wrong.push(extra);
+            }
+        }
+        assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
+
+    #[test]
+    fn lines_with_no_link_on_their_path_leave_it_declared_whatever_their_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        declared_job_and(
+            root,
+            "f+ /etc/plain 0644 root root - X\nF /var/lib/z 0644 root root - Y\n\
+             d /var/cache/man/a 0755\nf /var/log/journal/%m/system.journal 0640\n\
+             z /sys/kernel/security/tpm[0-9]/x 0600\nL /etc/mtab - - - - ../proc/self/mounts\n\
+             C /etc/passwd - - - - /usr/share/factory/etc/passwd\n",
+        );
+        fs::create_dir_all(root.join("var/cache/man/b")).unwrap();
+        fs::create_dir_all(root.join("var/log/journal")).unwrap();
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
+    }
 }

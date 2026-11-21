@@ -30,11 +30,13 @@
 //!   backslash in a field before the argument (systemd decodes C escapes in
 //!   every field, so a path may be `/\x72un/…`), and the content has only
 //!   escapes this reads (`\n`, `\t`, `\r`, `\\`, `\xNN`, octal) and no quote;
-//! - no line could write into `/run` another way ([`outside_is_plain`]): no
-//!   `L` line under it (`w` and `C` write through a link), and no `w`, `C`
-//!   or `L` line elsewhere that is, or has a parent that is, a link the image
-//!   makes, a link on its disk, or under `/proc` (`/proc/self/root/run`) or
-//!   `/dev`, but `/sys` and `/proc/sys`; any of these declares nothing.
+//! - no line could reach `/run` through a link ([`outside_is_plain`]): no
+//!   `L` line under it, and no line of any type elsewhere with a parent that
+//!   is a link the image makes (`L`, a glob counts) or one on its disk (each
+//!   name a glob may stand for is looked at), or under `/proc`
+//!   (`/proc/self/root/run`) but `/proc/sys`; a line that writes (`f`, `F`,
+//!   `w`, `C`) also when its own name is such a link or it is under `/dev`.
+//!   `/sys` and `/proc/sys` are exempt; any other declares nothing.
 //!
 //! `/var/run` and `/var/lock` are read as `/run` and `/run/lock` (Arch's
 //! `filesystem` links them there).
@@ -76,11 +78,11 @@ struct Line {
     argument: Option<String>,
 }
 
-/// A line that writes, copies or links outside `/run`: it may reach a path
-/// under `/run` through a link ([`outside_is_plain`]).
+/// A line outside `/run`: its path may lead into it through a link
+/// ([`outside_is_plain`]).
 #[derive(Debug)]
 struct Outside {
-    /// `w`, `C` or `L`.
+    /// Its type letter.
     kind: char,
     /// Absolute, simplified; a glob's characters as written.
     path: String,
@@ -150,53 +152,99 @@ pub(super) fn read_declarations(root: &Path, probe: MountFlags, mounts: &Mounts)
     Declarations::Read(Declared { lines })
 }
 
-/// Whether no line outside `/run` can write into it: `w` follows a link, and
-/// so does what `C` copies to. Such a line is plain when its path is under
-/// `/sys` or `/proc/sys` (never links into `/run`), or is neither `/proc`
-/// (`/proc/self/root/run`) nor `/dev` (`/dev/fd`), no link the image makes
-/// (`L`) is it or a parent of it, and on the image's disk neither it nor a
-/// parent is a link (a glob only in its last name, whose directory is read).
+/// Whether no line outside `/run` can reach into it through a link: a file
+/// made (`f`, `f+`, `F`), written (`w`), copied (`C`) or anything else made
+/// under a parent that is a link lands where the link leads. A line is plain
+/// when its path is under `/sys` or `/proc/sys` (never links into `/run`), or
+/// all of these hold:
+///
+/// - it is not under `/proc` (`/proc/self/root/run`), nor, for a line that
+///   writes (`f`, `F`, `w`, `C`), under `/dev` (`/dev/fd`);
+/// - no link the image makes (`L`, a glob counts) is a parent of it, or for
+///   a line that writes, it;
+/// - on the image's disk no parent is a link (each name a glob may stand for
+///   is looked at), nor, for a line that writes, it, unless it ends in a
+///   glob: the names that glob matches are not followed.
 fn outside_is_plain(root: &Path, outside: &[Outside]) -> bool {
     let links: Vec<&str> = outside
         .iter()
         .filter(|o| o.kind == 'L')
         .map(|o| o.path.as_str())
         .collect();
-    for line in outside.iter().filter(|o| o.kind != 'L') {
+    for line in outside {
         let path = line.path.as_str();
         if ["/sys/", "/proc/sys/"]
             .iter()
             .any(|dir| path.starts_with(dir))
-            && !has_glob(path)
         {
             continue;
         }
-        if ["/proc", "/dev"].iter().any(|dir| under(path, dir)) {
+        let writes = matches!(line.kind, 'f' | 'F' | 'w' | 'C');
+        if under(path, "/proc") || (writes && under(path, "/dev")) {
             return false;
         }
-        let mut at = path;
-        loop {
-            for link in &links {
-                if may_match(link, at) {
-                    return false;
-                }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let mut at = if writes { path } else { parent };
+        while !at.is_empty() {
+            // Either may be the glob.
+            if links
+                .iter()
+                .any(|link| may_match(link, at) || may_match(at, link))
+            {
+                return false;
             }
-            match at.rfind('/') {
-                Some(0) | None => break,
-                Some(i) => at = &at[..i],
-            }
+            at = at.rsplit_once('/').map_or("", |(up, _)| up);
         }
-        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-        if has_glob(dir) {
+        if parent_is_link(root, parent) {
             return false;
         }
-        let checked = if has_glob(name) { dir } else { path };
-        match entry_at(root, checked.trim_start_matches('/')) {
-            OnDisk::Symlink(_) | OnDisk::Unreadable(_) => return false,
-            OnDisk::File | OnDisk::Dir | OnDisk::Other | OnDisk::Absent => {}
+        if writes && !has_glob(name) && is_link(root, path) {
+            return false;
         }
     }
     true
+}
+
+/// Whether the entry at `path` (no glob) is a link, or cannot be told.
+fn is_link(root: &Path, path: &str) -> bool {
+    matches!(
+        entry_at(root, path.trim_start_matches('/')),
+        OnDisk::Symlink(_) | OnDisk::Unreadable(_)
+    )
+}
+
+/// How many names a glob in a parent may stand for before this gives up.
+const MAX_NAMES: usize = 4096;
+
+/// Whether `parent`, a directory path (a glob in any name), or a directory on
+/// its way is a link on the image's disk, or cannot be told: each name a glob
+/// matches on disk is looked at.
+fn parent_is_link(root: &Path, parent: &str) -> bool {
+    let mut layer = vec![String::new()];
+    for part in parent.split('/').filter(|p| !p.is_empty()) {
+        let mut next = Vec::new();
+        for base in &layer {
+            if has_glob(part) {
+                match list_dir(root, base) {
+                    Listing::Absent => {}
+                    Listing::Unreadable(_) => return true,
+                    Listing::Names(names) => next.extend(
+                        names
+                            .into_iter()
+                            .filter(|name| may_match(part, name))
+                            .map(|name| format!("{base}/{name}").trim_start_matches('/').into()),
+                    ),
+                }
+            } else {
+                next.push(format!("{base}/{part}").trim_start_matches('/').to_string());
+            }
+        }
+        if next.len() > MAX_NAMES || next.iter().any(|rel| is_link(root, rel)) {
+            return true;
+        }
+        layer = next;
+    }
+    false
 }
 
 /// Whether `path` is `dir` or under it.
@@ -232,8 +280,7 @@ fn has_glob(path: &str) -> bool {
     path.contains(['*', '?', '[', '\\'])
 }
 
-/// The lines of one file that touch `/run`, and those that write, copy or
-/// link elsewhere; an error when a line cannot be told (a backslash in a
+/// The lines of one file that touch `/run`, and those elsewhere; an error when a line cannot be told (a backslash in a
 /// field: systemd decodes C escapes in every field, so it may be any path,
 /// `/run` included).
 fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
@@ -272,12 +319,10 @@ fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
             continue;
         };
         let Some(path) = under_run(&simple) else {
-            if matches!(base, 'w' | 'C' | 'L') {
-                outside.push(Outside {
-                    kind: base,
-                    path: simple,
-                });
-            }
+            outside.push(Outside {
+                kind: base,
+                path: simple,
+            });
             continue;
         };
         if base == 'L' {
