@@ -282,6 +282,12 @@ races), not a bug; see the "Locking" section of the `scrub` module doc comment
 reports per-filesystem age (days since the last `finished`, zero-error scrub), WARN/FAIL against
 `[scrub].warn_age_days` / `fail_age_days`, and an immediate FAIL for any aborted/canceled/errored
 latest attempt or nonzero error counter — regardless of how recent or clean an earlier success was.
+A scrub is recorded `running` (pid and boot id) before it starts and replaced by its result as soon as
+its filesystem is done; a pass caught by SIGTERM/SIGINT/SIGHUP stops its `btrfs scrub`, records
+`interrupted` with the signal, skips the remaining targets, unmounts, and dies of that signal, so the
+unit's exit status is unchanged (bd `DAS-Backup-Manager-weo`). A `running` record whose process is gone or
+whose boot has passed reads as `interrupted` in `scrub status` and health (immediate FAIL, like an
+aborted scrub); a live one is judged by the age of the last success.
 It reads **only** `scrub-state.json` (mode `0644`), never the raw per-device
 `/var/lib/btrfs/scrub.status.<fsuuid>` record (mode `0600`, root-only, and the exact record type
 that made an aborted `system-recovery-A` scrub look healthy for 64 days). This keeps `btrdasd health`

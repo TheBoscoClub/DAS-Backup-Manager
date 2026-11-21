@@ -247,7 +247,11 @@ pub fn scrub_health_for(
     };
     let attempt = &fs.last_attempt;
 
-    if !attempt.ok {
+    // A `running` record whose pass is alive is neither a pass nor a failure:
+    // the last success still decides. One nobody is running any more is an
+    // interrupted pass (bd DAS-Backup-Manager-weo) and fails like an aborted one.
+    let running_now = attempt.is_live();
+    if !attempt.ok && !running_now {
         // Immediate fail: the latest attempt is aborted/canceled/errored, or
         // carries nonzero error counters (`ok` already folds both cases —
         // see `ScrubFsResult::ok`). This applies regardless of how recent or
@@ -263,7 +267,7 @@ pub fn scrub_health_for(
             age_days: fs
                 .last_success_epoch
                 .map(|t| age_days_between(now_epoch, t)),
-            last_outcome: Some(attempt.outcome.clone()),
+            last_outcome: Some(attempt.effective_outcome()),
             last_ok: Some(false),
             error_total: Some(attempt.error_total),
             resolve_error: None,
@@ -294,7 +298,7 @@ pub fn scrub_health_for(
         last_success_epoch: Some(success_epoch),
         age_days: Some(age),
         last_outcome: Some(attempt.outcome.clone()),
-        last_ok: Some(true),
+        last_ok: if running_now { None } else { Some(true) },
         error_total: Some(attempt.error_total),
         resolve_error: None,
     }
@@ -2247,6 +2251,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 error_total: 0,
                 counters: scrub::ScrubCounters::default(),
                 messages: Vec::new(),
+                ..Default::default()
             },
         }
     }
@@ -2276,8 +2281,57 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
                 error_total,
                 counters: scrub::ScrubCounters::default(),
                 messages: Vec::new(),
+                ..Default::default()
             },
         }
+    }
+
+    /// A `running` attempt record, written by `pid` in `boot_id`'s boot.
+    fn fs_state_running(
+        pid: Option<u32>,
+        boot_id: Option<String>,
+        age_days: i64,
+    ) -> scrub::FsState {
+        scrub::FsState {
+            target_label: "t1".into(),
+            mountpoint: "/mnt/t1".into(),
+            last_success_epoch: Some(NOW - age_days * 86_400),
+            last_attempt: scrub::AttemptState {
+                outcome: "running".into(),
+                started_epoch: NOW - 3600,
+                pid,
+                boot_id,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// bd DAS-Backup-Manager-weo: a `running` record nobody is running any
+    /// more is an interrupted pass: an immediate FAIL, like an aborted one.
+    #[test]
+    fn scrub_health_stale_running_record_is_an_interrupted_fail() {
+        let fs = fs_state_running(None, None, 10);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Fail);
+        assert_eq!(h.last_outcome.as_deref(), Some("interrupted"));
+        assert_eq!(h.last_ok, Some(false));
+        assert_eq!(h.age_days, Some(10), "age still from the last success");
+    }
+
+    /// A pass that is running right now is not a failure: the age of the last
+    /// success decides, as it did before the pass began.
+    #[test]
+    fn scrub_health_live_running_record_is_judged_by_age_not_failed() {
+        let fs = fs_state_running(Some(std::process::id()), scrub::current_boot_id(), 50);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.last_outcome.as_deref(), Some("running"));
+        assert_eq!(h.last_ok, None);
+        let fresh = fs_state_running(Some(std::process::id()), scrub::current_boot_id(), 10);
+        assert_eq!(
+            scrub_health_for(Some(&fresh), NOW, 45, 75).status,
+            ScrubHealthStatus::Ok
+        );
     }
 
     #[test]

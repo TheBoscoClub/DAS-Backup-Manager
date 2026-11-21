@@ -154,8 +154,15 @@
 //!
 //! * Keys of `filesystems` are **filesystem UUIDs**, not labels or mountpoints.
 //!   `target_label` is carried alongside for display only.
-//! * `last_attempt.outcome` is one of `finished`, `canceled`, `aborted`, or
-//!   `error` (the pass could not get far enough to produce a record at all).
+//! * `last_attempt.outcome` is one of `finished`, `canceled`, `aborted`,
+//!   `interrupted` (the pass caught SIGTERM, SIGINT or SIGHUP: `signal` names
+//!   it), `running`, or `error` (the pass could not get far enough to produce a
+//!   record at all). `running` is written before the scrub starts, with the
+//!   writer's `pid` and `boot_id`; it is replaced by the result when the
+//!   filesystem is done. A `running` record whose process is gone, or from an
+//!   earlier boot, is read as `interrupted` ([`AttemptState::effective_outcome`]):
+//!   the pass was killed without a chance to say so (bd
+//!   DAS-Backup-Manager-weo).
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
 //! * `last_success_epoch` is carried forward across failed passes — it is the
@@ -184,6 +191,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1038,9 +1046,9 @@ pub struct PassSummary {
 }
 
 /// Result of the most recent scrub attempt on one filesystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptState {
-    /// `finished`, `canceled`, `aborted`, or `error`.
+    /// `running`, `finished`, `canceled`, `aborted`, `interrupted`, or `error`.
     pub outcome: String,
     /// Authoritative pass/fail bit for this filesystem.
     pub ok: bool,
@@ -1052,6 +1060,44 @@ pub struct AttemptState {
     pub counters: ScrubCounters,
     #[serde(default)]
     pub messages: Vec<String>,
+    /// The signal that ended the pass (`SIGTERM`, `SIGINT`, `SIGHUP`), when
+    /// `outcome` is `interrupted` and the pass caught it. Absent for an
+    /// interruption found afterwards (a `running` record nobody finished).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Process that wrote a `running` record, to tell it from a stale one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Boot the `running` record was written in (`/proc/sys/kernel/random/boot_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+impl AttemptState {
+    /// Whether this is a `running` record whose pass is still alive: the
+    /// process that wrote it exists and this is the boot it was written in.
+    /// (A recycled pid inside one boot could fool it; the next pass replaces
+    /// the record either way.)
+    pub fn is_live(&self) -> bool {
+        if self.outcome != "running" {
+            return false;
+        }
+        let (Some(pid), Some(boot)) = (self.pid, self.boot_id.as_deref()) else {
+            return false;
+        };
+        current_boot_id().as_deref() == Some(boot) && Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// The outcome to show and judge by: a `running` record that nobody is
+    /// running any more is an interrupted pass whose end was never recorded
+    /// (SIGKILL, a power cut, a reboot that outran the handler).
+    pub fn effective_outcome(&self) -> String {
+        if self.outcome == "running" && !self.is_live() {
+            "interrupted".to_string()
+        } else {
+            self.outcome.clone()
+        }
+    }
 }
 
 /// Per-filesystem state, keyed in [`ScrubState::filesystems`] by FS UUID.
@@ -1185,12 +1231,31 @@ pub fn save_state(state: &ScrubState) -> Result<(), ScrubError> {
 /// Fold a completed pass into an existing state, preserving `last_success_epoch`
 /// for filesystems whose latest attempt failed.
 pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
-    state.schema_version = STATE_SCHEMA_VERSION;
     for result in &pass.results {
+        merge_result_into_state(state, result, pass.finished_epoch);
+    }
+    state.last_pass = Some(PassSummary {
+        started_epoch: pass.started_epoch,
+        finished_epoch: pass.finished_epoch,
+        targets_attempted: pass.results.len(),
+        targets_failed: pass.failed_count(),
+        success: pass.success(),
+    });
+}
+
+/// Fold one filesystem's result into `state`. `pass_finished_epoch` stands in
+/// for a result that carries no finish time of its own.
+fn merge_result_into_state(
+    state: &mut ScrubState,
+    result: &ScrubFsResult,
+    pass_finished_epoch: i64,
+) {
+    state.schema_version = STATE_SCHEMA_VERSION;
+    {
         if result.fsuuid.is_empty() {
             // No UUID resolved — there is no stable key to file this under, so
             // it stays in the email/report only.
-            continue;
+            return;
         }
         let ok = result.ok();
         let prior_success = state
@@ -1201,7 +1266,7 @@ pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
             Some(if result.finished_epoch > 0 {
                 result.finished_epoch
             } else {
-                pass.finished_epoch
+                pass_finished_epoch
             })
         } else {
             prior_success
@@ -1214,10 +1279,12 @@ pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
                 mountpoint: result.mountpoint.clone(),
                 last_success_epoch,
                 last_attempt: AttemptState {
-                    outcome: result
-                        .outcome
-                        .map(|o| o.as_str().to_string())
-                        .unwrap_or_else(|| "error".to_string()),
+                    outcome: match (result.interrupted_by, result.outcome) {
+                        (Some(_), _) => "interrupted".to_string(),
+                        (None, Some(o)) => o.as_str().to_string(),
+                        (None, None) => "error".to_string(),
+                    },
+                    signal: result.interrupted_by.map(signal_name),
                     ok,
                     started_epoch: result.started_epoch,
                     finished_epoch: result.finished_epoch,
@@ -1226,17 +1293,11 @@ pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
                     error_total: counters.error_total(),
                     counters,
                     messages: result.errors.clone(),
+                    ..Default::default()
                 },
             },
         );
     }
-    state.last_pass = Some(PassSummary {
-        started_epoch: pass.started_epoch,
-        finished_epoch: pass.finished_epoch,
-        targets_attempted: pass.results.len(),
-        targets_failed: pass.failed_count(),
-        success: pass.success(),
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,6 +1349,9 @@ pub struct ScrubFsResult {
     /// left it non-zero and masqueraded as "ran". This field is set exactly
     /// once, in lockstep with the first moment `started_epoch` is stamped.
     pub scrub_launched: bool,
+    /// The signal that stopped this filesystem's scrub (or kept it from
+    /// starting), when the pass caught one.
+    pub interrupted_by: Option<i32>,
 }
 
 impl ScrubFsResult {
@@ -1305,6 +1369,7 @@ impl ScrubFsResult {
             errors: Vec::new(),
             mounted_by_engine: false,
             scrub_launched: false,
+            interrupted_by: None,
         }
     }
 
@@ -1320,6 +1385,8 @@ impl ScrubFsResult {
     pub fn status_word(&self) -> &'static str {
         if self.ok() {
             "OK"
+        } else if self.interrupted_by.is_some() {
+            "INTERRUPTED"
         } else if !self.errors.is_empty() {
             // Engine-level problems (mount, unmount, stale record) outrank
             // whatever the status record happens to say.
@@ -1356,6 +1423,11 @@ impl ScrubPass {
     /// pass-level errors. A skipped pass counts as a success (nothing broke).
     pub fn success(&self) -> bool {
         self.errors.is_empty() && self.failed_count() == 0
+    }
+
+    /// The signal that stopped the pass, if one did.
+    pub fn interrupted_by(&self) -> Option<i32> {
+        self.results.iter().find_map(|r| r.interrupted_by)
     }
 }
 
@@ -1670,7 +1742,23 @@ pub fn run_scrub_pass(
         );
     }
 
-    let results = scrub_targets_with(config, progress, locks.maintenance(), &scrub_one_target);
+    // A stop request (SIGTERM from a reboot or `systemctl stop`, Ctrl-C) is
+    // caught for the rest of the pass: the scrub is stopped, the stop is
+    // recorded, the filesystem is unmounted; the caller then dies of the signal.
+    let _termination = catch_termination();
+    let scrub_and_file =
+        |config: &Config, label: &str, progress: &dyn ProgressCallback, held: &MaintenanceHeld| {
+            let result = scrub_one_target(config, label, progress, held);
+            record_result_logged(&state_path(), &result, progress);
+            result
+        };
+    let results = scrub_targets_with(
+        config,
+        progress,
+        locks.maintenance(),
+        &pending_signal,
+        &scrub_and_file,
+    );
 
     let mut pass = ScrubPass {
         status: PassStatus::Completed,
@@ -1696,14 +1784,20 @@ pub fn run_scrub_pass(
 
     email_scrub_report(&pass, config, progress, &crate::report::MAILX);
 
-    progress.on_complete(
-        pass.success(),
-        &format!(
+    let summary = match pass.interrupted_by() {
+        Some(signal) => format!(
+            "Interrupted by {} — {} of {} filesystems scrubbed cleanly before it",
+            signal_name(signal),
+            pass.results.len() - pass.failed_count(),
+            pass.results.len()
+        ),
+        None => format!(
             "{} of {} filesystems scrubbed cleanly",
             pass.results.len() - pass.failed_count(),
             pass.results.len()
         ),
-    );
+    };
+    progress.on_complete(pass.success(), &summary);
 
     Ok(pass)
 }
@@ -1734,6 +1828,7 @@ fn scrub_targets_with(
     config: &Config,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
+    stop: &dyn Fn() -> Option<i32>,
     scrub_one: &dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld) -> ScrubFsResult,
 ) -> Vec<ScrubFsResult> {
     let labels = config.scrub_target_labels();
@@ -1743,8 +1838,28 @@ fn scrub_targets_with(
     let mut results = Vec::new();
     // Sequential by construction: the DAS filesystems share one USB bus.
     for (i, label) in labels.iter().enumerate() {
+        if let Some(signal) = stop() {
+            // Caught between targets: this one is listed as not begun, so the
+            // pass reads as interrupted, and nothing after it starts.
+            let mut result = ScrubFsResult::new(label);
+            result.interrupted_by = Some(signal);
+            result.errors.push(format!(
+                "not started: the pass was interrupted by {}",
+                signal_name(signal)
+            ));
+            progress.on_log(
+                LogLevel::Error,
+                &format!(
+                    "{label}: scrub not started — interrupted by {}",
+                    signal_name(signal)
+                ),
+            );
+            results.push(result);
+            break;
+        }
         progress.on_progress((i + 1) as u64, total, &format!("Scrubbing {label}"));
         let result = scrub_one(config, label, progress, held);
+        let interrupted = result.interrupted_by.is_some();
         if result.ok() {
             progress.on_log(
                 LogLevel::Info,
@@ -1761,6 +1876,9 @@ fn scrub_targets_with(
             );
         }
         results.push(result);
+        if interrupted {
+            break;
+        }
     }
     results
 }
@@ -1775,10 +1893,23 @@ fn scrub_targets_with(
 /// state would erase that silently.
 fn persist_pass(pass: &ScrubPass, progress: &dyn ProgressCallback) -> Result<PathBuf, ScrubError> {
     let path = state_path();
-    let mut state = match load_state_from(&path) {
-        Ok(state) => state,
+    let mut state = load_state_for_write(&path, progress)?;
+    merge_pass_into_state(&mut state, pass);
+    save_state_to(&state, &path)?;
+    Ok(path)
+}
+
+/// Load the state a writer is about to change: an unparsable file is
+/// quarantined and a fresh state started (said in the log); any other read
+/// failure is returned, so an intact file is never overwritten from blank.
+fn load_state_for_write(
+    path: &Path,
+    progress: &dyn ProgressCallback,
+) -> Result<ScrubState, ScrubError> {
+    match load_state_from(path) {
+        Ok(state) => Ok(state),
         Err(ScrubError::StateCorrupt { detail, .. }) => {
-            let moved = quarantine_state_file(&path)?;
+            let moved = quarantine_state_file(path)?;
             progress.on_log(
                 LogLevel::Warning,
                 &format!(
@@ -1786,13 +1917,10 @@ fn persist_pass(pass: &ScrubPass, progress: &dyn ProgressCallback) -> Result<Pat
                     moved.display()
                 ),
             );
-            ScrubState::default()
+            Ok(ScrubState::default())
         }
-        Err(e) => return Err(e),
-    };
-    merge_pass_into_state(&mut state, pass);
-    save_state_to(&state, &path)?;
-    Ok(path)
+        Err(e) => Err(e),
+    }
 }
 
 /// Short human description of why a filesystem's scrub did not pass.
@@ -1868,6 +1996,16 @@ fn scrub_one_target(
     // `ScrubFsResult::scrub_launched` for why a preemptive stamp here was a
     // bug (`bd DAS-Backup-Manager-18p` review).
     let scrub_started = now_epoch();
+    record_running_logged(
+        &state_path(),
+        &RunningMarker {
+            label,
+            fsuuid: &fsuuid,
+            mountpoint: &mount_point,
+            started_epoch: scrub_started,
+        },
+        progress,
+    );
     match run_btrfs_scrub(&mount_point, &fsuuid, progress) {
         ScrubRunOutcome::SpawnFailed(e) => {
             result.errors.push(e);
@@ -1879,11 +2017,21 @@ fn scrub_one_target(
                 result.errors.push(e);
             }
         }
+        ScrubRunOutcome::Interrupted(signal) => {
+            result.started_epoch = scrub_started;
+            result.interrupted_by = Some(signal);
+            result
+                .errors
+                .push(format!("scrub interrupted by {}", signal_name(signal)));
+        }
     }
 
     // --- status by UUID (never by path) -----------------------------------
-    match read_scrub_status(&fsuuid) {
-        Ok(record) => {
+    // An interrupted scrub's record is whatever the stopped child left, not a
+    // result: the interruption is the result.
+    match read_scrub_status(&fsuuid).map(|record| (result.interrupted_by.is_none(), record)) {
+        Ok((false, _)) => {}
+        Ok((true, record)) => {
             // A record left over from an earlier scrub must never be read as
             // this pass's result — the 2026-07-27 stale-record trap. The
             // anchor is *this filesystem's* start, not the pass's: a pass runs
@@ -2109,6 +2257,9 @@ enum ScrubRunOutcome {
     /// `Ok(())` if it exited zero, `Err` describing what went wrong
     /// otherwise (nonzero exit, or the wait itself failing).
     Launched(Result<(), String>),
+    /// The pass caught a termination signal while the child ran (or before it
+    /// started); the child was stopped and reaped first.
+    Interrupted(i32),
 }
 
 /// True when a `resume` attempt exited nonzero *specifically* because the
@@ -2238,8 +2389,50 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
     // whatever is mounted there.
     let mount_point = args.last().map(String::as_str).unwrap_or("");
     let fsuuid = mounted_fs_uuid(mount_point).unwrap_or_default();
+    run_scrub_child(
+        "btrfs",
+        args,
+        &fsuuid,
+        SCRUB_POLL_INTERVAL,
+        &pending_signal,
+        progress,
+    )
+}
 
-    let mut child = match Command::new("btrfs")
+/// Ask a running scrub to leave (SIGTERM), give it [`CHILD_STOP_GRACE`], then
+/// kill it; always reaped, so nothing keeps scrubbing a filesystem the caller
+/// is about to unmount.
+fn stop_child(child: &mut std::process::Child) {
+    // SAFETY: signalling a child this process started and has not yet reaped.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + CHILD_STOP_GRACE;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// [`run_scrub_argv`] with the program, the poll interval and the source of
+/// "a termination signal arrived" supplied by the caller, so a test drives a
+/// signal at a stand-in child instead of a real scrub.
+fn run_scrub_child(
+    program: &str,
+    args: &[String],
+    fsuuid: &str,
+    poll: Duration,
+    pending: &dyn Fn() -> Option<i32>,
+    progress: &dyn ProgressCallback,
+) -> ScrubRunOutcome {
+    let mount_point = args.last().map(String::as_str).unwrap_or("");
+    // Never start a scrub for a pass that has already been told to stop.
+    if let Some(signal) = pending() {
+        return ScrubRunOutcome::Interrupted(signal);
+    }
+    let mut child = match Command::new(program)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2272,7 +2465,12 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(signal) = pending() {
+                    stop_child(&mut child);
+                    return ScrubRunOutcome::Interrupted(signal);
+                }
+            }
             Err(e) => {
                 // Never walk away from a live scrub: the caller unmounts this
                 // filesystem next, and an orphan would keep hammering the
@@ -2284,11 +2482,11 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
                 )));
             }
         }
-        std::thread::sleep(SCRUB_POLL_INTERVAL);
+        std::thread::sleep(poll);
         if last_log.elapsed().as_secs() >= SCRUB_PROGRESS_LOG_SECS {
             last_log = Instant::now();
             // Progress is read by UUID, like everything else.
-            if let Ok(record) = read_scrub_status(&fsuuid) {
+            if let Ok(record) = read_scrub_status(fsuuid) {
                 progress.on_log(
                     LogLevel::Info,
                     &format!(
@@ -2304,6 +2502,14 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
     let stderr = stderr_reader
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
+
+    // The scrub ended unsuccessfully with a stop request pending: the signal
+    // reached it (a supervisor signals the whole group) before the pass saw it.
+    if !status.success()
+        && let Some(signal) = pending()
+    {
+        return ScrubRunOutcome::Interrupted(signal);
+    }
 
     ScrubRunOutcome::Launched(if status.success() {
         Ok(())
@@ -2322,6 +2528,181 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
             }
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Termination signals and the "running" record
+// ---------------------------------------------------------------------------
+
+/// The termination signal the pass caught (0 = none).
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// The signals a stop request arrives as.
+const CAUGHT_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+/// How long a signalled `btrfs scrub` gets to leave before it is killed.
+const CHILD_STOP_GRACE: Duration = Duration::from_secs(30);
+
+extern "C" fn remember_signal(signal: libc::c_int) {
+    // An atomic store is async-signal-safe; nothing else happens here.
+    PENDING_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+/// The termination signal the pass caught, if any.
+pub fn pending_signal() -> Option<i32> {
+    match PENDING_SIGNAL.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Keeps the pass's handlers installed; dropping it puts the old ones back
+/// and forgets what was caught.
+pub struct TerminationGuard {
+    old: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+/// Catch SIGTERM, SIGINT and SIGHUP for the length of the returned guard, so
+/// the pass can stop its scrub, record why, unmount, and only then die of the
+/// signal ([`die_of_signal`]) instead of vanishing without a trace.
+pub fn catch_termination() -> TerminationGuard {
+    PENDING_SIGNAL.store(0, Ordering::SeqCst);
+    let mut old = Vec::new();
+    for signal in CAUGHT_SIGNALS {
+        // SAFETY: `sigaction` is plain data; zeroed, then every field the
+        // call reads is set. The handler only stores into an atomic.
+        let mut new: libc::sigaction = unsafe { std::mem::zeroed() };
+        new.sa_sigaction = remember_signal as extern "C" fn(libc::c_int) as usize;
+        new.sa_flags = 0;
+        // SAFETY: `new.sa_mask` is a valid set to initialise.
+        unsafe { libc::sigemptyset(&mut new.sa_mask) };
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: both pointers are valid; `signal` is a valid signal number.
+        if unsafe { libc::sigaction(signal, &new, &mut previous) } == 0 {
+            old.push((signal, previous));
+        }
+    }
+    TerminationGuard { old }
+}
+
+impl Drop for TerminationGuard {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.old {
+            // SAFETY: restoring the action `sigaction` itself returned.
+            unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+        }
+        PENDING_SIGNAL.store(0, Ordering::SeqCst);
+    }
+}
+
+/// End this process the way the signal would have, now that the pass has
+/// recorded it: default action, then the shell's `128 + N` as a fallback.
+/// The exit status a supervisor sees is the same as before the pass learned to
+/// record the signal.
+pub fn die_of_signal(signal: i32) -> ! {
+    // SAFETY: restoring the default action and raising a signal this process
+    // may receive at any time.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal)
+}
+
+/// How a signal number reads in the state file and the log.
+pub fn signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGTERM => "SIGTERM".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGHUP => "SIGHUP".to_string(),
+        other => format!("signal {other}"),
+    }
+}
+
+/// This boot's id, which tells a `running` record of an earlier boot from one
+/// of this boot's.
+pub fn current_boot_id() -> Option<String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// What a `running` record is written from.
+struct RunningMarker<'a> {
+    label: &'a str,
+    fsuuid: &'a str,
+    mountpoint: &'a str,
+    started_epoch: i64,
+}
+
+/// Write a `running` attempt for the filesystem about to be scrubbed, before
+/// the scrub starts: whatever then ends the pass without a word (SIGKILL, a
+/// power cut) still leaves `status` something that is not the earlier pass.
+/// The earlier success stays, so ageing is unchanged.
+fn record_running(
+    path: &Path,
+    marker: &RunningMarker,
+    progress: &dyn ProgressCallback,
+) -> Result<(), ScrubError> {
+    let mut state = load_state_for_write(path, progress)?;
+    let last_success_epoch = state
+        .filesystems
+        .get(marker.fsuuid)
+        .and_then(|f| f.last_success_epoch);
+    state.filesystems.insert(
+        marker.fsuuid.to_string(),
+        FsState {
+            target_label: marker.label.to_string(),
+            mountpoint: marker.mountpoint.to_string(),
+            last_success_epoch,
+            last_attempt: AttemptState {
+                outcome: "running".to_string(),
+                started_epoch: marker.started_epoch,
+                pid: Some(std::process::id()),
+                boot_id: current_boot_id(),
+                ..Default::default()
+            },
+        },
+    );
+    save_state_to(&state, path)
+}
+
+/// [`record_running`], with a failure logged: the pass goes on without the
+/// marker, and the log says so.
+fn record_running_logged(path: &Path, marker: &RunningMarker, progress: &dyn ProgressCallback) {
+    if let Err(e) = record_running(path, marker, progress) {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Could not record the running scrub of {} in {}: {e} — a pass killed before it                  ends will leave no trace there",
+                marker.label,
+                path.display()
+            ),
+        );
+    }
+}
+
+/// File one filesystem's result the moment it is done, with a failure logged
+/// (the end-of-pass write repeats it). Without this a pass killed during the
+/// next target would leave this one's `running` record standing.
+fn record_result_logged(path: &Path, result: &ScrubFsResult, progress: &dyn ProgressCallback) {
+    if result.fsuuid.is_empty() {
+        return;
+    }
+    let outcome = load_state_for_write(path, progress).and_then(|mut state| {
+        merge_result_into_state(&mut state, result, now_epoch());
+        save_state_to(&state, path)
+    });
+    if let Err(e) = outcome {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Could not record the result for {} in {}: {e}",
+                result.target_label,
+                path.display()
+            ),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3431,6 +3812,7 @@ Total to scrub:   401.28MiB\n";
             &config,
             &NullProgress,
             &MaintenanceHeld::assumed(),
+            &|| None,
             &scrub_one,
         );
         assert_eq!(*scrubbed.lock().unwrap(), ["first", "second"]);
@@ -3448,8 +3830,13 @@ Total to scrub:   401.28MiB\n";
             fs_result(label, "uuid", label == "primary-22tb", 1_000_400)
         };
 
-        let results =
-            scrub_targets_with(&config, &progress, &MaintenanceHeld::assumed(), &scrub_one);
+        let results = scrub_targets_with(
+            &config,
+            &progress,
+            &MaintenanceHeld::assumed(),
+            &|| None,
+            &scrub_one,
+        );
 
         assert_eq!(*scrubbed.lock().unwrap(), ["primary-22tb", "recovery-a"]);
         let labels: Vec<&str> = results.iter().map(|r| r.target_label.as_str()).collect();
@@ -3841,5 +4228,328 @@ Total to scrub:   401.28MiB\n";
                 "Could not send scrub report email: Email is not enabled in config".to_string()
             )]
         );
+    }
+}
+
+/// A pass that is stopped by a signal leaves a record of it (bd
+/// DAS-Backup-Manager-weo): `btrdasd scrub status` never shows an older
+/// finished pass as the current one.
+#[cfg(test)]
+mod interrupted_pass_tests {
+    use super::*;
+    use crate::progress::{NullProgress, TestProgress};
+
+    /// Handlers are process-wide; one test at a time touches them.
+    static SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    fn running_attempt(pid: Option<u32>, boot_id: Option<String>) -> AttemptState {
+        AttemptState {
+            outcome: "running".into(),
+            started_epoch: 1_000_000,
+            pid,
+            boot_id,
+            ..Default::default()
+        }
+    }
+
+    fn fs_state(attempt: AttemptState, last_success: Option<i64>) -> FsState {
+        FsState {
+            target_label: "primary".into(),
+            mountpoint: "/mnt/primary".into(),
+            last_success_epoch: last_success,
+            last_attempt: attempt,
+        }
+    }
+
+    /// The pass asked to stop while its child ran: the child is stopped and
+    /// reaped (the call returns long before the 5 s the child would take), and
+    /// the signal is what comes back.
+    #[test]
+    fn a_signal_stops_the_scrub_child_and_is_reported() {
+        let started = Instant::now();
+        // Quiet at the pre-spawn check, caught once the child runs.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = run_scrub_child(
+            "sleep",
+            &args(&["5"]),
+            "",
+            Duration::from_millis(20),
+            &|| {
+                (calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1)
+                    .then_some(libc::SIGTERM)
+            },
+            &NullProgress,
+        );
+        assert!(
+            matches!(outcome, ScrubRunOutcome::Interrupted(s) if s == libc::SIGTERM),
+            "got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the child was not stopped: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// No signal: the child runs to its own end, as before.
+    #[test]
+    fn without_a_signal_the_child_runs_to_its_end() {
+        let outcome = run_scrub_child(
+            "true",
+            &args(&["x"]),
+            "",
+            Duration::from_millis(20),
+            &|| None,
+            &NullProgress,
+        );
+        assert!(matches!(outcome, ScrubRunOutcome::Launched(Ok(()))));
+    }
+
+    /// A real SIGTERM, delivered to the process while the pass's handlers are
+    /// installed, is caught (the process lives) and remembered; dropping the
+    /// guard forgets it.
+    #[test]
+    fn a_real_sigterm_is_caught_and_remembered() {
+        let _serial = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = catch_termination();
+        assert_eq!(pending_signal(), None);
+        // SAFETY: raising a signal this process has just installed a handler for.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert_eq!(pending_signal(), Some(libc::SIGTERM));
+        drop(guard);
+        assert_eq!(pending_signal(), None, "the guard clears what it caught");
+    }
+
+    #[test]
+    fn signals_read_by_name() {
+        assert_eq!(signal_name(libc::SIGTERM), "SIGTERM");
+        assert_eq!(signal_name(libc::SIGINT), "SIGINT");
+        assert_eq!(signal_name(libc::SIGHUP), "SIGHUP");
+        assert_eq!(signal_name(libc::SIGUSR1), "signal 10");
+    }
+
+    /// The marker written before the scrub starts: `running`, this process,
+    /// this boot — and the last success of the earlier pass kept.
+    #[test]
+    fn the_running_record_is_written_before_the_scrub_and_keeps_the_last_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub-state.json");
+        let mut state = ScrubState::default();
+        state.filesystems.insert(
+            "uuid-a".into(),
+            fs_state(
+                AttemptState {
+                    outcome: "finished".into(),
+                    ok: true,
+                    ..Default::default()
+                },
+                Some(900_000),
+            ),
+        );
+        save_state_to(&state, &path).unwrap();
+
+        let marker = RunningMarker {
+            label: "primary",
+            fsuuid: "uuid-a",
+            mountpoint: "/mnt/primary",
+            started_epoch: 1_234_567,
+        };
+        record_running(&path, &marker, &NullProgress).unwrap();
+
+        let fs = load_state_from(&path).unwrap().filesystems["uuid-a"].clone();
+        assert_eq!(fs.last_attempt.outcome, "running");
+        assert!(!fs.last_attempt.ok);
+        assert_eq!(fs.last_attempt.started_epoch, 1_234_567);
+        assert_eq!(fs.last_attempt.pid, Some(std::process::id()));
+        assert_eq!(fs.last_attempt.boot_id, current_boot_id());
+        assert!(fs.last_attempt.boot_id.is_some(), "this host has a boot id");
+        assert_eq!(fs.last_success_epoch, Some(900_000), "age still measured");
+    }
+
+    /// A record that cannot be written is logged, never silent, and does not
+    /// stop the pass.
+    #[test]
+    fn a_running_record_that_cannot_be_written_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("a-file");
+        std::fs::write(&blocker, "x").unwrap();
+        // The parent "directory" is a regular file: the write cannot happen.
+        let path = blocker.join("scrub-state.json");
+        let marker = RunningMarker {
+            label: "primary",
+            fsuuid: "uuid-a",
+            mountpoint: "/mnt/primary",
+            started_epoch: 1,
+        };
+        let progress = TestProgress::default();
+        record_running_logged(&path, &marker, &progress);
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(level, msg)| *level == LogLevel::Warning
+                && msg.contains("running")
+                && msg.contains("scrub-state.json")),
+            "{logs:?}"
+        );
+    }
+
+    /// A `running` record is live only for the pass that wrote it: this
+    /// process, this boot. Anything else is an interruption nobody recorded.
+    #[test]
+    fn a_running_record_is_live_only_for_its_own_process_and_boot() {
+        let boot = current_boot_id();
+        let me = std::process::id();
+
+        let live = running_attempt(Some(me), boot.clone());
+        assert!(live.is_live());
+        assert_eq!(live.effective_outcome(), "running");
+
+        let other_boot = running_attempt(Some(me), Some("not-this-boot".into()));
+        assert!(!other_boot.is_live());
+        assert_eq!(other_boot.effective_outcome(), "interrupted");
+
+        let no_pid = running_attempt(None, boot.clone());
+        assert_eq!(no_pid.effective_outcome(), "interrupted");
+
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        let dead = running_attempt(Some(dead_pid), boot);
+        assert_eq!(dead.effective_outcome(), "interrupted");
+
+        // Only a running record is reinterpreted.
+        let finished = AttemptState {
+            outcome: "finished".into(),
+            ..Default::default()
+        };
+        assert_eq!(finished.effective_outcome(), "finished");
+    }
+
+    /// The pass's own result for a caught signal: `interrupted`, with the
+    /// signal's name, not ok — and the earlier success still the age anchor.
+    #[test]
+    fn an_interrupted_result_is_recorded_as_interrupted_with_its_signal() {
+        let mut result = ScrubFsResult::new("primary");
+        result.fsuuid = "uuid-a".into();
+        result.mountpoint = "/mnt/primary".into();
+        result.started_epoch = 1_000_000;
+        result.finished_epoch = 1_003_000;
+        result.interrupted_by = Some(libc::SIGTERM);
+        result
+            .errors
+            .push("scrub interrupted by SIGTERM".to_string());
+        let pass = ScrubPass {
+            status: PassStatus::Completed,
+            started_epoch: 1_000_000,
+            finished_epoch: 1_003_000,
+            results: vec![result],
+            errors: Vec::new(),
+        };
+        let mut state = ScrubState::default();
+        state.filesystems.insert(
+            "uuid-a".into(),
+            fs_state(
+                AttemptState {
+                    outcome: "finished".into(),
+                    ok: true,
+                    ..Default::default()
+                },
+                Some(900_000),
+            ),
+        );
+        merge_pass_into_state(&mut state, &pass);
+        let fs = &state.filesystems["uuid-a"];
+        assert_eq!(fs.last_attempt.outcome, "interrupted");
+        assert_eq!(fs.last_attempt.signal.as_deref(), Some("SIGTERM"));
+        assert!(!fs.last_attempt.ok);
+        assert_eq!(fs.last_success_epoch, Some(900_000));
+        assert_eq!(pass.interrupted_by(), Some(libc::SIGTERM));
+        assert_eq!(pass.results[0].status_word(), "INTERRUPTED");
+    }
+
+    /// A result is filed the moment its filesystem is done, so a pass killed
+    /// during the next target leaves this one recorded, not "running".
+    #[test]
+    fn a_finished_target_is_recorded_before_the_next_one_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub-state.json");
+        let marker = RunningMarker {
+            label: "primary",
+            fsuuid: "uuid-a",
+            mountpoint: "/mnt/primary",
+            started_epoch: 1,
+        };
+        record_running(&path, &marker, &NullProgress).unwrap();
+        let mut result = ScrubFsResult::new("primary");
+        result.fsuuid = "uuid-a".into();
+        result.outcome = Some(ScrubOutcome::Finished);
+        result.started_epoch = 1;
+        result.finished_epoch = 500;
+        record_result_logged(&path, &result, &NullProgress);
+        let fs = load_state_from(&path).unwrap().filesystems["uuid-a"].clone();
+        assert_eq!(fs.last_attempt.outcome, "finished");
+        assert_eq!(fs.last_success_epoch, Some(500));
+        assert_eq!(fs.last_attempt.pid, None);
+    }
+
+    fn two_target_config() -> Config {
+        let mut config = Config::default();
+        config.scrub.targets = vec!["first".into(), "second".into()];
+        config
+    }
+
+    /// A scrub stopped by a signal ends the pass: the next target is not begun.
+    #[test]
+    fn an_interrupted_target_ends_the_pass() {
+        let ran = std::sync::Mutex::new(Vec::new());
+        let scrub_one = |_: &Config, label: &str, _: &dyn ProgressCallback, _: &MaintenanceHeld| {
+            ran.lock().unwrap().push(label.to_string());
+            let mut r = ScrubFsResult::new(label);
+            r.interrupted_by = Some(libc::SIGTERM);
+            r
+        };
+        let results = scrub_targets_with(
+            &two_target_config(),
+            &NullProgress,
+            &MaintenanceHeld::assumed(),
+            &|| None,
+            &scrub_one,
+        );
+        assert_eq!(*ran.lock().unwrap(), ["first"]);
+        assert_eq!(results.len(), 1);
+    }
+
+    /// A signal that arrives between targets: the target it kept from starting
+    /// is listed as interrupted (so the pass is), and nothing after it starts.
+    #[test]
+    fn a_signal_between_targets_marks_the_unstarted_target_interrupted() {
+        let ran = std::sync::Mutex::new(Vec::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            // Quiet for the first target, caught before the second.
+            (calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1).then_some(libc::SIGHUP)
+        };
+        let scrub_one = |_: &Config, label: &str, _: &dyn ProgressCallback, _: &MaintenanceHeld| {
+            ran.lock().unwrap().push(label.to_string());
+            let mut r = ScrubFsResult::new(label);
+            r.outcome = Some(ScrubOutcome::Finished);
+            r
+        };
+        let results = scrub_targets_with(
+            &two_target_config(),
+            &NullProgress,
+            &MaintenanceHeld::assumed(),
+            &stop,
+            &scrub_one,
+        );
+        assert_eq!(*ran.lock().unwrap(), ["first"]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].target_label, "second");
+        assert_eq!(results[1].interrupted_by, Some(libc::SIGHUP));
+        assert!(!results[1].scrub_launched);
+        assert!(!results[1].ok());
     }
 }

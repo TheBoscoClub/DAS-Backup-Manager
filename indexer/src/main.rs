@@ -989,6 +989,8 @@ impl ScrubTargetView {
             "never" => "NEVER SCRUBBED",
             "error" => "ERROR",
             _ => match (self.ok, self.outcome.as_deref()) {
+                (_, Some("running")) => "RUNNING",
+                (_, Some("interrupted")) => "INTERRUPTED",
                 (Some(true), _) => "OK",
                 (Some(false), Some("aborted")) => "ABORTED",
                 (Some(false), Some("canceled")) => "CANCELED",
@@ -1075,13 +1077,23 @@ fn build_scrub_target_view(
 
     if let Some(fs) = state.and_then(|s| s.filesystems.get(&fsuuid)) {
         view.source = "state";
-        view.outcome = Some(fs.last_attempt.outcome.clone());
-        view.ok = Some(fs.last_attempt.ok);
+        view.outcome = Some(fs.last_attempt.effective_outcome());
         view.last_success_epoch = fs.last_success_epoch;
-        view.finished_epoch = Some(fs.last_attempt.finished_epoch);
-        view.duration_secs = Some(fs.last_attempt.duration_secs);
-        view.bytes_scrubbed = Some(fs.last_attempt.bytes_scrubbed);
-        view.counters_summary = Some(fs.last_attempt.counters.summary());
+        if fs.last_attempt.outcome == "running" {
+            // Written before the scrub began: it has no result yet, and the
+            // figures of the pass before it must not pass for this one's.
+            view.ok = if fs.last_attempt.is_live() {
+                None
+            } else {
+                Some(false)
+            };
+        } else {
+            view.ok = Some(fs.last_attempt.ok);
+            view.finished_epoch = Some(fs.last_attempt.finished_epoch);
+            view.duration_secs = Some(fs.last_attempt.duration_secs);
+            view.bytes_scrubbed = Some(fs.last_attempt.bytes_scrubbed);
+            view.counters_summary = Some(fs.last_attempt.counters.summary());
+        }
         return view;
     }
 
@@ -3374,9 +3386,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let progress = CliProgress;
                 let pass = scrub::run_scrub_pass(&cfg, &progress)?;
                 let exit_code = exit_code_for_pass(&pass);
-                let status_word = match pass.status {
-                    scrub::PassStatus::Completed => "completed",
-                    scrub::PassStatus::Skipped => "skipped",
+                let interrupted = pass.interrupted_by();
+                let status_word = match (pass.status, interrupted) {
+                    (_, Some(_)) => "interrupted",
+                    (scrub::PassStatus::Completed, None) => "completed",
+                    (scrub::PassStatus::Skipped, None) => "skipped",
                 };
                 if json {
                     println!(
@@ -3405,6 +3419,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                              command's exit code. See 'btrdasd scrub status' or 'btrdasd health'."
                         );
                     }
+                }
+                if let Some(signal) = interrupted {
+                    // The pass has recorded the stop; now end as the signal
+                    // would have, so the supervisor sees what it always saw.
+                    scrub::die_of_signal(signal);
                 }
                 std::process::exit(exit_code);
             }
@@ -4036,6 +4055,58 @@ mod tests {
         assert!(json.contains("\"last_success_epoch\":null"));
     }
 
+    /// bd DAS-Backup-Manager-weo: a pass that was killed leaves its `running`
+    /// record, and status must say INTERRUPTED, not show the earlier finished
+    /// pass as if it were current. A pass that is running now says RUNNING.
+    #[test]
+    fn status_reads_an_unfinished_running_record_as_interrupted() {
+        let uuid = "33333333-3333-3333-3333-333333333333";
+        let config = test_config(&[("killed-target", uuid)]);
+        let mut state = scrub::ScrubState::default();
+        let attempt = |pid, boot_id| scrub::AttemptState {
+            outcome: "running".into(),
+            started_epoch: 1_785_000_000,
+            pid,
+            boot_id,
+            ..Default::default()
+        };
+        let entry = |attempt| scrub::FsState {
+            target_label: "killed-target".into(),
+            mountpoint: "/mnt/killed-target".into(),
+            last_success_epoch: Some(1_784_000_000),
+            last_attempt: attempt,
+        };
+
+        state
+            .filesystems
+            .insert(uuid.into(), entry(attempt(None, None)));
+        let v = build_scrub_target_view(&config, "killed-target", Some(&state));
+        assert_eq!(v.status_word(), "INTERRUPTED");
+        assert_eq!(v.outcome.as_deref(), Some("interrupted"));
+        assert_eq!(v.last_success_epoch, Some(1_784_000_000));
+        let table = format_scrub_status(&[v], &config);
+        assert!(table.contains("INTERRUPTED"), "{table}");
+        assert!(table.contains("outcome=interrupted"), "{table}");
+
+        state.filesystems.insert(
+            uuid.into(),
+            entry(attempt(Some(std::process::id()), scrub::current_boot_id())),
+        );
+        let v = build_scrub_target_view(&config, "killed-target", Some(&state));
+        assert_eq!(v.status_word(), "RUNNING");
+        assert_eq!(v.outcome.as_deref(), Some("running"));
+    }
+
+    /// A pass the signal stopped is INTERRUPTED in the table whatever its `ok`.
+    #[test]
+    fn status_word_names_a_caught_signal_interrupted() {
+        let mut v = ScrubTargetView::new("t");
+        v.source = "state";
+        v.outcome = Some("interrupted".into());
+        v.ok = Some(false);
+        assert_eq!(v.status_word(), "INTERRUPTED");
+    }
+
     /// A target with a raw btrfs record but no entry in the engine's own
     /// state file (the real shape of all three DAS filesystems today — see
     /// bd DAS-Backup-Manager-0kn) must be reported from that record, not
@@ -4215,6 +4286,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             errors: Vec::new(),
             mounted_by_engine: false,
             scrub_launched,
+            interrupted_by: None,
         }
     }
 

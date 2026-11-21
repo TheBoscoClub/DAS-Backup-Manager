@@ -2985,6 +2985,24 @@ trips the unit into
 .B failed
 state.
 .PP
+A pass that receives SIGTERM, SIGINT or SIGHUP (a reboot, a stop, Ctrl\-C)
+stops its
+.B "btrfs scrub"
+(which leaves a resumable record), records the stop as
+.B interrupted
+with the signal's name in the state file, does not begin the next target,
+unmounts what it mounted, and then ends by that same signal, so a
+supervisor sees the exit status it saw before (bd
+.BR DAS\-Backup\-Manager\-weo ).
+A scrub is also recorded as
+.B running
+before it starts; a pass killed without the chance to say so (SIGKILL, power
+loss) leaves that record, which
+.B "scrub status"
+and
+.B "btrdasd health"
+read as interrupted.
+.PP
 .B btrdasd scrub run
 .RB [ \-\-config
 .IR PATH ]
@@ -3006,6 +3024,17 @@ for a filesystem with scrub history predating this CLI or the state
 file. A target with neither source is reported as
 .BR "NEVER SCRUBBED" ,
 not an error.
+.PP
+Status is
+.B RUNNING
+while the pass that wrote a
+.B running
+record is alive, and
+.B INTERRUPTED
+for a pass stopped by a signal or one whose
+.B running
+record outlived it (the earlier finished pass is never shown as the
+current one; its age still counts from the last success).
 .PP
 .B btrdasd scrub status
 .RB [ \-\-config
