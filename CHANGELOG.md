@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Disaster Recovery Guide's unattended step list matches the session's steps** (bd `DAS-Backup-Manager-3gzs.7`, `DAS-Backup-Manager-ua01`): it gains **slot** (after snapshot) and **desktop** (after kernel), the half-upgraded note names the snapshot step by its number again, and the script's header puts slot where it runs
+  - Troubleshooting says not to suspend a session's script: a stop across an in-guest reboot ends in exit status 6, and one over about 30 seconds ends reset watching for the rest of the session
 - **The Flatpak builds on the current KDE runtime, 6.11** (bd `DAS-Backup-Manager-jeaq`): the manifest named KDE 6.7, which Flathub marks end-of-life, so a bundle got no runtime security fixes
   - `runtime-version` is `6.11` (Qt 6.11.3, freedesktop 25.08 base); the release workflow's container image is `ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11` — the `bilelmoussaoui` images stop at `kde-6.7`
   - The Rust SDK extension and the `qtcharts` module are gone: the GUI is built alone (`BUILD_INDEXER` and `BUILD_HELPER` off), so nothing runs cargo, and the runtime ships Qt Charts at its own Qt version, which a copy built from source at 6.7.3 would not match

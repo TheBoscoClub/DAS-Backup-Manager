@@ -153,16 +153,18 @@
 #     before any other, or [core] would shadow its builds (bd 1igg);
 #     snapshot -- the OS snapshots its own @ read-only to
 #     @.pre-update.<YYYYMMDD-HHMM>, keeping the newest 2 (its own btrfs,
-#     never the host's); repo-level -- with [recovery_os].repo_level = "v3",
+#     never the host's); slot -- the last known good pair (the boot slot's
+#     entries and files, a writable clone of the snapshot as @.previous, the
+#     previous-root entries cachyos-recovery-previous.conf rebuilt from them),
+#     refreshed only when the last session proved its desktop, else kept;
+#     a failure only warns; repo-level -- with [recovery_os].repo_level = "v3",
 #     [cachyos-v3], [cachyos-core-v3] and [cachyos-extra-v3] put above
 #     [cachyos] (refused on a CPU without x86-64-v3; unset: nothing changes,
 #     bd 54f0); guard-lift (systemctl stop das-vm-guard); keyrings;
 #     upgrade (pacman -Syu --noconfirm); packages (qemu-guest-agent and the
 #     rescue tools git partclone zip gvfs gvfs-smb gvfs-mtp, and amd-ucode
 #     intel-ucode reinstalled); initramfs (the fallback image added
-#     to a preset that lacks it, then mkinitcpio -P); loader
-#     (cachyos-recovery-previous.conf rewritten to boot the newest
-#     @.pre-update.* read-only, removed when there is none); verify-btrbk
+#     to a preset that lacks it, then mkinitcpio -P); verify-btrbk
 #     (pacman -Qkk btrbk: 0 altered files); verify-boot (every file the loader
 #     entries name is on the ESP, every LABEL=/UUID= of /etc/fstab
 #     resolves -- bd ac82, read inside the OS); guard-engage (started again,
