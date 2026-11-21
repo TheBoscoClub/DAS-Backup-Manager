@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attended session's progress panel keeps the operator's instruction while it waits** (bd `DAS-Backup-Manager-343p`): the helper sent every percentage under the fixed stage name "progress", so the wait stage the GUI acts on was replaced as soon as it arrived and the panel read only "progress 9%"
+  - A `JobProgress` signal for a percentage now names the stage the job is in (`progress::SignalStage`)
+- **A recovery-OS session cancelled from the GUI reads "Cancelled, recovery OS still running", not a red "Failed"** (bd `DAS-Backup-Manager-z5od`): the helper puts "cancelled — " in front of the script's `kept (exit 3)` summary, which the GUI did not recognise
 - **An Upgrade refused for an out-of-date boot record reads "Not started", not "Failed"** (bd `DAS-Backup-Manager-eg4j.14`): the Recovery drives panel already named the remedy, but the progress panel painted the refusal as a red Failed and the desktop notification said "Recovery Drive Update Failed", though nothing had touched a drive
   - The progress panel shows **Not started** with the panel's words (press **Record** beside Upgrade, then start again, and the script's reasons whole); the notification is titled "Recovery Drive Update Not Started"
   - All three places use the one rule that recognises the refusal; any other failed session is still a red Failed

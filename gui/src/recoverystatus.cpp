@@ -514,16 +514,30 @@ QString shutDownInVmWords()
 
 namespace {
 const QLatin1String KeptPrefix("kept (exit 3)");
+
+// A job the GUI cancelled ends with this in front of the script's summary
+// (progress::OrderedProgress::finish); a kept session is still kept after it.
+QString withoutCancelPrefix(const QString &summary, bool *cancelled = nullptr)
+{
+    static const QString prefix = QStringLiteral(u"cancelled — ");
+    const bool has = summary.startsWith(prefix);
+    if (cancelled)
+        *cancelled = has;
+    return has ? summary.mid(prefix.size()) : summary;
+}
 }
 
 bool sessionKept(const QString &summary)
 {
-    return summary.startsWith(KeptPrefix);
+    return withoutCancelPrefix(summary).startsWith(KeptPrefix);
 }
 
 QString keptWords(const QString &summary, bool cancelled)
 {
-    QString detail = summary.mid(KeptPrefix.size());
+    bool prefixed = false;
+    const QString own = withoutCancelPrefix(summary, &prefixed);
+    cancelled = cancelled || prefixed;
+    QString detail = own.mid(KeptPrefix.size());
     if (detail.startsWith(QLatin1String(": ")))
         detail = detail.mid(2);
     QString words = QStringLiteral("%1: the recovery OS is still running in its VM. %2 Then press End session in the "

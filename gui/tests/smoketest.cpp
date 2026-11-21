@@ -318,6 +318,17 @@ private Q_SLOTS:
         QVERIFY(words.contains(QStringLiteral("A skipped"))); // the script's own lines stay
         QVERIFY(!words.contains(QStringLiteral("Failed")));
 
+        // A cancel from the GUI: the helper puts "cancelled — " in front
+        // (progress::OrderedProgress::finish). Seen live 2026-11-21: the
+        // panel read red "Failed" for exactly this summary.
+        const QString cancelled = QStringLiteral(u"cancelled — kept (exit 3): stderr: Nothing was detached");
+        QVERIFY2(sessionKept(cancelled), qPrintable(cancelled));
+        const QString cancelledWords = keptWords(cancelled, false);
+        QVERIFY2(cancelledWords.startsWith(QStringLiteral("Cancelled")), qPrintable(cancelledWords));
+        QVERIFY(cancelledWords.contains(QStringLiteral("Nothing was detached")));
+        QVERIFY(!cancelledWords.contains(QStringLiteral(u"cancelled —")));
+        QVERIFY(!sessionKept(QStringLiteral(u"cancelled — stopped after mounting the sources")));
+
         // The one instruction names the VM and says the drive stays on.
         QVERIFY(shutDownInVmWords().contains(QStringLiteral("inside its VM")));
         QVERIFY(shutDownInVmWords().contains(QStringLiteral("drive and the enclosure stay on")));
