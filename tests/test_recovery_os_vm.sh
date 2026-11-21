@@ -1317,6 +1317,21 @@ alive() {
     if [[ -n "$1" && "$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline")" == *hold-disk* ]]; then echo alive; else echo gone; fi
 }
 
+# Signal $1 to every process in process group $2 but pid $3, found by
+# provenance (/proc/<pid>/stat's pgrp), never by name.
+signal_group_but() {
+    local f st p g
+    for f in /proc/[0-9]*/stat; do
+        { read -r st <"$f"; } 2>/dev/null || continue
+        p=${f#/proc/}
+        p=${p%/stat}
+        st=${st##*) }
+        read -r _ _ g _ <<<"$st"
+        [[ "$g" == "$2" && "$p" != "$3" ]] || continue
+        kill -"$1" "$p" 2>/dev/null || :
+    done
+}
+
 # The driver in the background, then Ctrl-C as a terminal sends it: SIGINT to
 # its whole process group, once it is waiting for the guest. `set -m` gives
 # the job a process group of its own (and keeps SIGINT deliverable to an
@@ -1345,7 +1360,18 @@ run_interrupted() {
     sleep 0.2
     # What happens in the guest in the instant before the signal.
     if [[ -n "${BEFORE_SIG:-}" ]]; then eval "$BEFORE_SIG"; fi
-    kill -"${SIG:-INT}" -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIG${SIG:-INT})" >>"$T/driver.out"
+    if [[ -n "${SIG_SPARE_DRIVER:-}" ]]; then
+        # The group's signal as bash loses it (bd gbgj): every process in
+        # the group gets it but the driver's own shell, whose copy bash
+        # drops when it lands while the shell waits for a command
+        # substitution's child that then ends normally.
+        signal_group_but "${SIG:-INT}" "$dpid" "$dpid"
+    else
+        kill -"${SIG:-INT}" -- "-$dpid" 2>/dev/null || echo "(the driver had exited before SIG${SIG:-INT})" >>"$T/driver.out"
+    fi
+    # A second signal at once, to the driver's shell alone: as the copy it
+    # lost, sent again.
+    if [[ -n "${SIG_AGAIN:-}" ]]; then kill -"${SIG:-INT}" "$dpid" 2>/dev/null || :; fi
     # A backstop against a driver that never ends, not a measure of how fast
     # it winds down: 30 s was too short on a loaded host (CI on 63ab2a3b ran
     # beside a backup, the whole suite three times slower, and the two-drive
@@ -1974,6 +2000,35 @@ run_driver status
 has "status when idle: no holder" "$OUT" "Holder            none"
 has "status when idle: no guard" "$OUT" "  Session guard   none"
 has "status when idle: lock free" "$OUT" "Maintenance lock  free"
+
+# bd gbgj: bash drops a SIGINT that reaches the shell while it waits for a
+# command substitution's child that then ends normally (the child not being
+# a job, nothing runs the trap). Seen three times in CI as a two-drive run
+# that went on after Ctrl-C. Here the driver's shell never gets the group's
+# signal: the session must still end, kept, as at an interrupt it took.
+for how in lost lost-then-again; do
+    echo "--- interrupted, the session's own copy of SIGINT $how (bd gbgj)"
+    fixture
+    printf 'running\n' >"$S/states.running"
+    if [[ "$how" == lost ]]; then
+        SIG_SPARE_DRIVER=1 run_interrupted session A
+    else
+        SIG_SPARE_DRIVER=1 SIG_AGAIN=1 run_interrupted session A
+    fi
+    check "SIGINT $how: exit 3" "$RC" "3"
+    lacks "SIGINT $how: ended by the signal, not the backstop" "$OUT" "did not exit within"
+    lacks "SIGINT $how: no shell complaint" "$OUT" "trap:"
+    check "SIGINT $how: never destroyed" "$(file "$S/forbidden")" ""
+    lacks "SIGINT $how: nothing detached" "$(file "$S/virsh.calls")" "detach"
+    pid="$(holder_pid A)"
+    check "SIGINT $how: the holder outlives the driver" "$(alive "$pid")" "alive"
+    check "SIGINT $how: the record names the holder" "$(head -n 1 "$LOCK")" \
+        "recovery-os VM session system-recovery-A-2tb pid $pid"
+    printf 'shut off\n' >"$S/states"
+    run_driver session-end A
+    check "SIGINT $how: session-end finishes it" "$RC" "0"
+    check "SIGINT $how: then the lock is free" "$(lock_state)" "free"
+done
 
 echo "--- --timeout, and a guest that will not shut down"
 fixture

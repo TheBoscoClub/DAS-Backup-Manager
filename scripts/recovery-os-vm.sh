@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.4.0
+# Version: 2.4.1
 # Date: 2026-11-21
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -5255,6 +5255,109 @@ pair_on_exit() {
 }
 
 # ---------------------------------------------------------------------------
+# A session's signal traps, and the relay that makes them hold (bd gbgj)
+# ---------------------------------------------------------------------------
+# bash drops a SIGINT that reaches it while it waits for the child of a
+# command substitution and that child then ends normally: the child is no
+# job, so nothing runs the trap (bash 5.2 and 5.3, jobs.c waitchld). This
+# script waits on such children all the time, and a Ctrl-C or the helper's
+# JobCancel (SIGINT to the process group) lands on the child too late to end
+# it whenever it was already ending: the session ran on as if never
+# interrupted (seen three times in CI). The relay is a second receiver in the
+# same process group that never waits on a command substitution: it takes
+# the group's signal and sends it on to this shell -- after a second, and
+# again each second -- until the shell has acted on it (ignores it, the
+# handlers' first act), or is gone.
+
+# The trap of INT, TERM and HUP: none of them again, then the signal's exit
+# status. A second copy (the relay's) is then harmless.
+on_signal() {
+    trap '' INT TERM HUP
+    exit "$1"
+}
+
+# Every way out of a session, armed at once: on_exit, the three signals, the
+# relay.
+arm_session_traps() {
+    trap on_exit EXIT
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
+    trap 'on_signal 129' HUP
+    start_signal_relay
+}
+
+# Process $1's start time (clock ticks after boot) in PROC_START; 1 when it
+# is gone or a zombie. Read with builtins only: the relay calls it.
+proc_start() {
+    local st f
+    PROC_START=""
+    { read -r st <"/proc/$1/stat"; } 2>/dev/null || return 1
+    st=${st##*) }
+    read -r -a f <<<"$st"
+    [[ "${f[0]}" != Z && -n "${f[19]:-}" ]] || return 1
+    PROC_START=${f[19]}
+}
+
+# Whether process $1 ignores signal number $2 (its SigIgn mask).
+proc_ignores() {
+    local k v
+    { while read -r k v; do
+        if [[ "$k" == SigIgn: ]]; then
+            (((16#$v >> ($2 - 1)) & 1))
+            return
+        fi
+    done <"/proc/$1/status"; } 2>/dev/null
+    return 1
+}
+
+# Started from a subshell, so $! in this shell does not move: on_exit and
+# stop_reset_watch take pids from it.
+start_signal_relay() {
+    proc_start "$$" || return 0
+    (signal_relay "$$" "$PROC_START" &)
+}
+
+# The relay itself: $1 the session's shell, $2 its start time (a pid taken
+# again by another process is never signalled). Builtins only, never a
+# command substitution; it holds nothing (no lock, no output) and ends with
+# the shell.
+signal_relay() {
+    local main=$1 start=$2 got="" num=0 due=0 nap f n
+    set +e
+    trap - EXIT
+    trap 'got=INT num=2' INT
+    trap 'got=TERM num=15' TERM
+    trap 'got=HUP num=1' HUP
+    exec </dev/null >/dev/null 2>&1
+    # Every inherited descriptor (the maintenance lock among them) but the
+    # script's own (255).
+    for f in /proc/"$BASHPID"/fd/*; do
+        n=${f##*/}
+        if [[ "$n" =~ ^[[:digit:]]+$ ]] && ((n > 2 && n != 255)); then
+            exec {n}>&-
+        fi
+    done
+    # A pipe this process alone writes: a read on it waits out its timeout.
+    exec {nap}<> <(:)
+    while proc_start "$main" && [[ "$PROC_START" == "$start" ]]; do
+        if [[ -n "$got" ]]; then
+            if proc_ignores "$main" "$num"; then
+                # Taken, or the shell is past the point where it may be
+                # interrupted (it ignores the three for its last steps).
+                got="" due=0
+            elif ((due == 0)); then
+                due=$((SECONDS + 2))
+            elif ((SECONDS >= due)); then
+                kill -s "$got" "$main" 2>/dev/null
+                due=$((SECONDS + 1))
+            fi
+        fi
+        read -r -t 0.2 -u "$nap" _
+    done
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # The EXIT trap of a session
 # ---------------------------------------------------------------------------
 on_exit() {
@@ -5691,10 +5794,7 @@ cmd_session() {
     make_state_dir || refuse "cannot create $STATE_DIR"
 
     SESSION_START=$SECONDS
-    trap on_exit EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
+    arm_session_traps
 
     take_lock
     if [[ "$DRY_RUN" != true ]]; then
@@ -6942,10 +7042,7 @@ provision_undo() {
     VERDICT=no
     build_guard
     SESSION_START=$SECONDS
-    trap on_exit EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
+    arm_session_traps
     take_lock
     SESSION_EPOCH=$(date +%s)
     HISTORY_ARMED=true
@@ -6996,10 +7093,7 @@ cmd_provision() {
     VERDICT=no
     build_guard
     SESSION_START=$SECONDS
-    trap on_exit EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
+    arm_session_traps
     take_lock
     SESSION_EPOCH=$(date +%s)
     HISTORY_ARMED=true
