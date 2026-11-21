@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The helper logs each recovery-OS schedule write itself** (bd `DAS-Backup-Manager-3gzs.3`): one journal line per `RecoveryOsScheduleSet` call names the caller, the drives, and what was set (time and mode), cleared, or refused and why; before, only polkit's audit line and systemd's reload showed it
 - **`[recovery_os].timezone` — the time zone of a rebuilt recovery OS** (bd `DAS-Backup-Manager-cnjc`): `recovery-os-install.sh` linked the author's zone into every drive it built
   - An IANA name such as `Europe/Berlin`; `Config::validate` refuses a name that is not letters, digits, `_` `+` `-` and `/` or not a zone file under `/usr/share/zoneinfo` on the machine that validates, and `config validate` no longer warns the key is unknown
   - `btrdasd config dump-env` exports `DAS_RECOVERY_OS_TIMEZONE` only when set; `provision` passes it as `DAS_INSTALL_TIMEZONE`, and `configure` refuses, before writing anything, a name that is not a zone file in the new OS

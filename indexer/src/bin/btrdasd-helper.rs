@@ -828,6 +828,33 @@ fn now_epoch() -> Result<i64, String> {
         .map_err(|e| format!("The system clock reads before 1970: {e}"))
 }
 
+/// The journal line for one `RecoveryOsScheduleSet` call: who asked, for
+/// which drives, and what was written, cleared or refused (bd
+/// DAS-Backup-Manager-3gzs.3).
+fn schedule_write_line(
+    who: &str,
+    labels: &[String],
+    at_epoch: i64,
+    mode: Option<&str>,
+    result: Result<&str, String>,
+) -> String {
+    let drives = labels.join(" ");
+    let what = if at_epoch == 0 {
+        "clear".to_string()
+    } else {
+        format!(
+            "set for {at_epoch} (epoch seconds){}",
+            mode.map(|m| format!(", mode {m}")).unwrap_or_default()
+        )
+    };
+    match result {
+        Ok(unit) => {
+            format!("[info] recovery-OS schedule {what} of {drives} by {who}: done, {unit}")
+        }
+        Err(e) => format!("[warn] recovery-OS schedule {what} of {drives} by {who}: not done: {e}"),
+    }
+}
+
 /// One at a time: two `RecoveryOsScheduleSet` calls must not interleave
 /// their writes, reloads and removals.
 static SCHEDULE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2456,7 +2483,8 @@ impl HelperInterface {
 
         let config = load_config()?;
         let mode = (!mode.is_empty()).then(|| mode.to_string());
-        tokio::task::spawn_blocking(move || -> fdo::Result<String> {
+        let (log_labels, log_mode) = (labels.clone(), mode.clone());
+        let written = tokio::task::spawn_blocking(move || -> fdo::Result<String> {
             let _one = SCHEDULE_WRITE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2518,7 +2546,23 @@ impl HelperInterface {
             )
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("The schedule task panicked: {e}")))?
+        .map_err(|e| fdo::Error::Failed(format!("The schedule task panicked: {e}")))?;
+        // One line of its own per privileged write (bd DAS-Backup-Manager-3gzs.3):
+        // polkit's audit line names no label, systemd's reload no calendar.
+        eprintln!(
+            "{}",
+            schedule_write_line(
+                sender.as_str(),
+                &log_labels,
+                at_epoch,
+                log_mode.as_deref(),
+                written
+                    .as_ref()
+                    .map(String::as_str)
+                    .map_err(|e| e.to_string()),
+            )
+        );
+        written
     }
 
     /// The VNC socket of a drive's running session, made reachable by the
@@ -3182,6 +3226,38 @@ mod tests {
     }
 
     // --- recovery-OS methods (bd DAS-Backup-Manager-8249 stage 2)
+
+    /// Every privileged schedule write leaves a line naming who, which
+    /// drives and what (bd DAS-Backup-Manager-3gzs.3).
+    #[test]
+    fn a_schedule_write_names_who_which_drives_and_what() {
+        let labels = vec![
+            "system-recovery-A-2tb".to_string(),
+            "system-recovery-B-2tb".to_string(),
+        ];
+        let set = schedule_write_line(
+            ":1.42",
+            &labels,
+            1_795_300_000,
+            Some("sequential"),
+            Ok("das-recovery-os-update-pair.timer"),
+        );
+        assert_eq!(
+            set,
+            "[info] recovery-OS schedule set for 1795300000 (epoch seconds), mode sequential of \
+             system-recovery-A-2tb system-recovery-B-2tb by :1.42: done, das-recovery-os-update-pair.timer"
+        );
+        let cleared = schedule_write_line(":1.7", &labels[..1], 0, None, Ok("x.timer"));
+        assert!(
+            cleared.starts_with(
+                "[info] recovery-OS schedule clear of system-recovery-A-2tb by :1.7: done"
+            ),
+            "{cleared}"
+        );
+        let refused = schedule_write_line(":1.7", &labels[..1], 5, None, Err("too soon".into()));
+        assert!(refused.starts_with("[warn] "), "{refused}");
+        assert!(refused.ends_with("not done: too soon"), "{refused}");
+    }
 
     #[test]
     fn the_recovery_os_methods_check_polkit_before_their_first_side_effect() {
