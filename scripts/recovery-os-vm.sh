@@ -1674,6 +1674,18 @@ check_boot_record() {
     if ((schemas != 1)); then
         refuse "the boot record $file is not one JSON document ($schemas found)"
     fi
+    # One document (above); a key named twice in it (a hand-edited or damaged file): plain jq keeps the
+    # last, so a drive's 'will' could read as a later 'no'. --stream sees every
+    # leaf, the repeated ones too; a path seen twice is refused, never
+    # overridable (bd DAS-Backup-Manager-pc0).
+    local dup="" drc=0
+    dup="$(jq -nr --stream '[inputs | select(length == 2) | .[0]] | group_by(.) | map(select(length > 1)) | .[0][0] // empty | map(tostring) | join(".")' 2>&1 <"$file")" || drc=$?
+    if ((drc != 0)); then
+        refuse "the boot record $file cannot be read: ${dup:-jq exit $drc}"
+    fi
+    if [[ -n "$dup" ]]; then
+        refuse "the boot record $file names a key twice ($dup): jq would keep the last one, so what it says about '$LABEL' cannot be trusted -- $again"
+    fi
     if [[ "$schematype" != number ]]; then
         refuse "the boot record $file is not one this script can read: its schema_version is not a number ('$schema', a $schematype)"
     fi

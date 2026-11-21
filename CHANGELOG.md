@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A recovery-OS session refuses a boot record that names a key twice** (bd `DAS-Backup-Manager-pc0`): plain `jq` keeps the last of two same-named keys, so a drive entered twice, `will` first and `no` last, read as `no`; the preflight now reads every key with `jq --stream` after the one-document check and refuses a repeated one, naming it, with no override
 - **`btrdasd restore snapshot` no longer says "Restored 0 files" for a send/receive restore that restored a whole subvolume** (bd `DAS-Backup-Manager-eg4j.16`): the fast path counts no files, and 0 read as a measurement
   - `RestoreResult.files_restored` is now an `Option`: the text report reads `Restored whole snapshot (file count not taken) (<size>) in <n>s`, the helper's summary says "the whole snapshot (file count not taken)", and `--json` prints `"files_restored":null`; a recursive copy and `restore file` still print their real count
   - `files_restored` in `--json` can now be `null`: a consumer that read it as a number must accept null

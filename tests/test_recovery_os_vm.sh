@@ -953,7 +953,10 @@ if [[ "$1" == show ]]; then
     [[ -f "$STUB/unit.show.$unit" ]] || { echo "stub systemctl: no show answer for $unit" >&2; exit 99; }
     pid=$PPID drv=""
     while ((pid > 1)); do
-        if [[ "$(cat /proc/$pid/comm 2>/dev/null)" == bash ]] && tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | grep -q 'recovery-os-vm.sh'; then drv=$pid; fi
+        # The driver's own bash: its script argument (argv[1]) IS the driver.
+        # Not any shell whose command line merely names it (bash -c '... shellcheck
+        # scripts/recovery-os-vm.sh ...' above the suite was taken for it).
+        if [[ "$(cat /proc/$pid/comm 2>/dev/null)" == bash ]] && [[ "$(tr '\0' '\n' </proc/$pid/cmdline 2>/dev/null | sed -n 2p)" == */recovery-os-vm.sh ]]; then drv=$pid; fi
         pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
         [[ -n "$pid" ]] || break
     done
@@ -2274,6 +2277,24 @@ printf '{"schema_version":3,"drives":{}}{"schema_version":3,"drives":{}}\n' >"$S
 run_driver session A --dry-run
 check "two documents in the record: refused" "$RC" "1"
 has "two documents: says so" "$OUT" "not one JSON document"
+
+# The same drive named twice: plain jq keeps the LAST, so 'will' then 'no'
+# would read as 'no'. jq --stream sees both; never overridable (bd pc0).
+fixture
+write_state 4 "$(record_json system-recovery-A-2tb will)" "$(record_json system-recovery-A-2tb no)"
+run_driver session A --dry-run
+check "a drive named twice in the record: refused" "$RC" "1"
+has "a drive named twice: names the key" "$OUT" "names a key twice (drives.system-recovery-A-2tb"
+check "a drive named twice: nothing locked" "$(file "$S/flock.calls")" ""
+fixture
+write_state 4 "$(record_json system-recovery-A-2tb will)" "$(record_json system-recovery-A-2tb no)"
+run_driver session A --dry-run --accept-boot-record-risk
+check "a drive named twice: --accept-boot-record-risk does not lift it" "$RC" "1"
+fixture
+write_state 4 "$(record_json system-recovery-A-2tb no)" "$(record_json system-recovery-B-2tb no)"
+run_driver session A --dry-run
+check "two different drives, each once: not refused for it" "$RC" "0"
+lacks "two different drives: no duplicate named" "$OUT" "names a key twice"
 
 fixture
 write_state 2 "$(record_json system-recovery-A-2tb no)"
