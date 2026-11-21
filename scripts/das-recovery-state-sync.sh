@@ -6,7 +6,7 @@
 # /etc/das-backup/config.toml (btrdasd config derive-recovery). Then, only when
 # the state is older than the data (a night the state pass failed), an
 # incremental index catch-up in the background.
-# Version: 2.1.0
+# Version: 2.1.1
 # Date: 2026-11-21
 #
 # The live state (bd DAS-Backup-Manager-eg4j.10) is a subvolume at the drive's
@@ -77,6 +77,8 @@ STATE_NEW="${STATE_DIR:?}.new"
 STATE_OLD="${STATE_DIR:?}.old"
 MIGRATING="${STATE_DIR:?}.migrating"
 CONFIG_NEW="${CONFIG_OUT:?}.new"
+# Test seam like every DAS_STATE_SYNC_* name here: the unit never sets it, the
+# suite does (bd eg4j.15, note 6); the unit runs as root with a fixed environment.
 MARKER="${DAS_STATE_SYNC_MARKER:-$ROOT/etc/das-backup/recovery-drive}"
 RUN_DIR="${DAS_STATE_SYNC_RUN_DIR:-$ROOT/run/das-recovery-state}"
 TOP="${DAS_STATE_SYNC_TOP:-$RUN_DIR/top}" # the booted fs mounted at subvolid=5
@@ -324,8 +326,14 @@ marker_series
 
 # The drive's own received directory for the host's root volume: the
 # top-level directory the marker names.
-dir="$TOP/${SUBDIR:?}"
-[[ -d "$dir" && ! -L "$dir" ]] || die "no received '$SUBDIR' directory on this filesystem: not a target that receives the host's root"
+# Every component is checked, not only the last: a link in the middle of a
+# multi-part name would lead out of the drive's own tree (bd eg4j.15).
+dir="$TOP"
+IFS=/ read -ra subdir_parts <<<"${SUBDIR:?}"
+for part in "${subdir_parts[@]}"; do
+    dir="$dir/${part:?}"
+    [[ -d "$dir" && ! -L "$dir" ]] || die "no received '$SUBDIR' directory on this filesystem: not a target that receives the host's root"
+done
 
 # complete <path>: a finished receive is a read-only subvolume with a
 # Received UUID. A partial receive (interrupted btrfs receive) is writable and
@@ -338,10 +346,18 @@ complete() {
 }
 
 # newest <prefix>: the lexically greatest COMPLETE snapshot directory (stamps
-# sort); incomplete candidates are skipped with a logged line.
+# sort); incomplete candidates are skipped with a logged line. Only
+# "<prefix>.<btrbk stamp>" counts: YYYYMMDDTHHMM, with optional seconds and a
+# _N suffix. A series "foo" never takes "foo.bar.<stamp>" (another series) or
+# "foo.<stamp>.bak" (bd eg4j.15).
 newest() {
-    local c=("$dir/$1".*) i
-    [[ -e "${c[0]}" ]] || return 0
+    local g=("$dir/$1".*) c=() i stamp
+    for i in "${g[@]}"; do
+        stamp=${i##*/}
+        stamp=${stamp#"$1".}
+        [[ -e "$i" && "$stamp" =~ ^[0-9]{8}T[0-9]{4}([0-9]{2})?(_[0-9]+)?$ ]] && c+=("$i")
+    done
+    [[ ${#c[@]} -gt 0 ]] || return 0
     mapfile -t c < <(printf '%s\n' "${c[@]}" | LC_ALL=C sort -r)
     for i in "${c[@]}"; do
         if complete "$i"; then

@@ -685,6 +685,32 @@ mkdir -p "$R/sub" && mv "$R/nvme" "$R/sub/dir"
 run
 check "target_subdir may be a relative path of plain names" test "$RC" -eq 0
 
+echo "== series: a dotted sibling series is not this series (bd eg4j.15 note 1)"
+fixture
+mkdir -p "$R/nvme/das-state.extra.20261014T0348" "$R/nvme/root-.extra.20261014T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348.bak"
+echo db-extra >"$R/nvme/das-state.extra.20261014T0348/backup-index.db"
+echo "# extra" >"$R/nvme/root-.extra.20261014T0348/etc/das-backup/config.toml"
+run
+check "dotted sibling: exit 0" test "$RC" -eq 0
+check "dotted sibling: the state is the series' own newest" has "$LIVE/backup-index.db" db-0348
+check "dotted sibling: the sibling state is not snapshotted" file_lacks "$LOG" "das-state.extra"
+check "dotted sibling: the config is the series' own newest" has "$LOG" "--from $R/nvme/root-.20261012T0348/etc/das-backup/config.toml"
+check "dotted sibling: a name after the stamp is not a stamp" file_lacks "$LOG" "das-state.20261012T0348.bak"
+fixture
+mkdir -p "$R/nvme/das-state.20261012T0348_1" "$R/nvme/das-state.20261012T034815"
+echo db-n1 >"$R/nvme/das-state.20261012T0348_1/backup-index.db"
+run
+check "stamp forms: a _N suffix and a seconds stamp are stamps" has "$LOG" "btrfs subvolume snapshot $R/nvme/das-state.20261012T0348_1 "
+
+echo "== series: a symlink in the middle of target_subdir refuses (bd eg4j.15 note 2)"
+fixture
+printf 'bay=1\ntarget_subdir=sub/dir\nroot_series=root-\nstate_series=das-state\n' >"$MARKER_F"
+mkdir -p "$R/real" && mv "$R/nvme" "$R/real/dir" && ln -s real "$R/sub"
+run
+check "middle symlink: refused (exit 1)" test "$RC" -eq 1
+check "middle symlink: no snapshot" file_lacks "$LOG" "btrfs subvolume"
+check "middle symlink: says which directory" out_has "no received 'sub/dir' directory"
+
 if ((FAILS > 0)); then
     printf '%d check(s) FAILED\n' "$FAILS"
     exit 1

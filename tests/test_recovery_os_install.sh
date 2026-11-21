@@ -69,7 +69,7 @@ if [[ "$2" == btrdasd ]]; then
         /tmp/* | /run/* | /dev/* | /proc/* | /sys/*) echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2 ;;
     esac
     [[ -f "$root$cfg" ]] || { echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2; }
-    if [[ "$sub" == config ]]; then cat "$STUB_DUMPENV"; exit "${STUB_DUMPENV_RC:-0}"; fi
+    if [[ "$sub" == config ]]; then [[ -z "${STUB_DUMPENV_ERR:-}" ]] || echo "$STUB_DUMPENV_ERR" >&2; cat "$STUB_DUMPENV"; exit "${STUB_DUMPENV_RC:-0}"; fi
     cat "$STUB_INSPECT"; exit "${STUB_INSPECT_RC:-0}"
 fi
 EOF
@@ -467,6 +467,11 @@ fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
 printf '[Unit]\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
 run package STUB_DUMPENV_RC=2
 check "series: dump-env failing (exit 2) is a failed step, no marker" test "$RC" -eq 2 -a ! -e "$R/mnt/target/etc/das-backup/recovery-drive"
+fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
+printf '[Unit]\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
+run package STUB_DUMPENV_RC=2 STUB_DUMPENV_ERR="Error: config line 7: unknown key frobnicate"
+check "series: dump-env's own stderr reaches the refusal message (bd eg4j.15)" out_has "unknown key frobnicate"
+check "series: dump-env's stderr file removed from the target" test ! -e "$R/mnt/target/root/das-install-series.err"
 
 echo "== package: the installation's own documents (DAS_INSTALL_LOCAL_DOCS, installed at DAS_INSTALL_LOCAL_DOCS_DEST)"
 package_fixture() {

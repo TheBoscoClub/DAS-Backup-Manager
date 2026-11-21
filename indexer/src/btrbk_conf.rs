@@ -586,7 +586,8 @@ pub struct RecoverySeries {
 /// unambiguous: the host root is the one live `@` entry of exactly one source,
 /// and the state series is that same source's one live `after_index`
 /// [`STATE_SUBVOLUME`] entry (it is sent to the same directory). Never a
-/// guess: more than one candidate, or none, is `None`.
+/// guess: more than one candidate, or none, is `None`; so is a source that
+/// reaches no `role = "mirror"` target.
 pub fn recovery_series(config: &Config) -> Option<RecoverySeries> {
     let live = |sv: &SubvolConfig| sv.retired.is_none();
     let mut roots = config
@@ -595,6 +596,15 @@ pub fn recovery_series(config: &Config) -> Option<RecoverySeries> {
         .filter(|s| s.subvolumes.iter().any(|sv| live(sv) && sv.name == "@"));
     let source = roots.next()?;
     if roots.next().is_some() {
+        return None;
+    }
+    // A recovery drive's own received directory exists only if this source
+    // sends to a mirror target; else provisioning would succeed and every boot
+    // of the drive refuse (bd DAS-Backup-Manager-eg4j.15).
+    if !source_targets(config, source)
+        .iter()
+        .any(|t| t.role == TargetRole::Mirror)
+    {
         return None;
     }
     let names = resolve_snapshot_names(&source.subvolumes);
@@ -2303,9 +2313,19 @@ enabled = false
         );
     }
 
+    /// `cfg` plus a `role = "mirror"` target (a recovery drive), which every
+    /// source with no `target_labels` reaches.
+    fn with_mirror(mut cfg: Config) -> Config {
+        let mut mirror = cfg.targets[0].clone();
+        mirror.label = "system-recovery-A".into();
+        mirror.role = TargetRole::Mirror;
+        cfg.targets.push(mirror);
+        cfg
+    }
+
     #[test]
     fn recovery_series_names_what_btrbk_was_given_not_a_fixed_spelling() {
-        let mut cfg = test_config();
+        let mut cfg = with_mirror(test_config());
         cfg.sources[0].target_subdirs = vec!["hostdir".into(), "second".into()];
         cfg.sources[0].subvolumes[0].snapshot_name = Some("hostroot".into());
         let mut st = state_entry();
@@ -2332,13 +2352,13 @@ enabled = false
     #[test]
     fn recovery_series_is_none_when_it_is_not_unambiguous() {
         let with_state = || {
-            let mut cfg = test_config();
+            let mut cfg = with_mirror(test_config());
             cfg.sources[0].subvolumes.push(state_entry());
             cfg
         };
         assert!(recovery_series(&with_state()).is_some());
         // No state entry.
-        assert!(recovery_series(&test_config()).is_none());
+        assert!(recovery_series(&with_mirror(test_config())).is_none());
         // The state entry is not after_index.
         let mut cfg = with_state();
         cfg.sources[0].subvolumes[2].after_index = false;
@@ -2359,13 +2379,33 @@ enabled = false
         assert!(recovery_series(&cfg).is_none());
     }
 
+    /// The host's `@` must reach a mirror target, else provision succeeds and
+    /// every boot of the drive refuses (no received directory): `None`, so
+    /// provisioning refuses at once (bd DAS-Backup-Manager-eg4j.15).
+    #[test]
+    fn recovery_series_is_none_when_the_root_source_reaches_no_mirror() {
+        let mut cfg = with_mirror(test_config());
+        cfg.sources[0].subvolumes.push(state_entry());
+        assert!(recovery_series(&cfg).is_some());
+        // The source is scoped to the primary only.
+        cfg.sources[0].target_labels = vec!["primary-22tb".into()];
+        assert!(recovery_series(&cfg).is_none());
+        // Scoped to the mirror: reaches it.
+        cfg.sources[0].target_labels = vec!["system-recovery-A".into()];
+        assert!(recovery_series(&cfg).is_some());
+        // No mirror target at all.
+        let mut cfg = test_config();
+        cfg.sources[0].subvolumes.push(state_entry());
+        assert!(recovery_series(&cfg).is_none());
+    }
+
     /// Only a LIVE entry named exactly `@` makes a source the root's: another
     /// source with other live entries and a retired `@` beside them is not a
     /// second candidate (CI Mutants on 0e67e3da: `&&` -> `||` and `==` -> `!=`
     /// in the filter survived; bd DAS-Backup-Manager-pzj6).
     #[test]
     fn recovery_series_ignores_a_source_whose_only_at_entry_is_retired() {
-        let mut cfg = test_config();
+        let mut cfg = with_mirror(test_config());
         cfg.sources[0].subvolumes.push(state_entry());
         let mut other = cfg.sources[0].clone();
         other.label = "other".into();

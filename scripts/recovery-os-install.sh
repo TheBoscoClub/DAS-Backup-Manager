@@ -3,7 +3,7 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.6.0
+# Version: 1.6.1
 # Date: 2026-11-21
 #
 # Steps, in the order the driver runs them:
@@ -495,14 +495,19 @@ doc_path() {
 # makes the sync refuse at every boot.
 SERIES_SUBDIR="" SERIES_ROOT="" SERIES_STATE=""
 marker_series() {
-    local env_text rc k v
+    local env_text rc k v errf err=""
     need CONFIG
     mkdir -p "$TARGET/root"
     cp "$CONFIG" "$TARGET/root/das-install-series.toml" || cannot "cannot copy $CONFIG into the target"
-    env_text=$("$CHROOT" "$TARGET" btrdasd config dump-env --config /root/das-install-series.toml 2>/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")
+    # Its stderr (the config's own complaint) goes to a file in the target, read
+    # once for the refusal message and removed (bd eg4j.15).
+    errf="$TARGET/root/das-install-series.err"
+    env_text=$("$CHROOT" "$TARGET" btrdasd config dump-env --config /root/das-install-series.toml 2>"$errf" && printf '\nstatus=0' || printf '\nstatus=%s' "$?")
     rm -f "${TARGET:?}/root/das-install-series.toml"
+    err=$(head -c 300 "$errf" 2>/dev/null | head -n 1 | tr -d '[:cntrl:]') || err=""
+    rm -f "${errf:?}"
     rc=${env_text##*$'\n'status=}
-    [[ "$env_text" == *$'\n'status=* && "$rc" == 0 ]] || cannot "btrdasd config dump-env in the target exited ${rc:-unknown}: no root and state series for the marker"
+    [[ "$env_text" == *$'\n'status=* && "$rc" == 0 ]] || cannot "btrdasd config dump-env in the target exited ${rc:-unknown}: no root and state series for the marker${err:+ ($err)}"
     for k in SUBDIR ROOT_SERIES STATE_SERIES; do
         v=$(sed -n "s/^DAS_RECOVERY_$k='\(.*\)'\$/\1/p" <<<"$env_text" | head -1)
         [[ -n "$v" ]] || refuse "the host's configuration names no DAS_RECOVERY_$k (it needs exactly one source holding the root subvolume @ and its after_index state subvolume @/var/lib/das-backup): the drive's marker cannot say where the backups are"
@@ -525,6 +530,11 @@ step_package() {
     mkdir -p "$TARGET/payload"; cp "$PACKAGE" "$TARGET/payload/" || cannot "cannot copy the package into the target"
     "$CHROOT" "$TARGET" pacman -U --noconfirm "/payload/$(basename "$PACKAGE")" || cannot "pacman -U failed"
     rm -rf "${TARGET:?}/payload"
+    # After pacman -U on purpose: the series come from the INSTALLED btrdasd (the
+    # package's own reader of the host config). A refusal here leaves the target
+    # with the package installed and no marker; the step is re-run, never resumed
+    # (bd eg4j.15, note 4); it cannot move before pacman -U, the installed
+    # btrdasd is what reads the config.
     marker_series
     mkdir -p "$etc/das-backup" "$etc/systemd/system" "$etc/xdg/autostart" "$TARGET$desk"
     printf 'label=system-recovery-%s-2tb\nbay=%s\nprovisioned=%s\ntarget_subdir=%s\nroot_series=%s\nstate_series=%s\n' \
