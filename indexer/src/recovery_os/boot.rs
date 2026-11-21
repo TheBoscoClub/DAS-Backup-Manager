@@ -11470,4 +11470,84 @@ mod tests {
             "{reasons:?}"
         );
     }
+
+    // ---- bd DAS-Backup-Manager-3nb, review round: lines that reach /run another way ----
+
+    /// A declared script the image's own tmpfiles.d writes, run by the shutdown unit, and one
+    /// more tmpfiles.d line `extra` in `etc/tmpfiles.d`.
+    fn declared_job_and(root: &Path, extra: &str) {
+        shutdown_ramfs_root(root);
+        write(
+            root,
+            "usr/lib/tmpfiles.d/50-job.conf",
+            "f+ /run/job 0755 root root - #!/bin/sh\\ntrue\\n\n",
+        );
+        write(root, "etc/tmpfiles.d/60-x.conf", &format!("{extra}\n"));
+        shutdown_runs(root, "/run/job");
+    }
+
+    #[test]
+    fn a_line_whose_path_is_written_with_escapes_leaves_everything_to_that_os() {
+        // systemd decodes C escapes in every field: each of these appends btrbk to /run/job.
+        let mut wrong = Vec::new();
+        for extra in [
+            "w+ /\\x72un/job - - - - btrbk snapshot\\n",
+            "w+ /\\162un/job - - - - btrbk snapshot\\n",
+            "w+ /var/l\\x6fck/../run/job - - - - btrbk snapshot\\n",
+            "w+ /var/\\x72un/job - - - - btrbk snapshot\\n",
+            "R /\\x72*",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            declared_job_and(root, extra);
+            if verdict_of(root).0 != BootVerdict::May {
+                wrong.push(extra);
+            }
+        }
+        assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
+
+    #[test]
+    fn a_write_through_a_link_the_image_makes_leaves_everything_to_that_os() {
+        let mut wrong = Vec::new();
+        for extra in [
+            // w follows symlinks: this appends to /run/job.
+            "L /run/alias - - - - job\nw+ /run/alias - - - - btrbk snapshot\\n",
+            "L /run/d - - - - /run\nw+ /run/d/job - - - - btrbk snapshot\\n",
+            "w+ /proc/self/root/run/job - - - - btrbk snapshot\\n",
+            "w+ /proc/1/root/run/job - - - - btrbk snapshot\\n",
+            // A link made outside /run, written through.
+            "L /etc/alias - - - - /run/job\nw+ /etc/alias - - - - btrbk snapshot\\n",
+            "L /etc/d - - - - /run\nC+ /etc/d/job - - - - /usr/share/x\n",
+            // A link the image already has.
+            "w+ /etc/onlink - - - - btrbk snapshot\\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            declared_job_and(root, extra);
+            link(root, "etc/onlink", "/run/job");
+            if verdict_of(root).0 != BootVerdict::May {
+                wrong.push(extra);
+            }
+        }
+        assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
+
+    #[test]
+    fn writes_and_copies_a_stock_image_makes_elsewhere_leave_it_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        declared_job_and(
+            root,
+            "C /etc/passwd - - - - /usr/share/factory/etc/passwd\n\
+             C /etc/tpm2/*.json - - - - /usr/share/factory/etc/tpm2/*.json\n\
+             C! /etc/pam.d - - - - /usr/share/factory/etc/pam.d\n\
+             w- /sys/kernel/mm/x - - - - always\n\
+             w! /proc/sys/kernel/y - - - - 1\n\
+             L /etc/mtab - - - - ../proc/self/mounts\n",
+        );
+        fs::create_dir_all(root.join("etc/tpm2")).unwrap();
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
+    }
 }

@@ -2544,9 +2544,31 @@ are
 here. It stays unknown when another line names it, a parent or a glob that may
 match it (any type but a plain
 .B d
-for a parent), when a specifier, a quote, an escape this does not read or
-\fB..\fR is in the line, or when any tmpfiles.d file, or a directory of them,
-cannot be read. It rests on the limit below for what is put in place at boot:
+for a parent), when a specifier, a quote, a backslash in a path field (systemd
+decodes C escapes there, so it may name any path) or
+\fB..\fR is in a line, or when any tmpfiles.d file, or a directory of them,
+cannot be read. Nothing is declared at all when a line could write into
+.I /run
+by another way: any
+.B L
+line under it (\fBw\fR and \fBC\fR write through a link), and any
+.BR w ,
+.B C
+or
+.B L
+line elsewhere whose path is, or has a parent that is, a link the image makes,
+is under
+.I /proc
+(except
+.IR /proc/sys )
+or
+.IR /dev ,
+or is a link on the image's disk (a glob only in its last name; its directory
+is checked); paths under
+.I /sys
+and
+.I /proc/sys
+are exempt. It rests on the limit below for what is put in place at boot:
 a path declared there is still unknown to a service, the initramfs or a
 .I /run/tmpfiles.d
 that writes it besides

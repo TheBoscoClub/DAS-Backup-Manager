@@ -26,9 +26,15 @@
 //!   `!`;
 //! - no line of another type names a parent of it, and no line with a glob
 //!   matches it or a parent;
-//! - no `%` specifier is in its line (`%t` is `/run`), no `..` in a path, and
-//!   the content has only escapes this reads (`\n`, `\t`, `\r`, `\\`, `\xNN`,
-//!   octal) and no quote.
+//! - no `%` specifier is in its line (`%t` is `/run`), no `..` in a path, no
+//!   backslash in a field before the argument (systemd decodes C escapes in
+//!   every field, so a path may be `/\x72un/…`), and the content has only
+//!   escapes this reads (`\n`, `\t`, `\r`, `\\`, `\xNN`, octal) and no quote;
+//! - no line could write into `/run` another way ([`outside_is_plain`]): no
+//!   `L` line under it (`w` and `C` write through a link), and no `w`, `C`
+//!   or `L` line elsewhere that is, or has a parent that is, a link the image
+//!   makes, a link on its disk, or under `/proc` (`/proc/self/root/run`) or
+//!   `/dev`, but `/sys` and `/proc/sys`; any of these declares nothing.
 //!
 //! `/var/run` and `/var/lock` are read as `/run` and `/run/lock` (Arch's
 //! `filesystem` links them there).
@@ -36,7 +42,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::{FileRead, Listing, MountFlags, Mounts, list_dir, read_file};
+use super::{
+    Entry as OnDisk, FileRead, Listing, MountFlags, Mounts, entry_at, list_dir, read_file,
+};
 
 /// Where tmpfiles.d is read, highest precedence first (`tmpfiles.d(5)`,
 /// less `/run/tmpfiles.d`, which is empty at rest).
@@ -66,6 +74,16 @@ struct Line {
     path: String,
     /// The last field, as written.
     argument: Option<String>,
+}
+
+/// A line that writes, copies or links outside `/run`: it may reach a path
+/// under `/run` through a link ([`outside_is_plain`]).
+#[derive(Debug)]
+struct Outside {
+    /// `w`, `C` or `L`.
+    kind: char,
+    /// Absolute, simplified; a glob's characters as written.
+    path: String,
 }
 
 /// The lines of an image's tmpfiles.d that touch `/run`.
@@ -111,10 +129,14 @@ pub(super) fn read_declarations(root: &Path, probe: MountFlags, mounts: &Mounts)
         }
     }
     let mut lines = Vec::new();
+    let mut outside = Vec::new();
     for rel in files.values() {
         match read_file(root, rel, probe, Some(mounts)) {
             FileRead::Text(text) => match parse(&text) {
-                Ok(found) => lines.extend(found),
+                Ok((found, more)) => {
+                    lines.extend(found);
+                    outside.extend(more);
+                }
                 Err(_) => return Declarations::Unread,
             },
             // Masked, empty, or no regular file: systemd reads none of it.
@@ -122,7 +144,65 @@ pub(super) fn read_declarations(root: &Path, probe: MountFlags, mounts: &Mounts)
             FileRead::Unread(_) | FileRead::Unknown(_) => return Declarations::Unread,
         }
     }
+    if !outside_is_plain(root, &outside) {
+        return Declarations::Unread;
+    }
     Declarations::Read(Declared { lines })
+}
+
+/// Whether no line outside `/run` can write into it: `w` follows a link, and
+/// so does what `C` copies to. Such a line is plain when its path is under
+/// `/sys` or `/proc/sys` (never links into `/run`), or is neither `/proc`
+/// (`/proc/self/root/run`) nor `/dev` (`/dev/fd`), no link the image makes
+/// (`L`) is it or a parent of it, and on the image's disk neither it nor a
+/// parent is a link (a glob only in its last name, whose directory is read).
+fn outside_is_plain(root: &Path, outside: &[Outside]) -> bool {
+    let links: Vec<&str> = outside
+        .iter()
+        .filter(|o| o.kind == 'L')
+        .map(|o| o.path.as_str())
+        .collect();
+    for line in outside.iter().filter(|o| o.kind != 'L') {
+        let path = line.path.as_str();
+        if ["/sys/", "/proc/sys/"]
+            .iter()
+            .any(|dir| path.starts_with(dir))
+            && !has_glob(path)
+        {
+            continue;
+        }
+        if ["/proc", "/dev"].iter().any(|dir| under(path, dir)) {
+            return false;
+        }
+        let mut at = path;
+        loop {
+            for link in &links {
+                if may_match(link, at) {
+                    return false;
+                }
+            }
+            match at.rfind('/') {
+                Some(0) | None => break,
+                Some(i) => at = &at[..i],
+            }
+        }
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if has_glob(dir) {
+            return false;
+        }
+        let checked = if has_glob(name) { dir } else { path };
+        match entry_at(root, checked.trim_start_matches('/')) {
+            OnDisk::Symlink(_) | OnDisk::Unreadable(_) => return false,
+            OnDisk::File | OnDisk::Dir | OnDisk::Other | OnDisk::Absent => {}
+        }
+    }
+    true
+}
+
+/// Whether `path` is `dir` or under it.
+fn under(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// `/run` as one path: `/var/run` and `/var/lock` lead there. `None` when the
@@ -152,10 +232,13 @@ fn has_glob(path: &str) -> bool {
     path.contains(['*', '?', '[', '\\'])
 }
 
-/// The lines of one file that touch `/run`; an error when one that might
-/// cannot be told.
-fn parse(text: &str) -> Result<Vec<Line>, String> {
+/// The lines of one file that touch `/run`, and those that write, copy or
+/// link elsewhere; an error when a line cannot be told (a backslash in a
+/// field: systemd decodes C escapes in every field, so it may be any path,
+/// `/run` included).
+fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
     let mut found = Vec::new();
+    let mut outside = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -170,15 +253,10 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             return Err(format!("{line}: a specifier at the start of a path"));
         }
         let Some(fields) = fields else {
-            if line.contains("run") {
-                return Err(format!("{line}: not readable as a line"));
-            }
-            continue;
+            return Err(format!("{line}: not readable as a line"));
         };
+        // A line with no path names nothing.
         let (Some(kind), Some(path)) = (fields.first(), fields.get(1)) else {
-            if line.contains("run") {
-                return Err(format!("{line}: not a line of at least a type and a path"));
-            }
             continue;
         };
         if path.split('/').any(|part| part == "..") {
@@ -186,13 +264,26 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             return Err(format!("{line}: a path with `..` in it"));
         }
         let path = widen_specifiers(path);
-        let Some(path) = simplify(&path).and_then(|p| under_run(&p)) else {
+        let Some(simple) = simplify(&path) else {
             continue;
         };
         let mut letters = kind.chars();
         let Some(base) = letters.next() else {
             continue;
         };
+        let Some(path) = under_run(&simple) else {
+            if matches!(base, 'w' | 'C' | 'L') {
+                outside.push(Outside {
+                    kind: base,
+                    path: simple,
+                });
+            }
+            continue;
+        };
+        if base == 'L' {
+            // A link under /run is written through by `w` and `C`.
+            return Err(format!("{line}: a link under /run"));
+        }
         found.push(Line {
             kind: base,
             modifiers: letters.collect(),
@@ -201,7 +292,7 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             argument: fields.get(6).filter(|a| a.as_str() != "-").cloned(),
         });
     }
-    Ok(found)
+    Ok((found, outside))
 }
 
 /// `path` with each specifier (`%b`, `%H`...) made a glob's `*`: whatever it
@@ -369,7 +460,7 @@ impl Declared {
             }
         }
         let own = own?;
-        if own.modifiers.contains(['=', '~', '^']) {
+        if !own.modifiers.chars().all(|c| matches!(c, '+' | '-' | '!')) {
             return None;
         }
         match own.kind {
@@ -441,5 +532,18 @@ mod tests {
         assert!(unescape("\\x4").is_none());
         assert!(unescape("%t").is_none());
         assert!(unescape("'x'").is_none());
+    }
+
+    #[test]
+    fn only_the_modifiers_plus_minus_and_bang_leave_a_line_declared() {
+        let declared = |kind: &str| {
+            let (lines, _) = parse(&format!("{kind} /run/x 0644 root root - A\n")).unwrap();
+            Declared { lines }.entry("run/x")
+        };
+        assert_eq!(declared("f+!"), Some(Entry::File("A".into())));
+        assert_eq!(declared("d-"), Some(Entry::Dir));
+        for kind in ["f?", "f=", "f~", "f^", "f$", "d*x"] {
+            assert_eq!(declared(kind), None, "{kind}");
+        }
     }
 }
