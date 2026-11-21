@@ -67,6 +67,7 @@ install -Dm644 %{_vpath_builddir}/completions/btrdasd.fish %{buildroot}%{_datadi
 %{_datadir}/icons/hicolor/scalable/apps/btrdasd-gui.svg
 %{_datadir}/knotifications6/btrdasd-gui.notifyrc
 %{_mandir}/man1/btrdasd.1*
+%{_datadir}/das-backup/docs/
 %{_datadir}/bash-completion/completions/btrdasd
 %{_datadir}/zsh/site-functions/_btrdasd
 %{_datadir}/fish/vendor_completions.d/btrdasd.fish

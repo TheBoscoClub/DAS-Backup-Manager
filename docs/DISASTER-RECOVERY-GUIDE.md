@@ -64,9 +64,9 @@ Your backup targets are defined in `/etc/das-backup/config.toml`. Common categor
 
 ### Where Each Backup Lives on a Target
 
-Every snapshot sits at `<target mount>/<source target_subdir>/<snapshot_name>.<YYYYMMDDTHHMM>`, where `target_subdir` and `snapshot_name` come from `/etc/btrbk/btrbk.conf` (generated from `config.toml`; `btrdasd subvol list` shows the entries). For example, `@` is `/mnt/backup-<primary-label>/nvme/root-.20261002T1500` and `@home` is `/mnt/backup-<primary-label>/nvme/home.20261002T1500`. Two snapshots in the same minute get a `_1`, `_2`, … suffix.
+Every snapshot sits at `<target mount>/<source target_subdir>/<snapshot_name>.<YYYYMMDDTHHMM>`, where `target_subdir` and `snapshot_name` come from `/etc/btrbk/btrbk.conf` (generated from `config.toml`; `btrdasd subvol list` shows the entries). For example, `@` is `{{primary_mount}}/nvme/root-.20261002T1500` and `@home` is `{{primary_mount}}/nvme/home.20261002T1500`. Two snapshots in the same minute get a `_1`, `_2`, … suffix.
 
-- **Subvolumes adopted automatically**: every backup run adopts new subvolumes. One nested inside a configured subvolume joins that entry's source (same directory, same targets). Any other lands in a source named `<first source on that volume>-adopted`, sent to the **primary target only** — look under `<primary mount>/<first-source>-adopted/` (e.g. `/mnt/backup-<primary-label>/<volume>-adopted/`).
+- **Subvolumes adopted automatically**: every backup run adopts new subvolumes. One nested inside a configured subvolume joins that entry's source (same directory, same targets). Any other lands in a source named `<first source on that volume>-adopted`, sent to the **primary target only** — look under `<primary mount>/<first-source>-adopted/` (e.g. `{{primary_mount}}/<volume>-adopted/`).
 - **Retired subvolumes**: when a subvolume disappears its entry is marked `retired` and no new snapshots are taken, but its last snapshots stay on each target and are restorable until that target's longest retention window has passed since the retirement date; then the run deletes them.
 - **Boot copies (primary target only)**: the top level of the primary target holds writable `@` and `@home` made from the latest `root-`/`home` snapshots (rebuilt on full runs), plus `@.archive.<TS>` / `@home.archive.<TS>` of the ones they replaced (kept 60 days by default). On a recovery drive, `@` and `@home` are that drive's **own** OS — never restore your system from them.
 
@@ -234,13 +234,13 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 
 ### Scenario D: RAID-1 Backup Array Single-Leg Failure
 
-**Applies if** your primary backup is a BTRFS RAID-1 across two large drives (two DAS drives sharing one BTRFS UUID, `<primary-uuid>`).
+**Applies if** your primary backup is a BTRFS RAID-1 across two large drives (two DAS drives sharing one BTRFS UUID, `{{primary_uuid}}`).
 
 **Symptoms**:
 
-- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.16.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target <primary-label>  WARN  (RAID-1 degraded: … absent; …)` row under BACKUP OPERATIONS, and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
-- `sudo btrfs filesystem show <primary-label>` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show /mnt/backup-<primary-label>` then answers only `not a valid btrfs filesystem`
-- Once it is mounted (Step 2), `sudo btrfs device stats /mnt/backup-<primary-label>` shows non-zero error counters on one leg
+- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.16.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target {{primary_target}}  WARN  (RAID-1 degraded: … absent; …)` row under BACKUP OPERATIONS, and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
+- `sudo btrfs filesystem show {{primary_uuid}}` says `*** Some devices missing` — ask by label: between backups the array is not mounted, and `btrfs filesystem show {{primary_mount}}` then answers only `not a valid btrfs filesystem`
+- Once it is mounted (Step 2), `sudo btrfs device stats {{primary_mount}}` shows non-zero error counters on one leg
 
 **Why this is a separate scenario**: This array is not in `/etc/fstab` and has nothing to do with system boot. The system continues booting and running normally on its NVMe RAID-1. What needs recovery is the *backup target itself* — so that incremental backups, restores, and disaster-recovery procedures keep working during the days it takes to replace a drive.
 
@@ -251,9 +251,9 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 #### Step 1: Confirm which leg failed
 
 ```bash
-sudo btrfs filesystem show <primary-label>
+sudo btrfs filesystem show {{primary_uuid}}
 # Output looks like:
-#   Label: '<primary-label>' uuid: <primary-uuid>
+#   Label: '<fs-label>' uuid: {{primary_uuid}}
 #       Total devices 2 FS bytes used X.XTiB
 #       devid    1 size 20.01TiB used Y path /dev/sdX1
 #       devid    2 size 0 used 0 path MISSING
@@ -275,14 +275,14 @@ The `backup-run.sh` script always mounts by UUID with `[das].mount_opts` (which 
 # `cat /run/das-maintenance.lock` shows what the holder recorded.
 sudo flock -n /run/das-maintenance.lock true || echo "WAIT"
 
-# If /mnt/backup-<primary-label> is not currently mounted
-sudo mkdir -p /mnt/backup-<primary-label>
+# If {{primary_mount}} is not currently mounted
+sudo mkdir -p {{primary_mount}}
 sudo mount -t btrfs -o noatime,compress=zstd:3,space_cache=v2,autodefrag,commit=120,nossd,degraded \
-    UUID=<primary-uuid> /mnt/backup-<primary-label>
+    UUID={{primary_uuid}} {{primary_mount}}
 
 # Now that it is mounted: look for non-zero counters
 # (write_io_errs, read_io_errs, corruption_errs)
-sudo btrfs device stats /mnt/backup-<primary-label>
+sudo btrfs device stats {{primary_mount}}
 ```
 
 A backup that starts while you have it mounted uses your mount and unmounts it when it finishes; unmount it yourself when you are done.
@@ -333,7 +333,7 @@ Nothing may be using the DAS while it is off, and a backup run unmounts the arra
 ```bash
 sudo flock -n /run/das-maintenance.lock true || echo WAIT
 sudo flock /run/das-maintenance.lock bash   # a root shell holding the lock; backups and scrubs due meanwhile wait
-sudo umount /mnt/backup-<primary-label>                 # if you mounted it in Step 2
+sudo umount {{primary_mount}}                 # if you mounted it in Step 2
 ```
 
 Then power the DAS off, swap the drive, and power it on. Once it is up, run `sudo btrfs device scan` and mount the array again with Step 2's `mount` command (skip its lock check: you hold the lock).
@@ -345,11 +345,11 @@ The replacement must have a GPT partition that exactly matches the surviving leg
 ```bash
 sudo sgdisk --zap-all "$NEW"
 sudo sgdisk --new=1:2048:42970644446 --typecode=1:8300 \
-    --change-name=1:<primary-label> "$NEW"
+    --change-name=1:{{primary_target}} "$NEW"
 sudo partprobe "$NEW"
 ```
 
-Verify with `sudo sgdisk --print "$NEW"` — the partition should be sectors 2048–42970644446, 20.0 TiB, type 8300, name `<primary-label>`. Its partition is `"$NEW"-part1`.
+Verify with `sudo sgdisk --print "$NEW"` — the partition should be sectors 2048–42970644446, 20.0 TiB, type 8300, name `{{primary_target}}`. Its partition is `"$NEW"-part1`.
 
 #### Step 7: Replace the failed device in the array
 
@@ -359,10 +359,10 @@ MISSING_DEVID=<number from "MISSING" line>
 
 # Replace in the foreground (-B): the command returns when the replace is done,
 # ~24-48 hours for ~5 TiB over USB — only then go on to Step 8
-sudo btrfs replace start -B "$MISSING_DEVID" "$NEW"-part1 /mnt/backup-<primary-label>
+sudo btrfs replace start -B "$MISSING_DEVID" "$NEW"-part1 {{primary_mount}}
 
 # Monitor from another terminal (-1 prints once, so watch can repeat it)
-watch -n 60 sudo btrfs replace status -1 /mnt/backup-<primary-label>
+watch -n 60 sudo btrfs replace status -1 {{primary_mount}}
 ```
 
 `btrfs replace` reads from the surviving leg, writes to the new device, and updates the superblock. The filesystem stays usable while it runs, but no backup may run meanwhile: a backup run unmounts the array when it ends (Step 2). That is why you hold the maintenance lock until Step 9 — a backup due meanwhile waits for it, and runs afterwards.
@@ -373,8 +373,8 @@ First scrub, so every block is verified (and repaired from its good copy) before
 
 ```bash
 # Full read of every block on both legs, repairs any checksum mismatches
-sudo btrfs scrub start -B /mnt/backup-<primary-label>
-sudo btrfs scrub status /mnt/backup-<primary-label>
+sudo btrfs scrub start -B {{primary_mount}}
+sudo btrfs scrub status {{primary_mount}}
 # "Error summary: no errors found" is what you want
 ```
 
@@ -383,27 +383,27 @@ Then convert: any data that was written while the array was degraded is in `sing
 ```bash
 # `soft` filter only touches chunks that aren't already RAID-1
 sudo btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft \
-    /mnt/backup-<primary-label>
+    {{primary_mount}}
 
 # Watch progress
-sudo btrfs balance status /mnt/backup-<primary-label>
+sudo btrfs balance status {{primary_mount}}
 ```
 
 #### Step 9: Verify and reset counters
 
 ```bash
 # Confirm all error counters are zero
-sudo btrfs device stats /mnt/backup-<primary-label>
+sudo btrfs device stats {{primary_mount}}
 
 # Reset stats to baseline now that the array is healthy
-sudo btrfs device stats --reset /mnt/backup-<primary-label>
+sudo btrfs device stats --reset {{primary_mount}}
 
 # Confirm RAID-1 across the board
-sudo btrfs filesystem df /mnt/backup-<primary-label>
+sudo btrfs filesystem df {{primary_mount}}
 # Expect: Data, RAID1 / Metadata, RAID1 / System, RAID1 (no `single` lines)
 ```
 
-Unmount it when you are done (`sudo umount /mnt/backup-<primary-label>`), then `exit` the root shell from Step 5 to let the maintenance lock go: the backups that waited run now, and Step 10's `btrdasd setup` refuses while the lock is held. The next backup mounts the array itself.
+Unmount it when you are done (`sudo umount {{primary_mount}}`), then `exit` the root shell from Step 5 to let the maintenance lock go: the backups that waited run now, and Step 10's `btrdasd setup` refuses while the lock is held. The next backup mounts the array itself.
 
 #### Step 10: Update the config, bay map and CHANGELOG
 
@@ -561,12 +561,12 @@ Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (f
 5. **Mount the DAS backup** — the **primary** target, by filesystem UUID. Do not use a recovery drive's `@`/`@home`: those are that drive's own OS, not your system:
 
    ```bash
-   # Find the target's UUID (your primary target: <primary-label>, <primary-uuid>)
+   # Find the target's UUID (your primary target: {{primary_target}}, {{primary_uuid}})
    lsblk -o NAME,SERIAL,LABEL,UUID
 
    # Mount its top level read-only (degraded is harmless with both RAID-1 legs present)
    sudo mkdir -p /mnt/backup
-   sudo mount -t btrfs -o ro,degraded UUID=<primary-target-uuid> /mnt/backup
+   sudo mount -t btrfs -o ro,degraded UUID={{primary_uuid}} /mnt/backup
 
    # Pick the snapshot to restore from (newest last)
    ls /mnt/backup/nvme/ | grep -E '^(root-|home)\.'
@@ -743,14 +743,14 @@ sudo reboot
 3. **If you also need to reset a user password**:
 
    ```bash
-   passwd <username>
+   passwd {{install_user}}
    ```
 
 4. **If sudo is broken** (user removed from wheel group, sudoers corrupted):
 
    ```bash
    # Add user back to wheel group
-   usermod -aG wheel <username>
+   usermod -aG wheel {{install_user}}
 
    # Or fix sudoers (this opens a safe editor that checks syntax)
    visudo
@@ -880,11 +880,11 @@ This prints what fstab SHOULD contain based on currently mounted filesystems. Co
    linux   /vmlinuz-linux-cachyos
    initrd  /amd-ucode.img
    initrd  /initramfs-linux-cachyos.img
-   options root=UUID=<your-root-uuid> rw rootflags=subvol=/@
+   options root=UUID={{root_uuid}} rw rootflags=subvol=/@
    ENTRY
    ```
 
-   Replace `<your-root-uuid>` with your actual root partition UUID from `blkid`.
+   The UUID is this host's root filesystem as read when the guide was last rendered; check it against `blkid` before relying on it.
 
 5. **If initramfs is corrupt or missing**, regenerate it:
 
@@ -1170,7 +1170,7 @@ sudo umount /mnt/target /mnt/backup
 
 ```bash
 # Mount source snapshot and target
-sudo mount -t btrfs -o subvol=nvme/root-.20261002T1500,ro,degraded UUID=<backup-target-uuid> /mnt/snapshot
+sudo mount -t btrfs -o subvol=nvme/root-.20261002T1500,ro,degraded UUID={{primary_uuid}} /mnt/snapshot
 sudo mount -o subvol=@ /dev/<target-partition> /mnt/target
 
 # Sync (--delete removes files that don't exist in the snapshot)
@@ -1610,6 +1610,18 @@ Only a *complete* receive counts: a snapshot that is not read-only, or has no Re
 `recovery-os-vm.sh provision` rebuilds a recovery drive's own OS from the host in one command. The host writes nothing to the drive: the installer runs as root **inside the drive's own VM**, from the CachyOS live ISO, and the host only drives it through the guest agent. No partition table is written and no btrfs filesystem is made: partition 2 keeps every received backup, so the first backup run afterwards is an ordinary incremental, not a full send. The old OS is set aside by renaming and is deleted only after the new one has booted and been proven.
 
 **Your own recovery documents.** The documents shipped with the package are generic templates. Put your filled-in copies of `EMERGENCY-QUICK-REFERENCE.md`, `DISASTER-RECOVERY-GUIDE.md` and `STORAGE-ARCHITECTURE-AND-RECOVERY.md` in `/etc/das-backup-docs/`, the directory beside `/etc/das-backup/` (`[recovery_os].local_docs_dir` names another). `provision` carries every regular `*.md` file there to the recovery drive, installs it at the same path, and points the Desktop links at your copies; a document you have not filled in keeps the generic version. A symlink or other non-regular file there is a refusal. Keep the directory flat: only its top-level `*.md` files are carried. Earlier versions kept them in `/etc/das-backup/docs/`: `sudo btrdasd setup --upgrade` moves that directory once (it refuses, changing nothing, when both exist), and `provision` refuses while the old one is still there.
+
+**The guides fill themselves in.** The three guides above ship as templates under `/usr/share/das-backup/docs/`. When the local documents directory exists, `btrdasd docs refresh` (every backup run) renders each of them into it: a name written `\{{name}}` in a template is replaced by this installation's value, and the file is rewritten only when its text changes. A guide already there under the same name is replaced by the render, so keep your own text in a document of another name. The names and where each value comes from:
+
+| Name | Value |
+| --- | --- |
+| `\{{primary_target}}` | the primary target's `label` in `config.toml` |
+| `\{{primary_uuid}}` | the primary target's `mount_uuid` |
+| `\{{primary_mount}}` | the primary target's `mount` |
+| `\{{install_user}}` | `[recovery_os].install_user` |
+| `\{{root_uuid}}` | the UUID of the btrfs filesystem mounted at `/` (one read-only `findmnt`) |
+
+A value the installation does not supply (no `mount_uuid`, no `install_user`, or two primary targets, between which it will not guess) appears as `[FILL IN: name]`: set the missing key in `config.toml`; the next run fills it. Placeholders in `<angle brackets>` are operational (a snapshot stamp, a new drive's device) and stay as they are. Documents named `author-*.md`, and any other file, are never rendered; marked blocks (below) in a guide are filled after the names. `--templates DIR` names another template directory; `--check` reports what would change.
 
 **Lists the configuration keeps current.** A list in your documents that the configuration already holds, such as the subvolumes of one source, can be marked so it never drifts. Put the two marker lines around it, each on a line of its own:
 

@@ -1769,6 +1769,57 @@ printed (also with no record yet);
 .B 2
 the database could not be read.
 .\"
+.SS docs refresh
+.B btrdasd docs refresh
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-dir
+.IR DIR ]
+.RB [ \-\-templates
+.IR DIR ]
+.RB [ \-\-check ]
+.PP
+Keep the installation's own recovery documents
+.RB ( [recovery_os].local_docs_dir ,
+default
+.IR /etc/das\-backup\-docs )
+current. The guides installed as templates under
+.I share/das\-backup/docs
+(the three recovery guides; default
+.IR /usr/share/das\-backup/docs ,
+used when it exists, or
+.BR \-\-templates )
+are rendered into the directory first: each
+.B {{name}}
+in a template is replaced by the value
+.B config.toml
+or one read\-only
+.B findmnt
+supplies
+.RB ( primary_target ,
+.BR primary_uuid ,
+.BR primary_mount ,
+.BR install_user ,
+.BR root_uuid ),
+and a name nothing supplies becomes the visible blank
+.BR "[FILL IN: name]" ,
+never a guess; two primary targets are not guessed between.
+.B \e{{
+writes the braces literally.
+A rendered file is written only when its text changes (temp file and rename,
+mode 0644); a symlink at the destination or a template that is not a regular file is
+refused. Every other top\-level
+.I *.md
+(never
+.IR author\-*.md ,
+which are not templates) has its marked blocks filled. A directory that does not
+exist has no documents. Exit 0: done (or, with
+.BR \-\-check ,
+all current); 1:
+.B \-\-check
+found a document that would change; 2: a document was refused or the refresh
+could not run.
+.\"
 .SS subvol expire
 Delete the backups of retired subvolumes whose window has passed. Run by
 .B backup\-run.sh

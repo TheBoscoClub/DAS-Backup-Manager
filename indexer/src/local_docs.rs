@@ -153,7 +153,7 @@ impl<'a> Probe<'a> {
         got
     }
     /// Every btrfs mount on this host.
-    fn mounts(&self) -> Result<Vec<Mount>, String> {
+    pub(crate) fn mounts(&self) -> Result<Vec<Mount>, String> {
         parse_mounts(&self.output(FINDMNT)?)
     }
 }
@@ -776,6 +776,24 @@ pub fn refresh_dir(
     write: bool,
     probe: &Probe,
 ) -> Result<Vec<DocReport>, String> {
+    refresh_dir_except(
+        config,
+        dir,
+        write,
+        probe,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// [`refresh_dir`] leaving the named files alone (the rendered guides, which
+/// `doc_templates` has just handled).
+pub(crate) fn refresh_dir_except(
+    config: &Config,
+    dir: &Path,
+    write: bool,
+    probe: &Probe,
+    skip: &std::collections::BTreeSet<String>,
+) -> Result<Vec<DocReport>, String> {
     let listing = match fs::read_dir(dir) {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -785,7 +803,10 @@ pub fn refresh_dir(
     for entry in listing {
         let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.extension().is_some_and(|x| x == "md") {
+        let skipped = path
+            .file_name()
+            .is_some_and(|n| skip.contains(&n.to_string_lossy().into_owned()));
+        if path.extension().is_some_and(|x| x == "md") && !skipped {
             paths.push(path);
         }
     }

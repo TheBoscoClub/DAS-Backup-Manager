@@ -5,6 +5,7 @@ pub mod caldate;
 pub mod config;
 pub mod coverage;
 pub mod db;
+pub mod doc_templates;
 pub mod doctor;
 pub mod expire;
 pub mod forget;

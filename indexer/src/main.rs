@@ -690,7 +690,10 @@ enum DocsAction {
     /// -->` and `<!-- /btrdasd:subvolume-table -->`, filled from config.toml
     /// and the live btrfs mounts (findmnt, read only). A filesystem block
     /// (`btrdasd:filesystem volume=<path>`) holds that volume's devices and
-    /// usage in whole GiB (btrfs filesystem show/df, lsblk; needs root). Exit 0: done (or, with --check, all current); 1: --check
+    /// usage in whole GiB (btrfs filesystem show/df, lsblk; needs root). The
+    /// installed guide templates (--templates) are rendered into the directory
+    /// first: each `{{name}}` is filled from config.toml or a read-only probe,
+    /// and one nothing supplies becomes the blank `[FILL IN: name]`. Exit 0: done (or, with --check, all current); 1: --check
     /// found a document that would change; 2: a document was refused (left as
     /// it was) or the refresh could not run.
     Refresh {
@@ -700,6 +703,10 @@ enum DocsAction {
         /// The documents' directory (default: [recovery_os].local_docs_dir, as resolved for provision)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// The installed guide templates to render into the directory (default:
+        /// /usr/share/das-backup/docs when it exists)
+        #[arg(long)]
+        templates: Option<PathBuf>,
         /// Say what would change, write nothing
         #[arg(long)]
         check: bool,
@@ -3048,7 +3055,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ----- Subvol commands -----
         Commands::Docs {
-            action: DocsAction::Refresh { config, dir, check },
+            action:
+                DocsAction::Refresh {
+                    config,
+                    dir,
+                    templates,
+                    check,
+                },
         } => {
             let run = || -> Result<i32, String> {
                 let cfg = Config::load(&config).map_err(|e| e.to_string())?;
@@ -3058,7 +3071,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let runner = buttered_dasd::fsutil::SystemRunner;
                 let probe = buttered_dasd::local_docs::Probe::system(&runner);
-                let reports = buttered_dasd::local_docs::refresh_dir(&cfg, &dir, !check, &probe)?;
+                let default_templates = PathBuf::from("/usr/share/das-backup/docs");
+                let templates =
+                    templates.or_else(|| default_templates.is_dir().then_some(default_templates));
+                let reports = buttered_dasd::doc_templates::refresh_all(
+                    &cfg,
+                    templates.as_deref(),
+                    &dir,
+                    !check,
+                    &probe,
+                )?;
                 for r in &reports {
                     use buttered_dasd::local_docs::DocOutcome;
                     let p = r.path.display();

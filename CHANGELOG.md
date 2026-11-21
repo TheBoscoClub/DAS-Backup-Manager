@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `btrdasd doctor` runs `btrfs scrub start --help` and `btrfs --version` (no scrub) and reports `SCRUB TOOL`, exit `1`, naming the version, when either option line is gone or the help cannot be read
   - `--json` adds `scrub_tool_finding`; the probe is not part of `scrub run`, so no unit fails and no supervisor restarts
   - Documented in `docs/INSTALL.md`
+- **The recovery guides render themselves from the installed templates** (bd `DAS-Backup-Manager-riwa`): the installation's copies of the three guides were filled in by hand once and went stale
+  - `docs/DISASTER-RECOVERY-GUIDE.md`, `EMERGENCY-QUICK-REFERENCE.md` and `STORAGE-ARCHITECTURE-AND-RECOVERY.md` are installed under `share/das-backup/docs/`, and `btrdasd docs refresh` (every backup run) renders each into the local docs directory before the marked-block pass
+  - `{{name}}` marks what the installation decides: `primary_target`, `primary_uuid`, `primary_mount` (the primary target in `config.toml`), `install_user` (`[recovery_os].install_user`) and `root_uuid` (one read-only `findmnt`); `<angle>` placeholders are operational and stay
+  - A name nothing supplies — an unset key, two primary targets, a name this version does not know — becomes the visible blank `[FILL IN: name]`, never a guess; `\{{` writes the braces literally
+  - Written atomically (mode 0644) only when the text differs, so a current guide is not rewritten nightly; a symlink at the destination is refused; `author-*.md` and other files are never templates; no directory, no documents
+  - `--templates DIR` names another template directory; `docs refresh` now has a man page entry
+  - Documented in `docs/INSTALL.md`, `docs/ARCHITECTURE.md`, the Disaster Recovery Guide and `btrdasd(1)`
+
 - **`[recovery_os].timezone` — the time zone of a rebuilt recovery OS** (bd `DAS-Backup-Manager-cnjc`): `recovery-os-install.sh` linked the author's zone into every drive it built
   - An IANA name such as `Europe/Berlin`; `Config::validate` refuses a name that is not letters, digits, `_` `+` `-` and `/` or not a zone file under `/usr/share/zoneinfo` on the machine that validates, and `config validate` no longer warns the key is unknown
   - `btrdasd config dump-env` exports `DAS_RECOVERY_OS_TIMEZONE` only when set; `provision` passes it as `DAS_INSTALL_TIMEZONE`, and `configure` refuses, before writing anything, a name that is not a zone file in the new OS

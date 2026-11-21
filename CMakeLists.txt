@@ -214,6 +214,17 @@ endif()
 
 install(FILES docs/btrdasd.1 DESTINATION share/man/man1)
 
+# The three recovery guides, as templates: `btrdasd docs refresh` renders them
+# into the installation's local docs directory (bd DAS-Backup-Manager-riwa).
+# Only these three live here: the render takes every *.md in the directory.
+install(
+    FILES
+        docs/DISASTER-RECOVERY-GUIDE.md
+        docs/EMERGENCY-QUICK-REFERENCE.md
+        docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
+    DESTINATION share/das-backup/docs
+)
+
 # =============================================================================
 # Shell completions (generated at build time, installed as files)
 # =============================================================================
