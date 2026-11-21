@@ -355,7 +355,7 @@ newest() {
     for i in "${g[@]}"; do
         stamp=${i##*/}
         stamp=${stamp#"$1".}
-        [[ -e "$i" && "$stamp" =~ ^[0-9]{8}T[0-9]{4}([0-9]{2})?(_[0-9]+)?$ ]] && c+=("$i")
+        [[ -e "$i" && "$stamp" =~ ^[[:digit:]]{8}T[[:digit:]]{4}([[:digit:]]{2})?(_[[:digit:]]+)?$ ]] && c+=("$i")
     done
     [[ ${#c[@]} -gt 0 ]] || return 0
     mapfile -t c < <(printf '%s\n' "${c[@]}" | LC_ALL=C sort -r)
