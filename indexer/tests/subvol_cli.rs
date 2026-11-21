@@ -1131,11 +1131,20 @@ fn btrdasd_handed(
         .env("DAS_BACKUP_LOCK", lock)
         .env("DAS_BACKUP_LOCK_FD", fd_env);
     if let Some(fd) = fd {
-        // SAFETY: dup2 is async-signal-safe; the new descriptor 9 shares
-        // `fd`'s open file description and is not close-on-exec.
+        // SAFETY: dup2 and fcntl are async-signal-safe; the new descriptor 9
+        // shares `fd`'s open file description and is not close-on-exec.
+        // When `fd` already is 9, dup2(9, 9) changes nothing and leaves Rust's
+        // close-on-exec flag set, so exec would close it: clear the flag
+        // instead (a CI flake whenever the parent's lock file landed on 9).
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(fd, 9) < 0 {
+                let ok = if fd == 9 {
+                    let flags = libc::fcntl(9, libc::F_GETFD);
+                    flags >= 0 && libc::fcntl(9, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0
+                } else {
+                    libc::dup2(fd, 9) >= 0
+                };
+                if !ok {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
