@@ -2520,7 +2520,38 @@ mount shadows the disk's copy at boot \(em so it is unknown. So is one under
 or
 .IR /sys ,
 which only a running system fills \(em something at boot may put it there
-\(em and one reached through a link that lives in such a place. So is
+\(em and one reached through a link that lives in such a place, unless the
+image itself declares it: a path under
+.I /run
+that exactly one line of its
+.IR tmpfiles.d (5)
+files
+.RI ( etc/tmpfiles.d ,
+.IR usr/local/lib/tmpfiles.d ,
+.IR usr/lib/tmpfiles.d ;
+a name in a higher one replaces the same name below it) makes, as a file
+.RB ( f ,
+.BR f+ ;
+its argument the content, read like a script on disk when it is one) or a
+directory
+.RB ( d ),
+is read as that, with no mount point over it (a directory is nothing to run).
+.I /var/run
+and
+.I /var/lock
+are
+.I /run
+here. It stays unknown when another line names it, a parent or a glob that may
+match it (any type but a plain
+.B d
+for a parent), when a specifier, a quote, an escape this does not read or
+\fB..\fR is in the line, or when any tmpfiles.d file, or a directory of them,
+cannot be read. It rests on the limit below for what is put in place at boot:
+a path declared there is still unknown to a service, the initramfs or a
+.I /run/tmpfiles.d
+that writes it besides
+.BR systemd\-tmpfiles .
+So is
 anything not here when that fstab cannot be read. A unit tree under such a
 mount point may hold any unit at boot, whatever its copy here lists, and
 with no copy here at all: a unit not found in a tree above it, and any

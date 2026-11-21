@@ -75,7 +75,11 @@
 //! running system fills (`/run`…), by its path or through a link on the way,
 //! is not what it will see there, so it is unknown — a unit tree under one
 //! may hold any unit. A word that is not there, and nowhere boot could see
-//! another, is nothing to run.
+//! another, is nothing to run. One exception under `/run`: what the image's
+//! own `tmpfiles.d` makes there — one plain `f`/`f+`/`d` line, nothing else
+//! naming it, a parent or a glob matching it ([`tmpfiles`]) — is read as the
+//! file (a script too) or directory it makes, on the limit below for what a
+//! running system puts in place.
 //!
 //! Not read, so a `no` holds only within it (the man page lists each in
 //! plain words): a program named through a variable or in an option's
@@ -95,6 +99,8 @@
 //! hides it; units generators create at boot (and `systemd.unit=` on the kernel
 //! command line), units udev, D-Bus or mounts start, user units and user
 //! managers, and `/etc/rc.local`.
+
+mod tmpfiles;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -968,6 +974,9 @@ struct Mounts {
     points: Vec<(String, String)>,
     /// Why its fstab could not be read, if it could not.
     fstab: Option<String>,
+    /// What its tmpfiles.d declares under `/run` (bd DAS-Backup-Manager-3nb);
+    /// `None` where none was read.
+    declared: Option<tmpfiles::Declarations>,
 }
 
 impl Mounts {
@@ -1099,7 +1108,13 @@ fn read_mounts(root: &Path, trees: &[Tree], enabled: &EnabledUnits, probe: Mount
         }
         points.push((point, name));
     }
-    Mounts { points, fstab }
+    let mut mounts = Mounts {
+        points,
+        fstab,
+        declared: None,
+    };
+    mounts.declared = Some(tmpfiles::read_declarations(root, probe, &mounts));
+    mounts
 }
 
 /// What an absolute path a command names is, for whether it runs btrbk.
@@ -1151,9 +1166,18 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
         return Program::Other;
     }
     if let Some(dir) = VOLATILE.iter().find(|v| under(rel, v)) {
-        return Program::Unknown(format!(
-            "{path}: under /{dir}, which only a running system fills"
-        ));
+        // What the image's own tmpfiles.d makes there at boot is a file or a
+        // directory this reads as it would on disk (bd DAS-Backup-Manager-3nb).
+        if let Some(why) = mounts.covers(rel) {
+            return Program::Unknown(why);
+        }
+        return match mounts.declared.as_ref().and_then(|d| d.entry(rel)) {
+            Some(tmpfiles::Entry::Dir) => Program::Other,
+            Some(tmpfiles::Entry::File(text)) => program_from_text(text, role),
+            None => Program::Unknown(format!(
+                "{path}: under /{dir}, which only a running system fills"
+            )),
+        };
     }
     if let Some(why) = mounts.covers(rel) {
         return Program::Unknown(why);
@@ -1242,11 +1266,7 @@ fn read_script(root: &Path, rel: &str, role: Role) -> Program {
     if let Err(e) = (&mut file).take(4).read_to_end(&mut head) {
         return Program::Unknown(format!("{rel}: {e}"));
     }
-    let script = match role {
-        Role::Script | Role::Code => !head.starts_with(b"\x7fELF"),
-        Role::Program | Role::Argument | Role::Inert => head.starts_with(b"#!"),
-    };
-    if !script {
+    if !is_script(&head, role) {
         return Program::Other;
     }
     let mut text = Vec::new();
@@ -1262,13 +1282,37 @@ fn read_script(root: &Path, rel: &str, role: Role) -> Program {
     if read > MAX_READ_BYTES {
         return Program::Unknown(format!("{rel}: larger than 64 KiB, not read"));
     }
-    let text = String::from_utf8_lossy(&text).into_owned();
+    program_of(String::from_utf8_lossy(&text).into_owned(), role)
+}
+
+/// Whether a file starting with `head` is read as a script run as `role`.
+fn is_script(head: &[u8], role: Role) -> bool {
+    match role {
+        Role::Script | Role::Code => !head.starts_with(b"\x7fELF"),
+        Role::Program | Role::Argument | Role::Inert => head.starts_with(b"#!"),
+    }
+}
+
+/// A script's whole text, run as `role` ([`read_script`]).
+fn program_of(text: String, role: Role) -> Program {
     match role {
         Role::Script => Program::Script(text),
         Role::Code => Program::Code(text),
         _ if runs_sh(&text) => Program::Script(text),
         _ => Program::Code(text),
     }
+}
+
+/// A file the image's tmpfiles.d makes, `text` its content, run as `role`:
+/// read as [`read_script`] reads one on disk.
+fn program_from_text(text: String, role: Role) -> Program {
+    if !is_script(text.as_bytes(), role) {
+        return Program::Other;
+    }
+    if text.len() as u64 > MAX_READ_BYTES {
+        return Program::Unknown("a file its tmpfiles.d line makes, larger than 64 KiB".into());
+    }
+    program_of(text, role)
 }
 
 /// Whether a script's `#!` line runs a shell: its interpreter — or the
@@ -4553,6 +4597,7 @@ mod tests {
     const UNMOUNTED: Mounts = Mounts {
         points: Vec::new(),
         fstab: None,
+        declared: None,
     };
     /// Links read, as on a `noatime` mount — where every DAS target is.
     const FOLLOW: MountFlags = |_| Some(libc::ST_NOATIME);
@@ -11158,5 +11203,271 @@ mod tests {
         assert!(lines[1] == "echo after", "{lines:?}");
         // Still an error when it really never closes.
         assert!(shell_lines("printf $'open\n").is_err());
+    }
+
+    // ---- bd DAS-Backup-Manager-3nb: what the image itself puts under /run ----
+
+    /// systemd's mkinitcpio shutdown unit, in the shape CachyOS ships it.
+    const SHUTDOWN_UNIT: &str = "[Unit]\nDescription=Generate shutdown-ramfs\n\
+        ConditionPathExists=/run/initramfs/mkinitcpio-shutdown.conf\n\n[Service]\nType=oneshot\n\
+        RuntimeDirectory=initcpio-tmp\n\
+        ExecStart=/usr/bin/mkinitcpio -c /run/initramfs/mkinitcpio-shutdown.conf \
+        -d /run/initramfs -k none -t ${RUNTIME_DIRECTORY}\n";
+    /// mkinitcpio's own tmpfiles.d file, in the shape it ships it.
+    const SHUTDOWN_TMPFILES: &str = "# Create /run/initramfs for shutdown\n\
+        d /run/initramfs 0755 root root\n\n# Create config for shutdown ramfs\n\
+        f+ /run/initramfs/mkinitcpio-shutdown.conf 0644 root root - HOOKS=(sd-shutdown)\\n\n";
+
+    /// A CachyOS desktop root whose `/boot` is the ESP, mounted from elsewhere, with
+    /// mkinitcpio's shutdown unit enabled and its tmpfiles.d file in place.
+    fn shutdown_ramfs_root(root: &Path) {
+        cachyos_mounted(root);
+        let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
+        write(
+            root,
+            "etc/fstab",
+            &format!("{fstab}UUID=e /boot vfat umask=0077 0 2\n"),
+        );
+        binary(root, "usr/bin/mkinitcpio");
+        unit(
+            root,
+            VENDOR,
+            "mkinitcpio-generate-shutdown-ramfs.service",
+            SHUTDOWN_UNIT,
+        );
+        enable(
+            root,
+            ETC,
+            "multi-user.target.wants",
+            "mkinitcpio-generate-shutdown-ramfs.service",
+        );
+        write(
+            root,
+            "usr/lib/tmpfiles.d/20-mkinitcpio.conf",
+            SHUTDOWN_TMPFILES,
+        );
+    }
+
+    /// The shutdown unit's one command replaced by `exec`.
+    fn shutdown_runs(root: &Path, exec: &str) {
+        unit(
+            root,
+            VENDOR,
+            "mkinitcpio-generate-shutdown-ramfs.service",
+            &format!("[Service]\nExecStart={exec}\n"),
+        );
+    }
+
+    #[test]
+    fn a_path_the_image_s_tmpfiles_declares_under_run_is_what_boot_puts_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn a_path_under_run_no_tmpfiles_line_declares_still_may_be_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        // The directory is declared, what is in it is not.
+        shutdown_runs(root, "/usr/bin/mkinitcpio -k /run/initramfs/shutdown");
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("/run/initramfs/shutdown")),
+            "{reasons:?}"
+        );
+        // With no tmpfiles file at all, the declared pair reads as it did.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        fs::remove_file(root.join("usr/lib/tmpfiles.d/20-mkinitcpio.conf")).unwrap();
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("/run/initramfs/mkinitcpio-shutdown.conf")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_the_image_s_tmpfiles_writes_under_run_is_read_and_runs_btrbk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        write(
+            root,
+            "usr/lib/tmpfiles.d/50-job.conf",
+            "f+ /run/job 0755 root root - #!/bin/sh\\nbtrbk run\\n\n",
+        );
+        shutdown_runs(root, "/run/job");
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::Will, "{reasons:?}");
+    }
+
+    #[test]
+    fn the_tmpfiles_file_that_wins_by_name_is_the_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        // /etc's file of the same name replaces the package's: here with a script.
+        write(
+            root,
+            "etc/tmpfiles.d/20-mkinitcpio.conf",
+            "d /run/initramfs 0755 root root\n\
+             f+ /run/initramfs/mkinitcpio-shutdown.conf 0644 root root - #!/bin/sh\\nbtrbk run\\n\n",
+        );
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::Will, "{reasons:?}");
+        // Masked there, the package's file is gone: nothing is declared.
+        fs::remove_file(root.join("etc/tmpfiles.d/20-mkinitcpio.conf")).unwrap();
+        link(root, "etc/tmpfiles.d/20-mkinitcpio.conf", "/dev/null");
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+    }
+
+    #[test]
+    fn a_second_line_for_the_path_or_a_parent_leaves_it_to_that_os() {
+        for extra in [
+            "w /run/initramfs/mkinitcpio-shutdown.conf - - - - echo\\n",
+            "w+ /run/initramfs/mkinitcpio-shutdown.conf - - - - echo\\n",
+            "L+ /run/initramfs/mkinitcpio-shutdown.conf - - - - /tmp/x",
+            "C /run/initramfs/mkinitcpio-shutdown.conf - - - - /usr/share/x",
+            "f /run/initramfs/mkinitcpio-shutdown.conf 0644 root root - X=1",
+            "r /run/initramfs/mkinitcpio-shutdown.conf",
+            "L+ /run/initramfs - - - - /root/elsewhere",
+            "R /run/initramfs",
+            "z /run/initramfs/mkinitcpio-shutdown.conf 0755",
+            "R /run/init*",
+            "x /run/initramfs/*",
+            "w /run/initramfs/mk[i]nitcpio-shutdown.conf - - - - X",
+            "w /var/run/initramfs/mkinitcpio-shutdown.conf - - - - X",
+            "w %t/initramfs/mkinitcpio-shutdown.conf - - - - X",
+            "w /run/initramfs/../initramfs/mkinitcpio-shutdown.conf - - - - X",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            shutdown_ramfs_root(root);
+            write(
+                root,
+                "usr/lib/tmpfiles.d/30-more.conf",
+                &format!("{extra}\n"),
+            );
+            let (verdict, reasons) = verdict_of(root);
+            assert_eq!(verdict, BootVerdict::May, "{extra}: {reasons:?}");
+        }
+        // A line that touches nothing under /run changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        write(
+            root,
+            "usr/lib/tmpfiles.d/30-more.conf",
+            "w /var/lib/x - - - - X\nR /tmp/*\nd /run/other 0755\nx /var/lib/*\n",
+        );
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn a_tmpfiles_file_that_cannot_be_read_declares_nothing() {
+        // Over 64 KiB: not read in part.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        write(
+            root,
+            "usr/lib/tmpfiles.d/30-big.conf",
+            &format!("# {}\n", "x".repeat(70_000)),
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // A link that cannot be read here (a mount that records access times).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        link(
+            root,
+            "usr/lib/tmpfiles.d/30-link.conf",
+            "20-mkinitcpio.conf",
+        );
+        let r = read_refusing(root);
+        assert_eq!(
+            r.at_boot.verdict,
+            BootVerdict::May,
+            "{:?}",
+            r.at_boot.reasons
+        );
+        // One of the directories is no directory.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        write(root, "etc/tmpfiles.d", "not a directory");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+    }
+
+    #[test]
+    fn a_tmpfiles_argument_with_a_specifier_a_quote_or_an_unknown_escape_is_not_read() {
+        for arg in ["#!/bin/sh\\nbtrbk %b\\n", "\"X\"", "X\\q", "X\\x4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            shutdown_ramfs_root(root);
+            write(
+                root,
+                "usr/lib/tmpfiles.d/20-mkinitcpio.conf",
+                &format!(
+                    "d /run/initramfs 0755 root root\n\
+                     f+ /run/initramfs/mkinitcpio-shutdown.conf 0644 root root - {arg}\n"
+                ),
+            );
+            let (verdict, reasons) = verdict_of(root);
+            assert_eq!(verdict, BootVerdict::May, "{arg}: {reasons:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_image_declares_through_the_alias_of_run_is_read_as_well() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        write(
+            root,
+            "usr/lib/tmpfiles.d/50-job.conf",
+            "f+ /var/run/job 0755 root root - #!/bin/sh\\nbtrbk run\\n\n",
+        );
+        shutdown_runs(root, "/run/job");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+    }
+
+    #[test]
+    fn a_function_s_argument_under_boot_stays_unknown_in_mkinitcpio_s_own_script() {
+        // mkinitcpio's script calls its own function with "/boot/vmlinuz-linux": a
+        // function may run what it is given, so what is under /boot (the ESP, which
+        // this never reads) stays unknown (bd DAS-Backup-Manager-3nb).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        shutdown_ramfs_root(root);
+        fs::remove_file(root.join("usr/bin/mkinitcpio")).unwrap();
+        script(
+            root,
+            "usr/bin/mkinitcpio",
+            "want_file() {\n    local -n var=\"$1\"\n}\n\
+             want_file kernelimg 'kernel image' \"$KERNELIMAGE\" \"/boot/vmlinuz-linux\" || return\n",
+        );
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!(verdict, BootVerdict::May, "{reasons:?}");
+        assert!(
+            reasons.iter().all(|r| !r.contains("/run/")),
+            "only /boot is left: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("/boot/vmlinuz-linux")),
+            "{reasons:?}"
+        );
     }
 }
