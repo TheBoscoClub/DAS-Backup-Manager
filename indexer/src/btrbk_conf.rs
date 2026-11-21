@@ -566,6 +566,56 @@ pub fn source_subdir(source: &crate::config::Source) -> &str {
         .map_or(source.label.as_str(), String::as_str)
 }
 
+/// The subvolume the state pass sends after indexing (bd DAS-Backup-Manager-9eq9).
+pub const STATE_SUBVOLUME: &str = "@/var/lib/das-backup";
+
+/// Where a recovery drive finds the host's newest root and state snapshots
+/// among what the backup runs received: the directory under the target
+/// ([`source_subdir`]) and the two snapshot names as btrbk was given them
+/// ([`resolve_snapshot_names`]); the snapshots are `<root>.<stamp>` and
+/// `<state>.<stamp>` in it. Provisioning writes them into the drive's marker
+/// (bd DAS-Backup-Manager-pzj6).
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecoverySeries {
+    pub subdir: String,
+    pub root: String,
+    pub state: String,
+}
+
+/// The [`RecoverySeries`] of a configuration, or `None` when it is not
+/// unambiguous: the host root is the one live `@` entry of exactly one source,
+/// and the state series is that same source's one live `after_index`
+/// [`STATE_SUBVOLUME`] entry (it is sent to the same directory). Never a
+/// guess: more than one candidate, or none, is `None`.
+pub fn recovery_series(config: &Config) -> Option<RecoverySeries> {
+    let live = |sv: &SubvolConfig| sv.retired.is_none();
+    let mut roots = config
+        .sources
+        .iter()
+        .filter(|s| s.subvolumes.iter().any(|sv| live(sv) && sv.name == "@"));
+    let source = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    let names = resolve_snapshot_names(&source.subvolumes);
+    let pick = |want: &dyn Fn(&SubvolConfig) -> bool| -> Option<String> {
+        let mut hits = source
+            .subvolumes
+            .iter()
+            .zip(&names)
+            .filter(|(sv, _)| live(sv) && want(sv));
+        let (_, name) = hits.next()?;
+        hits.next().is_none().then(|| name.clone())
+    };
+    let root = pick(&|sv| sv.name == "@" && !sv.after_index)?;
+    let state = pick(&|sv| sv.name == STATE_SUBVOLUME && sv.after_index)?;
+    Some(RecoverySeries {
+        subdir: source_subdir(source).to_string(),
+        root,
+        state,
+    })
+}
+
 /// A directory as written in `config.toml`, in one spelling: repeated `/`
 /// collapsed, `.` components and a trailing `/` dropped (`/vol/` and `/vol`,
 /// `./ssd/` and `ssd` are each one directory). Text only — the filesystem is
@@ -2251,6 +2301,62 @@ enabled = false
                 .iter()
                 .all(|p| p.snapshot_name != "das-state")
         );
+    }
+
+    #[test]
+    fn recovery_series_names_what_btrbk_was_given_not_a_fixed_spelling() {
+        let mut cfg = test_config();
+        cfg.sources[0].target_subdirs = vec!["hostdir".into(), "second".into()];
+        cfg.sources[0].subvolumes[0].snapshot_name = Some("hostroot".into());
+        let mut st = state_entry();
+        st.snapshot_name = Some("keepstate".into());
+        cfg.sources[0].subvolumes.push(st);
+        assert_eq!(
+            recovery_series(&cfg),
+            Some(RecoverySeries {
+                subdir: "hostdir".into(),
+                root: "hostroot".into(),
+                state: "keepstate".into(),
+            })
+        );
+        // No target_subdirs: the source label; no snapshot_name: btrbk's own.
+        cfg.sources[0].target_subdirs.clear();
+        cfg.sources[0].subvolumes[0].snapshot_name = None;
+        let got = recovery_series(&cfg).unwrap();
+        assert_eq!(
+            (got.subdir.as_str(), got.root.as_str()),
+            ("nvme-root", "root")
+        );
+    }
+
+    #[test]
+    fn recovery_series_is_none_when_it_is_not_unambiguous() {
+        let with_state = || {
+            let mut cfg = test_config();
+            cfg.sources[0].subvolumes.push(state_entry());
+            cfg
+        };
+        assert!(recovery_series(&with_state()).is_some());
+        // No state entry.
+        assert!(recovery_series(&test_config()).is_none());
+        // The state entry is not after_index.
+        let mut cfg = with_state();
+        cfg.sources[0].subvolumes[2].after_index = false;
+        assert!(recovery_series(&cfg).is_none());
+        // A retired state entry is not live.
+        let mut cfg = with_state();
+        cfg.sources[0].subvolumes[2].retired = Some("2026-01-01".into());
+        assert!(recovery_series(&cfg).is_none());
+        // Two sources hold a live `@`.
+        let mut cfg = with_state();
+        let mut second = cfg.sources[0].clone();
+        second.label = "other".into();
+        cfg.sources.push(second);
+        assert!(recovery_series(&cfg).is_none());
+        // No `@` at all.
+        let mut cfg = with_state();
+        cfg.sources[0].subvolumes[0].name = "@root".into();
+        assert!(recovery_series(&cfg).is_none());
     }
 
     #[test]

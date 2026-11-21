@@ -63,12 +63,13 @@ echo "arch-chroot $*" >>"$STUB_LOG"
 if [[ "$2" == btrdasd ]]; then
     # The real arch-chroot mounts fresh /tmp, /run, /dev, /proc and /sys over the
     # target's (bd eg4j.6): a file put there from outside is not seen inside.
-    root=$1 cfg=""
+    root=$1 cfg="" sub=$3
     while (($#)); do [[ "$1" == --config ]] && cfg=$2; shift; done
     case "$cfg" in
         /tmp/* | /run/* | /dev/* | /proc/* | /sys/*) echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2 ;;
     esac
     [[ -f "$root$cfg" ]] || { echo "Error: cannot read $cfg: No such file or directory (os error 2)"; exit 2; }
+    if [[ "$sub" == config ]]; then cat "$STUB_DUMPENV"; exit "${STUB_DUMPENV_RC:-0}"; fi
     cat "$STUB_INSPECT"; exit "${STUB_INSPECT_RC:-0}"
 fi
 EOF
@@ -127,6 +128,7 @@ fixture() {
         mkdir -p "$R/mnt/top/$s"; echo "ro received" >"$R/mnt/top/$s/.subvol"
     done
     printf '5eed0008-0000-4000-8000-000000000008\n' >"$WORK/blkid.out"
+    printf "DAS_VERSION='1'\nDAS_RECOVERY_SUBDIR='hostdir'\nDAS_RECOVERY_ROOT_SERIES='hostroot-'\nDAS_RECOVERY_STATE_SERIES='keepstate'\n" >"$WORK/dumpenv.out"
     printf 'RECOVERY OS\n  system-recovery-A-2tb  (/)\n    btrbk config        /etc/btrbk/btrbk.conf (1 byte)\n    btrbk at boot       no — btrbk.timer masked\n' >"$WORK/inspect.out"
     printf 'pkg\n' >"$R/payload/das-backup-manager-0.7.23.0-1-x86_64.pkg.tar.zst"
     printf 'ssh-ed25519 AAAA test\n' >"$R/payload/authorized_keys"
@@ -135,7 +137,7 @@ fixture() {
 run() { # <step> [VAR=value ...]
     local step=$1; shift
     RC=0; : >"$WORK/findcount"
-    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" FIX_TOP="$R/mnt/top" STUB_BLKID="$WORK/blkid.out" STUB_INSPECT="$WORK/inspect.out" STUB_PARTUUID="$WORK/partuuid.out" STUB_P1UUID="$WORK/p1uuid.out" STUB_FINDCOUNT="$WORK/findcount" \
+    OUT=$(env PATH="$BIN:$PATH" STUB_LOG="$LOG" FIX_TOP="$R/mnt/top" STUB_BLKID="$WORK/blkid.out" STUB_INSPECT="$WORK/inspect.out" STUB_DUMPENV="$WORK/dumpenv.out" STUB_PARTUUID="$WORK/partuuid.out" STUB_P1UUID="$WORK/p1uuid.out" STUB_FINDCOUNT="$WORK/findcount" \
         FIX_ESP="$R/mnt/esp-old" DAS_INSTALL_ESP_MNT="$R/mnt/esp-old" DAS_INSTALL_ESP_PARTUUID=aaaaaaaa-01 \
         DAS_INSTALL_CONFIG="$R/payload/config.toml" DAS_INSTALL_CP="$BIN/cpwrap" \
         DAS_INSTALL_SYNC="$BIN/sync" DAS_INSTALL_MV="$BIN/mvwrap" STUB_MVCOUNT="$WORK/mvcount" STUB_REQUIRE_MANIFEST=1 \
@@ -431,6 +433,11 @@ check "package: the payload copy removed from the target" test ! -e "$R/mnt/targ
 check "package: marker written" test -f "$R/mnt/target/etc/das-backup/recovery-drive"
 check "package: marker names the drive" has "$R/mnt/target/etc/das-backup/recovery-drive" "label=system-recovery-A-2tb"
 check "package: marker names the bay (D9 reads it)" has "$R/mnt/target/etc/das-backup/recovery-drive" "bay=1"
+check "package: marker names where the root snapshots are (the sync reads it)" has "$R/mnt/target/etc/das-backup/recovery-drive" "target_subdir=hostdir"
+check "package: marker names the root series" has "$R/mnt/target/etc/das-backup/recovery-drive" "root_series=hostroot-"
+check "package: marker names the state series" has "$R/mnt/target/etc/das-backup/recovery-drive" "state_series=keepstate"
+check "package: values read by the installed btrdasd in the chroot" has "$LOG" "arch-chroot $R/mnt/target btrdasd config dump-env --config /root/das-install-series.toml"
+check "package: the config copy removed from the target" test ! -e "$R/mnt/target/root/das-install-series.toml"
 check "package: the sync unit installed into etc" test -f "$R/mnt/target/etc/systemd/system/das-recovery-state-sync.service"
 check "package: the sync unit enabled" has "$LOG" "systemctl enable das-recovery-state-sync.service"
 for u in das-backup.timer das-backup-full.timer das-scrub.timer das-backup-doctor.timer btrbk.timer btrbk.service; do
@@ -442,6 +449,24 @@ check "package: Recovery Guide on the Desktop" test "$(readlink "$R/mnt/target/h
 check "package: Storage architecture on the Desktop" test "$(readlink "$R/mnt/target/home/recovery/Desktop/STORAGE-ARCHITECTURE-AND-RECOVERY.md")" = /usr/share/das-backup/docs/STORAGE-ARCHITECTURE-AND-RECOVERY.md
 check "package, no local documents: nothing at /etc/das-backup-docs" test ! -e "$R/mnt/target/etc/das-backup-docs"
 check "package, no local documents: nothing at the old /etc/das-backup/docs" test ! -e "$R/mnt/target/etc/das-backup/docs"
+
+echo "== package: a host config that does not name the series refuses, writing no marker"
+for bad in "" "DAS_RECOVERY_SUBDIR='hostdir'\nDAS_RECOVERY_ROOT_SERIES='r-'\n" \
+    "DAS_RECOVERY_SUBDIR='a'\nDAS_RECOVERY_ROOT_SERIES='r-'\nDAS_RECOVERY_STATE_SERIES=''\n" \
+    "DAS_RECOVERY_SUBDIR='a'\nDAS_RECOVERY_ROOT_SERIES='../x'\nDAS_RECOVERY_STATE_SERIES='s'\n" \
+    "DAS_RECOVERY_SUBDIR='a'\nDAS_RECOVERY_ROOT_SERIES='r/x'\nDAS_RECOVERY_STATE_SERIES='s'\n" \
+    "DAS_RECOVERY_SUBDIR='/abs'\nDAS_RECOVERY_ROOT_SERIES='r'\nDAS_RECOVERY_STATE_SERIES='s'\n"; do
+    fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
+    printf '[Unit]\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
+    printf "%b" "$bad" >"$WORK/dumpenv.out"
+    run package
+    check "series '${bad//\\n/ }': refused (exit 3)" test "$RC" -eq 3
+    check "series '${bad//\\n/ }': no marker written" test ! -e "$R/mnt/target/etc/das-backup/recovery-drive"
+done
+fixture; mkdir -p "$R/mnt/target/usr/lib/das-backup"
+printf '[Unit]\n' >"$R/mnt/target/usr/lib/das-backup/das-recovery-state-sync.service"
+run package STUB_DUMPENV_RC=2
+check "series: dump-env failing (exit 2) is a failed step, no marker" test "$RC" -eq 2 -a ! -e "$R/mnt/target/etc/das-backup/recovery-drive"
 
 echo "== package: the installation's own documents (DAS_INSTALL_LOCAL_DOCS, installed at DAS_INSTALL_LOCAL_DOCS_DEST)"
 package_fixture() {

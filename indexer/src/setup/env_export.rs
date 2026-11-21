@@ -116,6 +116,15 @@ pub fn dump_env(config: &Config) -> String {
         out.push_str(&kv("DAS_RECOVERY_OS_REPO_LEVEL", level));
     }
 
+    // Where a recovery drive finds the host's newest root and state snapshots:
+    // absent when the configuration does not name exactly one of each, so
+    // provision can refuse "not determinable" (bd DAS-Backup-Manager-pzj6).
+    if let Some(series) = buttered_dasd::btrbk_conf::recovery_series(config) {
+        out.push_str(&kv("DAS_RECOVERY_SUBDIR", &series.subdir));
+        out.push_str(&kv("DAS_RECOVERY_ROOT_SERIES", &series.root));
+        out.push_str(&kv("DAS_RECOVERY_STATE_SERIES", &series.state));
+    }
+
     // Sources (indexed)
     out.push_str(&format!("DAS_SOURCE_COUNT={}\n", config.sources.len()));
     for (i, src) in config.sources.iter().enumerate() {
@@ -299,6 +308,29 @@ mod tests {
         let output = dump_env(&config);
         assert!(
             output.contains("DAS_BTRBK_STATE_CONF='/etc/btrbk/btrbk-state.conf'\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn dump_env_exports_the_recovery_series_only_when_determinable() {
+        let mut config = test_config();
+        assert!(!dump_env(&config).contains("DAS_RECOVERY_SUBDIR"));
+        config.sources[0].subvolumes.push(SubvolConfig {
+            name: "@/var/lib/das-backup".to_string(),
+            snapshot_name: Some("keepstate".to_string()),
+            after_index: true,
+            ..Default::default()
+        });
+        config.sources[0].subvolumes[0].snapshot_name = Some("hostroot".to_string());
+        let output = dump_env(&config);
+        assert!(output.contains("DAS_RECOVERY_SUBDIR='nvme'\n"), "{output}");
+        assert!(
+            output.contains("DAS_RECOVERY_ROOT_SERIES='hostroot'\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("DAS_RECOVERY_STATE_SERIES='keepstate'\n"),
             "{output}"
         );
     }

@@ -33,6 +33,7 @@ file_lacks() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
 out_has() { grep -qF -- "$1" <<<"$OUT"; }
 status_is() { [[ "$(cat "$R/run/das-recovery-state/status" 2>/dev/null)" == "$1" ]]; }
 no_leftovers() { test ! -e "$R/.das-recovery-state/next" -a ! -e "$R/.das-recovery-state/previous" -a ! -e "$R/etc/das-backup/config.toml.new"; }
+no_writes() { file_lacks "$LOG" "subvolume snapshot" && file_lacks "$LOG" "subvolume delete"; }
 no_walk() { file_lacks "$LOG" " walk "; } # the catch-up (systemd-run also starts the set-aside removal)
 
 mkdir -p "$BIN"
@@ -170,7 +171,7 @@ fixture() {
     rm -f "${WORK:?}/mv-count" "${WORK:?}/calls.log.mounted" "${WORK:?}/calls.log.state-mounted" "${WORK:?}/timings" "${WORK:?}/booted"
     mkdir -p "$R/etc/das-backup" "$R/run" "$R/var/lib/das-backup" \
         "$R/nvme/root-.20261012T0348/etc/das-backup" "$R/nvme/das-state.20261012T0348"
-    printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\n' >"$R/etc/das-backup/recovery-drive"
+    printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\ntarget_subdir=nvme\nroot_series=root-\nstate_series=das-state\n' >"$R/etc/das-backup/recovery-drive"
     echo previous >"$R/var/lib/das-backup/previous"
     echo "# host config" >"$R/nvme/root-.20261012T0348/etc/das-backup/config.toml"
     echo db-0348 >"$R/nvme/das-state.20261012T0348/backup-index.db"
@@ -533,7 +534,7 @@ check "d9 derive fails: no total written (a failed boot measures nothing)" test 
 check "d9 derive fails: status still the failure" grep -q '^failed: derive-recovery refused' "$R/run/das-recovery-state/status"
 
 echo "== D9: a marker with no bay line"
-fixture; printf 'hand-made\n' >"$R/etc/das-backup/recovery-drive"; run
+fixture; printf 'hand-made\ntarget_subdir=nvme\nroot_series=root-\nstate_series=das-state\n' >"$R/etc/das-backup/recovery-drive"; run
 check "d9 hand-made marker: booted is written with an EMPTY provisioned value" test "$(cat "$WORK/booted")" = "provisioned="
 check "d9 no bay: exit 0" test "$RC" -eq 0
 check "d9 no bay: Bay ?" has "$LOG" "DAS recovery disk, Bay ?."
@@ -612,6 +613,77 @@ echo "x" >"$R/nvme/root-.20261012T0348/etc/x/a.md"
 run STUB_DOCS_DIR="/etc/../etc/x"
 check "a docs path with .. : not copied" test ! -e "$R/etc/x/a.md"
 check "a docs path with .. : sync still exit 0" test "$RC" -eq 0
+
+# The marker names where the host's snapshots are (bd pzj6): the values come
+# from it and nowhere else.
+MARKER_F="$R/etc/das-backup/recovery-drive"
+echo "== series: other names than nvme, root- and das-state are read from the marker"
+fixture
+printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\ntarget_subdir=hostdir\nroot_series=hostroot-\nstate_series=keepstate\n' >"$MARKER_F"
+mv "$R/nvme" "$R/hostdir"
+mv "$R/hostdir/root-.20261012T0348" "$R/hostdir/hostroot-.20261012T0348"
+mv "$R/hostdir/das-state.20261012T0348" "$R/hostdir/keepstate.20261012T0348"
+run
+check "names: exit 0" test "$RC" -eq 0
+check "names: the state snapshotted from the named series" has "$LOG" "btrfs subvolume snapshot $R/hostdir/keepstate.20261012T0348 $R/.das-recovery-state/next"
+check "names: config derived from the named root series" has "$LOG" "--from $R/hostdir/hostroot-.20261012T0348/etc/das-backup/config.toml"
+check "names: the state is live" has "$LIVE/backup-index.db" db-0348
+check "names: status" status_is "synced 20261012T0348"
+fixture
+printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\ntarget_subdir=hostdir\nroot_series=hostroot-\nstate_series=keepstate\n' >"$MARKER_F"
+run
+check "names, drive holds the old names only: refused, nothing guessed" test "$RC" -eq 1
+check "names, old names on disk: status names the missing directory" status_is "failed: no received 'hostdir' directory on this filesystem: not a target that receives the host's root"
+check "names, old names on disk: no snapshot, no swap" file_lacks "$LOG" "btrfs subvolume"
+
+echo "== series: a marker missing one refuses, changing nothing (fail closed)"
+for k in target_subdir root_series state_series; do
+    fixture; prior_live
+    grep -v "^$k=" "$MARKER_F" >"$WORK/marker.new" && mv -f "$WORK/marker.new" "$MARKER_F"
+    run
+    check "no $k: exit 1" test "$RC" -eq 1
+    check "no $k: status names the missing line" grep -q "^failed: the marker .* has no $k= line" "$R/run/das-recovery-state/status"
+    check "no $k: said in the journal" out_has "has no $k= line"
+    check "no $k: no snapshot, no delete" no_writes
+    check "no $k: nothing derived" test ! -e "$R/etc/das-backup/config.toml" -a ! -e "$R/etc/das-backup/config.toml.new"
+    check "no $k: the previous live state is mounted again" has "$LOG" "mount -o subvol=/.das-recovery-state/current,nodev,nosuid,noexec"
+    check "no $k: and it is the earlier one" has "$LIVE/backup-index.db" db-earlier
+    check "no $k: the booted marker is still written" test -f "$WORK/booted"
+    # An inherited variable never stands in for a missing line.
+    fixture
+    grep -v "^$k=" "$MARKER_F" >"$WORK/marker.new" && mv -f "$WORK/marker.new" "$MARKER_F"
+    run DAS_STATE_SYNC_SUBDIR=nvme TARGET_SUBDIR=nvme ROOT_SERIES=root- STATE_SERIES=das-state k="$k"
+    check "no $k, environment set: still refused" test "$RC" -eq 1
+done
+fixture; printf 'label=system-recovery-A-2tb\nbay=1\nprovisioned=20261013-010203\ntarget_subdir=\nroot_series=root-\nstate_series=das-state\n' >"$MARKER_F"
+run
+check "empty target_subdir: refused, not read as the volume's top level" test "$RC" -eq 1
+check "empty target_subdir: no snapshot" file_lacks "$LOG" "btrfs subvolume"
+
+echo "== series: a value that is not a plain name refuses"
+# shellcheck disable=SC2016 # '$x' is a literal value to refuse
+for bad in '..' '../x' '/abs' 'a/../b' 'a//b' '.' 'a b' 'a*' 'a;b' '$x'; do
+    for k in target_subdir root_series state_series; do
+        fixture
+        printf 'bay=1\ntarget_subdir=nvme\nroot_series=root-\nstate_series=das-state\n' >"$MARKER_F"
+        sed -i "s|^$k=.*|$k=$bad|" "$MARKER_F"
+        run
+        check "$k='$bad': refused (exit 1)" test "$RC" -eq 1
+        check "$k='$bad': no snapshot, nothing mounted" file_lacks "$LOG" "btrfs subvolume"
+    done
+done
+for k in root_series state_series; do
+    fixture
+    printf 'bay=1\ntarget_subdir=nvme\nroot_series=root-\nstate_series=das-state\n' >"$MARKER_F"
+    sed -i "s|^$k=.*|$k=a/b|" "$MARKER_F"
+    run
+    check "$k holding a slash: refused" test "$RC" -eq 1
+done
+fixture
+printf 'bay=1\ntarget_subdir=sub/dir\nroot_series=root-\nstate_series=das-state\n' >"$MARKER_F"
+mkdir -p "$R/sub" && mv "$R/nvme" "$R/sub/dir"
+run
+check "target_subdir may be a relative path of plain names" test "$RC" -eq 0
 
 if ((FAILS > 0)); then
     printf '%d check(s) FAILED\n' "$FAILS"

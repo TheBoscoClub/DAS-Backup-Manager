@@ -3,8 +3,8 @@
 # OS. Runs as root INSIDE the CachyOS live system, in the drive's own VM
 # (recovery-os-updater-<label>), driven step by step by recovery-os-vm.sh
 # provision through the guest agent. The host never writes to the drive.
-# Version: 1.5.6
-# Date: 2026-11-18
+# Version: 1.6.0
+# Date: 2026-11-21
 #
 # Steps, in the order the driver runs them:
 #   replace-os       p2 (by UUID) at $TOP: refuse a wrong UUID, a wrong p1
@@ -50,7 +50,12 @@
 # with it: that directory's path, resolved on the host, /etc/das-backup-docs
 # by default; package installs the documents at the same path on the drive,
 # whose config.toml is derived from the host's at boot, and points the Desktop
-# links at them; bd DAS-Backup-Manager-5237.6).
+# links at them; bd DAS-Backup-Manager-5237.6). package also needs
+# DAS_INSTALL_CONFIG: the drive's marker records where the host's newest root and
+# state snapshots are (target_subdir, root_series, state_series), read from that
+# config by the installed btrdasd (config dump-env) and refused when missing or
+# not a plain name; das-recovery-state-sync reads them at every boot
+# (bd DAS-Backup-Manager-pzj6).
 #
 # Deletion and undo act ONLY on names a manifest lists, never on a pattern
 # match: the manifest is written atomically before the first rename.
@@ -483,6 +488,32 @@ doc_path() {
     fi
 }
 
+# marker_series: the three values the sync unit needs to find the host's newest
+# root and state snapshots, from the host's config (DAS_INSTALL_CONFIG) as the
+# INSTALLED btrdasd reads it; sets SERIES_SUBDIR, SERIES_ROOT, SERIES_STATE.
+# Refuses (3) on anything missing or not a plain name: a marker without them
+# makes the sync refuse at every boot.
+SERIES_SUBDIR="" SERIES_ROOT="" SERIES_STATE=""
+marker_series() {
+    local env_text rc k v
+    need CONFIG
+    mkdir -p "$TARGET/root"
+    cp "$CONFIG" "$TARGET/root/das-install-series.toml" || cannot "cannot copy $CONFIG into the target"
+    env_text=$("$CHROOT" "$TARGET" btrdasd config dump-env --config /root/das-install-series.toml 2>/dev/null && printf '\nstatus=0' || printf '\nstatus=%s' "$?")
+    rm -f "${TARGET:?}/root/das-install-series.toml"
+    rc=${env_text##*$'\n'status=}
+    [[ "$env_text" == *$'\n'status=* && "$rc" == 0 ]] || cannot "btrdasd config dump-env in the target exited ${rc:-unknown}: no root and state series for the marker"
+    for k in SUBDIR ROOT_SERIES STATE_SERIES; do
+        v=$(sed -n "s/^DAS_RECOVERY_$k='\(.*\)'\$/\1/p" <<<"$env_text" | head -1)
+        [[ -n "$v" ]] || refuse "the host's configuration names no DAS_RECOVERY_$k (it needs exactly one source holding the root subvolume @ and its after_index state subvolume @/var/lib/das-backup): the drive's marker cannot say where the backups are"
+        # One plain name, or a relative path of them (the subdir): never empty, ., .. or an absolute path.
+        [[ "$v" =~ ^[${ASCII_ALNUM}._-]+(/[${ASCII_ALNUM}._-]+)*$ && ! "$v" =~ (^|/)\.\.?(/|$) ]] ||
+            refuse "DAS_RECOVERY_$k '$v' is not a plain name"
+        [[ "$k" == SUBDIR || "$v" != */* ]] || refuse "DAS_RECOVERY_$k '$v' holds a '/'"
+        case "$k" in SUBDIR) SERIES_SUBDIR=$v ;; ROOT_SERIES) SERIES_ROOT=$v ;; *) SERIES_STATE=$v ;; esac
+    done
+}
+
 step_package() {
     need PACKAGE PKG_SHA LETTER BAY STAMP
     check_account
@@ -494,8 +525,10 @@ step_package() {
     mkdir -p "$TARGET/payload"; cp "$PACKAGE" "$TARGET/payload/" || cannot "cannot copy the package into the target"
     "$CHROOT" "$TARGET" pacman -U --noconfirm "/payload/$(basename "$PACKAGE")" || cannot "pacman -U failed"
     rm -rf "${TARGET:?}/payload"
+    marker_series
     mkdir -p "$etc/das-backup" "$etc/systemd/system" "$etc/xdg/autostart" "$TARGET$desk"
-    printf 'label=system-recovery-%s-2tb\nbay=%s\nprovisioned=%s\n' "$LETTER" "$BAY" "$STAMP" >"$etc/das-backup/recovery-drive"
+    printf 'label=system-recovery-%s-2tb\nbay=%s\nprovisioned=%s\ntarget_subdir=%s\nroot_series=%s\nstate_series=%s\n' \
+        "$LETTER" "$BAY" "$STAMP" "$SERIES_SUBDIR" "$SERIES_ROOT" "$SERIES_STATE" >"$etc/das-backup/recovery-drive"
     [[ -f "$TARGET/usr/lib/das-backup/das-recovery-state-sync.service" ]] || cannot "the package shipped no das-recovery-state-sync.service"
     cp "$TARGET/usr/lib/das-backup/das-recovery-state-sync.service" "$etc/systemd/system/" || cannot "cannot install the sync unit"
     "$CHROOT" "$TARGET" systemctl enable das-recovery-state-sync.service || cannot "cannot enable the sync unit"

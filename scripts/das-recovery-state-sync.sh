@@ -6,8 +6,8 @@
 # /etc/das-backup/config.toml (btrdasd config derive-recovery). Then, only when
 # the state is older than the data (a night the state pass failed), an
 # incremental index catch-up in the background.
-# Version: 2.0.0
-# Date: 2026-11-19
+# Version: 2.1.0
+# Date: 2026-11-21
 #
 # The live state (bd DAS-Backup-Manager-eg4j.10) is a subvolume at the drive's
 # top level, .das-recovery-state/current: each boot a writable snapshot of the
@@ -25,6 +25,16 @@
 # /var/lib/das-backup.migrating, never deleted on the boot path: after "ready",
 # a background unit at idle I/O priority removes it (rm --one-file-system),
 # and a boot that finds it still there starts the removal again.
+#
+# Where the host's snapshots are among what the backup runs received (the
+# directory under the target, the root series' name, the state series' name) is
+# not guessed: provisioning writes target_subdir=, root_series= and
+# state_series= into the marker from the host's configuration (bd
+# DAS-Backup-Manager-pzj6). A marker without one of them, or with one that is
+# not a plain name, is a refusal like any other failure: the previous state
+# stays, the journal and the status say which line is missing, and nothing
+# falls back to a built-in name. The derived config.toml cannot carry them
+# (it has no sources, and on a first boot not yet a file).
 #
 # Never runs on the host: ConditionPathExists=/etc/das-backup/recovery-drive
 # in the unit, and the marker is written only by provisioning. A failure
@@ -100,6 +110,11 @@ DYING=""
 TOP_OK=""        # the top level is mounted and read back as this drive's
 STATE_MOUNTED="" # the live state is mounted at $STATE_DIR and read back
 declare -A PHASE_AT=()
+SUBDIR=""        # the received directory, from the marker's target_subdir=
+ROOT_SERIES=""   # the root snapshots' name, from root_series=
+STATE_SERIES=""  # the state snapshots' name, from state_series=
+# Spelled out, never a bracket range: a range follows the locale's collation.
+ASCII_ALNUM=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
 
 say() { printf '%s\n' "$*"; }
 status() {
@@ -284,10 +299,33 @@ if state_seen=$(mounted_as "$STATE_DIR") && [[ -n "$state_seen" ]]; then
     exit 1
 fi
 
-# The drive's own received directory for the nvme volume: the top-level
-# directory named like the target's subdir.
-dir="$TOP/nvme"
-[[ -d "$dir" ]] || die "no received 'nvme' directory on this filesystem: not a target that receives the host's root"
+# marker_series: the three names the marker carries, read from the marker only
+# (never from the environment), each checked before any path is built from it.
+# One plain name, or for the directory a relative path of them: never empty,
+# never . or .., never absolute.
+marker_series() {
+    local k v
+    for k in target_subdir root_series state_series; do
+        v=$(sed -n "s/^$k=//p" "$MARKER" 2>/dev/null | head -1) || v=""
+        [[ -n "$v" ]] ||
+            die "the marker $MARKER has no $k= line (provisioning writes it from the host's configuration; this drive was provisioned without it): cannot tell where the backups are, state left as it was"
+        [[ "$v" =~ ^[${ASCII_ALNUM}._-]+(/[${ASCII_ALNUM}._-]+)*$ && ! "$v" =~ (^|/)\.\.?(/|$) ]] ||
+            die "the marker's $k= '$v' is not a plain name: state left as it was"
+        [[ "$k" == target_subdir || "$v" != */* ]] ||
+            die "the marker's $k= '$v' holds a '/': state left as it was"
+        case "$k" in
+            target_subdir) SUBDIR=$v ;;
+            root_series) ROOT_SERIES=$v ;;
+            *) STATE_SERIES=$v ;;
+        esac
+    done
+}
+marker_series
+
+# The drive's own received directory for the host's root volume: the
+# top-level directory the marker names.
+dir="$TOP/${SUBDIR:?}"
+[[ -d "$dir" && ! -L "$dir" ]] || die "no received '$SUBDIR' directory on this filesystem: not a target that receives the host's root"
 
 # complete <path>: a finished receive is a read-only subvolume with a
 # Received UUID. A partial receive (interrupted btrfs receive) is writable and
@@ -315,14 +353,14 @@ newest() {
 }
 
 phase find "finding the newest backup"
-state_snap=$(newest das-state)
-root_snap=$(newest root-)
+state_snap=$(newest "${STATE_SERIES:?}")
+root_snap=$(newest "${ROOT_SERIES:?}")
 
-[[ -n "$root_snap" ]] || die "no received root- snapshot: the host's config.toml cannot be derived"
+[[ -n "$root_snap" ]] || die "no received $ROOT_SERIES snapshot: the host's config.toml cannot be derived"
 [[ -r "$root_snap/etc/das-backup/config.toml" ]] || die "the newest root snapshot ${root_snap##*/} has no etc/das-backup/config.toml"
 if [[ -z "$state_snap" ]]; then
     # Not die(): the status word for this case is exactly "no state snapshot".
-    say "das-recovery-state-sync: no received das-state snapshot yet (the next backup run sends one): state left as it was" >&2
+    say "das-recovery-state-sync: no received $STATE_SERIES snapshot yet (the next backup run sends one): state left as it was" >&2
     restore_previous
     phase "done" "no backup received yet"
     status "no state snapshot"
