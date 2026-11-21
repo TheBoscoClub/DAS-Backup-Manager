@@ -1717,8 +1717,8 @@ A recovery drive exists to boot a machine that is **not** the one it was made on
 
 | Drive | Date | Way | Files | Bytes | Duration | Result |
 | --- | --- | --- | --- | --- | --- | --- |
-| A | — | — | — | — | — | not yet proven |
-| B | — | — | — | — | — | not yet proven |
+| A | 2026-11-21 | Way 1 (VM) | 12 files, 1 link | 7,181,255,627 | 81 s | `sha256sum -c` all OK; sparse, hard link and symlink kept |
+| B | 2026-11-21 | Way 1 (VM) | 12 files, 1 link | 7,181,255,627 | 36 s | `sha256sum -c` all OK; sparse, hard link and symlink kept |
 
 ---
 
