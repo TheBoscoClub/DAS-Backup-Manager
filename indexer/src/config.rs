@@ -2878,6 +2878,10 @@ impl Config {
         existing: &str,
         fault: &dyn Fn(&mut String),
     ) -> Result<(String, Vec<String>), String> {
+        // Test builds only: a mutant that loops the splice fails the run
+        // instead of timing it out (bd DAS-Backup-Manager-2kb1.16).
+        #[cfg(feature = "test-overrides")]
+        let _bound = crate::wall_clock::arm("Config::edited_into_with", crate::wall_clock::LIMIT);
         let unchanged = "the file was left unchanged";
         let doc = toml_edit::Document::parse(existing)
             .map_err(|e| format!("the file on disk is not TOML ({e}); {unchanged}"))?;

@@ -26,6 +26,9 @@ pub mod scrub;
 pub mod static_send;
 pub mod subvol;
 pub mod unit_links;
+#[cfg(feature = "test-overrides")]
+#[doc(hidden)]
+pub mod wall_clock;
 
 /// The product version, all four segments, as `CMakeLists.txt` writes it
 /// (`build.rs` reads it there).

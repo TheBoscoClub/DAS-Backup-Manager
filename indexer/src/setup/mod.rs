@@ -235,6 +235,13 @@ fn dispatch(
             // one by the time they are answered. The answers are kept: the
             // operator is asked whether to wait, never made to answer again
             // (bd DAS-Backup-Manager-896).
+            // Test builds only: a mutant that retries a refusal forever fails
+            // the run instead of timing it out (bd DAS-Backup-Manager-2kb1.16).
+            #[cfg(test)]
+            let _bound = buttered_dasd::wall_clock::arm(
+                "dispatch's retry loop",
+                buttered_dasd::wall_clock::LIMIT,
+            );
             loop {
                 let attempt = installer::under_setup_locks(&host.site, job, |held| {
                     // The wizard pre-filled what --modify read; anything written
