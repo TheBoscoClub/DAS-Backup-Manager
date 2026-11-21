@@ -4741,10 +4741,15 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::Duration;
 
-    /// Long enough to be sure a command is blocked, not merely slow to start.
+    /// How long a command that must wait is watched to be sure it is blocked.
+    /// Only the "must wait" checks use it: a starved thread there reads as
+    /// waiting, which is the expected outcome, never a false failure.
     const STILL_WAITING: Duration = Duration::from_millis(300);
-    /// Ample for a command looking every 10 ms to notice a release.
-    const NOTICES: Duration = Duration::from_secs(1);
+    /// Ceiling for a command that must finish (proceed, fail or defer at once).
+    /// It returns the moment the command does, so only a real hang waits this
+    /// long. A short one made a thread starved by host load read as "waited for
+    /// the lock" (bd DAS-Backup-Manager-2kb1.7).
+    const FINISHES: Duration = Duration::from_secs(30);
 
     /// Every log line a command wrote.
     #[derive(Default)]
@@ -4852,7 +4857,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         .map_err(|e| e.to_string())
     }
 
-    /// [`run_cmd`] on a thread: what it returned within `limit`, or `None`
+    /// [`run_cmd`] on a thread: what it returned within [`FINISHES`], or `None`
     /// while it is still running. A command that should not wait, but does,
     /// then fails its test instead of hanging it.
     fn run_cmd_within(
@@ -4860,7 +4865,6 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         cmd: Cmd,
         no_wait: bool,
         delegated: Option<String>,
-        limit: Duration,
     ) -> (Option<Result<Ran, String>>, Arc<Logged>) {
         let logs = Arc::new(Logged::default());
         let (tx, rx) = mpsc::channel();
@@ -4874,7 +4878,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
                 &cmd_logs,
             ));
         });
-        (rx.recv_timeout(limit).ok(), logs)
+        (rx.recv_timeout(FINISHES).ok(), logs)
     }
 
     /// Whether `out` is what the command does once it is past the lock.
@@ -4891,7 +4895,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
     fn proceeds_at_once_when_the_lock_is_free(cmd: Cmd) {
         let rig = LockRig::new();
-        let (out, logs) = run_cmd_within(&rig, cmd, false, None, STILL_WAITING);
+        let (out, logs) = run_cmd_within(&rig, cmd, false, None);
         let out = out.unwrap_or_else(|| panic!("{cmd:?} waited for a free lock"));
         assert_proceeded(cmd, &out);
         assert!(logs.waiting_lines().is_empty(), "nothing to wait for");
@@ -4931,7 +4935,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
 
         drop(holder);
         let out = rx
-            .recv_timeout(NOTICES)
+            .recv_timeout(FINISHES)
             .unwrap_or_else(|_| panic!("{cmd:?} must proceed once the lock is released"));
         assert_proceeded(cmd, &out);
         worker.join().unwrap();
@@ -4940,7 +4944,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
     fn with_no_wait_defers_while_the_lock_is_held(cmd: Cmd) {
         let rig = LockRig::new();
         let holder = rig.hold();
-        let (out, logs) = run_cmd_within(&rig, cmd, true, None, STILL_WAITING);
+        let (out, logs) = run_cmd_within(&rig, cmd, true, None);
         assert_eq!(out, Some(Ok(Ran::Deferred)), "{cmd:?} must defer at once");
         assert!(
             logs.waiting_lines().is_empty(),
@@ -5210,7 +5214,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert_eq!(rc, 0, "the caller holds the lock");
 
         let fd = parent.as_raw_fd().to_string();
-        let (out, logs) = run_cmd_within(&rig, Cmd::Walk, false, Some(fd), STILL_WAITING);
+        let (out, logs) = run_cmd_within(&rig, Cmd::Walk, false, Some(fd));
         assert_eq!(
             out,
             Some(Ok(Ran::Done)),
@@ -5242,7 +5246,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         )
         .unwrap();
         for no_wait in [false, true] {
-            let (out, logs) = run_cmd_within(&rig, Cmd::Walk, no_wait, None, STILL_WAITING);
+            let (out, logs) = run_cmd_within(&rig, Cmd::Walk, no_wait, None);
             let err = out
                 .expect("fails at once, never waits for its caller")
                 .expect_err("a lock its own caller holds must fail the command");
@@ -5267,8 +5271,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let bystander = std::fs::File::open(rig.path("das-maintenance.lock")).unwrap();
         let fd = bystander.as_raw_fd().to_string();
         for named in [fd.as_str(), "eight"] {
-            let (out, _) =
-                run_cmd_within(&rig, Cmd::Walk, false, Some(named.into()), STILL_WAITING);
+            let (out, _) = run_cmd_within(&rig, Cmd::Walk, false, Some(named.into()));
             let err = out
                 .expect("a hold that cannot be proven fails at once, never waits")
                 .expect_err("a hold that cannot be proven must fail");
