@@ -1640,3 +1640,73 @@ fn a_pass_killed_with_its_child_leaves_a_mount_the_next_pass_takes_down() {
     assert!(log.contains("left mounted by an earlier job"), "{log}");
     assert_resumed_to_the_end(&r, "cgroupkill-next");
 }
+
+/// A second claim during the resumed segment: the pass stops a running
+/// `btrfs scrub resume -B` the same way (SIGTERM leaves it resumable there
+/// too), yields again (`yields` 2), and still resumes to the end with the
+/// original start.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_resumed_segment_yields_again_and_still_finishes() {
+    assert!(is_root(), "must run as root");
+    let tag = "twice";
+    let mut r = start_running(tag);
+    let mut first = start_backup(&r.rig, &r.site, Backup::Full);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the first backup to hold the lock",
+        || r.rig.dir.join("holds").exists(),
+    );
+    let bytes_at_first = r.rig.bytes_scrubbed();
+    std::fs::write(r.rig.dir.join("release"), "").unwrap();
+    first.wait_within(std::time::Duration::from_secs(30));
+    // Back to scrubbing: a resumed segment, under way and past the first stop.
+    wait_for(
+        std::time::Duration::from_secs(180),
+        "the resumed segment to scrub on",
+        || {
+            assert!(r.pass.running(), "the pass ended: {}", log_of(&r.rig, tag));
+            let rec = r.rig.read_record();
+            r.site
+                .attempt(&r.rig)
+                .is_some_and(|a| a.outcome == "running")
+                && record_u64(&rec, "t_resumed").unwrap_or(0) > 0
+                && record_u64(&rec, "finished") == Some(0)
+                && record_u64(&rec, "data_bytes_scrubbed").unwrap_or(0)
+                    > bytes_at_first + 128 * 1024 * 1024
+        },
+    );
+    let mut second = start_backup(&r.rig, &r.site, Backup::Full);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the second backup to hold the lock",
+        || r.rig.dir.join("holds").exists(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.rig.dir.join("saw"))
+            .unwrap()
+            .trim(),
+        "unmounted"
+    );
+    let attempt = r.site.attempt(&r.rig).expect("a yielded record");
+    assert_eq!(attempt.outcome, "yielded", "{attempt:?}");
+    assert_eq!(attempt.yields, Some(2), "{attempt:?}");
+    let rec = r.rig.read_record();
+    assert_eq!(
+        (record_u64(&rec, "canceled"), record_u64(&rec, "finished")),
+        (Some(0), Some(0)),
+        "a stopped resume left a resumable record: {rec}"
+    );
+    r.rig.set_slow_delay(0);
+    std::fs::write(r.rig.dir.join("release"), "").unwrap();
+    second.wait_within(std::time::Duration::from_secs(30));
+    let status = r.pass.wait_within(std::time::Duration::from_secs(600));
+    assert!(status.success(), "{status:?}\n{}", log_of(&r.rig, tag));
+    assert_eq!(
+        log_of(&r.rig, tag)
+            .matches("giving the DAS maintenance lock up to test-backup pid")
+            .count(),
+        2
+    );
+    assert_resumed_to_the_end(&r, tag);
+}
