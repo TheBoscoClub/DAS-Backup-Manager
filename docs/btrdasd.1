@@ -3102,10 +3102,15 @@ Status is
 .B RUNNING
 while the pass that wrote a
 .B running
-record is alive, and
+record is alive,
+.B YIELDED
+while a pass paused for a backup is alive (the line names whom it yielded
+to and, when recorded, at what time), and
 .B INTERRUPTED
 for a pass stopped by a signal or one whose
 .B running
+or
+.B yielded
 record outlived it (the earlier finished pass is never shown as the
 current one; its age still counts from the last success).
 .PP
