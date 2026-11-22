@@ -47,7 +47,7 @@ cleanup_test() {
 trap cleanup_test EXIT
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup monotonic_secs; do
+for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup monotonic_secs; do
     body="$(extract "$RUN" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
@@ -60,6 +60,8 @@ done
 
 LOCK="$WORK/das-maintenance.lock"
 MAINTENANCE_LOCKFILE="$LOCK"
+CLAIM_LOCKFILE="$WORK/das-maintenance-claim.lock" # the claim a waiting backup holds (su1b.2)
+YIELD_ANSWER_SECS=180
 declare -A OP_STATUS=() # written by record_op, as in backup-run.sh
 log_info() { echo "INFO: $*" >>"$WORK/log"; }
 log_warn() { echo "WARN: $*" >>"$WORK/log"; }

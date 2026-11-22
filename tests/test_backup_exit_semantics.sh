@@ -147,6 +147,7 @@ check() { # check <name> <got> <want>
 # ---------------------------------------------------------------------------
 LOCK_LINE='LOCKFILE="/run/das-backup.lock"'
 MAINT_LINE='MAINTENANCE_LOCKFILE="/run/das-maintenance.lock"'
+CLAIM_LINE='CLAIM_LOCKFILE="/run/das-maintenance-claim.lock"'
 ROOT_LINE='    if [[ $EUID -ne 0 ]]; then'
 # The bound on one mail send, shortened so a stalled relay costs this suite
 # seconds, not a minute a case.
@@ -155,18 +156,19 @@ MAIL_LINE='MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10'
 # unmount_all looks there, so it looks in this suite's own directory.
 # shellcheck disable=SC2016 # the script's literal ${...}
 ESP_LINE='ESP_MOUNT_ROOT="${DAS_ESP_MOUNT_ROOT:-/run/das-backup/esp}"'
-for line in "$LOCK_LINE" "$MAINT_LINE" "$ROOT_LINE" "$MAIL_LINE" "$ESP_LINE"; do
+for line in "$LOCK_LINE" "$MAINT_LINE" "$CLAIM_LINE" "$ROOT_LINE" "$MAIL_LINE" "$ESP_LINE"; do
     n="$(grep -cxF -- "$line" "$SRC")"
     [[ "$n" == 1 ]] || harness_broken "expected exactly one line '$line' in $SRC, found $n"
 done
 sed -e "s|^LOCKFILE=\"/run/das-backup.lock\"\$|LOCKFILE=\"$RUN_DIR/das-backup.lock\"|" \
     -e "s|^MAINTENANCE_LOCKFILE=\"/run/das-maintenance.lock\"\$|MAINTENANCE_LOCKFILE=\"$RUN_DIR/das-maintenance.lock\"|" \
+    -e "s|^CLAIM_LOCKFILE=\"/run/das-maintenance-claim.lock\"\$|CLAIM_LOCKFILE=\"$RUN_DIR/das-maintenance-claim.lock\"|" \
     -e 's|^    if \[\[ \$EUID -ne 0 \]\]; then$|    if [[ ${DAS_TEST_EUID:?} -ne 0 ]]; then|' \
     -e 's|^MAIL_TIMEOUT_SECS=60 MAIL_KILL_AFTER_SECS=10$|MAIL_TIMEOUT_SECS=2 MAIL_KILL_AFTER_SECS=1|' \
     -e "s|^ESP_MOUNT_ROOT=\"\\\${DAS_ESP_MOUNT_ROOT:-/run/das-backup/esp}\"\$|ESP_MOUNT_ROOT=\"$RUN_DIR/esp\"|" \
     "$SRC" >"$COPY"
 changed="$(diff "$SRC" "$COPY" | grep -c '^>')"
-[[ "$changed" == 5 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 5"
+[[ "$changed" == 6 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 6"
 # The guard that matters: nothing outside a comment may still name a real
 # lock. If this ever fires, the copy is never run.
 #

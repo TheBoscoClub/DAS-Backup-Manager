@@ -1,9 +1,18 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.20.2
+# Version: 4.21.0
 # Date: 2026-11-22
 #
 # Features:
+#   - A backup asks a scrub to let it go first (v4.21.0, bd
+#     DAS-Backup-Manager-su1b.2): while it waits for the maintenance lock it
+#     holds /run/das-maintenance-claim.lock shared on fd 7 (acquire_claim), so
+#     a scrub pass holding the lock stops its scrub, unmounts, and gives the
+#     lock up; the run lets the claim go once it holds the lock
+#     (release_claim), and every child started while it waits gets `7<&-`.
+#     A claim nobody answers within YIELD_ANSWER_SECS (180 s) is one WARN
+#     naming the holder; the run keeps waiting and its exit status does not
+#     change. The report gains a `Scrub yield` row beside `Maintenance lock`.
 #   - A drive's serial is read by one strict rule (v4.20.2, bd
 #     DAS-Backup-Manager-2kb1.17): parse_drive_serial() takes exactly one
 #     "Serial Number:" (ATA, NVMe) or "Serial number:" (SCSI, SAS) line, the
@@ -831,6 +840,15 @@ acquire_singleton_lock
 # acquire_maintenance_lock() (defined below, called early in main(), after
 # this singleton but before any mount work).
 MAINTENANCE_LOCKFILE="/run/das-maintenance.lock"
+# The claim lock (indexer/src/maintenance.rs CLAIM_LOCK_PATH, MUST match): held
+# shared on fd 7 by acquire_claim() while this run waits for the maintenance
+# lock, so a scrub pass holding it gives it up (bd DAS-Backup-Manager-su1b.2).
+CLAIM_LOCKFILE="/run/das-maintenance-claim.lock"
+# How long a claim may go unanswered before the run says so (maintenance.rs
+# YIELD_ANSWER_SECS, the same number): three times a scrub's worst ordinary
+# yield. The run keeps waiting after it; its exit status does not change.
+YIELD_ANSWER_SECS=180
+CLAIM_HELD="false"
 
 # ============================================================================
 # CONFIGURATION (loaded from config.toml via btrdasd)
@@ -1105,29 +1123,116 @@ acquire_maintenance_lock() {
         ! chmod 600 -- "$MAINTENANCE_LOCKFILE"; then
         log_warn "Cannot make $MAINTENANCE_LOCKFILE root's alone (0600): any local user can hold it"
     fi
-    if flock -n 8; then
+    # Claim the lock while this run waits for it, so a scrub pass that holds
+    # it gives it up (bd DAS-Backup-Manager-su1b.2). From here until
+    # release_claim every child this function starts gets `7<&-`: a child
+    # that kept fd 7 would keep the scrub paused for as long as it lived.
+    acquire_claim
+    local wait_start
+    wait_start=$(monotonic_secs 7<&-)
+    if flock -n 8 7<&-; then
         record_maintenance_holder
+        release_claim
         return
+    fi
+
+    # Who holds it, read once, before the wait: only a scrub answers a claim,
+    # and only a scrub's answer is reported as a yield.
+    local holder by_scrub="false"
+    holder="$(maintenance_holder 7<&-)"
+    if [[ "$holder" == "btrdasd scrub run pid "* ]]; then
+        by_scrub="true"
     fi
 
     # Mirrors scrub.rs's LOCK_WAIT_ANNOUNCE_SECS=5s probe before announcing.
-    sleep 5
-    if flock -n 8; then
-        record_maintenance_holder
-        return
+    sleep 5 7<&-
+    if ! flock -n 8 7<&-; then
+        log_info "DAS maintenance lock held by $holder — waiting..." 7<&-
+        if [[ "$by_scrub" == "true" ]]; then
+            log_info "Claimed $CLAIM_LOCKFILE: asked the scrub to yield; it gives the lock up within about a minute and resumes once this backup is done" 7<&-
+        fi
+        # Wait the rest of YIELD_ANSWER_SECS, counted from the claim; a lock
+        # still held then is said once, and the wait goes on: defer, never
+        # skip (operator 2026-11-22). `-E 75` tells the timeout from a flock
+        # that failed (fail-silent.md rule 6).
+        local left=$((YIELD_ANSWER_SECS - ($(monotonic_secs 7<&-) - wait_start)))
+        ((left >= 1)) || left=1
+        local lock_rc=0
+        flock -w "$left" -E 75 8 7<&- || lock_rc=$?
+        if ((lock_rc == 75)); then
+            local still
+            still="$(maintenance_holder 7<&-)"
+            log_warn "The DAS maintenance lock is still held by $still ${YIELD_ANSWER_SECS}s after this backup claimed it: a scrub pass gives it up within about a minute, so its holder is not one that answers a claim (an older scrub, a recovery-OS VM session, doctor); this backup keeps waiting" 7<&-
+            record_op "scrub_yield" "WARN" "no answer after ${YIELD_ANSWER_SECS}s from $still; the backup waited on"
+            lock_rc=0
+            flock -E 75 8 7<&- || lock_rc=$?
+        fi
+        if ((lock_rc != 0)); then
+            log_error "Cannot lock $MAINTENANCE_LOCKFILE (flock exit $lock_rc) — could not start" 7<&-
+            exit 1
+        fi
     fi
-
-    log_info "DAS maintenance lock held by $(maintenance_holder) — waiting..."
-    local wait_start
-    wait_start=$(monotonic_secs)
-
-    flock 8
     record_maintenance_holder
+    release_claim
 
     local wait_secs
     wait_secs=$(( $(monotonic_secs) - wait_start ))
     log_info "DAS maintenance lock acquired after waiting ${wait_secs}s"
     record_op "lock_wait" "OK" "waited ${wait_secs}s for $MAINTENANCE_LOCKFILE"
+    if [[ -z "${OP_STATUS[scrub_yield]:-}" ]]; then
+        if [[ "$by_scrub" == "true" ]]; then
+            record_op "scrub_yield" "OK" "scrub yielded after ${wait_secs}s"
+        else
+            record_op "scrub_yield" "N/A" "the lock was held by $holder, not a scrub"
+        fi
+    fi
+}
+
+# Claim the maintenance lock: hold $CLAIM_LOCKFILE shared on fd 7 while this
+# run waits for the lock (bd DAS-Backup-Manager-su1b.2), recorded as
+# "backup-run.sh pid N". A scrub pass that holds the lock probes the claim
+# (an exclusive non-blocking try, which a shared hold refuses) and gives the
+# lock up; it never waits on the claim, so the claim adds no edge to the
+# singleton → maintenance order. A flock, not a request file: it ends with
+# this process, so a run killed by SIGKILL leaves no request behind.
+# The `flock -s` waits only while a scrub's probe holds the file, an instant.
+# A claim that cannot be taken is a WARN and the run waits as it always did —
+# the backup is never kept from running by its claim.
+acquire_claim() {
+    CLAIM_HELD="false"
+    if ! exec 7<>"$CLAIM_LOCKFILE"; then
+        log_warn "Cannot open the claim lock $CLAIM_LOCKFILE: a scrub pass will not give the maintenance lock up for this backup"
+        return 0
+    fi
+    # Root's alone: only root may make a scrub pause (bd qab).
+    if [[ -f "$CLAIM_LOCKFILE" && ! -L "$CLAIM_LOCKFILE" ]] &&
+        ! chmod 600 -- "$CLAIM_LOCKFILE" 7<&-; then
+        log_warn "Cannot make $CLAIM_LOCKFILE root's alone (0600): any local user can pause a scrub" 7<&-
+    fi
+    local rc=0
+    flock -s 7 || rc=$?
+    if ((rc != 0)); then
+        log_warn "Cannot claim $CLAIM_LOCKFILE (flock exit $rc): a scrub pass will not give the maintenance lock up for this backup" 7<&-
+        exec 7<&-
+        return 0
+    fi
+    CLAIM_HELD="true"
+    if ! printf 'backup-run.sh pid %s\n' "$$" >"$CLAIM_LOCKFILE"; then
+        log_warn "Could not record this run as the claimant in $CLAIM_LOCKFILE" 7<&-
+    fi
+}
+
+# Let the claim go, once this run holds the maintenance lock: the record
+# emptied while still held, the hold released, fd 7 closed, so no step of the
+# run, and no child it starts, keeps a scrub paused.
+release_claim() {
+    [[ "${CLAIM_HELD:-false}" == "true" ]] || return 0
+    if ! : >"$CLAIM_LOCKFILE"; then
+        log_warn "Could not empty the claimant record in $CLAIM_LOCKFILE"
+    fi
+    flock -u 7 || true
+    exec 7<&-
+    CLAIM_HELD="false"
 }
 
 # Record this run as the holder of the maintenance lock, in the lock file
@@ -4108,6 +4213,7 @@ generate_report() {
 BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
   Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
+  Scrub yield           ${OP_STATUS[scrub_yield]:-N/A}  (${OP_STATUS[scrub_yield_detail]:-the lock was free})
   USB link              ${OP_STATUS[usb_link]:-N/A}  (${OP_STATUS[usb_link_detail]:-not checked})
   btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
   Snapshot counts       ${OP_STATUS[btrbk_counters]:-N/A}  (${OP_STATUS[btrbk_counters_detail]:-n/a})
@@ -4144,7 +4250,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.20.2
+  backup-run.sh v4.21.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
