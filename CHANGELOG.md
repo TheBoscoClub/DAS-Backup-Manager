@@ -106,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The configured I/O scheduler reaches both legs of a RAID1 target** (bd `DAS-Backup-Manager-su1b.4`): `backup-run.sh` set `[das].io_scheduler` on the one disk the filesystem UUID resolves to, so a pair's second drive kept the host's default (`backup-run.sh` 4.21.1)
 - **`backup-run.sh` and `backup-verify.sh` read a drive's serial by the partition script's strict rule** (bd `DAS-Backup-Manager-2kb1.17`): both took awk's third field of `Serial Number:` only, so a SAS/SCSI drive (`Serial number:`) was never identified, a value with a blank matched on its first word, and a `smartctl` that could not open the drive was believed
   - Exactly one `Serial Number:` or `Serial number:` line, the whole trimmed value, `smartctl`'s failure bits (exit status 1 and 2) refused; a faithful `parse_drive_serial` copy in each script (no shared library), named for the partition script's
   - `backup-run.sh` (4.20.2): a target found by serial (no `mount_uuid`) whose serial cannot be read, or reads ambiguously, now refuses the btrbk run (`mounted_is_target`); `find_device_by_serial` returns no device for a serial on two nodes

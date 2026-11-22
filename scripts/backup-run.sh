@@ -1,9 +1,12 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.21.0
+# Version: 4.21.1
 # Date: 2026-11-22
 #
 # Features:
+#   - The I/O scheduler reaches every disk of a target (v4.21.1, bd
+#     DAS-Backup-Manager-su1b.4): a RAID1 pair's second leg was left on the
+#     host's default (one filesystem UUID resolves to one member).
 #   - A backup asks a scrub to let it go first (v4.21.0, bd
 #     DAS-Backup-Manager-su1b.2): while it waits for the maintenance lock it
 #     holds /run/das-maintenance-claim.lock shared on fd 7 (acquire_claim), so
@@ -1540,17 +1543,34 @@ check_das_connected() {
     fi
 }
 
+# Every disk of a target, once each: the disk under the partition blkid
+# resolves its UUID to, and every disk found by one of its serials. A
+# multi-drive target (a RAID1 pair) has one filesystem UUID that blkid
+# resolves to ONE member, so the UUID alone reached one leg and left the other
+# on whatever the host's rules set (bd DAS-Backup-Manager-su1b.4).
+io_scheduler_devices() {
+    local label=$1 pair dev seen=" "
+    for dev in "${DISCOVERED_DEVICES[$label]:-}" $(
+        for pair in ${TARGET_SERIAL_DEVS[$label]:-}; do printf '%s\n' "${pair#*=}"; done
+    ); do
+        [[ -n "$dev" && "$seen" != *" $dev "* ]] || continue
+        seen+="$dev "
+        printf '%s\n' "$dev"
+    done
+}
+
 set_io_scheduler() {
     log_info "Setting I/O scheduler to $DAS_IO_SCHEDULER for DAS drives..."
 
+    local label drive dev
     for label in "${!DISCOVERED_DEVICES[@]}"; do
-        local drive="${DISCOVERED_DEVICES[$label]}"
-        if [[ -n "$drive" && -b "$drive" ]]; then
-            local dev="${drive#/dev/}"
+        while IFS= read -r drive; do
+            [[ -n "$drive" && -b "$drive" ]] || continue
+            dev="${drive#/dev/}"
             if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
                 echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
             fi
-        fi
+        done < <(io_scheduler_devices "$label")
     done
 }
 
@@ -4250,7 +4270,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.21.0
+  backup-run.sh v4.21.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

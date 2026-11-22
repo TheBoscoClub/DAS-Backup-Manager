@@ -400,6 +400,10 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_usb_link.sh
     )
     add_test(
+        NAME shell-io-scheduler
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_scheduler.sh
+    )
+    add_test(
         NAME shell-state-pass
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_state_pass.sh
     )
