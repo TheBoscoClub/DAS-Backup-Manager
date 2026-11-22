@@ -2004,25 +2004,25 @@ fn hold_for_cli(
 /// point that exists and is not mounted (the script's own leftover check ran
 /// first). The mount is left for the script, which unmounts it.
 fn cmd_mount_target(label: &str, config: &Path) -> i32 {
-    let cant = |why: String| {
+    let cannot_run = |why: String| {
         println!("RAID GUARD: CANNOT-RUN  ({why})");
         2
     };
     let cfg = match Config::load(config) {
         Ok(c) => c,
-        Err(e) => return cant(format!("cannot read {}: {e}", config.display())),
+        Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
     };
     let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
-        return cant(format!("no [[target]] labelled '{label}'"));
+        return cannot_run(format!("no [[target]] labelled '{label}'"));
     };
     if !buttered_dasd::raid_guard::is_guarded(target) {
-        return cant(format!(
+        return cannot_run(format!(
             "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
         ));
     }
     let lock = CliLock::production();
     let Some(raw) = &lock.delegated else {
-        return cant(format!(
+        return cannot_run(format!(
             "only under a maintenance lock handed down by {}",
             maintenance::DELEGATED_FD_ENV
         ));
@@ -2039,14 +2039,14 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
         .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
     {
         Ok(h) => h,
-        Err(e) => return cant(e),
+        Err(e) => return cannot_run(e),
     };
     let mount_path = Path::new(&target.mount);
     if !mount_path.is_dir() {
-        return cant(format!("{} is not a directory", target.mount));
+        return cannot_run(format!("{} is not a directory", target.mount));
     }
     if health::is_mountpoint(mount_path) {
-        return cant(format!("{} is already a mount point", target.mount));
+        return cannot_run(format!("{} is already a mount point", target.mount));
     }
     let result = mount::mount_guarded_target(&cfg, target, &CliProgress, &held);
     let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
