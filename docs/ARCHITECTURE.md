@@ -96,7 +96,7 @@ The system has six major components:
          ▼
 2. backup-run.sh (orchestrator)
          │
-         ├──▶ singleton lock (/run/das-backup.lock: held by a backup → skip, exit 0; held by setup or a config edit → wait ≤ 15 min, then go on or skip; unusable → exit 1), then maintenance lock (/run/das-maintenance.lock, blocking)
+         ├──▶ singleton lock (/run/das-backup.lock: held by a backup → skip, exit 0; held by setup or a config edit → wait ≤ 15 min, then go on or skip; unusable → exit 1), then the claim (/run/das-maintenance-claim.lock, shared, held only while waiting: a scrub holding the lock yields), then maintenance lock (/run/das-maintenance.lock, blocking)
          ├──▶ mount sources, verify_sources_before_write()   → every source volume is the expected filesystem
          │                                   (one already mounted, as fstab mounts a data volume, is used as found)
          ├──▶ btrdasd subvol sync          → adopts new subvolumes, retires vanished ones, edits config.toml in place when the plan changes it (unknown keys and comments kept), and btrbk.conf whenever it differs from what config.toml renders to
@@ -257,16 +257,17 @@ backup is enforced by the engine's own blocking maintenance lock — identical t
 `btrdasd scrub run` invocation, so there is no unit-layer special case. The timer default
 (`*-*-01 03:05:00`) deliberately fires five minutes after the 03:00 daily
 backup on the 1st: the backup already holds the maintenance lock, so the scrub blocks and then
-starts the moment the backup finishes — and if a long scrub is still running when the *next*
-day's 03:00 backup fires, the same lock holds that backup until the scrub completes (deferral,
-never a skipped backup). The three DAS filesystems are scrubbed **sequentially** in
+starts the moment the backup finishes. A backup that fires while a pass is running does not wait
+for the pass: it claims the lock and the pass yields to it (below, "The scrub yields to a
+backup"). The three DAS filesystems are scrubbed **sequentially** in
 `[scrub].targets` list order because they share one USB path; the host's native NVMe/SATA
 filesystems are scrubbed by the system-scope `btrfs-scrub@` timers outside this project and may
 run in parallel with each other and with this engine. `[scrub].enabled` gates
 only whether `das-scrub.timer` is enabled by `btrdasd setup`; the engine still honors a manual
 run regardless (warn-only). See `.claude/rules/backup.md` for the design rationale.
 
-**Operational note — a caught-up boot scrub can legitimately delay a backup by hours.**
+*Superseded 2026-11-22: a caught-up scrub no longer delays a backup by hours — the pass yields to it;
+see bd `DAS-Backup-Manager-su1b.2`.* **Operational note — a caught-up boot scrub can legitimately delay a backup by hours.**
 `das-scrub.timer` sets `Persistent=true`, so a monthly fire missed while the host was off (or the
 DAS enclosure was disconnected) runs as soon as the timer unit is next active, not just at the next
 `OnCalendar=` match. Combined with the service's unbounded `TimeoutStartSec`, a catch-up scrub that
@@ -277,6 +278,41 @@ visible symptom is a backup that starts hours late with `journalctl` "waiting on
 lines in between, not a missed or broken backup. This is the designed trade-off (deferral over data
 races), not a bug; see the "Locking" section of the `scrub` module doc comment
 (`indexer/src/scrub.rs`) for the lock-acquisition order.
+
+**The scrub yields to a backup** (bd `DAS-Backup-Manager-su1b.2`, operator decision 2026-11-01; the
+2026-11-01 nightly waited 8 h 28 m behind a pass and a reboot ended it having written nothing). The
+maintenance lock stays a single-occupancy room — one holder at a time, and only the holder mounts or
+unmounts — but a scrub pass hands the key back when a backup knocks:
+
+- *The knock* is a third lock, `/run/das-maintenance-claim.lock` (root's alone). A backup —
+  `backup-run.sh` (dry runs included), `btrdasd backup run|snapshot|send`, the helper's `BackupRun`,
+  and nothing else — takes it **shared** after its singleton and holds it only while it waits for the
+  maintenance lock (`backup-run.sh` on fd 7, closed for every child it starts meanwhile). A flock,
+  not a request file or a signal: it ends with its holder, so a backup killed by SIGKILL leaves no
+  request behind and no pid steers the scrub.
+- *The scrub* never waits on it: it probes (`LOCK_EX|LOCK_NB`, let go at once) before it first takes the
+  maintenance lock and right after, before each filesystem's mount, and at every 5 s poll of its
+  `btrfs scrub` child. Lock order stays singleton → (claim) → maintenance, and the claim adds no wait
+  anywhere a cycle could form.
+- *The yield*: stop the child with SIGTERM and reap it (on kernel 7.3.5 / btrfs-progs 7.3 that leaves a
+  `canceled:0 finished:0` record, which resumes; SIGINT and `btrfs scrub cancel` leave `canceled:1` —
+  proven by the A1 loop rig), confirm the kernel stopped (else leave the mount and do not resume that
+  filesystem), unmount its own mount, write a `yielded` attempt (pid, boot id, claimant, count,
+  pause), and only then release the lock. The pass waits outside with its singleton, answers signals,
+  takes the lock back once nobody claims, reads `config.toml` again, and runs the same filesystem
+  again: `btrfs scrub resume`, keeping the original `t_start`. The backup mounts afresh — no mount
+  is handed over, so every job owns the mount it uses.
+- *Unanswered*: a holder that is not a yielding scrub (a recovery-OS VM session, doctor, an older
+  binary) — after `YIELD_ANSWER_SECS` (180 s) the backup logs one WARN naming it and keeps waiting;
+  its exit status does not change. The report's `Scrub yield` row says `OK (scrub yielded after N s)`,
+  `WARN`, or `N/A`.
+- *Failure shapes*: a pass that yielded and then died reads `interrupted` (health FAIL) — never a
+  silent lost month; the next pass resumes. A claim probe that cannot look costs one pause. A dying
+  claimant costs at most one pause. Option B (backup and scrub sharing the lock with counted mounts)
+  was rejected: its safety would rest on every unmount site, in two languages, obeying a refcount
+  protocol, where A keeps one holder by construction.
+- By hand: `sudo flock -s /run/das-maintenance-claim.lock <command>` pauses a pass for as long as the
+  command runs.
 
 **Health integration** (`indexer/src/health.rs`, bd `DAS-Backup-Manager-5kb`): `TargetHealth::scrub`
 reports per-filesystem age (days since the last `finished`, zero-error scrub), WARN/FAIL against
@@ -290,7 +326,8 @@ whose boot has passed reads as `interrupted` in `scrub status` and health (immed
 aborted scrub); a live one is judged by the age of the last success. Readers also know `yielded`, a pass
 paused for a backup and waiting to resume the same filesystem (bd `DAS-Backup-Manager-su1b.2`): it carries
 pid and boot id like `running` and is read the same way (`YIELDED` with its holder and time in `scrub status`,
-judged by age in health; `interrupted` once its process is gone). No pass writes it yet; the scrub report lists
+judged by age in health; `interrupted` once its process is gone). The pass writes it as it gives the lock up
+(below); the scrub report lists
 each yield of a target as information, never as a problem.
 It reads **only** `scrub-state.json` (mode `0644`), never the raw per-device
 `/var/lib/btrfs/scrub.status.<fsuuid>` record (mode `0600`, root-only, and the exact record type

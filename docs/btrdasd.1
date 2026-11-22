@@ -3023,6 +3023,32 @@ If another scrub pass holds
 this one is skipped (exit 0). The shared maintenance lock is waited for, so a
 pass started during a backup begins when the backup ends.
 .PP
+A pass never makes a backup wait for it (bd
+.BR DAS\-Backup\-Manager\-su1b.2 ).
+A backup that wants the targets claims them, holding
+.I /run/das\-maintenance\-claim.lock
+while it waits. The pass looks for a claim before it first takes the
+maintenance lock, before each filesystem's mount and every 5 seconds while it
+scrubs; on one it stops its
+.B btrfs scrub
+(SIGTERM, which leaves the scrub resumable), unmounts the filesystem, records it
+.BR yielded ,
+and gives the lock up. Once the backup is done it takes the lock back, reads
+config.toml again, and resumes the same filesystem with
+.BR "btrfs scrub resume" .
+A signal while it waits records the filesystem interrupted, as during a scrub.
+Only backups claim:
+.BR backup\-run.sh ,
+.BR "btrdasd backup run" ,
+.BR snapshot ,
+.B send
+and the GUI's backup.
+.B "sudo flock \-s /run/das\-maintenance\-claim.lock"
+.I command
+pauses a pass for as long as
+.I command
+runs.
+.PP
 This runs even when
 .B [scrub].enabled
 is
@@ -3081,7 +3107,7 @@ shows
 with whom it yielded to and when, and
 .B "btrdasd health"
 judges it by the age of the last success while its process lives in this
-boot; one whose process is gone reads as interrupted. No pass writes it yet.
+boot; one whose process is gone reads as interrupted.
 .PP
 .B btrdasd scrub run
 .RB [ \-\-config

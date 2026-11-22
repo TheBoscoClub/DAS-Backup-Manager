@@ -53,9 +53,11 @@ pub fn is_embedded_script(path: &str) -> bool {
 ///
 /// `TimeoutStartSec=infinity` (not a fixed bound): `backup-run.sh` takes the
 /// blocking `/run/das-maintenance.lock` shared with the scrub engine
-/// (`indexer/src/scrub.rs`, bd DAS-Backup-Manager-212/atq), so a backup that
-/// starts while a scrub pass is running legitimately waits — potentially for
-/// hours — before it can proceed. A finite `TimeoutStartSec` would SIGKILL the
+/// (`indexer/src/scrub.rs`, bd DAS-Backup-Manager-212/atq). A scrub pass gives
+/// that lock up to a backup that claims it (bd DAS-Backup-Manager-su1b.2), so
+/// the wait behind a scrub is about a minute; but a recovery-OS VM session or
+/// an older scrub binary does not answer a claim, and a backup then still
+/// waits — potentially for hours. A finite `TimeoutStartSec` would SIGKILL the
 /// backup mid-wait. The maintenance lock is the correctness mechanism against
 /// overlap, not a timeout (user decision 2026-07-27, bd DAS-Backup-Manager-b6f).
 ///
@@ -183,10 +185,11 @@ pub const SCRUB_IO_LEVEL: &str = "0";
 /// (which would stop the other unit — cancellation was explicitly scrapped
 /// in favor of deferral), NO `ExecStopPost` cancel, NO `RuntimeMaxSec=`. The
 /// scrub engine (`indexer/src/scrub.rs`) itself defers to a running backup
-/// via the blocking `/run/das-maintenance.lock` shared with
-/// `backup-run.sh`, so a unit-layer mechanism would not cover manual
-/// `btrdasd scrub run` invocations anyway. `TimeoutStartSec=infinity`
-/// because the pass (and any lock wait ahead of it) is unbounded — a real
+/// via `/run/das-maintenance.lock` shared with `backup-run.sh`, and yields
+/// the lock to a backup that claims it mid-pass, resuming afterwards (bd
+/// DAS-Backup-Manager-su1b.2), so a unit-layer mechanism would not cover
+/// manual `btrdasd scrub run` invocations anyway. `TimeoutStartSec=infinity`
+/// because the pass (and any lock wait or pause in it) is unbounded — a real
 /// monthly pass across the DAS filesystems runs many hours.
 ///
 /// `ExecStart` is preceded by a comment documenting the exit-code split
@@ -237,11 +240,12 @@ pub fn render_systemd_scrub_service(config: &Config) -> String {
 /// fires: the backup already holds /run/das-maintenance.lock, so the scrub
 /// engine's blocking acquire starts the scrub the moment the backup finishes
 /// — "scrub follows the backup on the 1st" (user decision 2026-08-02,
-/// superseding the fixed-05:30 gap design of 2026-07-27). The same blocking
-/// flock covers overrun in the other direction: a scrub still running when
-/// the next day's 03:00 backup fires HOLDS that backup until the scrub
-/// completes — deferral, never a skip. When the 1st is a Sunday, the 04:00
-/// full backup likewise defers behind the running scrub. NO
+/// superseding the fixed-05:30 gap design of 2026-07-27). In the other
+/// direction a backup no longer waits behind a running pass (operator
+/// 2026-11-01, bd DAS-Backup-Manager-su1b.2): the backup claims the lock,
+/// the pass stops its scrub, unmounts and gives the lock up, and resumes the
+/// same filesystem once the backup is done — the 03:00 backup and, on a
+/// Sunday the 1st, the 04:00 full backup each run within about a minute. NO
 /// `RandomizedDelaySec`: the maintenance lock — not timing — is the
 /// serialization mechanism.
 pub fn render_systemd_scrub_timer(config: &Config) -> String {

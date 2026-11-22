@@ -179,7 +179,7 @@ How much history do you want to keep?
 
 The `das-backup.timer` systemd unit (or cron job on sysvinit/OpenRC) runs nightly:
 
-1. `backup-run.sh` takes its locks (waiting if a scrub holds the maintenance lock) and checks that the DAS is connected
+1. `backup-run.sh` takes its locks (a scrub pass holding the maintenance lock gives it up to the backup's claim and resumes afterwards) and checks that the DAS is connected
 2. Mounts the source top-level volumes and verifies each is the expected filesystem
 3. Syncs subvolumes with the config (`btrdasd subvol sync`): adopts new subvolumes, retires vanished ones, regenerates `btrbk.conf` when it differs
 4. Mounts the targets by filesystem UUID (`mount_uuid`), else by drive serial, and verifies each is the expected filesystem before anything writes to it

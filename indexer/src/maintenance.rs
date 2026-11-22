@@ -51,7 +51,12 @@ const MAX_RECORD_CHARS: usize = 200;
 /// a unit a stop left `failed`, so a runtime drop-in refuses manual starts
 /// first. `systemctl mask` cannot: the unit is installed in
 /// `/etc/systemd/system` (bd DAS-Backup-Manager-8f8j, tested 2026-11-08).
-const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: write \
+/// The claim (bd DAS-Backup-Manager-su1b.2) pauses a pass for one command
+/// instead, with no unit touched.
+const STOP_A_SCRUB: &str = "If this cannot wait and a scrub holds it: run the job as \
+     `sudo flock -s /run/das-maintenance-claim.lock <command>` — the scrub pass gives the lock \
+     up within about a minute and resumes by itself once the command ends; or, to stop the \
+     scrub instead, write \
      /run/systemd/system/das-scrub.service.d/brake.conf with [Unit] \
      RefuseManualStart=yes, systemctl daemon-reload, then systemctl stop das-scrub.timer \
      das-scrub.service (a supervisor cannot restart it while the drop-in is there); once \
@@ -541,8 +546,9 @@ pub fn deferred_line(path: &Path, holder: &str) -> String {
 /// waits on it (the probe is `LOCK_NB`), so it adds no wait to the
 /// singleton → maintenance order and no deadlock.
 ///
-/// Nothing claims yet: the scrub's yield (step A5) and the backups' claim
-/// (step A6) are later steps.
+/// Who claims: backups only (operator 2026-11-22) — `backup-run.sh` and
+/// `backup::acquire_claiming_locks_at` (CLI `backup run|snapshot|send`, the
+/// helper's `BackupRun`). The scrub's side is `scrub::ClaimWatch`.
 pub const CLAIM_LOCK_PATH: &str = "/run/das-maintenance-claim.lock";
 
 /// How long a backup that claims the maintenance lock waits for a scrub to
@@ -1167,6 +1173,8 @@ mod tests {
             "RefuseManualStart=yes",
             "systemctl stop das-scrub.timer das-scrub.service",
             "remove that drop-in",
+            "flock -s /run/das-maintenance-claim.lock <command>",
+            "resumes",
         ] {
             assert!(line.contains(part), "{part:?} missing from: {line}");
         }

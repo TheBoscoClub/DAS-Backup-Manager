@@ -10,16 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A backup no longer waits behind a scrub pass** (bd `DAS-Backup-Manager-su1b.2`, steps A5 and A6, operator decision 2026-11-01): a backup claims the maintenance lock, and a scrub pass holding it stops its scrub, unmounts, gives the lock up and resumes the same filesystem once the backup is done
+  - The pass probes `/run/das-maintenance-claim.lock` before it first takes the lock, right after, before each mount and at every 5 s poll; on a claim it stops `btrfs scrub` with SIGTERM (reaped; the record stays `canceled:0 finished:0`), checks the kernel stopped, unmounts what it mounted, records the filesystem `yielded`, and only then lets the lock go
+  - It waits with its singleton held and signals answered (a SIGTERM records `interrupted` and the pass dies of it, nothing mounted), takes the lock back once nobody claims, reads `config.toml` again, and runs `btrfs scrub resume` on the same filesystem, keeping its original start; the backup mounts the target afresh
+  - A kernel scrub not seen to stop is left mounted and that filesystem is not resumed in the pass; a record older than the stopped segment is never read as its result; a claim probe that cannot look costs one pause
+  - Only backups claim: `backup-run.sh` (4.21.0, dry runs included; fd 7, closed for every child it starts while waiting), `btrdasd backup run`, `snapshot`, `send` and the GUI's backup; never `walk`, `restore`, index jobs or `backup boot-archive`
+  - A claim nobody answers within 180 s is one warning naming the holder; the backup keeps waiting and its exit status does not change. The report gains a `Scrub yield` row (`OK  (scrub yielded after N s)`, `WARN`, or `N/A`)
+  - A pass that yielded and then died reads `interrupted` (health FAIL) and the next pass resumes it
+  - `sudo flock -s /run/das-maintenance-claim.lock <command>` pauses a pass for as long as the command runs; the waiting line of `walk` and `restore` says so
+  - Proven on a delayed loop rig with a real `btrdasd scrub run` and every kill (claimant before and after the yield, the pass while yielded, SIGTERM while yielded, the pass with its child mid-scrub); new suite `tests/test_backup_claim.sh`
 - **The claim lock a backup will use to ask a scrub to pause** (bd `DAS-Backup-Manager-su1b.2`, step A2): `maintenance::Claim` holds `/run/das-maintenance-claim.lock` shared, recorded as `<job> pid <pid>` and emptied before it lets go; `maintenance::claim_is_held` probes it exclusive and non-blocking and lets go at once
   - A probe that cannot open or lock the file is an error, never "nobody claims"; the file is root's alone (0600), its descriptor close-on-exec
   - A claimant killed by SIGKILL leaves no claim (its record is read as no longer running); a shell claimant's claim outlives it only through a child that kept the descriptor
-  - Inert — nothing claims or probes yet: the scrub's pause and the backups' claim are later steps, so no run changes
+  - Inert when added; the scrub probes it and the backups claim it since steps A5 and A6 (below)
 - **Each recovery drive's last guard report is kept after the session** (bd `DAS-Backup-Manager-yvcs`): `session-end` deleted `/run/das-recovery-os-vm/<label>.guard`, so a session that ended `NOT engaged: no report` left the host nothing to explain it
   - `recovery-os-vm.sh` (2.5.0) copies the report (virtlogd's rotations first) and its session state to `/var/lib/das-backup/recovery-os-vm-guard/<label>.report` and `<label>.state` (root's only) before removing them: `started=`, `resumed=`, `stopped=` where the power-off is known, `kept=`; best effort, a failure is a warning
   - A recovery OS that powered off without reporting is said with how long it ran: `the recovery OS powered off without reporting, <time> after its start`, and in `status` and `session-end` `it ran <time> from its start before it powered off`, the power-off taken from the session's own sighting or libvirt's log of the domain (its last `shutting down` line) — `not known`, never a guess, when neither has it
   - Documented in the Disaster Recovery Guide (troubleshooting, and beside the session history)
 
-- **Scrub status and health understand a pass paused for a backup** (bd `DAS-Backup-Manager-su1b.2`, step A3): groundwork for a scrub that yields the targets to a waiting backup; no pass pauses yet, so nothing changes on a running system
+- **Scrub status and health understand a pass paused for a backup** (bd `DAS-Backup-Manager-su1b.2`, step A3): groundwork for a scrub that yields the targets to a waiting backup; the pause itself is steps A5 and A6 (below)
   - A scrub-state record `yielded` (with `pid`, `boot_id` and the optional `yielded_to`, `yielded_epoch`, `yields`, `paused_secs`) is in progress, like `running`: `btrdasd health` judges it by the age of the last success while its process lives in this boot, and reads it `interrupted` (immediate FAIL) once that process is gone
   - `btrdasd scrub status` shows it `YIELDED` — `yielded to <holder> at HH:MM, resumes when it finishes` — and none of the earlier pass's figures; `--json` carries it in `status` and `outcome`, no new keys
   - The scrub report lists each yield of a target (time, holder, pause) under `YIELDS TO BACKUPS`; a target that yielded and finished clean is a clean pass
@@ -70,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`btrdasd scrub run` reads `config.toml` again once it holds its locks** (bd `DAS-Backup-Manager-su1b.2`, A4 review): a pass that waited for setup or for the maintenance lock no longer runs on the file it started with
 - **`btrdasd setup` refuses while a scrub pass is alive** (bd `DAS-Backup-Manager-su1b.2`, step A4): every mode that writes or removes installed files now takes `/run/das-scrub.lock` between the backup singleton and the maintenance lock, without waiting, and holds it to the end; held — a pass scrubbing, or waiting for the maintenance lock — it writes nothing and exits `75`, naming the lock on stderr
   - A pass that died (SIGKILL included) leaves the lock free and no longer blocks setup; an unopenable lock file is an error, never free; `--check` still takes no lock
   - Setup records itself in `/run/das-scrub.lock` (`btrdasd setup … pid N`), emptied before it lets go; a scrub pass records itself there too (`btrdasd scrub run pid N`)

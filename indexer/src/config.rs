@@ -450,11 +450,11 @@ fn default_scrub_on_calendar() -> String {
     // 03:05 on the 1st — five minutes AFTER the 03:00 daily backup fires, so
     // the backup already holds /run/das-maintenance.lock and the scrub
     // engine's blocking acquire makes the scrub start the moment the backup
-    // finishes ("scrub follows the backup", user decision 2026-08-02). The
-    // same blocking flock also guarantees the inverse on overrun: a scrub
-    // still running when the NEXT day's 03:00 backup fires HOLDS that backup
-    // (deferral, never a skip) and releases it the moment the scrub
-    // completes.
+    // finishes ("scrub follows the backup", user decision 2026-08-02). On
+    // overrun the inverse no longer holds a backup for the whole pass
+    // (operator 2026-11-01, bd DAS-Backup-Manager-su1b.2): a backup that fires
+    // while the pass runs claims the lock, the pass gives it up within about
+    // a minute and resumes the same filesystem once the backup is done.
     "*-*-01 03:05:00".into()
 }
 fn default_scrub_warn_age_days() -> u32 {

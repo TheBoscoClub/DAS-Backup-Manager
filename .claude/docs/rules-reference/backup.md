@@ -101,7 +101,7 @@ nothing written or removed, the lock named on **stderr** (the maintenance one wi
 record, the scrub singleton with its pass's — `btrdasd scrub run pid N`, since the A4 fix round),
 exit 75. The scrub singleton is there since bd `su1b.2` step A4: a scrub pass holds
 it for its whole life but the maintenance lock only while it scrubs, so a pass waiting for that
-lock — or, once step A5 lands, yielded to a backup — would otherwise go on with files setup
+lock — or yielded to a backup (step A5) — would otherwise go on with files setup
 replaced or removed under it. With the writes atomic, the locks still
 matter: a run must see one version of the files from start to end — the scripts it calls later,
 the `btrbk.conf` btrbk reads, the config sync reads again — an uninstall removes them, and the
@@ -144,7 +144,7 @@ busy=; for u in das-backup.service das-backup-full.service das-scrub.service; do
 ```
 
 `das-scrub.service` joined the loop with bd `su1b.2` step A4: a scrub pass runs the installed
-`btrdasd`, and from step A5 it holds no maintenance lock while yielded to a backup, so the backup
+`btrdasd`, and it holds no maintenance lock while yielded to a backup (step A5), so the backup
 units alone cannot show it. Its unit only: a `btrdasd scrub run` started by hand is not seen
 (the check does not probe `/run/das-scrub.lock`, which would make a scrub starting in that
 instant skip its pass). Checked 2026-11-22 with a stub `systemctl` and a scratch lock: the scrub
@@ -762,16 +762,28 @@ Both roots are compared **after resolution**, so a symlinked ancestor cannot smu
   that has been made. `das-backup.timer` carries `RandomizedDelaySec=1800`, so the backup starts
   anywhere in 03:00–03:30 while the scrub fires at a fixed 03:05 — the backup wins the lock only
   when its delay lands in the first five minutes of thirty, roughly one time in six.
-  **Both orders are correct.** What the design guarantees is not sequence but the two-lock
+  *Superseded 2026-11-22: a backup no longer waits behind a scrub pass — the pass yields to it and
+  resumes; see bd `DAS-Backup-Manager-su1b.2`.* **Both orders are correct.** What the design guarantees is not sequence but the two-lock
   interlock below: whichever job takes the maintenance lock first runs, the other blocks on
   `flock` and starts automatically the instant it is released — an overrunning scrub HOLDS the
   next backup until done (defer, never skip), a confirmed invariant. Observed 2026-09-01:
   scrub 03:05:03, backup 03:16:52, backup deferred behind the full pass and run on release.
+- **Why that changed (operator decision 2026-11-01).** On 2026-11-01 the 03:12 nightly waited on the
+  scrub's maintenance lock 8 h 28 m, was stopped by a reboot (exit 143) and wrote nothing. The rule
+  now: a scrub does not block a backup through the lock either. The backup claims the lock
+  (`/run/das-maintenance-claim.lock`, §Maintenance Interlock), the pass stops its scrub (SIGTERM to the
+  `btrfs` child: on kernel 7.3.5 / btrfs-progs 7.3 that leaves `canceled:0 finished:0`, which
+  `decide_from` resumes; SIGINT and `btrfs scrub cancel` leave `canceled:1`, proven by the A1 rig),
+  unmounts, lets go, and resumes the same filesystem with `btrfs scrub resume` once the backup is done.
+  Cost: the pass ends later by the backup's length plus about a minute. The design note's option B
+  (backup and scrub sharing the lock with counted mounts) was not chosen: its correctness rests on every
+  unmount site in two languages obeying a refcount protocol, where A keeps one holder at a time.
 
 <!-- full original lines moved from the rule file, 2026-11-01 -->
 - Targets are scrubbed sequentially in `[scrub].targets` order (shared USB path).
 - `[scrub].on_calendar` is a *preference* for backup-first, not a guarantee; the backup timer has a randomised
-  delay. **Both orders are correct** — the interlock makes the second job wait. An overrunning scrub defers
+  delay. *Superseded 2026-11-22: the pass yields to a waiting backup; see bd `DAS-Backup-Manager-su1b.2`.*
+  **Both orders are correct** — the interlock makes the second job wait. An overrunning scrub defers
   the next backup, never skips it.
 
 ## Supervisor Interaction — A Service Supervisor May Restart Failed Units
@@ -994,7 +1006,17 @@ unreadable serial is a refusal, never a pass (bd `7tx` 4).
 Backups (`scripts/backup-run.sh`) and the scheduled BTRFS scrub engine (`indexer/src/scrub.rs`) both mount and unmount the same DAS filesystems, so they must never run concurrently. Two-lock design, identical on both sides, acquired in the same order (singleton → maintenance) so the pair is deadlock-free by construction:
 
 1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n -E 75` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0; a lock that cannot be opened or taken ⇒ "could not start", exit 1, bd `ismb`). Scrub: `flock -n` on `/run/das-scrub.lock`, recorded `btrdasd scrub run pid N` (held ⇒ skip naming the holder, no state written; held by `btrdasd setup` ⇒ wait up to 900 s, then skip with a WARN, bd `su1b.2` A4).
-2. **Maintenance lock** — `/run/das-maintenance.lock`, path shared verbatim between both sides. Blocking on both sides: whichever job arrives second **waits**, it is never skipped or canceled. Held for the entire operation, including that job's own mounts/unmounts.
+2. **Maintenance lock** — `/run/das-maintenance.lock`, path shared verbatim between both sides. Blocking on both sides: whichever job arrives second **waits**, it is never skipped or canceled. Held for the entire operation, including that job's own mounts/unmounts — except that a scrub pass gives it up to a backup that claims it (3).
+3. **The claim** (bd `su1b.2`, steps A5/A6, 2026-11-22) — `/run/das-maintenance-claim.lock`. Who holds what, step by step:
+   - The backup takes its singleton, then the claim **shared** (`backup-run.sh`: `acquire_claim`, `flock -s` on fd 7; Rust: `maintenance::Claim` in `backup::acquire_claiming_locks_at`), records `<job> pid N` in it, and waits for maintenance; every child the script starts meanwhile gets `7<&-`. Once it holds maintenance it empties the record, unlocks and closes the claim (`release_claim`), so nothing it runs afterwards keeps a scrub paused.
+   - The scrub holds its singleton for the whole pass and maintenance in a `MaintenanceSlot`. It probes the claim (`LOCK_EX|LOCK_NB`, released at once; a probe never blocks, so the claim adds no edge to the singleton → maintenance order): before it first takes maintenance and right after (claimed → let it go unused), before each filesystem's mount, and at every 5 s poll of the `btrfs` child.
+   - Claimed mid-scrub: `stop_child` (SIGTERM, 30 s grace, SIGKILL, reaped); `live_scrub_state` must read `NotRunning` (otherwise the mount is left as it is, the filesystem filed with the error and not resumed in this pass, and the lock given up all the same: the backup's leftover check meets `EBUSY` and aborts exit 3 before btrbk); the record is read by UUID and trusted only if its last start/resume is this segment's (`Finished` → filed as a result, `Canceled` → a WARN that the resume starts from zero, stale or none → the resume decides from the earlier record); the pass unmounts what it mounted, writes `yielded` (pid, boot id, `yielded_to`, `yields`, `paused_secs`), and only then drops maintenance (record emptied, then unlocked).
+   - It then waits, singleton and signal handlers kept, polling: a signal files `interrupted` with the signal and the process dies of it, nothing mounted. Once nobody claims it retakes maintenance, re-probes, reads `config.toml` again (a failure ends the pass with the reason; a filesystem no longer listed is filed as not resumed), and runs the same filesystem again: `ensure_mounted` (a leftover taken down, bd `jgm`) → `decide_scrub_start_mode` → `Resume` → `btrfs scrub resume -B -c 2 -n 0`.
+   - The backup mounts afresh (operator Q4): no mount is handed over, so every job still owns the mount it uses.
+   - A claim nobody answers in `YIELD_ANSWER_SECS` (180 s, three times a worst ordinary yield) is one WARN naming the holder (an older scrub, a recovery-OS VM session, doctor) and the `Scrub yield` row's WARN; the backup keeps waiting and its exit status follows the usual rule (operator Q5). A claim probe that cannot look is read as a claim once, then as none until it can look again.
+   - Kill cases (all proven on the loop rig, `indexer/tests/scrub_loopback.rs`): a claimant SIGKILLed before or after the yield takes its claim with it; the pass resumes (at most one needless pause). A pass SIGKILLed while yielded holds only its singleton, freed; its `yielded` record reads `interrupted` (health FAIL, operator Q3) and the next pass resumes. A pass and its child SIGKILLed mid-scrub leave the target mounted; the next job takes it down and the next pass resumes.
+   - Who may claim (operator Q2): backups only — `backup-run.sh` (dry runs too), `btrdasd backup run|snapshot|send`, the helper's `BackupRun`. `walk`, `restore`, index jobs and `backup boot-archive` keep the plain wait.
+   - By hand: `flock -s /run/das-maintenance-claim.lock <command>` pauses a scrub for as long as the command runs; the pass resumes by itself afterwards.
 
 Deadlock-freedom depends only on both sides **acquiring** in the same order (singleton, then maintenance) — never the reverse. Release order does not need to match on both sides for that guarantee to hold. The two implementations release differently: the scrub engine's `ScrubLocks` (Rust) has an explicit field-drop order (`maintenance` before `singleton`) that deliberately releases maintenance first; `backup-run.sh` (bash) has no equivalent — both fd 9 (singleton) and fd 8 (maintenance) simply stay open until the process exits, and the kernel's fd-teardown order at exit is unspecified and irrelevant here, since nothing in this design depends on it.
 

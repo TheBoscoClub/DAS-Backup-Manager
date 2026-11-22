@@ -127,9 +127,10 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 
 - **This project is the ONLY thing that scrubs the `[scrub].targets` filesystems**, and **never scrubs or
   services non-backup filesystems.** No other component adds a scrub timer for the backup media.
-- Targets are scrubbed sequentially in `[scrub].targets` order. `[scrub].on_calendar` is a *preference* for
-  backup-first, not a guarantee: **both orders are correct** — the interlock makes the second job wait; an
-  overrunning scrub defers the next backup, never skips it.
+- Targets are scrubbed sequentially in `[scrub].targets` order. A backup never waits behind a scrub pass
+  (operator 2026-11-01, bd `su1b.2`): the pass yields to it (§Maintenance Interlock, the claim) and
+  resumes the same filesystem afterwards; the pass ends later by the backups' length, with no skipped
+  region. A scrub that started while a backup waits lets the backup go first.
 
 ## Supervisor Interaction — A Service Supervisor May Restart Failed Units
 
@@ -205,8 +206,21 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
    - `backup-run.sh` finds it held by setup or a config edit → waits, `SINGLETON_WAIT_SECS` (900 s), saying whom; still held → skip, exit 0, a WARN that this backup did NOT run.
    - `/run/das-scrub.lock` carries its holder's record too (`btrdasd scrub run pid N`, or `btrdasd setup … pid N` while setup writes; bd `su1b.2`). A scrub pass finding it held by setup → waits `SETUP_WAIT_SECS` (900 s), saying whom; still held → skip, exit 0, a WARN that this pass did NOT run. Held by anything else → skip, naming the holder. `scrub cancel` refuses setup's hold, cancelling nothing.
    - Held by a backup → skip, exit 0, naming it. No record, no pid, or the pid gone → skip, exit 0, with the same WARN; never a silent skip.
-2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides, held for the whole operation.
-   Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.
+2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides; one holder at a time, and only its
+   holder mounts or unmounts. Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.
+3. **The claim** (bd `su1b.2`, operator 2026-11-22): `/run/das-maintenance-claim.lock`, 0600. Only backups
+   claim — `backup-run.sh` (dry runs too), `btrdasd backup run|snapshot|send`, the helper's `BackupRun`
+   (`backup::acquire_claiming_locks_at`); never `walk`, `restore`, index jobs or `backup boot-archive`.
+   - A backup holds it shared (`flock -s`, `backup-run.sh` fd 7, `7<&-` on every child meanwhile) from after
+     its singleton until it holds maintenance, then lets it go; a cancelled GUI wait lets it go too.
+   - The scrub only probes it (`LOCK_EX|LOCK_NB`, never waits): before it first takes maintenance, right after,
+     before each mount, at each 5 s poll. Claimed → stop the child (`stop_child`, SIGTERM, reaped), confirm
+     the kernel stopped (`live_scrub_state` = `NotRunning`, else leave the mount and do not resume that
+     filesystem), unmount its own mount, write `yielded`, only then release maintenance; wait (singleton held,
+     signals answered), retake, re-read `config.toml`, `btrfs scrub resume` the same filesystem.
+   - A claim nobody answers in `YIELD_ANSWER_SECS` (180 s): one WARN naming the holder, the backup keeps
+     waiting, exit status unchanged (`Scrub yield` report row). A probe that cannot look costs one pause.
+   - A pass that yielded and dies before resuming reads `interrupted` (health FAIL, operator Q3).
 
 - **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`);
   `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down
