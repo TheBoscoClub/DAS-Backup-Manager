@@ -99,7 +99,8 @@
 //! # Locking (two locks, acquired singleton → maintenance)
 //!
 //! * `/run/das-scrub.lock` — non-blocking. Held means another scrub pass is
-//!   already running, so this invocation **skips** (logs and returns
+//!   already running, or `btrdasd setup` is writing the installed files (it
+//!   holds this lock too, bd DAS-Backup-Manager-su1b.2), so this invocation **skips** (logs and returns
 //!   [`PassStatus::Skipped`]); it never queues.
 //! * `/run/das-maintenance.lock` — blocking, shared with `backup-run.sh`. Held
 //!   for the entire pass, including this module's own mounts and unmounts, so a
@@ -210,6 +211,7 @@ use crate::mount::partition_device;
 use crate::progress::{LogLevel, ProgressCallback};
 
 /// Non-blocking singleton lock — a second scrub pass skips rather than queues.
+/// `btrdasd setup` holds it too while it writes, so a pass started then skips.
 pub const SCRUB_LOCK_PATH: &str = "/run/das-scrub.lock";
 /// Blocking maintenance lock, shared with `backup-run.sh`.
 pub const MAINTENANCE_LOCK_PATH: &str = "/run/das-maintenance.lock";

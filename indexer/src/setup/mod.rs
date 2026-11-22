@@ -111,7 +111,7 @@ type UpgradeMode<'a> = &'a dyn Fn(
 /// What `btrdasd setup` does to the host, one seam per step: the host's own
 /// in production ([`run`]), scratch files and recorders in tests.
 struct SetupHost<'a> {
-    /// Where setup's two locks are.
+    /// Where setup's three locks are.
     site: installer::SetupLockSite,
     /// `--check`: read-only, so it takes no lock.
     check: &'a dyn Fn() -> Result<(), Box<dyn std::error::Error>>,
@@ -174,7 +174,7 @@ fn select_action(args: &SetupArgs) -> Action {
 
 /// Do what `args` asks, with the config at `config_path` and the host as
 /// `host` binds it; progress to `say`, a refusal to `warn`. Every mode that
-/// writes or removes installed files does so under setup's two locks, taken
+/// writes or removes installed files does so under setup's three locks, taken
 /// only once its questions are answered: held across a prompt, the backup
 /// singleton would make a backup the timer starts meanwhile skip its run. A
 /// wizard refused then keeps its answers and offers to wait and retry.

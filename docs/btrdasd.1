@@ -543,7 +543,7 @@ so once a run is in
 .B main
 bash reads its file no more.
 .B cmake \-\-install
-takes neither lock: never run it while a backup runs. CMake 4.4.3 replaces each
+takes no lock: never run it while a backup or a scrub runs. CMake 4.4.3 replaces each
 file by removing it and creating a new one, executable only once complete, so
 a run already going keeps its script, though it calls the new sibling scripts
 and
@@ -3704,6 +3704,8 @@ Singleton locks: one backup, scrub, reconcile pass (also taken by
 and
 .BR forget / purge )
 or drift check at a time.
+.B btrdasd setup
+holds the backup and scrub ones while it writes, so a scrub started then skips.
 .TP
 .I /run/das\-maintenance.lock
 Shared maintenance lock held by every job that mounts the backup targets \(em

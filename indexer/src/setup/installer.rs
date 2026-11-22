@@ -1419,9 +1419,9 @@ pub enum Locked<T> {
 }
 
 /// Run `change` — the part of a setup mode that writes or removes installed
-/// files — holding setup's two locks from before its first write until it
+/// files — holding setup's three locks from before its first write until it
 /// returns, and let them go then, whether it succeeded or failed. While a job
-/// holds either lock `change` is not run, and the result says which lock, and
+/// holds any of them `change` is not run, and the result says which lock, and
 /// by whom.
 pub fn under_setup_locks<T>(
     site: &SetupLockSite,
@@ -4620,7 +4620,7 @@ auth = "starttls""#,
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::SystemTime;
 
-    /// Scratch stand-ins for the two locks setup takes, in a directory of
+    /// Scratch stand-ins for the three locks setup takes, in a directory of
     /// their own, so they are never part of a tree a test compares.
     struct ScratchLocks {
         _dir: tempfile::TempDir,
@@ -4827,6 +4827,7 @@ auth = "starttls""#,
         let site = case.site.as_ref().unwrap_or(&locks.site);
         let _backup = (case.holding == Holding::Backup).then(|| locks.hold_backup());
         let _scrub = (case.holding == Holding::Maintenance).then(|| locks.hold_maintenance());
+        let _pass = (case.holding == Holding::ScrubPass).then(|| locks.hold_scrub_pass());
 
         // Each step notes the locks and the maintenance lock's record, then
         // leaves its own mark in that record. The next step finding the mark
@@ -4996,6 +4997,35 @@ auth = "starttls""#,
                  (exit 75).",
                 run.maintenance_lock.display()
             )]
+        );
+    }
+
+    #[test]
+    fn an_upgrade_writes_nothing_and_exits_75_while_a_scrub_pass_is_alive() {
+        let run = upgrade_installed_tree(UpgradeCase {
+            holding: Holding::ScrubPass,
+            ..Default::default()
+        });
+
+        assert_eq!(run.outcome, Ok(SetupOutcome::Refused));
+        assert_eq!(run.changed, Vec::<PathBuf>::new());
+        assert_eq!(run.config.general.version, "0.0.1");
+        assert_eq!(
+            run.steps,
+            Vec::<String>::new(),
+            "nothing written or restarted"
+        );
+        assert!(
+            !run.maintenance_opened,
+            "the maintenance lock is not opened"
+        );
+        assert_eq!(run.locks_after, BOTH_FREE, "setup holds nothing");
+        assert_eq!(run.warnings.len(), 1, "{:?}", run.warnings);
+        assert!(
+            run.warnings[0]
+                .starts_with("Refused, nothing written or removed: the scrub singleton "),
+            "{:?}",
+            run.warnings
         );
     }
 
@@ -5459,7 +5489,7 @@ auth = "starttls""#,
         // A pass stand-in: one process holding the singleton by flock(2), as
         // `btrdasd scrub run` does. The shell locks its own descriptor, then
         // becomes `sleep` (exec, no fork), so it is the only holder.
-        let mut pass = std::process::Command::new("sh")
+        let pass = std::process::Command::new("sh")
             .arg("-c")
             .arg(r#"exec 9<>"$1" && flock -x 9 && exec sleep 600"#)
             .arg("sh")
@@ -5468,7 +5498,16 @@ auth = "starttls""#,
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("flock(1) runs");
+            .expect("the stand-in runs");
+        // SIGKILLed and reaped however the test ends, so no `sleep` outlives it.
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut pass = Reaped(pass);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !(locks.site.scrub.exists() && locks.scrub_state() == "held") {
             assert!(
@@ -5479,9 +5518,9 @@ auth = "starttls""#,
         }
 
         let alive = under_setup_locks(&locks.site, "btrdasd setup", |_| Ok(()));
-        // SIGKILL and reap the stand-in before any assertion can unwind past it.
-        let _ = pass.kill();
-        let _ = pass.wait();
+        // SIGKILL, then reap: the pass is dead.
+        let _ = pass.0.kill();
+        let _ = pass.0.wait();
         let dead = under_setup_locks(&locks.site, "btrdasd setup", |_| Ok(()));
 
         assert!(
@@ -5546,7 +5585,7 @@ auth = "starttls""#,
 
     // Every other mode that writes or removes installed files — the wizard,
     // `--modify` and `--force` install; `--uninstall`; `--uninstall-all` —
-    // runs its core under the same two locks.
+    // runs its core under the same three locks.
 
     #[derive(Clone, Copy, Debug)]
     enum Mode {
