@@ -3010,13 +3010,24 @@ when there is nothing to resume. The targets are scrubbed one at a time, in
 .B [scrub].targets
 order.
 .PP
-A scrub runs at the highest priority that cannot block writes: every
+A scrub runs at the highest I/O priority that cannot hold writes back
+without a bound (btrfs\-progs would otherwise run its per\-device workers in
+the idle class), chosen per filesystem before each start or resume. Every
 .B btrfs scrub
 is given
-.BR "\-c 2 \-n 0"
-(best-effort I/O class, level 0; btrfs\-progs would otherwise run its
-per\-device workers in the idle class), and the systemd unit runs at nice
-\-20 with the same I/O class and level. The real\-time class is never used.
+.B "\-c 1 \-n 0"
+(real\-time I/O class, level 0) when every device of the filesystem, as
+listed in
+.IR /sys/fs/btrfs/<fsuuid>/devices/ ,
+runs mq\-deadline and exposes
+.IR queue/iosched/prio_aging_expire ,
+which bounds how long a lower class waits (10 s by default); otherwise, a
+device on bfq or any other scheduler or anything unreadable included, it is
+given
+.B "\-c 2 \-n 0"
+(best\-effort I/O class, level 0). The pass logs one line per filesystem
+naming the class and why. The systemd unit runs at nice \-20, best\-effort
+I/O level 0; the per\-device workers ignore the unit's I/O class.
 .PP
 If another scrub pass holds
 .IR /run/das\-scrub.lock ,

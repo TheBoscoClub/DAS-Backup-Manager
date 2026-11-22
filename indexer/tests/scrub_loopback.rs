@@ -786,7 +786,8 @@ fn live_scrub_is_never_force_restarted() {
 //
 // A scrub that yields to a backup must be stopped in a way that leaves a record
 // `btrfs scrub resume` continues from. Each test below stops a real
-// `btrfs scrub start -B -c 2 -n 0` (the engine's own invocation, as a direct
+// `btrfs scrub start -B -c 2 -n 0` (the engine's best-effort invocation; on
+// all-mq-deadline disks it passes `-c 1 -n 0` instead, bd su1b.5; as a direct
 // child: the process `stop_child` signals) by one method, unmounts, remounts,
 // and resumes. The assertions pin what was observed on kernel 7.3.5 with
 // btrfs-progs v7.3; another kernel or progs version may differ, and every
