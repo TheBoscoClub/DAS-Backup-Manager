@@ -533,11 +533,18 @@ case "$cmd" in
             printf '  vcpu.current=4\n  vcpu.maximum=4\n'
             # libvirt leaves the per-vCPU fields out when it cannot read them.
             if [[ ! -f "$S/domstats_no_vcpu" ]]; then
-                for i in 0 1 2 3; do
+                ids="0 1 2 3"
+                # Four time lines from three vCPUs: one id twice, or a key
+                # under an id that is no vCPU's time (bd cc8h). libvirt emits
+                # neither; a count of lines would take them for four.
+                if [[ -f "$S/domstats_dup_vcpu" ]]; then ids="0 1 2 0"; fi
+                if [[ -f "$S/domstats_sub_vcpu" ]]; then ids="0 1 2"; fi
+                for i in $ids; do
                     t=0
                     if [[ -f "$S/resumed" ]] || [[ -f "$S/vcpu_ran" && "$i" == 2 ]]; then t=1530000000; fi
                     printf '  vcpu.%s.state=1\n  vcpu.%s.time=%s\n  vcpu.%s.wait=0\n' "$i" "$i" "$t" "$i"
                 done
+                if [[ -f "$S/domstats_sub_vcpu" ]]; then printf '  vcpu.0.x.time=0\n'; fi
             fi
         fi
         echo
@@ -4035,6 +4042,7 @@ DURING_STOP="$NEXT_BOOT_B; touch \"\$S/guest.silent\"" GUARD_SECS=2 run_watch_st
 check "watch stopped across a reset, then silence, may: shut down (exit 6)" "$RC" "6"
 has "watch stopped across a reset, then silence, may: said" "$OUT" "the session guard did not confirm: the recovery OS was reset, and no boot after that reported its guard engaged within 0h 00m 02s"
 has "watch stopped across a reset, then silence, may: asked to shut down" "$(events)" "virsh shutdown"
+lacks "watch stopped across a reset, then silence, may: no boot to explain (bd cc8h)" "$OUT" "came before the place this reset was recorded at"
 check "watch stopped across a reset, then silence, may: never destroyed" "$(file "$S/forbidden")" ""
 
 # The new boot's line 1 written while the watch was stopped: the reset is
@@ -4051,6 +4059,10 @@ DURING_STOP="$NEXT_BOOT_B"'; line "$ENG4" "$BOOT_B" 1 >>"$(cat "$S/guard_port")"
 check "watch stopped, the new boot's line 1 before the watch read the reset, may: proof still asked (exit 6)" "$RC" "6"
 has "watch stopped, the new boot's line 1 before the watch read the reset: the reset recorded" "$OUT" "the recovery OS was reset (a reboot inside it, or virsh reset)"
 has "watch stopped, the new boot's line 1 before the watch read the reset: said" "$OUT" "no boot after that reported its guard engaged within 0h 00m 02s"
+# ... and the log above it shows that boot engaged: the failure says why
+# that line does not answer the reset (bd cc8h).
+has "watch stopped, the new boot's line 1 before the watch read the reset: the boot shown engaged" "$OUT" "the recovery OS booted again (boot $BOOT_B), and its guard is engaged"
+has "watch stopped, the new boot's line 1 before the watch read the reset: why it does not count" "$OUT" "no boot after that reported its guard engaged within 0h 00m 02s (boot $BOOT_B reported engaged, but its first line came before the place this reset was recorded at: a reset read late -- the reset watch stopped or starved -- is recorded where the report stood when it was read, so that line cannot be shown to come after the reset)"
 
 # Output of the event stream not recognised, that names a reboot: a reset.
 fixture
@@ -4139,6 +4151,20 @@ printf '3 badreset\n3 silence\n' >"$S/guest.script"
 DRIVER_TIMEOUT=40 GUARD_SECS=1 run_driver session A
 check "a reset line that cannot be parsed, then silence, may: a reset (exit 6)" "$RC" "6"
 has "a reset line that cannot be parsed: said" "$OUT" "no boot after that reported its guard engaged within 0h 00m 01s"
+# session-end of a saved report whose second boot's line 1 lies before the
+# place the reset was recorded at (a reset read late): the boot is not let
+# off, and the text says why its engaged line does not answer it (bd cc8h).
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+{ line "$ENG4"; line "$ENG4" "$BOOT_B"; } >"$STATE/system-recovery-A-2tb.guard" 2>/dev/null || :
+printf 'reset %s %s %s\n' "$(stat -c %i "$STATE/system-recovery-A-2tb.guard")" "$(stat -c %s "$STATE/system-recovery-A-2tb.guard")" "$(date +%s)" >>"$STATE/system-recovery-A-2tb.resets"
+printf 'shut off\n' >"$S/states"
+GUARD_SECS=300 run_driver session-end A
+check "session-end, a reset recorded after the new boot's line 1, may: exit 6" "$RC" "6"
+has "session-end, a reset recorded after the new boot's line 1: why that boot does not count" "$OUT" "session guard: NOT confirmed: the recovery OS was reset, and was shut off before a boot after that reported its guard engaged (boot $BOOT_B reported engaged, but its first line came before the place this reset was recorded at"
 
 echo "--- round 4: a line left unfinished at power-off (M-1)"
 fixture
@@ -4201,8 +4227,10 @@ touch "$S/dumpxml_live_sleep" "$S/vcpu_ran"
 WAIT_FILE="$S/in_live_dumpxml" run_interrupted session A
 check "interrupted while paused, its vCPUs ran: kept (exit 3)" "$RC" "3"
 check "interrupted while paused, its vCPUs ran: never destroyed" "$(file "$S/forbidden")" ""
-# The read fails, or gives no vCPU time: nothing is destroyed.
-for how in domstats_fail domstats_no_vcpu; do
+# The read fails, or gives no vCPU time -- or four time lines that are not
+# four vCPUs' (an id twice, a key under an id that is no vCPU time; bd cc8h):
+# nothing is destroyed.
+for how in domstats_fail domstats_no_vcpu domstats_dup_vcpu domstats_sub_vcpu; do
     fixture
     write_state 3 "$(record_json system-recovery-A-2tb may)"
     touch "$S/live_drops_guard" "$S/$how"

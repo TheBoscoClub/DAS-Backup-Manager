@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `backup-verify.sh` (3.3.0): an unreadable or ambiguous serial is the empty string
   - `tests/test_serial_identity.sh` (CTest `shell-serial-identity`)
 - **`[das].model_pattern` has its blanks removed on both sides** (bd `DAS-Backup-Manager-2kb1.15`): `backup-verify.sh` removed them from the disk's model but not from the pattern, so a pattern written with a space matched nothing; `backup-run.sh`'s USB link probe removed them from neither, and now from both, as `docs/INSTALL.md` says
+- **A late-read reset's failure no longer contradicts the log above it** (bd `DAS-Backup-Manager-cc8h`): when the session read a reset late (its script stopped or starved), a new boot whose first line came before that read is logged as engaged, then the failure said `no boot after that reported its guard engaged`
+  - `recovery-os-vm.sh` (2.4.2) now names that boot and says why it does not count: its first line came before the place the reset was recorded at, so it cannot be shown to come after the reset; the same in `status` and `session-end`. The judgement is unchanged (the cautious side)
+  - The one destroy, of a paused domain never resumed, counts each vCPU's time once by its id: a reading with a vCPU's time twice, or a time under a key that is no vCPU's, destroys nothing (libvirt emits neither)
+  - Documented in the Disaster Recovery Guide's troubleshooting
 
 - **Recovery panel polish** (bd `DAS-Backup-Manager-v173`, `DAS-Backup-Manager-3gzs.5`): small honesty fixes in the GUI's recovery drive panel and notifications
   - End session is enabled only for a holder named `other:`; any other holder is refused with the reason, and a document with no drives disables every action
