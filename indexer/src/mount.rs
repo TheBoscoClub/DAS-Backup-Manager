@@ -241,6 +241,66 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         }
     }
 
+    fn forget(&self, path: &str) -> Result<(), String> {
+        let out = self.run(Command::new("btrfs").args(["device", "scan", "--forget", path]))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed("btrfs device scan --forget", &out))
+        }
+    }
+
+    fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String> {
+        let out = self.run(Command::new("mount").args(["-t", "btrfs", "-o", opts, device, at]))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let why = failed("mount", &out);
+        if (self.probes.is_mountpoint)(Path::new(at))
+            && let Err(u) = umount_retrying(self.runner, at, |_| {})
+        {
+            return Err(format!(
+                "{why}; it is mounted anyway and will not unmount: {u}"
+            ));
+        }
+        Err(why)
+    }
+
+    fn temp_mountpoint(&self) -> Result<String, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let at = format!(
+            "/run/btrdasd-raid-probe.{}.{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&at)
+            .map_err(|e| format!("cannot create {at}: {e}"))?;
+        Ok(at)
+    }
+
+    fn remove_mountpoint(&self, at: &str) -> Result<(), String> {
+        std::fs::remove_dir(at).map_err(|e| format!("cannot remove {at}: {e}"))
+    }
+
+    fn fsid_mounted(&self, fsid: &str) -> Result<bool, String> {
+        let out = self.run(Command::new("findmnt").args([
+            "-n",
+            "-o",
+            "TARGET",
+            "-S",
+            &format!("UUID={fsid}"),
+        ]))?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(failed("findmnt", &out)),
+        }
+    }
+
     fn read_super(&self, path: &str) -> Result<String, String> {
         let out = self.run(Command::new("btrfs").args(["inspect-internal", "dump-super", path]))?;
         if out.status.success() {

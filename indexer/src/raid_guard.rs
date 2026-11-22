@@ -1010,6 +1010,17 @@ pub trait MemberHost {
     fn members(&self, fsid: &str) -> Result<Vec<String>, String>;
     /// `btrfs device scan <path>`: register this one device.
     fn scan(&self, path: &str) -> Result<(), String>;
+    /// `btrfs device scan --forget <path>`: unregister this one device, by
+    /// its exact path (never unscoped).
+    fn forget(&self, path: &str) -> Result<(), String>;
+    /// `mount -t btrfs -o <opts> <device> <at>`: one member by its own path.
+    fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String>;
+    /// A new private, empty directory to probe-mount one member at.
+    fn temp_mountpoint(&self) -> Result<String, String>;
+    /// Remove the directory [`MemberHost::temp_mountpoint`] made.
+    fn remove_mountpoint(&self, at: &str) -> Result<(), String>;
+    /// Whether filesystem `fsid` is mounted anywhere now.
+    fn fsid_mounted(&self, fsid: &str) -> Result<bool, String>;
     /// `btrfs inspect-internal dump-super <path>`.
     fn read_super(&self, path: &str) -> Result<String, String>;
     /// Whether a drive with this serial is attached.
@@ -1391,6 +1402,16 @@ pub fn mount_guarded(
                 &s.rejected.iter().collect::<Vec<_>>(),
             )));
         }
+        // Members whose superblock generations differ, whatever the primary
+        // says (it may be a stale copy from before an accept; review round
+        // 3): each member's own witness is read alone before anything is
+        // mounted read-write, and a member any copy rejects is refused.
+        if s.all_present()
+            && generations_differ(&s.members)
+            && let Some(refusal) = member_witness_check(host, plan, &s, &rejected, progress)
+        {
+            return refusal;
+        }
         // Members whose superblock generations differ with no record to say
         // why (the primary lost to a rollback, or never written): one of them
         // may be a drive `raid accept` gave up, whose tree the kernel would
@@ -1483,6 +1504,189 @@ pub fn mount_guarded(
     mount_degraded(host, plan, s, absent_serials, progress)
 }
 
+/// Whether the members' superblock generations are not all one.
+fn generations_differ(members: &[Member]) -> bool {
+    members
+        .first()
+        .is_some_and(|f| members.iter().any(|m| m.generation != f.generation))
+}
+
+/// Devices forgotten for a one-member probe, registered again when it goes
+/// out of scope, on every path. A registration that fails here leaves the
+/// member unknown to the kernel: the plain mount then fails and the guard
+/// waits or refuses, the cautious direction.
+struct Reregister<'a> {
+    host: &'a dyn MemberHost,
+    paths: Vec<String>,
+}
+
+impl Drop for Reregister<'_> {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            let _ = self.host.scan(&path);
+        }
+    }
+}
+
+/// Each present member's own witness, read with that member alone: every
+/// other present member forgotten by its exact path, the member mounted
+/// [`PROBE_OPTS`] at a private directory, the witness read, unmounted, the
+/// others registered again. Refused when the filesystem is mounted anywhere
+/// (nothing is forgotten or mounted then), when a probe fails, or when a
+/// member's own copy cannot be read.
+fn member_witnesses(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    members: &[Member],
+) -> Result<Vec<Copy>, String> {
+    match host.fsid_mounted(plan.fsid) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(format!(
+                "filesystem {} is mounted elsewhere: its members, whose generations differ, \
+                 cannot each be read alone — not mounting it",
+                plan.fsid
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "whether filesystem {} is mounted elsewhere cannot be read ({e})",
+                plan.fsid
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for m in members {
+        let mut again = Reregister {
+            host,
+            paths: Vec::new(),
+        };
+        for other in members.iter().filter(|o| o.path != m.path) {
+            again.paths.push(other.path.clone());
+            host.forget(&other.path).map_err(|e| {
+                format!(
+                    "{} cannot be set aside to read {} alone ({e})",
+                    other.path, m.path
+                )
+            })?;
+        }
+        let at = host.temp_mountpoint()?;
+        if let Err(e) = host.mount_device(PROBE_OPTS, &m.path, &at) {
+            let _ = host.remove_mountpoint(&at);
+            return Err(format!(
+                "{}: the read-only probe of this member alone failed ({e})",
+                m.path
+            ));
+        }
+        let copy = host.read_witness(&at, plan.fsid);
+        host.umount(&at)
+            .map_err(|e| format!("{}: the probe mount at {at} will not unmount ({e})", m.path))?;
+        let _ = host.remove_mountpoint(&at);
+        if let Copy::Bad(e) = &copy {
+            return Err(format!(
+                "{}: its own RAID record is unreadable ({e})",
+                m.path
+            ));
+        }
+        out.push(copy);
+        drop(again);
+    }
+    Ok(out)
+}
+
+/// The per-member check of members whose generations differ: `None` to go
+/// on, `Some` the job's outcome (a refusal, or a read-only job's mount of a
+/// member no copy rejects).
+fn member_witness_check(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: &Survey,
+    primary_rejected: &BTreeSet<String>,
+    progress: &dyn ProgressCallback,
+) -> Option<Result<Outcome, Failure>> {
+    let witnesses = match member_witnesses(host, plan, &s.members) {
+        Ok(w) => w,
+        Err(why) => {
+            let why = format!(
+                "{why} — the members' generations differ and each member's own record must be \
+                 read before a read-write mount; restore the NEWEST copy of the RAID record, or \
+                 pull the drive that is not wanted"
+            );
+            return Some(match plan.intent {
+                Intent::Write => Err(refused(why)),
+                // Mounted elsewhere: never a second mount of it.
+                Intent::ReadOnly if why.contains("mounted elsewhere") => Err(refused(why)),
+                Intent::ReadOnly => mount_read_only_unvouched(
+                    host,
+                    plan,
+                    Survey {
+                        members: s.members.clone(),
+                        expected: s.expected,
+                        rejected: Vec::new(),
+                    },
+                    why,
+                    progress,
+                ),
+            });
+        }
+    };
+    let mut rejected = primary_rejected.clone();
+    for copy in &witnesses {
+        if let Copy::Read(r) = copy {
+            rejected.extend(r.rejected.iter().map(|m| m.dev_uuid.clone()));
+        }
+    }
+    let found: Vec<&Member> = s
+        .members
+        .iter()
+        .filter(|m| rejected.contains(&m.dev_uuid))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    let why = format!(
+        "{} (found by reading each member's own record; the primary copy may be older than the \
+         accept — restore the NEWEST copy of the record)",
+        rejected_why(&found)
+    );
+    Some(match plan.intent {
+        Intent::Write => Err(refused(why)),
+        Intent::ReadOnly => {
+            // Only a member no copy rejects, alone: the rejected ones set
+            // aside (left unregistered: they are refused anyway).
+            let Some(keep) = s.members.iter().find(|m| !rejected.contains(&m.dev_uuid)) else {
+                return Some(Err(refused(why)));
+            };
+            for r in &found {
+                if let Err(e) = host.forget(&r.path) {
+                    return Some(Err(refused(format!(
+                        "{why}; and {} cannot be set aside ({e})",
+                        r.path
+                    ))));
+                }
+            }
+            match host.mount_device(&stale_read_opts(plan.mount_opts), &keep.path, plan.mount) {
+                Ok(()) => {
+                    let outcome = Outcome::ReadOnly {
+                        members: vec![keep.clone()],
+                        why,
+                    };
+                    let (status, detail) = outcome.status_line();
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Target '{}': {status}: {detail}", plan.label),
+                    );
+                    Ok(outcome)
+                }
+                Err(e) => Err(Failure::MountFailed(format!(
+                    "the read-only mount of {} failed: {e}; {why}",
+                    keep.path
+                ))),
+            }
+        }
+    })
+}
+
 /// Why members whose superblock generations differ cannot be mounted
 /// read-write when no record is readable, or `None` when they agree (a
 /// healthy pair has one generation).
@@ -1494,8 +1698,9 @@ fn diverged_without_record(plan: &Plan<'_>, members: &[Member]) -> Option<String
     Some(format!(
         "the members' superblock generations differ ({}) and no RAID record explains it \
          ({} is absent): one of them may lack writes the other holds, or be a drive 'btrdasd \
-         raid accept' gave up — not mounting it read-write. Restore the record from a backup, \
-         or, if one drive is dead, pull it and run 'btrdasd raid accept {}'",
+         raid accept' gave up — not mounting it read-write (each member's own record named no \
+         rejection). Restore the NEWEST copy of the record from a backup, or, if one drive is \
+         dead, pull it and run 'btrdasd raid accept {}'",
         members
             .iter()
             .map(|m| format!(
@@ -2176,16 +2381,23 @@ pub fn accept(
     // it. Only the members the explanation named may be present.
     let accepted_uuids: BTreeSet<&str> =
         found.present.iter().map(|m| m.dev_uuid.as_str()).collect();
+    // Every listed path must be read: one whose superblock cannot be read is
+    // a refusal, never left out (review round 3).
     let now_present: Vec<Member> = host
         .members(plan.fsid)
         .map_err(|e| format!("not accepted, nothing changed: cannot list the members ({e})"))?
         .iter()
-        .filter_map(|path| {
+        .map(|path| {
             host.read_super(path)
                 .and_then(|t| parse_super(path, &t, plan.fsid))
-                .ok()
+                .map_err(|e| {
+                    format!(
+                        "not accepted, nothing changed: {path} is listed with this filesystem \
+                         and its superblock cannot be read ({e}) — unplug that drive first"
+                    )
+                })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let foreign: Vec<String> = now_present
         .iter()
         .filter(|m| !accepted_uuids.contains(m.dev_uuid.as_str()))
@@ -2196,6 +2408,23 @@ pub fn accept(
             "not accepted, nothing changed: {} is attached as well — unplug it first, then run \
              'btrdasd raid accept {}' again",
             foreign.join(", "),
+            plan.label
+        ));
+    }
+    // The absent drive attached again, whatever blkid lists.
+    let back: Vec<&String> = found
+        .absent_serials
+        .iter()
+        .filter(|serial| host.serial_attached(serial))
+        .collect();
+    if !back.is_empty() {
+        return Err(format!(
+            "not accepted, nothing changed: drive {} is attached again — unplug it first, then \
+             run 'btrdasd raid accept {}' again",
+            back.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             plan.label
         ));
     }
@@ -2357,6 +2586,14 @@ mod tests {
         /// The kernel's devinfo, when a case says it (else the present
         /// drives, each missing as `missing` says).
         devinfo: RefCell<Option<DevInfo>>,
+        /// The member a device mount mounted alone: its own view.
+        alone: RefCell<Option<String>>,
+        /// Device paths whose ro mount fails, and whose superblock cannot be
+        /// read.
+        fail_device_mount: RefCell<BTreeSet<String>>,
+        bad_super: RefCell<BTreeSet<String>>,
+        /// The filesystem is mounted elsewhere.
+        mounted_elsewhere: Cell<bool>,
         fail_mount_plain: Cell<bool>,
         hide_members: Cell<bool>,
         /// The kernel as the incident left it (a `--forget`): a member is
@@ -2382,6 +2619,10 @@ mod tests {
                 witness: RefCell::new(BTreeMap::new()),
                 missing: RefCell::new(Ok(Vec::new())),
                 devinfo: RefCell::new(None),
+                alone: RefCell::new(None),
+                fail_device_mount: RefCell::new(BTreeSet::new()),
+                bad_super: RefCell::new(BTreeSet::new()),
+                mounted_elsewhere: Cell::new(false),
                 fail_mount_plain: Cell::new(false),
                 hide_members: Cell::new(false),
                 model_kernel: Cell::new(false),
@@ -2431,7 +2672,35 @@ mod tests {
             self.registered.borrow_mut().insert(path.to_string());
             Ok(())
         }
+        fn forget(&self, path: &str) -> Result<(), String> {
+            self.log(format!("forget {path}"));
+            self.registered.borrow_mut().remove(path);
+            Ok(())
+        }
+        fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String> {
+            self.log(format!("mount-dev {opts} {device} {at}"));
+            if self.fail_device_mount.borrow().contains(device) {
+                return Err("wrong fs type (fake)".into());
+            }
+            let uuid = self.drives.iter().find(|d| d.1 == device).unwrap().3;
+            *self.alone.borrow_mut() = Some(uuid.to_string());
+            *self.mounted.borrow_mut() = Some(opts.to_string());
+            Ok(())
+        }
+        fn temp_mountpoint(&self) -> Result<String, String> {
+            Ok("/run/fake-probe".into())
+        }
+        fn remove_mountpoint(&self, at: &str) -> Result<(), String> {
+            self.log(format!("rmdir {at}"));
+            Ok(())
+        }
+        fn fsid_mounted(&self, _fsid: &str) -> Result<bool, String> {
+            Ok(self.mounted_elsewhere.get())
+        }
         fn read_super(&self, path: &str) -> Result<String, String> {
+            if self.bad_super.borrow().contains(path) {
+                return Err(format!("{path}: bad superblock (fake)"));
+            }
             let d = self.drives.iter().find(|d| d.1 == path).unwrap();
             Ok(sup(d.2, d.3, d.4))
         }
@@ -2454,6 +2723,7 @@ mod tests {
         fn umount(&self, mount: &str) -> Result<(), String> {
             self.log(format!("umount {mount}"));
             *self.mounted.borrow_mut() = None;
+            *self.alone.borrow_mut() = None;
             Ok(())
         }
         fn missing_devids(&self, _fsid: &str) -> Result<Vec<u64>, String> {
@@ -2475,9 +2745,10 @@ mod tests {
                 self.mounted.borrow().is_some(),
                 "witness read while unmounted"
             );
+            let view = self.alone.borrow().clone().unwrap_or_else(|| self.view());
             self.witness
                 .borrow()
-                .get(&self.view())
+                .get(&view)
                 .cloned()
                 .unwrap_or(Copy::Absent)
         }
@@ -3393,7 +3664,7 @@ mod tests {
             "{why}"
         );
         assert!(
-            !host.calls().iter().any(|c| c.starts_with("mount")),
+            !host.calls().iter().any(|c| c.starts_with("mount ")),
             "{:?}",
             host.calls()
         );
@@ -3405,7 +3676,7 @@ mod tests {
         let mounts: Vec<String> = host
             .calls()
             .into_iter()
-            .filter(|c| c.starts_with("mount"))
+            .filter(|c| c.starts_with("mount "))
             .collect();
         assert_eq!(
             mounts,
@@ -3508,6 +3779,210 @@ mod tests {
         assert_eq!(host.calls().last().unwrap(), "umount /mnt/p");
         assert!(!host.calls().iter().any(|c| c == "write witness"));
         assert_eq!(case.primary(), Copy::Read(period), "nothing written");
+    }
+
+    /// Review round 3 (F1-stale): a primary that reads but predates the
+    /// accept (an old backup, a recovery OS's copy) — rejected nothing, the
+    /// period on X — with X and Y attached and their generations apart. Each
+    /// member's own witness is read alone: Y's rejects X. Refused before any
+    /// read-write mount; every member forgotten for a probe is registered
+    /// again.
+    #[test]
+    fn diverged_members_are_read_one_by_one_and_a_rejection_on_either_refuses() {
+        let case = Case::new();
+        let stale = Record {
+            members: vec![PeriodMember {
+                devid: 1,
+                dev_uuid: DX.into(),
+                generation: 60,
+            }],
+            rejected: Vec::new(),
+            since: 500,
+            last: 500,
+            ..accepted()
+        };
+        put_primary(&case, &stale);
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        host.witness
+            .borrow_mut()
+            .insert(DX.into(), Copy::Read(stale.clone()));
+        host.witness
+            .borrow_mut()
+            .insert(DY.into(), Copy::Read(accepted()));
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("raid accept") && why.contains(DX), "{why}");
+        let calls = host.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("mount ")),
+            "a filesystem mount: {calls:?}"
+        );
+        for (forgotten, probed) in [("/dev/sdc1", "/dev/sdb1"), ("/dev/sdb1", "/dev/sdc1")] {
+            let f = calls
+                .iter()
+                .position(|c| *c == format!("forget {forgotten}"))
+                .unwrap_or_else(|| panic!("{forgotten} not forgotten: {calls:?}"));
+            let m = calls
+                .iter()
+                .position(|c| *c == format!("mount-dev {PROBE_OPTS} {probed} /run/fake-probe"))
+                .unwrap_or_else(|| panic!("{probed} not probed alone: {calls:?}"));
+            let r = calls
+                .iter()
+                .rposition(|c| *c == format!("scan {forgotten}"))
+                .unwrap_or_else(|| panic!("{forgotten} not registered again: {calls:?}"));
+            assert!(f < m && m < r, "{calls:?}");
+        }
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "forget" || c.ends_with("--forget"))
+        );
+        assert_eq!(case.primary(), Copy::Read(stale), "nothing written");
+    }
+
+    /// A member whose own probe mount fails: refused for writing, and the
+    /// member forgotten for it is registered again all the same.
+    #[test]
+    fn a_failed_member_probe_refuses_and_still_registers_the_others_again() {
+        let case = Case::new();
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        put_primary(
+            &case,
+            &Record {
+                members: vec![PeriodMember {
+                    devid: 1,
+                    dev_uuid: DX.into(),
+                    generation: 60,
+                }],
+                rejected: Vec::new(),
+                ..accepted()
+            },
+        );
+        host.fail_device_mount
+            .borrow_mut()
+            .insert("/dev/sdb1".into());
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("/dev/sdb1"), "{why}");
+        let calls = host.calls();
+        let f = calls
+            .iter()
+            .position(|c| c == "forget /dev/sdc1")
+            .expect("forgot");
+        let r = calls.iter().rposition(|c| c == "scan /dev/sdc1").unwrap();
+        assert!(f < r, "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("mount ")), "{calls:?}");
+    }
+
+    /// The filesystem mounted somewhere else: nothing is forgotten or probed.
+    #[test]
+    fn diverged_members_of_a_filesystem_mounted_elsewhere_are_refused_untouched() {
+        let case = Case::new();
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        host.mounted_elsewhere.set(true);
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("mounted"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("forget") || c.starts_with("mount")),
+            "{:?}",
+            host.calls()
+        );
+    }
+
+    /// A healthy pair (one generation): no forget, no probe.
+    #[test]
+    fn a_healthy_pair_is_never_forgotten_or_probed() {
+        let case = Case::new();
+        let host = both();
+        assert!(matches!(case.run(&host).0, Ok(Outcome::Normal { .. })));
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("forget") || c.starts_with("mount-dev")),
+            "{:?}",
+            host.calls()
+        );
+    }
+
+    /// Review round 3 (F2-gap): during the prompt a drive appears whose
+    /// superblock cannot be read: refused, never filtered out.
+    #[test]
+    fn accept_refuses_a_listed_member_whose_superblock_cannot_be_read() {
+        let (case, period) = split_brain_case();
+        let host = FakeHost::new(vec![
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 1),
+        ]);
+        host.bad_super.borrow_mut().insert("/dev/sdb1".into());
+        let mut confirm = |_: &str| {
+            host.polls.set(1);
+            Ok("primary".to_string())
+        };
+        let runs = |_: i64, _: i64| Ok(Some(0));
+        let why = accept(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        )
+        .unwrap_err();
+        assert!(why.contains("/dev/sdb1"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount ") && !c.contains(PROBE_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+        assert_eq!(case.primary(), Copy::Read(period));
+    }
+
+    /// Review round 3 (F2-gap): the absent drive's serial is attached again
+    /// during the prompt although blkid does not list it: refused.
+    #[test]
+    fn accept_refuses_when_the_absent_drive_s_serial_is_attached_again() {
+        let (case, period) = split_brain_case();
+        let host = FakeHost::new(vec![
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 1),
+        ]);
+        let mut confirm = |_: &str| {
+            host.polls.set(1);
+            host.hide_members.set(true);
+            Ok("primary".to_string())
+        };
+        let runs = |_: i64, _: i64| Ok(Some(0));
+        let why = accept(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        )
+        .unwrap_err();
+        assert!(why.contains("SERIAL11"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount ") && !c.contains(PROBE_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+        assert_eq!(case.primary(), Copy::Read(period));
     }
 
     #[test]
