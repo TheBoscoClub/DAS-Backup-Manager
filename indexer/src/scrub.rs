@@ -163,6 +163,14 @@
 //!   earlier boot, is read as `interrupted` ([`AttemptState::effective_outcome`]):
 //!   the pass was killed without a chance to say so (bd
 //!   DAS-Backup-Manager-weo).
+//!   `yielded` (bd DAS-Backup-Manager-su1b.2) means the pass gave the
+//!   maintenance lock up to a waiting backup and waits to resume the same
+//!   filesystem; it carries `pid` and `boot_id` like `running`, plus the
+//!   optional `yielded_to` (the claim's holder record), `yielded_epoch`,
+//!   `yields` (count this pass) and `paused_secs` (total before this yield).
+//!   Readers treat it as `running`: in progress while its process lives in
+//!   this boot, `interrupted` otherwise. Readers know it; no pass writes it
+//!   yet (that is step A5).
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
 //! * `last_success_epoch` is carried forward across failed passes — it is the
@@ -1062,7 +1070,8 @@ pub struct PassSummary {
 /// Result of the most recent scrub attempt on one filesystem.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptState {
-    /// `running`, `finished`, `canceled`, `aborted`, `interrupted`, or `error`.
+    /// `running`, `yielded`, `finished`, `canceled`, `aborted`,
+    /// `interrupted`, or `error`.
     pub outcome: String,
     /// Authoritative pass/fail bit for this filesystem.
     pub ok: bool,
@@ -1085,15 +1094,38 @@ pub struct AttemptState {
     /// Boot the `running` record was written in (`/proc/sys/kernel/random/boot_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// On a `yielded` record: the holder record of the claim the pass gave
+    /// the maintenance lock up for (`backup-run.sh pid 1234`), as the
+    /// claimant wrote it. Display only; free text from a lock file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_to: Option<String>,
+    /// On a `yielded` record: when the pass gave the lock up. Absent means
+    /// unknown, never "at the epoch".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_epoch: Option<i64>,
+    /// On a `yielded` record: how many times this pass has yielded so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yields: Option<u32>,
+    /// On a `yielded` record: total seconds this pass has spent paused
+    /// before this yield.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_secs: Option<u64>,
 }
 
 impl AttemptState {
-    /// Whether this is a `running` record whose pass is still alive: the
-    /// process that wrote it exists and this is the boot it was written in.
-    /// (A recycled pid inside one boot could fool it; the next pass replaces
-    /// the record either way.)
+    /// Whether this record says the pass is in progress: `running`
+    /// (scrubbing now) or `yielded` (paused for a backup, waiting to resume;
+    /// bd DAS-Backup-Manager-su1b.2).
+    pub fn is_in_progress(&self) -> bool {
+        self.outcome == "running" || self.outcome == "yielded"
+    }
+
+    /// Whether this is an in-progress record ([`Self::is_in_progress`])
+    /// whose pass is still alive: the process that wrote it exists and this
+    /// is the boot it was written in. (A recycled pid inside one boot could
+    /// fool it; the next pass replaces the record either way.)
     pub fn is_live(&self) -> bool {
-        if self.outcome != "running" {
+        if !self.is_in_progress() {
             return false;
         }
         let (Some(pid), Some(boot)) = (self.pid, self.boot_id.as_deref()) else {
@@ -1102,11 +1134,12 @@ impl AttemptState {
         current_boot_id().as_deref() == Some(boot) && Path::new(&format!("/proc/{pid}")).exists()
     }
 
-    /// The outcome to show and judge by: a `running` record that nobody is
-    /// running any more is an interrupted pass whose end was never recorded
-    /// (SIGKILL, a power cut, a reboot that outran the handler).
+    /// The outcome to show and judge by: a `running` or `yielded` record
+    /// that nobody is running any more is an interrupted pass whose end was
+    /// never recorded (SIGKILL, a power cut, a reboot that outran the
+    /// handler, or one while the pass was paused for a backup).
     pub fn effective_outcome(&self) -> String {
-        if self.outcome == "running" && !self.is_live() {
+        if self.is_in_progress() && !self.is_live() {
             "interrupted".to_string()
         } else {
             self.outcome.clone()
@@ -1366,6 +1399,23 @@ pub struct ScrubFsResult {
     /// The signal that stopped this filesystem's scrub (or kept it from
     /// starting), when the pass caught one.
     pub interrupted_by: Option<i32>,
+    /// Each time this filesystem's scrub gave the maintenance lock up to a
+    /// waiting backup and later resumed (bd DAS-Backup-Manager-su1b.2).
+    /// Information for the report, never an error: a target that yielded
+    /// and then finished clean is a clean pass.
+    pub yields: Vec<ScrubYield>,
+}
+
+/// One pause of a filesystem's scrub for a backup, as the report lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubYield {
+    /// When the scrub gave the maintenance lock up.
+    pub at_epoch: i64,
+    /// The claim's holder record (`backup-run.sh pid 1234`), as written.
+    pub holder: String,
+    /// How long the scrub waited before it took the lock again; `None`
+    /// while unknown (the pass ended before it resumed).
+    pub paused_secs: Option<u64>,
 }
 
 impl ScrubFsResult {
@@ -1384,6 +1434,7 @@ impl ScrubFsResult {
             mounted_by_engine: false,
             scrub_launched: false,
             interrupted_by: None,
+            yields: Vec::new(),
         }
     }
 
@@ -2825,6 +2876,32 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
         }
     }
 
+    let yields: Vec<String> = pass
+        .results
+        .iter()
+        .flat_map(|result| {
+            result.yields.iter().map(|y| {
+                let at = crate::caldate::local_datetime(y.at_epoch)
+                    .map(|t| t.chars().take(16).collect::<String>())
+                    .unwrap_or_else(|| format!("epoch {}", y.at_epoch));
+                let pause = y.paused_secs.map_or_else(
+                    || "pause length unknown".to_string(),
+                    |p| format!("paused {}", format_duration(p)),
+                );
+                format!(
+                    "{}: yielded at {at} to {}, {pause}",
+                    result.target_label, y.holder
+                )
+            })
+        })
+        .collect();
+    if !yields.is_empty() {
+        r.push_str(&format!("\nYIELDS TO BACKUPS\n{thin}\n"));
+        for y in &yields {
+            r.push_str(&format!("  • {y}\n"));
+        }
+    }
+
     r.push_str(&format!("\n{sep}\n"));
     r
 }
@@ -4114,6 +4191,58 @@ Total to scrub:   401.28MiB\n";
         assert!(!report.contains("PROBLEMS"));
     }
 
+    /// bd DAS-Backup-Manager-su1b.2 (step A3): a target that yielded to a
+    /// backup and then finished clean is a clean pass; the report lists each
+    /// yield (time, holder, pause) as information, never as a problem.
+    #[test]
+    fn a_clean_target_that_yielded_reports_clean_and_lists_each_yield() {
+        let config = Config::default();
+        let mut result = fs_result("primary-22tb", "uuid-a", true, 1_000_400);
+        result.yields = vec![
+            ScrubYield {
+                at_epoch: 1_000_100,
+                holder: "backup-run.sh pid 4242".into(),
+                paused_secs: Some(1_260),
+            },
+            ScrubYield {
+                at_epoch: 1_000_300,
+                holder: "btrdasd backup pid 77".into(),
+                paused_secs: None,
+            },
+        ];
+        assert!(result.ok(), "a yield is not an error");
+        let pass = pass_with(vec![result]);
+        assert!(pass.success());
+        let report = format_scrub_report(&pass, &config);
+        assert!(report.contains("ALL SCRUBS COMPLETED CLEANLY"), "{report}");
+        assert!(!report.contains("PROBLEMS"), "{report}");
+        assert!(report.contains("YIELDS TO BACKUPS"), "{report}");
+        let at = |e: i64| crate::caldate::local_datetime(e).unwrap()[..16].to_string();
+        assert!(
+            report.contains(&format!(
+                "primary-22tb: yielded at {} to backup-run.sh pid 4242, paused 21m 0s",
+                at(1_000_100)
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "primary-22tb: yielded at {} to btrdasd backup pid 77, pause length unknown",
+                at(1_000_300)
+            )),
+            "{report}"
+        );
+    }
+
+    /// A pass with no yield prints no yield section: the report of every
+    /// pass before A5 is unchanged.
+    #[test]
+    fn a_pass_without_yields_prints_no_yield_section() {
+        let config = Config::default();
+        let pass = pass_with(vec![fs_result("primary-22tb", "uuid-a", true, 1_000_400)]);
+        assert!(!format_scrub_report(&pass, &config).contains("YIELD"));
+    }
+
     #[test]
     fn skipped_pass_is_a_success_and_reports_as_skipped() {
         let config = Config::default();
@@ -4440,6 +4569,92 @@ mod interrupted_pass_tests {
             ..Default::default()
         };
         assert_eq!(finished.effective_outcome(), "finished");
+    }
+
+    /// bd DAS-Backup-Manager-su1b.2 (step A3): a `yielded` record (the pass
+    /// gave the maintenance lock up to a backup and waits to resume) is live
+    /// by the same test as `running`: its own process, this boot. A stale
+    /// one is a pass that died while paused: `interrupted` (operator Q3).
+    #[test]
+    fn a_yielded_record_is_live_only_for_its_own_process_and_boot() {
+        let boot = current_boot_id();
+        let me = std::process::id();
+        let yielded = |pid: Option<u32>, boot_id: Option<String>| AttemptState {
+            outcome: "yielded".into(),
+            yielded_to: Some("backup-run.sh pid 4242".into()),
+            yielded_epoch: Some(1_000_100),
+            yields: Some(1),
+            paused_secs: Some(0),
+            ..running_attempt(pid, boot_id)
+        };
+
+        let live = yielded(Some(me), boot.clone());
+        assert!(live.is_live());
+        assert_eq!(live.effective_outcome(), "yielded");
+        assert!(!live.ok, "a yielded attempt is not a pass");
+
+        let other_boot = yielded(Some(me), Some("not-this-boot".into()));
+        assert!(!other_boot.is_live());
+        assert_eq!(other_boot.effective_outcome(), "interrupted");
+
+        let no_pid = yielded(None, boot.clone());
+        assert!(!no_pid.is_live());
+        assert_eq!(no_pid.effective_outcome(), "interrupted");
+
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        let dead = yielded(Some(dead_pid), boot);
+        assert!(!dead.is_live());
+        assert_eq!(dead.effective_outcome(), "interrupted");
+    }
+
+    /// The new fields are optional: a record from before them loads, and a
+    /// record that does not use them serialises without them, so the state
+    /// file stays `schema_version 1`. And a reader that predates `yielded`
+    /// (it knows only the weo fields) still loads a `yielded` record and
+    /// sees `ok: false`: cautious, not permissive. Rule 10: these hold on
+    /// the code as it was, so they cannot be seen red without mutating it.
+    #[test]
+    fn yield_fields_are_optional_and_an_older_reader_sees_not_ok() {
+        let old = format!(
+            r#"{{"outcome":"finished","ok":true,"started_epoch":1,"finished_epoch":2,
+            "duration_secs":1,"bytes_scrubbed":5,"error_total":0,"counters":{}}}"#,
+            serde_json::to_string(&ScrubCounters::default()).unwrap()
+        );
+        let a: AttemptState = serde_json::from_str(&old).unwrap();
+        assert_eq!(a.yielded_to, None);
+        assert_eq!(a.yields, None);
+        let text = serde_json::to_string(&a).unwrap();
+        for key in ["yielded_to", "yielded_epoch", "yields", "paused_secs"] {
+            assert!(!text.contains(key), "{key} written when unused: {text}");
+        }
+
+        #[derive(Deserialize)]
+        struct OlderReader {
+            outcome: String,
+            ok: bool,
+        }
+        let yielded = AttemptState {
+            outcome: "yielded".into(),
+            pid: Some(1),
+            boot_id: Some("b".into()),
+            yielded_to: Some("backup-run.sh pid 4242".into()),
+            yielded_epoch: Some(10),
+            yields: Some(2),
+            paused_secs: Some(30),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&yielded).unwrap();
+        let older: OlderReader = serde_json::from_str(&text).unwrap();
+        assert_eq!(older.outcome, "yielded");
+        assert!(!older.ok);
+        let back: AttemptState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.yielded_to.as_deref(), Some("backup-run.sh pid 4242"));
+        assert_eq!(
+            (back.yielded_epoch, back.yields, back.paused_secs),
+            (Some(10), Some(2), Some(30))
+        );
     }
 
     /// The pass's own result for a caught signal: `interrupted`, with the

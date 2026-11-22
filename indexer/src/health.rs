@@ -247,9 +247,11 @@ pub fn scrub_health_for(
     };
     let attempt = &fs.last_attempt;
 
-    // A `running` record whose pass is alive is neither a pass nor a failure:
-    // the last success still decides. One nobody is running any more is an
-    // interrupted pass (bd DAS-Backup-Manager-weo) and fails like an aborted one.
+    // A `running` or `yielded` (paused for a backup, bd
+    // DAS-Backup-Manager-su1b.2) record whose pass is alive is neither a pass
+    // nor a failure: the last success still decides. One nobody is running any
+    // more is an interrupted pass (bd DAS-Backup-Manager-weo) and fails like an
+    // aborted one.
     let running_now = attempt.is_live();
     if !attempt.ok && !running_now {
         // Immediate fail: the latest attempt is aborted/canceled/errored, or
@@ -2332,6 +2334,59 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
             scrub_health_for(Some(&fresh), NOW, 45, 75).status,
             ScrubHealthStatus::Ok
         );
+    }
+
+    /// A `yielded` record: the pass gave the maintenance lock up to a backup.
+    fn fs_state_yielded(
+        pid: Option<u32>,
+        boot_id: Option<String>,
+        age_days: i64,
+    ) -> scrub::FsState {
+        let mut fs = fs_state_running(pid, boot_id, age_days);
+        fs.last_attempt.outcome = "yielded".into();
+        fs.last_attempt.yielded_to = Some("backup-run.sh pid 4242".into());
+        fs.last_attempt.yielded_epoch = Some(NOW - 600);
+        fs.last_attempt.yields = Some(1);
+        fs.last_attempt.paused_secs = Some(0);
+        fs
+    }
+
+    /// bd DAS-Backup-Manager-su1b.2 (step A3): a pass paused for a backup is
+    /// in progress, not a failure: the age of the last success decides, as
+    /// for a live `running` record.
+    #[test]
+    fn scrub_health_live_yielded_record_is_judged_by_age_not_failed() {
+        let fs = fs_state_yielded(Some(std::process::id()), scrub::current_boot_id(), 50);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.last_outcome.as_deref(), Some("yielded"));
+        assert_eq!(h.last_ok, None);
+        assert_eq!(h.age_days, Some(50));
+        let fresh = fs_state_yielded(Some(std::process::id()), scrub::current_boot_id(), 10);
+        assert_eq!(
+            scrub_health_for(Some(&fresh), NOW, 45, 75).status,
+            ScrubHealthStatus::Ok
+        );
+    }
+
+    /// A paused pass that died before it resumed (dead pid, another boot, no
+    /// pid) is interrupted: an immediate FAIL (operator Q3, 2026-11-22).
+    #[test]
+    fn scrub_health_stale_yielded_record_is_an_interrupted_fail() {
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        for fs in [
+            fs_state_yielded(None, None, 10),
+            fs_state_yielded(Some(std::process::id()), Some("not-this-boot".into()), 10),
+            fs_state_yielded(Some(dead_pid), scrub::current_boot_id(), 10),
+        ] {
+            let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+            assert_eq!(h.status, ScrubHealthStatus::Fail);
+            assert_eq!(h.last_outcome.as_deref(), Some("interrupted"));
+            assert_eq!(h.last_ok, Some(false));
+            assert_eq!(h.age_days, Some(10));
+        }
     }
 
     #[test]

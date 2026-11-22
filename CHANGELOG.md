@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A recovery OS that powered off without reporting is said with how long it ran: `the recovery OS powered off without reporting, <time> after its start`, and in `status` and `session-end` `it ran <time> from its start before it powered off`, the power-off taken from the session's own sighting or libvirt's log of the domain (its last `shutting down` line) — `not known`, never a guess, when neither has it
   - Documented in the Disaster Recovery Guide (troubleshooting, and beside the session history)
 
+- **Scrub status and health understand a pass paused for a backup** (bd `DAS-Backup-Manager-su1b.2`, step A3): groundwork for a scrub that yields the targets to a waiting backup; no pass pauses yet, so nothing changes on a running system
+  - A scrub-state record `yielded` (with `pid`, `boot_id` and the optional `yielded_to`, `yielded_epoch`, `yields`, `paused_secs`) is in progress, like `running`: `btrdasd health` judges it by the age of the last success while its process lives in this boot, and reads it `interrupted` (immediate FAIL) once that process is gone
+  - `btrdasd scrub status` shows it `YIELDED` — `yielded to <holder> at HH:MM, resumes when it finishes` — and none of the earlier pass's figures; `--json` carries it in `status` and `outcome`, no new keys
+  - The scrub report lists each yield of a target (time, holder, pause) under `YIELDS TO BACKUPS`; a target that yielded and finished clean is a clean pass
+  - The state file stays `schema_version 1`: the new fields are optional and written only when used
+  - Documented in `docs/ARCHITECTURE.md` and `btrdasd(1)`
 - **The helper logs each recovery-OS schedule write itself** (bd `DAS-Backup-Manager-3gzs.3`): one journal line per `RecoveryOsScheduleSet` call names the caller, the drives, and what was set (time and mode), cleared, or refused and why; before, only polkit's audit line and systemd's reload showed it
 - **The weekly doctor checks that `btrfs scrub` still accepts `-c`/`-n`** (bd `DAS-Backup-Manager-su1b.3`): every scrub argv carries `-c 2 -n 0`, deprecated upstream, and a btrfs-progs release that drops them would fail every target's scrub while `btrdasd scrub run` exits 0
   - `btrdasd doctor` runs `btrfs scrub start --help` and `btrfs --version` (no scrub) and reports `SCRUB TOOL`, exit `1`, naming the version, when either option line is gone or the help cannot be read

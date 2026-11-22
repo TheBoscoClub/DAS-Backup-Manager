@@ -3063,6 +3063,18 @@ loss) leaves that record, which
 and
 .B "btrdasd health"
 read as interrupted.
+A record
+.B yielded
+(a pass paused for a backup, waiting to resume the same filesystem; bd
+.BR DAS\-Backup\-Manager\-su1b.2 )
+is read the same way:
+.B "scrub status"
+shows
+.B YIELDED
+with whom it yielded to and when, and
+.B "btrdasd health"
+judges it by the age of the last success while its process lives in this
+boot; one whose process is gone reads as interrupted. No pass writes it yet.
 .PP
 .B btrdasd scrub run
 .RB [ \-\-config

@@ -287,7 +287,11 @@ its filesystem is done; a pass caught by SIGTERM/SIGINT/SIGHUP stops its `btrfs 
 `interrupted` with the signal, skips the remaining targets, unmounts, and dies of that signal, so the
 unit's exit status is unchanged (bd `DAS-Backup-Manager-weo`). A `running` record whose process is gone or
 whose boot has passed reads as `interrupted` in `scrub status` and health (immediate FAIL, like an
-aborted scrub); a live one is judged by the age of the last success.
+aborted scrub); a live one is judged by the age of the last success. Readers also know `yielded`, a pass
+paused for a backup and waiting to resume the same filesystem (bd `DAS-Backup-Manager-su1b.2`): it carries
+pid and boot id like `running` and is read the same way (`YIELDED` with its holder and time in `scrub status`,
+judged by age in health; `interrupted` once its process is gone). No pass writes it yet; the scrub report lists
+each yield of a target as information, never as a problem.
 It reads **only** `scrub-state.json` (mode `0644`), never the raw per-device
 `/var/lib/btrfs/scrub.status.<fsuuid>` record (mode `0600`, root-only, and the exact record type
 that made an aborted `system-recovery-A` scrub look healthy for 64 days). This keeps `btrdasd health`

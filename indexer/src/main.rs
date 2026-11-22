@@ -997,6 +997,7 @@ impl ScrubTargetView {
             "error" => "ERROR",
             _ => match (self.ok, self.outcome.as_deref()) {
                 (_, Some("running")) => "RUNNING",
+                (_, Some("yielded")) => "YIELDED",
                 (_, Some("interrupted")) => "INTERRUPTED",
                 (Some(true), _) => "OK",
                 (Some(false), Some("aborted")) => "ABORTED",
@@ -1063,6 +1064,23 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The status line of a pass paused for a backup: whom it yielded to and,
+/// when recorded, at what local time. An unrecorded time is left out, never
+/// shown as one derived from 0.
+fn yielded_detail(attempt: &scrub::AttemptState) -> String {
+    let holder = attempt
+        .yielded_to
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .unwrap_or("a backup");
+    let at = attempt
+        .yielded_epoch
+        .and_then(buttered_dasd::caldate::local_datetime)
+        .map(|t| format!(" at {}", t.chars().skip(11).take(5).collect::<String>()))
+        .unwrap_or_default();
+    format!("yielded to {holder}{at}, resumes when it finishes")
+}
+
 /// Build one target's status view. `state` is the already-loaded engine
 /// state (or `None` if it could not be loaded at all — a warning about that
 /// is the caller's job, once, not per-target).
@@ -1086,14 +1104,15 @@ fn build_scrub_target_view(
         view.source = "state";
         view.outcome = Some(fs.last_attempt.effective_outcome());
         view.last_success_epoch = fs.last_success_epoch;
-        if fs.last_attempt.outcome == "running" {
-            // Written before the scrub began: it has no result yet, and the
+        if fs.last_attempt.is_in_progress() {
+            // Written before the scrub began, or when it paused for a backup
+            // (bd DAS-Backup-Manager-su1b.2): it has no result yet, and the
             // figures of the pass before it must not pass for this one's.
-            view.ok = if fs.last_attempt.is_live() {
-                None
-            } else {
-                Some(false)
-            };
+            let live = fs.last_attempt.is_live();
+            view.ok = if live { None } else { Some(false) };
+            if live && fs.last_attempt.outcome == "yielded" {
+                view.detail = Some(yielded_detail(&fs.last_attempt));
+            }
         } else {
             view.ok = Some(fs.last_attempt.ok);
             view.finished_epoch = Some(fs.last_attempt.finished_epoch);
@@ -4130,6 +4149,87 @@ mod tests {
         assert_eq!(v.outcome.as_deref(), Some("running"));
     }
 
+    /// bd DAS-Backup-Manager-su1b.2 (step A3): a pass paused for a backup
+    /// says YIELDED, names whom it yielded to and when, and shows none of
+    /// the earlier pass's figures as its own. One whose process died while
+    /// paused says INTERRUPTED.
+    #[test]
+    fn status_reads_a_yielded_record_as_yielded_or_interrupted() {
+        let uuid = "44444444-4444-4444-4444-444444444444";
+        let config = test_config(&[("paused-target", uuid)]);
+        let mut state = scrub::ScrubState::default();
+        let attempt = |pid, boot_id, yielded_epoch| scrub::AttemptState {
+            outcome: "yielded".into(),
+            started_epoch: 1_785_000_000,
+            finished_epoch: 0,
+            pid,
+            boot_id,
+            yielded_to: Some("backup-run.sh pid 4242".into()),
+            yielded_epoch,
+            yields: Some(1),
+            paused_secs: Some(0),
+            ..Default::default()
+        };
+        let entry = |attempt| scrub::FsState {
+            target_label: "paused-target".into(),
+            mountpoint: "/mnt/paused-target".into(),
+            last_success_epoch: Some(1_784_000_000),
+            last_attempt: attempt,
+        };
+        let table = |v: &ScrubTargetView| format_scrub_status(std::slice::from_ref(v), &config);
+
+        state.filesystems.insert(
+            uuid.into(),
+            entry(attempt(
+                Some(std::process::id()),
+                scrub::current_boot_id(),
+                Some(1_785_003_600),
+            )),
+        );
+        let v = build_scrub_target_view(&config, "paused-target", Some(&state));
+        assert_eq!(v.status_word(), "YIELDED");
+        assert_eq!(v.outcome.as_deref(), Some("yielded"));
+        assert_eq!(v.ok, None, "no result yet");
+        assert_eq!(v.finished_epoch, None);
+        assert_eq!(v.bytes_scrubbed, None);
+        assert_eq!(v.last_success_epoch, Some(1_784_000_000));
+        let hhmm =
+            buttered_dasd::caldate::local_datetime(1_785_003_600).unwrap()[11..16].to_string();
+        let shown = table(&v);
+        assert!(
+            shown.contains(&format!(
+                "yielded to backup-run.sh pid 4242 at {hhmm}, resumes when it finishes"
+            )),
+            "{shown}"
+        );
+        assert!(scrub_target_json(&v).contains("\"status\":\"YIELDED\""));
+
+        // No time recorded: say nothing about when, never a time from 0.
+        state.filesystems.insert(
+            uuid.into(),
+            entry(attempt(
+                Some(std::process::id()),
+                scrub::current_boot_id(),
+                None,
+            )),
+        );
+        let v = build_scrub_target_view(&config, "paused-target", Some(&state));
+        let shown = table(&v);
+        assert!(
+            shown.contains("(yielded to backup-run.sh pid 4242, resumes when it finishes)"),
+            "{shown}"
+        );
+
+        state
+            .filesystems
+            .insert(uuid.into(), entry(attempt(None, None, Some(1_785_003_600))));
+        let v = build_scrub_target_view(&config, "paused-target", Some(&state));
+        assert_eq!(v.status_word(), "INTERRUPTED");
+        assert_eq!(v.outcome.as_deref(), Some("interrupted"));
+        assert_eq!(v.ok, Some(false));
+        assert_eq!(v.finished_epoch, None);
+    }
+
     /// A pass the signal stopped is INTERRUPTED in the table whatever its `ok`.
     #[test]
     fn status_word_names_a_caught_signal_interrupted() {
@@ -4320,6 +4420,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             mounted_by_engine: false,
             scrub_launched,
             interrupted_by: None,
+            yields: Vec::new(),
         }
     }
 
