@@ -230,6 +230,13 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
    - A claim nobody answers in `YIELD_ANSWER_SECS` (180 s): one WARN naming the holder, the backup keeps
      waiting, exit status unchanged (`Scrub yield` report row). A probe that cannot look costs one pause.
    - A pass that yielded and dies before resuming reads `interrupted` (health FAIL, operator Q3).
+4. **Pause by hand** (bd `su1b.15`): `btrdasd scrub pause` writes `/run/das-scrub-pause` (0600) only while a pass holds `/run/das-scrub.lock`, then takes the claim shared.
+   - A pass that sees the request in its yield wait → files the cut filesystem `paused`, ends exit 0, its locks released; never a SIGTERM to the pass, never `systemctl stop`.
+   - The request alone makes a pass yield at checkpoints 3 and 4; the waits for the maintenance lock never wait on it.
+   - A pass that starts while the request exists → runs nothing, removes nothing, exits 0; one that ran to its end without meeting it removes it.
+   - `pause` waits at most 240 s (`PAUSE_ANSWER_SECS`), kills nothing; not ended → exit 1, request left.
+   - `btrdasd scrub resume` → refuses while the singleton is held; else removes the request and `systemctl start --no-block das-scrub.service`.
+   - `paused` is not in progress and not a failure: health WARN (FAIL only past `fail_age_days`), status `PAUSED`.
 
 - **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`);
   `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down
