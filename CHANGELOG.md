@@ -116,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The DAS drives' request queue size follows their scheduler** (bd `DAS-Backup-Manager-su1b.8`): new `[das].nr_requests` (default `64`; `0` leaves it alone), written by the generated udev rule right after the scheduler and by `backup-run.sh` (4.21.2), because a scheduler switch resets it to 2 on a single-command USB drive; at 2 the I/O class did nothing and two competing readers fell from 185 to 54 MiB/s combined
 - **The configured I/O scheduler reaches both legs of a RAID1 target** (bd `DAS-Backup-Manager-su1b.4`): `backup-run.sh` set `[das].io_scheduler` on the one disk the filesystem UUID resolves to, so a pair's second drive kept the host's default (`backup-run.sh` 4.21.1)
 - **`backup-run.sh` and `backup-verify.sh` read a drive's serial by the partition script's strict rule** (bd `DAS-Backup-Manager-2kb1.17`): both took awk's third field of `Serial Number:` only, so a SAS/SCSI drive (`Serial number:`) was never identified, a value with a blank matched on its first word, and a `smartctl` that could not open the drive was believed
   - Exactly one `Serial Number:` or `Serial number:` line, the whole trimmed value, `smartctl`'s failure bits (exit status 1 and 2) refused; a faithful `parse_drive_serial` copy in each script (no shared library), named for the partition script's

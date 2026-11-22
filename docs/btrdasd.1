@@ -3731,7 +3731,9 @@ targets' drive serials and
 .I /etc/udev/rules.d/99\-das\-backup\-io\-scheduler.rules
 Generated udev rule that pins
 .B [das].io_scheduler
-on each target's whole disk, matched on the drive serials, at every add and
+and then
+.B [das].nr_requests
+(a scheduler switch resets the queue size) on each target's whole disk, matched on the drive serials, at every add and
 change event (re\-plug, enclosure power cycle, boot), so the scheduler holds
 between backups and overrides a host rule for rotational disks on those drives
 only. Not generated when

@@ -483,11 +483,26 @@ pub fn render_udev_io_scheduler(config: &Config) -> Option<String> {
     if !buttered_dasd::config::IO_SCHEDULERS.contains(&scheduler) {
         return None;
     }
+    // A scheduler switch resets queue/nr_requests, so it is written after
+    // the scheduler on the same line; udev applies a line's assignments in
+    // order (bd DAS-Backup-Manager-su1b.8). 0 leaves it alone; an out-of-range
+    // value never reaches the rule (Config::validate and generate refuse it).
+    let nr = config.das.nr_requests;
+    let nr_attr = if (buttered_dasd::config::NR_REQUESTS_MIN
+        ..=buttered_dasd::config::NR_REQUESTS_MAX)
+        .contains(&nr)
+    {
+        format!(", ATTR{{queue/nr_requests}}=\"{nr}\"")
+    } else {
+        String::new()
+    };
     let mut out = format!(
         "{GENERATED_HEADER}#\n\
          # Pins the I/O scheduler of the backup target drives ([das].io_scheduler in\n\
-         # config.toml) at every add/change event; do not edit, change the key and\n\
-         # re-run: sudo btrdasd setup --upgrade. Verify with: sudo btrdasd setup --check\n"
+         # config.toml), then their request queue size ([das].nr_requests; a\n\
+         # scheduler switch resets it), at every add/change event; do not edit,\n\
+         # change the keys and re-run: sudo btrdasd setup --upgrade.\n\
+         # Verify with: sudo btrdasd setup --check\n"
     );
     let mut seen: Vec<String> = Vec::new();
     for target in &config.targets {
@@ -498,7 +513,7 @@ pub fn render_udev_io_scheduler(config: &Config) -> Option<String> {
             } else if !seen.contains(&serial) {
                 out.push_str(&format!(
                     "ACTION==\"add|change\", SUBSYSTEM==\"block\", ENV{{DEVTYPE}}==\"disk\", \
-                     ENV{{ID_SERIAL_SHORT}}==\"{serial}\", ATTR{{queue/scheduler}}=\"{scheduler}\"\n"
+                     ENV{{ID_SERIAL_SHORT}}==\"{serial}\", ATTR{{queue/scheduler}}=\"{scheduler}\"{nr_attr}\n"
                 ));
                 seen.push(serial);
             }
@@ -635,6 +650,17 @@ impl GeneratedFiles {
         // (bd su1b.4). Unset means no rule; a stale one then drops out of the
         // manifest and the upgrade removes it. A value outside the safe set
         // is refused, as `Config::validate` does.
+        let nr = config.das.nr_requests;
+        if nr != 0
+            && !(buttered_dasd::config::NR_REQUESTS_MIN..=buttered_dasd::config::NR_REQUESTS_MAX)
+                .contains(&nr)
+        {
+            return Err(format!(
+                "das.nr_requests {nr} must be 0 or {}..={}",
+                buttered_dasd::config::NR_REQUESTS_MIN,
+                buttered_dasd::config::NR_REQUESTS_MAX
+            ));
+        }
         if !config.das.io_scheduler.is_empty() {
             let rule = render_udev_io_scheduler(config).ok_or_else(|| {
                 format!(
@@ -1229,11 +1255,36 @@ pub(crate) mod tests {
         for serial in ["SERIAL08", "SERIAL11", "SERIAL12"] {
             let line = format!(
                 "ACTION==\"add|change\", SUBSYSTEM==\"block\", ENV{{DEVTYPE}}==\"disk\", \
-                 ENV{{ID_SERIAL_SHORT}}==\"{serial}\", ATTR{{queue/scheduler}}=\"mq-deadline\"\n"
+                 ENV{{ID_SERIAL_SHORT}}==\"{serial}\", ATTR{{queue/scheduler}}=\"mq-deadline\", \
+                 ATTR{{queue/nr_requests}}=\"64\"\n"
             );
             assert!(result.contains(&line), "missing {serial}:\n{result}");
         }
         assert_eq!(result.matches("ATTR{queue/scheduler}").count(), 3);
+        // nr_requests follows the scheduler on the same line: a scheduler
+        // switch resets it (bd DAS-Backup-Manager-su1b.8).
+        assert_eq!(
+            result
+                .matches("ATTR{queue/scheduler}=\"mq-deadline\", ATTR{queue/nr_requests}=\"64\"\n")
+                .count(),
+            3,
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn render_udev_io_scheduler_leaves_nr_requests_alone_at_zero() {
+        let mut config = config_with_uuid_target();
+        config.das.io_scheduler = "mq-deadline".to_string();
+        config.das.nr_requests = 0;
+        let result = render_udev_io_scheduler(&config).expect("a rule");
+        assert!(!result.contains("nr_requests}="), "{result}");
+        config.das.nr_requests = 128;
+        let result = render_udev_io_scheduler(&config).expect("a rule");
+        assert!(
+            result.contains(", ATTR{queue/nr_requests}=\"128\"\n"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -1298,5 +1349,13 @@ pub(crate) mod tests {
         config.das.io_scheduler = "cfq".to_string();
         let why = GeneratedFiles::generate(&config).err().expect("refused");
         assert!(why.contains("io_scheduler"), "{why}");
+    }
+
+    #[test]
+    fn generate_refuses_an_nr_requests_the_kernel_would_change() {
+        let mut config = test_config();
+        config.das.nr_requests = 2;
+        let why = GeneratedFiles::generate(&config).err().expect("refused");
+        assert!(why.contains("nr_requests 2"), "{why}");
     }
 }

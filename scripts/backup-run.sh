@@ -1,9 +1,11 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.21.1
+# Version: 4.21.2
 # Date: 2026-11-22
 #
 # Features:
+#   - The configured request queue size follows the scheduler (v4.21.2, bd
+#     DAS-Backup-Manager-su1b.8): a scheduler switch resets nr_requests.
 #   - The I/O scheduler reaches every disk of a target (v4.21.1, bd
 #     DAS-Backup-Manager-su1b.4): a RAID1 pair's second leg was left on the
 #     host's default (one filesystem UUID resolves to one member).
@@ -1569,6 +1571,12 @@ set_io_scheduler() {
             dev="${drive#/dev/}"
             if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
                 echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
+            fi
+            # A scheduler switch resets nr_requests (to 2 on a single-command
+            # USB drive), so the configured size follows it (bd
+            # DAS-Backup-Manager-su1b.8); 0 or unset leaves it alone.
+            if [[ "${DAS_NR_REQUESTS:-0}" =~ ^[[:digit:]]+$ && "${DAS_NR_REQUESTS:-0}" != 0 && -f "/sys/block/$dev/queue/nr_requests" ]]; then
+                echo "$DAS_NR_REQUESTS" > "/sys/block/$dev/queue/nr_requests" 2>/dev/null || true
             fi
         done < <(io_scheduler_devices "$label")
     done
@@ -4270,7 +4278,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.21.1
+  backup-run.sh v4.21.2
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

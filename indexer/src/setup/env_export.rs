@@ -56,6 +56,7 @@ pub fn dump_env(config: &Config) -> String {
         config.das.expected_link_mbit_s
     ));
     out.push_str(&kv("DAS_IO_SCHEDULER", &config.das.io_scheduler));
+    out.push_str(&format!("DAS_NR_REQUESTS={}\n", config.das.nr_requests));
     out.push_str(&kv("DAS_MOUNT_OPTS", &config.das.mount_opts));
 
     // Boot
@@ -291,6 +292,7 @@ mod tests {
         assert!(output.contains("DAS_BTRBK_CONF="));
         assert!(output.contains("DAS_MODEL_PATTERN='ExampleDAS'"));
         assert!(output.contains("DAS_IO_SCHEDULER='mq-deadline'"));
+        assert!(output.contains("DAS_NR_REQUESTS=64\n"), "{output}");
         assert!(output.contains("DAS_BOOT_ENABLED=true"));
         assert!(output.contains("DAS_BOOT_ARCHIVE_RETENTION_DAYS=365"));
         assert!(output.contains("DAS_SCRUB_ENABLED=true"));

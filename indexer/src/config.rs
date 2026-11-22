@@ -355,6 +355,15 @@ pub struct Das {
     pub expected_link_mbit_s: u32,
     #[serde(default = "default_io_scheduler")]
     pub io_scheduler: String,
+    /// `queue/nr_requests` for every target drive, written straight after the
+    /// scheduler (a scheduler switch resets it to twice the drive's queue
+    /// depth: 2 on a single-command USB drive). Measured on a 2 TB DAS drive
+    /// (bd DAS-Backup-Manager-su1b.8): at 2 the I/O class does nothing and two
+    /// competing readers fall from 185 to 54 MiB/s combined; at 64 the class
+    /// holds and the combined rate stays. 0 leaves it alone; otherwise
+    /// [`NR_REQUESTS_MIN`]..=[`NR_REQUESTS_MAX`].
+    #[serde(default = "default_nr_requests")]
+    pub nr_requests: u32,
     #[serde(default)]
     pub mount_opts: String,
 }
@@ -365,6 +374,7 @@ impl Default for Das {
             model_pattern: String::new(),
             expected_link_mbit_s: default_expected_link_mbit_s(),
             io_scheduler: default_io_scheduler(),
+            nr_requests: default_nr_requests(),
             mount_opts: String::new(),
         }
     }
@@ -377,6 +387,16 @@ fn default_expected_link_mbit_s() -> u32 {
 fn default_io_scheduler() -> String {
     "mq-deadline".into()
 }
+
+fn default_nr_requests() -> u32 {
+    64
+}
+
+/// The kernel's floor for `queue/nr_requests` (`BLKDEV_MIN_RQ`): a smaller
+/// write is silently raised to it, so config refuses one.
+pub const NR_REQUESTS_MIN: u32 = 4;
+/// A ceiling well above anything a single spinning drive can use.
+pub const NR_REQUESTS_MAX: u32 = 4096;
 
 /// The values `[das].io_scheduler` takes: the names of the kernel's
 /// multiqueue block schedulers. The value is written into a generated udev
@@ -3432,6 +3452,15 @@ impl Config {
             ));
         }
 
+        let nr = self.das.nr_requests;
+        if nr != 0 && !(NR_REQUESTS_MIN..=NR_REQUESTS_MAX).contains(&nr) {
+            errors.push(format!(
+                "das.nr_requests {nr} must be 0 (leave the drives' value alone) or \
+                 {NR_REQUESTS_MIN}..={NR_REQUESTS_MAX}: the kernel raises anything \
+                 below {NR_REQUESTS_MIN} to {NR_REQUESTS_MIN} without saying so"
+            ));
+        }
+
         if self.doctor.max_snapshot_age_days == 0 {
             errors.push(
                 "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
@@ -4643,6 +4672,7 @@ mod tests {
         assert_eq!(parsed.general.btrbk_conf, "/etc/btrbk/btrbk.conf");
         assert!(parsed.das.model_pattern.is_empty());
         assert_eq!(parsed.das.io_scheduler, "mq-deadline");
+        assert_eq!(parsed.das.nr_requests, 64);
         assert!(parsed.boot.enabled);
         assert_eq!(parsed.boot.subvolumes, vec!["@", "@home"]);
         assert_eq!(parsed.boot.archive_retention_days, 60);
@@ -4938,6 +4968,26 @@ mod tests {
 
     /// bd su1b.4: the scheduler is written into a udev rule and a sysfs file,
     /// so only the kernel's known names pass; empty is "leave the drives alone".
+    #[test]
+    fn validate_accepts_nr_requests_zero_or_in_the_kernel_range() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        for good in [0, 4, 64, 4096] {
+            cfg.das.nr_requests = good;
+            assert!(
+                !cfg.validate().iter().any(|e| e.contains("das.nr_requests")),
+                "{good} was refused: {:?}",
+                cfg.validate()
+            );
+        }
+        for bad in [1, 2, 3, 4097] {
+            cfg.das.nr_requests = bad;
+            assert!(
+                cfg.validate().iter().any(|e| e.contains("das.nr_requests")),
+                "{bad} was accepted"
+            );
+        }
+    }
+
     #[test]
     fn validate_accepts_only_a_known_io_scheduler_or_none_set() {
         let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();

@@ -558,7 +558,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `general` | version, install_prefix, db_path, log_file, growth_log, last_report, btrbk_conf | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
-| `das` | model_pattern, expected_link_mbit_s, io_scheduler, mount_opts | DAS enclosure match, I/O scheduler, target mount options |
+| `das` | model_pattern, expected_link_mbit_s, io_scheduler, nr_requests, mount_opts | DAS enclosure match, I/O scheduler and request queue size, target mount options |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
 | `doctor` | exclude[], max_snapshot_age_days | Older exclusion list, still read and merged with `[subvolumes].exclude`; the delivery check's age limit (default 3) |
@@ -587,7 +587,7 @@ Templates are rendered programmatically (no external template files):
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
 | `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
 | `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |
-| `render_udev_io_scheduler()` | `/etc/udev/rules.d/99-das-backup-io-scheduler.rules` | Pins `[das].io_scheduler` on each target's whole disk (`ID_SERIAL_SHORT`, `add\|change`) so it holds between runs and beats the host's generic rotational rule; `None` (no file, a stale one pruned by the manifest diff) when empty; `Config::validate` and `generate` refuse a name outside `IO_SCHEDULERS`. `setup --check` compares the file with the render and reads each drive's live `queue/scheduler`; `setup` re-applies it with a `udevadm trigger` matched on the serials (bd su1b.4) |
+| `render_udev_io_scheduler()` | `/etc/udev/rules.d/99-das-backup-io-scheduler.rules` | Pins `[das].io_scheduler`, then `[das].nr_requests` (a scheduler switch resets it; bd `su1b.8`), on each target's whole disk (`ID_SERIAL_SHORT`, `add\|change`) so it holds between runs and beats the host's generic rotational rule; `None` (no file, a stale one pruned by the manifest diff) when empty; `Config::validate` and `generate` refuse a name outside `IO_SCHEDULERS`. `setup --check` compares the file with the render and reads each drive's live `queue/scheduler`; `setup` re-applies it with a `udevadm trigger` matched on the serials (bd su1b.4) |
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
 | embedded scripts (`include_str!`) | `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh` | Real production scripts installed flat at `${prefix}/lib/das-backup/` (same layout as cmake's install) |
 
