@@ -128,7 +128,7 @@ The system's automatic backups already mount by UUID with `degraded` in their mo
 
 #### 3. Replace the failed drive
 
-Hold the maintenance lock from here to the end of step 8: a backup run unmounts the array when it ends, even in the middle of a replace. On `WAIT` (a backup, scrub or recovery-OS VM session holds the DAS) never power the DAS off — wait:
+Hold the maintenance lock from here to the end of step 8: a backup run unmounts the array when it ends, even in the middle of a replace. On `WAIT` (a backup, scrub or recovery-OS VM session holds the DAS) never power the DAS off — wait. A scrub pass gives the lock up within about a minute if you take it through the claim instead: `sudo flock -s /run/das-maintenance-claim.lock flock /run/das-maintenance.lock bash` (the pass stays paused until that shell exits, then resumes):
 
 ```bash
 sudo flock -n /run/das-maintenance.lock true || echo WAIT
