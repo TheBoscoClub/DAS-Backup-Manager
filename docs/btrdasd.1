@@ -1048,7 +1048,7 @@ whatever
 .B [das].mount_opts
 says; a member not present, or a mount that fails, is waited for
 .RB ( [das].member_wait_secs ,
-default 60), polling every 5 seconds and scanning again;
+default 900, at most 3600), polling every 5 seconds and scanning again;
 .IP 3. 4
 only when a configured drive is still absent after the wait is it mounted
 degraded: the period is recorded (the present members' device UUIDs and

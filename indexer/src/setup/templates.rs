@@ -290,8 +290,19 @@ pub fn render_systemd_scrub_timer(config: &Config) -> String {
 /// (exit 0) rather than queuing — so it never has a legitimate reason to run
 /// long, and a bound here is a real safety net against a hung `btrfs`
 /// subprocess rather than fighting the unit's own design.
+///
+/// The 600 s grows by `[das].member_wait_secs` for every RAID-1 target (bd
+/// DAS-Backup-Manager-su1b.11): the doctor mounts each through the guard,
+/// which waits that long for a late member before deciding, and a bound that
+/// fired inside the wait would kill a check doing what it should.
 pub fn render_systemd_doctor_service(config: &Config) -> String {
     let prefix = &config.general.install_prefix;
+    let raid_targets = config
+        .targets
+        .iter()
+        .filter(|t| buttered_dasd::raid_guard::is_guarded(t))
+        .count() as u64;
+    let timeout = 600 + raid_targets * u64::from(config.das.member_wait_secs);
 
     format!(
         "{GENERATED_HEADER}\n\
@@ -332,7 +343,8 @@ pub fn render_systemd_doctor_service(config: &Config) -> String {
          StandardError=journal\n\
          Nice=19\n\
          IOSchedulingClass=idle\n\
-         TimeoutStartSec=600\n\
+         # 600 s, plus [das].member_wait_secs for each RAID-1 target.\n\
+         TimeoutStartSec={timeout}\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -971,8 +983,35 @@ pub(crate) mod tests {
         // Deliberately finite (unlike das-backup/das-scrub's infinity) — the
         // doctor's own lock acquisition is non-blocking, so it never has a
         // legitimate reason to run long.
-        assert!(result.contains("TimeoutStartSec=600"));
+        assert!(result.contains("TimeoutStartSec=600\n"));
         assert!(!result.contains("TimeoutStartSec=infinity"));
+    }
+
+    /// bd DAS-Backup-Manager-su1b.11: the doctor mounts each RAID-1 target
+    /// through the guard, which may wait `[das].member_wait_secs` for a late
+    /// member; a fixed 600 s bound would kill it mid-wait (the unit failed,
+    /// a supervisor restarting it). The bound is 600 s plus that wait for
+    /// every RAID-1 target.
+    #[test]
+    fn the_doctor_unit_bound_covers_the_raid_member_wait() {
+        let mut config = test_config();
+        let mut raid = config.targets[0].clone();
+        raid.label = "raid".into();
+        raid.mount_uuid = Some("5eed0016-0000-4000-8000-000000000016".into());
+        raid.serials = vec!["SERIAL11".into(), "SERIAL12".into()];
+        config.targets.push(raid);
+        config.das.member_wait_secs = 900;
+        let result = render_systemd_doctor_service(&config);
+        assert!(result.contains("TimeoutStartSec=1500\n"), "{result}");
+        config.das.member_wait_secs = 3600;
+        let two = {
+            let mut c = config.clone();
+            let mut second = c.targets.last().unwrap().clone();
+            second.label = "raid2".into();
+            c.targets.push(second);
+            c
+        };
+        assert!(render_systemd_doctor_service(&two).contains("TimeoutStartSec=7800\n"));
     }
 
     #[test]

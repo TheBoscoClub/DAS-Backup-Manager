@@ -93,7 +93,7 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 
 - A RAID-1 target (`mount_uuid` and more than one serial, `raid_guard::is_guarded`) → mounted only by `raid_guard::mount_guarded`: the Rust jobs through `mount.rs`, the script through `btrdasd backup mount-target` (fd 8 handed down); never `mount -o` with `[das].mount_opts`' `degraded` (bd `su1b.10`).
 - Members → found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each `btrfs device scan <its path>`; never an unscoped scan, never `--forget`, in code, tests or proofs.
-- The mount → without `degraded` first; a member not present, or a plain mount that fails → poll every 5 s for `[das].member_wait_secs` (60), rescanning.
+- The mount → without `degraded` first; a member not present, or a plain mount that fails → poll every 5 s for `[das].member_wait_secs` (900, at most 3600; operator 2026-11-22, bd `su1b.11`), rescanning.
 - Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
 - A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
 - Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").

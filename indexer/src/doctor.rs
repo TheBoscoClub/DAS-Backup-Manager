@@ -109,7 +109,7 @@ impl From<scrub::ScrubError> for DoctorError {
 ///
 /// **Kill-signal case (documented, not handled by a signal handler).** A
 /// `SIGKILL` — e.g. `systemd` escalating past `das-backup-doctor.service`'s
-/// `TimeoutStartSec=600` — gives [`mount::MountGuard`]'s `Drop` impl no chance
+/// `TimeoutStartSec` (600 s plus `[das].member_wait_secs` per RAID-1 target) — gives [`mount::MountGuard`]'s `Drop` impl no chance
 /// to run, so any source volumes newly mounted by this invocation are *not*
 /// unmounted. The two locks are unaffected: `flock(2)` is released by the
 /// kernel the instant the holding process's file descriptors close, which a
