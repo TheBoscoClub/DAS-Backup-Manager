@@ -127,7 +127,7 @@ fn run_udevadm(args: &[&str]) -> Result<(), String> {
 /// already attached. Not fatal — the rule file is in place and applies on the
 /// next attach or boot — but never silent: until it applies, a desktop login
 /// can still automount the targets.
-fn apply_udev_rules() {
+fn apply_udev_rules(config: &Config) {
     let steps: [&[&str]; 2] = [
         &["control", "--reload"],
         &["trigger", "--action=change", "--subsystem-match=block"],
@@ -139,6 +139,18 @@ fn apply_udev_rules() {
                  applied to attached drives; it takes effect on the next boot"
             );
             return;
+        }
+    }
+    // The scheduler rule, re-applied to the target drives alone, with its own
+    // warning: the broad trigger above covers every block device for the
+    // udisks rule, and this one must not depend on it (bd su1b.4).
+    if let Some(args) = io_scheduler_trigger_args(config) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Err(e) = run_udevadm(&args) {
+            eprintln!(
+                "Warning: {e} — the I/O-scheduler rule is installed but not yet \
+                 applied to attached drives; it takes effect at their next add/change event"
+            );
         }
     }
 }
@@ -224,6 +236,159 @@ pub fn udisks_exposure(export_db: &str, config: &Config) -> Vec<TargetExposure> 
         slot.exposed.sort();
     }
     found
+}
+
+/// The installed rule file's text; `None` when there is no such file.
+fn read_installed_io_rule(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The lines `setup --check` prints about the I/O-scheduler udev rule: the
+/// installed file against what setup would write now (bd
+/// `DAS-Backup-Manager-su1b.4`). A file that could not be read is reported as
+/// not checked, never as current.
+pub fn io_scheduler_rule_report(
+    installed: Result<Option<String>, String>,
+    config: &Config,
+) -> Vec<String> {
+    let path = crate::setup::templates::UDEV_IO_SCHEDULER_RULES;
+    let fix = "  Fix with: sudo btrdasd setup --upgrade".to_string();
+    let installed = match installed {
+        Ok(text) => text,
+        Err(e) => return vec![format!("I/O scheduler rule NOT checked: {e}")],
+    };
+    let expected = crate::setup::templates::render_udev_io_scheduler(config);
+    match (expected, installed) {
+        (None, None) => {
+            vec!["I/O scheduler not pinned by udev ([das].io_scheduler is empty)".to_string()]
+        }
+        (None, Some(_)) => vec![
+            format!("I/O scheduler rule {path} is STALE — [das].io_scheduler is empty"),
+            fix,
+        ],
+        (Some(_), None) => vec![format!("I/O scheduler rule {path} MISSING"), fix],
+        (Some(want), Some(have)) if want == have => vec![format!(
+            "I/O scheduler rule current ({} pinned on the target drives at every add/change)",
+            config.das.io_scheduler
+        )],
+        (Some(_), Some(_)) => vec![
+            format!("I/O scheduler rule {path} is STALE — it differs from what setup would write"),
+            fix,
+        ],
+    }
+}
+
+/// The scheduler a `queue/scheduler` file names as active: the bracketed word
+/// of `mq-deadline kyber [bfq] none`.
+pub fn active_scheduler(text: &str) -> Option<String> {
+    let rest = text.split('[').nth(1)?;
+    let name = rest.split(']').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The `udevadm trigger` arguments that re-apply the scheduler rule on the
+/// target drives and nothing else: a change event for each whole disk whose
+/// serial the config names. `None` when no scheduler is configured or no
+/// configured serial is safe to name.
+pub fn io_scheduler_trigger_args(config: &Config) -> Option<Vec<String>> {
+    if config.das.io_scheduler.is_empty() {
+        return None;
+    }
+    let mut serials: Vec<String> = Vec::new();
+    for serial in config.targets.iter().flat_map(|t| t.effective_serials()) {
+        if crate::setup::templates::is_udev_safe_value(&serial) && !serials.contains(&serial) {
+            serials.push(serial);
+        }
+    }
+    if serials.is_empty() {
+        return None;
+    }
+    let mut args = vec![
+        "trigger".to_string(),
+        "--action=change".to_string(),
+        "--subsystem-match=block".to_string(),
+    ];
+    args.extend(
+        serials
+            .into_iter()
+            .map(|s| format!("--property-match=ID_SERIAL_SHORT={s}")),
+    );
+    Some(args)
+}
+
+/// The lines `setup --check` prints about the scheduler each attached target
+/// drive is on right now, read from the kernel (`active` is given a drive's
+/// udev `P:` path) rather than from the rule file: a rule that is current and
+/// was never applied would otherwise read as working. Empty when no scheduler
+/// is configured.
+pub fn io_scheduler_live_report(
+    export_db: &Result<String, String>,
+    active: &dyn Fn(&str) -> Result<String, String>,
+    config: &Config,
+) -> Vec<String> {
+    let want = config.das.io_scheduler.as_str();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let db = match export_db {
+        Ok(db) => db,
+        Err(e) => return vec![format!("I/O scheduler of the drives NOT checked: {e}")],
+    };
+    let serials: Vec<String> = config
+        .targets
+        .iter()
+        .flat_map(|t| t.effective_serials())
+        .collect();
+    let mut lines = Vec::new();
+    let mut off = false;
+    let mut found = false;
+    for record in db.split("\n\n") {
+        let prop = |key: &str| {
+            record
+                .lines()
+                .filter_map(|l| l.strip_prefix("E: "))
+                .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        };
+        let devpath = record.lines().find_map(|l| l.strip_prefix("P: "));
+        if prop("SUBSYSTEM") != Some("block") || prop("DEVTYPE") != Some("disk") {
+            continue;
+        }
+        let (Some(devpath), Some(devname), Some(serial)) =
+            (devpath, prop("DEVNAME"), prop("ID_SERIAL_SHORT"))
+        else {
+            continue;
+        };
+        if !serials.iter().any(|s| s == serial) {
+            continue;
+        }
+        found = true;
+        match active(devpath) {
+            Ok(text) => match active_scheduler(&text) {
+                Some(now) if now == want => lines.push(format!("Drive {devname} runs {now}")),
+                Some(now) => {
+                    off = true;
+                    lines.push(format!("Drive {devname} runs {now}, not {want}"));
+                }
+                None => lines.push(format!(
+                    "Drive {devname} scheduler NOT read: no active one listed"
+                )),
+            },
+            Err(e) => lines.push(format!("Drive {devname} scheduler NOT read: {e}")),
+        }
+    }
+    if !found {
+        lines.push(
+            "No target drive attached — their I/O scheduler could not be checked".to_string(),
+        );
+    }
+    if off {
+        lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+    }
+    lines
 }
 
 /// The BTRFS filesystem UUIDs udev reports on the drives carrying any of
@@ -419,7 +584,7 @@ pub fn install(config: &Config, _held: &SetupLocks) -> Result<(), Box<dyn std::e
         Path::new(CONFIG_FILE),
         Path::new(MANIFEST_FILE),
     )?;
-    apply_udev_rules();
+    apply_udev_rules(config);
     // Only in real installs — `install_to_prefix` never touches the host's units.
     let units_dir = buttered_dasd::unit_links::units_dir(Path::new(CONFIG_FILE))?;
     install_schedule(
@@ -1841,6 +2006,13 @@ pub fn check() -> Result<(), Box<dyn std::error::Error>> {
         &CheckProbes {
             relay_up: &relay_reachable,
             export_db: &|| command_stdout("udevadm", &["info", "--export-db"]),
+            io_rule: &|| {
+                read_installed_io_rule(Path::new(crate::setup::templates::UDEV_IO_SCHEDULER_RULES))
+            },
+            active_scheduler: &|devpath| {
+                std::fs::read_to_string(format!("/sys{devpath}/queue/scheduler"))
+                    .map_err(|e| e.to_string())
+            },
             scrub_unit: &|| {
                 command_stdout(
                     "systemctl",
@@ -1864,6 +2036,11 @@ struct CheckProbes<'a> {
     relay_up: RelayProbe<'a>,
     /// udev's database, as `udevadm info --export-db` prints it.
     export_db: &'a dyn Fn() -> Result<String, String>,
+    /// The installed I/O-scheduler udev rule: its text, `None` when the file is
+    /// absent, `Err` when it cannot be read.
+    io_rule: &'a dyn Fn() -> Result<Option<String>, String>,
+    /// A block device's `queue/scheduler`, given its udev `P:` path.
+    active_scheduler: &'a dyn Fn(&str) -> Result<String, String>,
     /// The effective priority of `das-scrub.service`, as
     /// `systemctl show -p Nice,IOSchedulingClass,IOSchedulingPriority` prints it.
     scrub_unit: &'a dyn Fn() -> Result<String, String>,
@@ -1959,6 +2136,12 @@ fn check_with(
     // installed and does nothing (bd DAS-Backup-Manager-a10).
     let export_db = (probes.export_db)();
     for line in mount_uuid_report(&export_db, &config) {
+        say(line);
+    }
+    for line in io_scheduler_rule_report((probes.io_rule)(), &config) {
+        say(line);
+    }
+    for line in io_scheduler_live_report(&export_db, probes.active_scheduler, &config) {
         say(line);
     }
     for line in udisks_report(export_db, &config) {
@@ -2440,6 +2623,207 @@ mod tests {
         );
         assert!(btrfs_uuids_for_serials(&db, &["NOTHERE".into()]).is_empty());
         assert!(btrfs_uuids_for_serials(&db, &[]).is_empty());
+    }
+
+    /// A config naming `SERIAL11` and `SERIAL12`, scheduler `mq-deadline`.
+    fn scheduler_config() -> Config {
+        let mut config = Config::default();
+        config.das.io_scheduler = "mq-deadline".to_string();
+        config
+            .targets
+            .push(exposure_target("pair", &["SERIAL11", "SERIAL12"], None));
+        config
+    }
+
+    #[test]
+    fn io_scheduler_rule_report_says_current_stale_or_missing() {
+        let config = scheduler_config();
+        let rule = crate::setup::templates::render_udev_io_scheduler(&config).unwrap();
+        let said = |r: Result<Option<String>, String>, c: &Config| io_scheduler_rule_report(r, c);
+
+        let current = said(Ok(Some(rule.clone())), &config);
+        assert_eq!(current.len(), 1, "{current:?}");
+        assert!(current[0].contains("current"), "{current:?}");
+        assert!(current[0].contains("mq-deadline"), "{current:?}");
+
+        let missing = said(Ok(None), &config);
+        assert!(missing[0].contains("MISSING"), "{missing:?}");
+        assert!(missing[1].contains("setup --upgrade"), "{missing:?}");
+
+        let stale = said(Ok(Some(rule.replace("mq-deadline", "bfq"))), &config);
+        assert!(stale[0].contains("STALE"), "{stale:?}");
+        assert!(stale[1].contains("setup --upgrade"), "{stale:?}");
+
+        let unread = said(Err("permission denied".into()), &config);
+        assert_eq!(unread.len(), 1);
+        assert!(
+            unread[0].contains("NOT checked: permission denied"),
+            "{unread:?}"
+        );
+    }
+
+    #[test]
+    fn io_scheduler_rule_report_with_no_scheduler_wants_no_rule() {
+        let mut config = scheduler_config();
+        config.das.io_scheduler = String::new();
+        let none = io_scheduler_rule_report(Ok(None), &config);
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(none[0].contains("not pinned"), "{none:?}");
+        let left = io_scheduler_rule_report(Ok(Some("old rule\n".into())), &config);
+        assert!(left[0].contains("STALE"), "{left:?}");
+        assert!(left[1].contains("setup --upgrade"), "{left:?}");
+    }
+
+    /// Records trimmed from `udevadm info --export-db`: two whole disks of the
+    /// pair (with a partition each), and an unrelated disk.
+    fn disk_db() -> String {
+        "P: /devices/x/block/sdi\nN: sdi\nE: DEVNAME=/dev/sdi\nE: DEVTYPE=disk\n\
+         E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=SERIAL11\n\
+         \n\
+         P: /devices/x/block/sdi/sdi1\nN: sdi1\nE: DEVNAME=/dev/sdi1\nE: DEVTYPE=partition\n\
+         E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=SERIAL11\nE: ID_FS_TYPE=btrfs\n\
+         \n\
+         P: /devices/x/block/sdj\nN: sdj\nE: DEVNAME=/dev/sdj\nE: DEVTYPE=disk\n\
+         E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=SERIAL12\n\
+         \n\
+         P: /devices/x/block/sda\nN: sda\nE: DEVNAME=/dev/sda\nE: DEVTYPE=disk\n\
+         E: SUBSYSTEM=block\nE: ID_SERIAL_SHORT=OTHER\n"
+            .to_string()
+    }
+
+    #[test]
+    fn active_scheduler_reads_the_bracketed_name() {
+        assert_eq!(
+            active_scheduler("mq-deadline kyber [bfq] none\n"),
+            Some("bfq".to_string())
+        );
+        assert_eq!(active_scheduler("[none]"), Some("none".to_string()));
+        assert_eq!(active_scheduler("mq-deadline bfq\n"), None);
+        assert_eq!(active_scheduler(""), None);
+    }
+
+    #[test]
+    fn io_scheduler_live_report_names_each_drive_off_the_scheduler() {
+        let config = scheduler_config();
+        let read = |p: &str| match p {
+            "/devices/x/block/sdi" => Ok("[mq-deadline] kyber bfq none\n".to_string()),
+            "/devices/x/block/sdj" => Ok("mq-deadline kyber [bfq] none\n".to_string()),
+            other => panic!("read a device that is not a target's: {other}"),
+        };
+        let lines = io_scheduler_live_report(&Ok(disk_db()), &read, &config);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "Drive /dev/sdi runs mq-deadline");
+        assert!(
+            lines[1].contains("Drive /dev/sdj runs bfq, not mq-deadline"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("setup --upgrade"), "{lines:?}");
+    }
+
+    #[test]
+    fn io_scheduler_live_report_never_reads_a_failure_as_a_match() {
+        let config = scheduler_config();
+        let unread = |_: &str| Err("no such file".to_string());
+        let lines = io_scheduler_live_report(&Ok(disk_db()), &unread, &config);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| l.contains("NOT read")), "{lines:?}");
+        let db_down =
+            io_scheduler_live_report(&Err("udevadm exited with 1".into()), &unread, &config);
+        assert_eq!(db_down.len(), 1);
+        assert!(db_down[0].contains("NOT checked: udevadm exited with 1"));
+        let none = io_scheduler_live_report(&Ok(String::new()), &unread, &config);
+        assert!(none[0].contains("No target drive attached"), "{none:?}");
+        let mut off = scheduler_config();
+        off.das.io_scheduler = String::new();
+        assert!(io_scheduler_live_report(&Ok(disk_db()), &unread, &off).is_empty());
+    }
+
+    #[test]
+    fn setup_check_reports_the_scheduler_rule_it_finds_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = valid_config(dir.path());
+        config.das.io_scheduler = "mq-deadline".to_string();
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let rule = dir
+            .path()
+            .join("etc/udev/rules.d/99-das-backup-io-scheduler.rules");
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("I/O scheduler rule") && l.contains("current")),
+            "{lines:#?}"
+        );
+        std::fs::remove_file(&rule).unwrap();
+        let lines = run_check(&config_path, &manifest_path, true, Ok(String::new()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("I/O scheduler rule") && l.contains("MISSING")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn install_writes_the_io_scheduler_rule_and_a_later_empty_scheduler_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = valid_config(dir.path());
+        config.das.io_scheduler = "mq-deadline".to_string();
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let rule = dir
+            .path()
+            .join("etc/udev/rules.d/99-das-backup-io-scheduler.rules");
+        let text = std::fs::read_to_string(&rule).unwrap();
+        assert!(text.contains("ENV{ID_SERIAL_SHORT}==\"ABC123\""), "{text}");
+        assert!(
+            text.contains("ATTR{queue/scheduler}=\"mq-deadline\""),
+            "{text}"
+        );
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(manifest.contains(&rule.to_string_lossy().to_string()));
+
+        // The scheduler is unset and setup runs again: no rule, none listed.
+        config.das.io_scheduler = String::new();
+        install_to_prefix(&config, dir.path(), &config_path, &manifest_path).unwrap();
+        assert!(!rule.exists(), "stale rule left on disk");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(!manifest.contains("io-scheduler"), "{manifest}");
+    }
+
+    #[test]
+    fn uninstall_removes_the_io_scheduler_rule_the_manifest_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = valid_config(dir.path());
+        config.das.io_scheduler = "mq-deadline".to_string();
+        let (_c, manifest_path) = install_config_into(&config, dir.path());
+        let rule = dir
+            .path()
+            .join("etc/udev/rules.d/99-das-backup-io-scheduler.rules");
+        assert!(rule.is_file());
+        let (_removed, problems) = uninstall_from_manifest(&manifest_path);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!rule.exists());
+    }
+
+    #[test]
+    fn udev_trigger_args_match_the_target_serials_only() {
+        let config = scheduler_config();
+        assert_eq!(
+            io_scheduler_trigger_args(&config),
+            Some(vec![
+                "trigger".to_string(),
+                "--action=change".to_string(),
+                "--subsystem-match=block".to_string(),
+                "--property-match=ID_SERIAL_SHORT=SERIAL11".to_string(),
+                "--property-match=ID_SERIAL_SHORT=SERIAL12".to_string(),
+            ])
+        );
+        let mut off = scheduler_config();
+        off.das.io_scheduler = String::new();
+        assert_eq!(io_scheduler_trigger_args(&off), None);
+        let mut bad = scheduler_config();
+        bad.targets[0].serials = vec!["a\"b".to_string()];
+        assert_eq!(io_scheduler_trigger_args(&bad), None);
     }
 
     #[test]
@@ -5772,6 +6156,17 @@ auth = "starttls""#,
         let probes = CheckProbes {
             relay_up: &|_| relay_up,
             export_db: &|| export_db.clone(),
+            // The rule as installed under the test's root, beside the config.
+            io_rule: &|| {
+                read_installed_io_rule(
+                    &config_path
+                        .parent()
+                        .and_then(Path::parent)
+                        .unwrap()
+                        .join("udev/rules.d/99-das-backup-io-scheduler.rules"),
+                )
+            },
+            active_scheduler: &|_| Err("not read in this test".to_string()),
             scrub_unit: &|| scrub_unit.clone(),
             // `mailx` stands for "asked for only when email is enabled".
             dependencies: &|email_enabled| {
@@ -5936,6 +6331,10 @@ auth = "starttls""#,
                 "  Its drive is not attached (or holds no BTRFS filesystem) — attach it and run \
                  setup --check again to read its UUID"
                     .to_string(),
+                "I/O scheduler rule current (mq-deadline pinned on the target drives at every \
+                 add/change)"
+                    .to_string(),
+                "No target drive attached — their I/O scheduler could not be checked".to_string(),
                 "Target tgt not attached — udisks visibility could not be checked".to_string(),
                 "btrbk (/usr/bin/btrbk)".to_string(),
                 "smartctl (required, not found)".to_string(),
@@ -6003,6 +6402,11 @@ auth = "starttls""#,
         expected.extend([
             "No manifest found. Files may be from a manual install.".to_string(),
             "das-scrub.service runs at nice -20, best-effort I/O level 0".to_string(),
+            "I/O scheduler rule /etc/udev/rules.d/99-das-backup-io-scheduler.rules MISSING"
+                .to_string(),
+            "  Fix with: sudo btrdasd setup --upgrade".to_string(),
+            "I/O scheduler of the drives NOT checked: udevadm info --export-db exited with 1"
+                .to_string(),
             "udisks visibility NOT checked: udevadm info --export-db exited with 1".to_string(),
             "btrbk (/usr/bin/btrbk)".to_string(),
             "smartctl (required, not found)".to_string(),

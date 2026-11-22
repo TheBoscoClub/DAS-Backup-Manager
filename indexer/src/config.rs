@@ -378,6 +378,12 @@ fn default_io_scheduler() -> String {
     "mq-deadline".into()
 }
 
+/// The values `[das].io_scheduler` takes: the names of the kernel's
+/// multiqueue block schedulers. The value is written into a generated udev
+/// rule and into `/sys/block/*/queue/scheduler`, so nothing else passes. Empty
+/// is also accepted and means "leave the drives' scheduler alone".
+pub const IO_SCHEDULERS: [&str; 4] = ["mq-deadline", "bfq", "kyber", "none"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Boot {
     #[serde(default = "default_true")]
@@ -3416,6 +3422,16 @@ impl Config {
             }
         }
 
+        if !self.das.io_scheduler.is_empty()
+            && !IO_SCHEDULERS.contains(&self.das.io_scheduler.as_str())
+        {
+            errors.push(format!(
+                "das.io_scheduler {:?} must be one of {}, or empty to leave the drives' scheduler alone",
+                self.das.io_scheduler,
+                IO_SCHEDULERS.join(", ")
+            ));
+        }
+
         if self.doctor.max_snapshot_age_days == 0 {
             errors.push(
                 "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
@@ -4915,6 +4931,38 @@ mod tests {
                 cfg.validate()
                     .iter()
                     .any(|e| e.contains("recovery_os.repo_level")),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// bd su1b.4: the scheduler is written into a udev rule and a sysfs file,
+    /// so only the kernel's known names pass; empty is "leave the drives alone".
+    #[test]
+    fn validate_accepts_only_a_known_io_scheduler_or_none_set() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        for good in ["mq-deadline", "bfq", "kyber", "none", ""] {
+            cfg.das.io_scheduler = good.into();
+            assert!(
+                !cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("das.io_scheduler")),
+                "{good:?} was refused: {:?}",
+                cfg.validate()
+            );
+        }
+        for bad in [
+            "cfq",
+            "MQ-DEADLINE",
+            "mq-deadline ",
+            "bfq\", RUN+=\"x",
+            "noop",
+        ] {
+            cfg.das.io_scheduler = bad.into();
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("das.io_scheduler")),
                 "{bad:?} was accepted"
             );
         }

@@ -587,6 +587,7 @@ Templates are rendered programmatically (no external template files):
 | `render_systemd_scrub_service()` / `render_systemd_scrub_timer()` | `das-scrub.{service,timer}` | Monthly scrub from `[scrub].on_calendar` |
 | `render_systemd_doctor_service()` / `render_systemd_doctor_timer()` | `das-backup-doctor.{service,timer}` | Weekly drift check, `SuccessExitStatus=1` |
 | `render_udev_udisks_ignore()` | `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules` | Hides every target from udisks2 by serial and `mount_uuid` |
+| `render_udev_io_scheduler()` | `/etc/udev/rules.d/99-das-backup-io-scheduler.rules` | Pins `[das].io_scheduler` on each target's whole disk (`ID_SERIAL_SHORT`, `add\|change`) so it holds between runs and beats the host's generic rotational rule; `None` (no file, a stale one pruned by the manifest diff) when empty; `Config::validate` and `generate` refuse a name outside `IO_SCHEDULERS`. `setup --check` compares the file with the render and reads each drive's live `queue/scheduler`; `setup` re-applies it with a `udevadm trigger` matched on the serials (bd su1b.4) |
 | `render_cron_entry()` | cron lines | For sysvinit/OpenRC systems |
 | embedded scripts (`include_str!`) | `backup-run.sh`, `backup-verify.sh`, `boot-archive-cleanup.sh` | Real production scripts installed flat at `${prefix}/lib/das-backup/` (same layout as cmake's install) |
 
