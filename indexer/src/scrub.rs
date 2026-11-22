@@ -2500,7 +2500,7 @@ fn ensure_mounted(
         match crate::mount::mount_guarded_target(
             config,
             target,
-            crate::raid_guard::Intent::Write,
+            crate::raid_guard::Job::Scrub.intent(),
             progress,
             held,
         ) {

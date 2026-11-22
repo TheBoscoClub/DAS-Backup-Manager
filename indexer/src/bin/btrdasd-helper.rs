@@ -2725,7 +2725,7 @@ fn index_walk_job(
     let held = maintenance::hold_for_job(site, "btrdasd-helper IndexWalk job", progress)?;
     let mut guard = mount::ensure_targets_mounted(
         config,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::IndexWalk.intent(),
         progress,
         &held,
     )
@@ -2812,7 +2812,7 @@ fn restore_files_job(
     let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreFiles job", progress)?;
     let mut guard = mount::ensure_targets_mounted(
         config,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::RestoreFiles.intent(),
         progress,
         &held,
     )
@@ -2868,7 +2868,7 @@ fn restore_snapshot_job(
     let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreSnapshot job", progress)?;
     let mut guard = mount::ensure_targets_mounted(
         config,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::RestoreSnapshot.intent(),
         progress,
         &held,
     )

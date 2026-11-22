@@ -946,7 +946,7 @@ fn perform_delivery_check(
     );
     let mut guard = match mount::ensure_targets_mounted(
         config,
-        crate::raid_guard::Intent::ReadOnly,
+        crate::raid_guard::Job::Doctor.intent(),
         progress,
         held,
     ) {

@@ -5461,7 +5461,7 @@ mod tests {
         let progress = NullProgress;
         let result = ensure_targets_mounted(
             &config,
-            raid_guard::Intent::Write,
+            raid_guard::Job::Backup.intent(),
             &progress,
             &MaintenanceHeld::assumed(),
         );

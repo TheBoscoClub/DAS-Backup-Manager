@@ -70,15 +70,96 @@ pub const PROBE_OPTS: &str = "ro,degraded,rescue=nologreplay";
 pub const STALE_READ_OPTS: &str = "ro,degraded,rescue=nologreplay";
 
 /// What the job that asks for a mount will do to the target. Every caller
-/// says it; nothing infers it from the mount options.
+/// says it, through [`Job::intent`]; nothing infers it from the mount
+/// options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
-    /// The job writes the target: backups (run, snapshot, send, static),
-    /// boot archiving, the state pass, forget and purge, the scrub, setup.
+    /// The job writes the target, or writes state derived from its contents
+    /// (the index, a record): given a split-brain member it is refused.
     Write,
-    /// The job only reads the target: walk, reindex, reconcile, restore,
-    /// browsing, the doctor, the recovery-OS reading.
+    /// The job persists nothing derived from what it reads: it may read a
+    /// split-brain member, read-only.
     ReadOnly,
+}
+
+/// Every job that mounts a target, and the [`Intent`] it mounts with. Only a
+/// job that persists nothing derived from the target's contents (browsing,
+/// restoring a file or snapshot to the host, the doctor's report) is
+/// [`Intent::ReadOnly`]. A walk, an index job, reindex and reconcile
+/// (`--rebuild`, `--repair` included) write the index from what the mount
+/// shows, and the recovery-OS reading writes its state file: on a
+/// split-brain member they would delete real index entries and record old
+/// contents as current, so they are [`Intent::Write`] and refused (bd
+/// DAS-Backup-Manager-su1b.11, security review 2026-11-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// `btrdasd backup run|snapshot|send|static`, the helper's `BackupRun`.
+    Backup,
+    /// `btrdasd backup boot-archive`.
+    BootArchive,
+    /// `btrdasd forget`, `btrdasd purge`.
+    Forget,
+    /// The scrub engine.
+    Scrub,
+    /// `btrdasd backup mount-target`, for `backup-run.sh`.
+    MountTarget,
+    /// `btrdasd walk`.
+    Walk,
+    /// The helper's `IndexWalk`.
+    IndexWalk,
+    /// `btrdasd reindex`.
+    Reindex,
+    /// `btrdasd reconcile`.
+    Reconcile,
+    /// `btrdasd recovery-os record` and the backup's recovery-OS reading.
+    RecoveryOsRecord,
+    /// `btrdasd restore file`, the helper's `RestoreFiles`.
+    RestoreFiles,
+    /// `btrdasd restore snapshot`, the helper's `RestoreSnapshot`.
+    RestoreSnapshot,
+    /// `btrdasd restore browse`.
+    Browse,
+    /// `btrdasd doctor`'s delivery check (a report; it records nothing).
+    Doctor,
+}
+
+impl Job {
+    /// Every job, for the tests that hold the table to its rule.
+    pub const ALL: [Job; 14] = [
+        Job::Backup,
+        Job::BootArchive,
+        Job::Forget,
+        Job::Scrub,
+        Job::MountTarget,
+        Job::Walk,
+        Job::IndexWalk,
+        Job::Reindex,
+        Job::Reconcile,
+        Job::RecoveryOsRecord,
+        Job::RestoreFiles,
+        Job::RestoreSnapshot,
+        Job::Browse,
+        Job::Doctor,
+    ];
+
+    /// The intent this job mounts with.
+    pub const fn intent(self) -> Intent {
+        match self {
+            Job::RestoreFiles | Job::RestoreSnapshot | Job::Browse | Job::Doctor => {
+                Intent::ReadOnly
+            }
+            Job::Backup
+            | Job::BootArchive
+            | Job::Forget
+            | Job::Scrub
+            | Job::MountTarget
+            | Job::Walk
+            | Job::IndexWalk
+            | Job::Reindex
+            | Job::Reconcile
+            | Job::RecoveryOsRecord => Intent::Write,
+        }
+    }
 }
 /// The first line of every record copy.
 const FORMAT_LINE: &str = "format=das-backup-raid-record 1";
@@ -1745,6 +1826,81 @@ mod tests {
             "{:?}",
             host.calls()
         );
+    }
+
+    /// Only jobs that persist nothing derived from the target's contents may
+    /// read a split-brain member: every job that writes the index, a record
+    /// or a state file from what it reads is refused it.
+    #[test]
+    fn only_jobs_that_persist_nothing_from_the_target_read_a_split_brain_member() {
+        let read_only: Vec<Job> = Job::ALL
+            .into_iter()
+            .filter(|j| j.intent() == Intent::ReadOnly)
+            .collect();
+        assert_eq!(
+            read_only,
+            [
+                Job::RestoreFiles,
+                Job::RestoreSnapshot,
+                Job::Browse,
+                Job::Doctor
+            ]
+        );
+        for job in [
+            Job::Walk,
+            Job::IndexWalk,
+            Job::Reindex,
+            Job::Reconcile,
+            Job::RecoveryOsRecord,
+        ] {
+            let case = Case::new();
+            assert!(case.run(&only_x()).0.is_ok());
+            let why = refusal(case.run_as(&only_y(), job.intent()).0);
+            assert!(why.contains("split brain"), "{job:?}: {why}");
+        }
+    }
+
+    /// Every caller names its job: each `ensure_targets_mounted(` and
+    /// `mount_guarded_target(` call in the sources passes
+    /// `Job::<job>.intent()`, never a bare `Intent`, so the table above is the
+    /// whole classification.
+    #[test]
+    fn every_target_mount_names_its_job() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = vec![src];
+        let mut calls = 0;
+        while let Some(p) = paths.pop() {
+            if p.is_dir() {
+                paths.extend(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&p).unwrap();
+            for name in ["ensure_targets_mounted(", "mount_guarded_target("] {
+                for (at, _) in text.match_indices(name) {
+                    let before = &text[..at];
+                    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+                    let line_head = text[line_start..at].trim_start();
+                    if before.ends_with("fn ")
+                        || before.ends_with('"')
+                        || line_head.starts_with("//")
+                    {
+                        continue;
+                    }
+                    let end = text[at..].find(';').map_or(text.len(), |e| at + e);
+                    let args = &text[at..end];
+                    assert!(
+                        args.contains("Job::") && args.contains(".intent()"),
+                        "{}: a target mount that does not name its job: {args}",
+                        p.display()
+                    );
+                    calls += 1;
+                }
+            }
+        }
+        assert!(calls >= 15, "the scan found only {calls} calls");
     }
 
     #[test]

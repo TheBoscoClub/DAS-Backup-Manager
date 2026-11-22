@@ -124,7 +124,7 @@ where
     let progress = CliProgress;
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Intent::Write,
+        buttered_dasd::raid_guard::Job::Forget.intent(),
         &progress,
         locks.maintenance(),
     )?;
@@ -2056,7 +2056,7 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     let result = mount::mount_guarded_target(
         &cfg,
         target,
-        buttered_dasd::raid_guard::Intent::Write,
+        buttered_dasd::raid_guard::Job::MountTarget.intent(),
         &CliProgress,
         &held,
     );
@@ -2079,7 +2079,7 @@ fn cmd_walk(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::Walk.intent(),
         progress,
         &held,
     )?;
@@ -2201,7 +2201,7 @@ fn cmd_restore_file(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::RestoreFiles.intent(),
         progress,
         &held,
     )?;
@@ -2239,7 +2239,7 @@ fn cmd_restore_snapshot(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::RestoreSnapshot.intent(),
         progress,
         &held,
     )?;
@@ -2275,7 +2275,7 @@ fn cmd_restore_browse(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Intent::ReadOnly,
+        buttered_dasd::raid_guard::Job::Browse.intent(),
         progress,
         &held,
     )?;
@@ -2417,7 +2417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(
                 &cfg,
-                buttered_dasd::raid_guard::Intent::ReadOnly,
+                buttered_dasd::raid_guard::Job::Reindex.intent(),
                 &progress,
                 locks.maintenance(),
             )?;
@@ -2525,7 +2525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(
                 &cfg,
-                buttered_dasd::raid_guard::Intent::ReadOnly,
+                buttered_dasd::raid_guard::Job::Reconcile.intent(),
                 &progress,
                 locks.maintenance(),
             )?;
@@ -2925,7 +2925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // classifies it, not 1 ("could not start").
                 let mut guard = match mount::ensure_targets_mounted(
                     &cfg,
-                    buttered_dasd::raid_guard::Intent::Write,
+                    buttered_dasd::raid_guard::Job::BootArchive.intent(),
                     &progress,
                     locks.maintenance(),
                 ) {

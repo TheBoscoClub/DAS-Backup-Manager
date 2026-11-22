@@ -97,9 +97,9 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 - Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
 - A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
 - Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").
-- Every caller of `ensure_targets_mounted` / `mount_guarded_target` passes `raid_guard::Intent` explicitly; never infer it from the mount options.
-- `Intent::Write` → backups (run, snapshot, send, static), boot archiving, forget and purge, the scrub, `backup mount-target`.
-- `Intent::ReadOnly` → walk, reindex, reconcile, restore, browse, the GUI helper's index and restore jobs, the doctor, the recovery-OS reading.
+- Every caller of `ensure_targets_mounted` / `mount_guarded_target` passes `raid_guard::Job::<job>.intent()`; never a bare `Intent`, never inferred from the mount options (`every_target_mount_names_its_job` scans for it).
+- `Intent::ReadOnly` → only a job that persists nothing derived from the target's contents: restore file, restore snapshot, browse, the doctor's report.
+- `Intent::Write` → everything else, including walk, the helper's index walk, reindex, reconcile and the recovery-OS reading: they write the index or a state file from what they read (security review 2026-11-22).
 - Split brain with `Intent::ReadOnly` → mounted `<mount_opts>,ro,degraded,rescue=nologreplay`, a `STALE-READ-ONLY` WARN naming the date its data stops, no record change (operator 2026-11-22, bd `su1b.11`); an unreadable record stays refused for every job.
 - Every member back → normal mount, the record becomes scrub-owed (a WARN row, a doctor finding) until a completed scrub begun after the rejoin clears it.
 - After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` unreadable is refused on both paths; a member missing is refused by `verify_targets_before_btrbk` unless the guard mounted it degraded this run, and by `verify_write_targets` while every configured drive is attached.

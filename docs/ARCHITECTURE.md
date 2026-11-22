@@ -216,10 +216,12 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
 refused, 2 could not run). Single-device targets are mounted as before. Every
-caller says what its job does to the target (`raid_guard::Intent`, never
-inferred): `Write` for backups, boot archiving, forget/purge, the scrub;
-`ReadOnly` for walk, reindex, reconcile, restore, browse, the doctor and the
-recovery-OS reading.
+caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
+`ReadOnly` only for a job that persists nothing derived from the target's
+contents (restore file, restore snapshot, browse, the doctor's report);
+`Write` for everything else — backups, boot archiving, forget/purge, the
+scrub, and walk, index walk, reindex, reconcile and the recovery-OS reading,
+which write the index or a state file from what they read.
 
 ```text
 blkid -c /dev/null -t UUID=<fsid> -o device   → the members, never found by serial alone

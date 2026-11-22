@@ -1065,14 +1065,16 @@ every member present again mounts normally and the record says a scrub is
 owed
 .RB ( SCRUB\-OWED )
 until a completed scrub begun after the rejoin clears it;
-a job that only reads the target (walk, reindex, reconcile, restore, browse,
-doctor, the GUI's index and restore jobs) is given a split\-brain member
-read\-only instead
+a job that persists nothing derived from the target's contents (restore
+file, restore snapshot, browse, the GUI's restores, the doctor) is given a
+split\-brain member read\-only instead
 .RB ( ro,degraded,rescue=nologreplay ,
 status
 .BR STALE\-READ\-ONLY ),
 with a warning naming the date its data stops and no change to the record;
-every job that writes the target stays refused (see
+every job that writes the target, or writes the index or a state file from
+what it reads (walk, reindex, reconcile, the GUI's index walk, the
+recovery\-OS reading), stays refused (see
 .BR "raid accept" );
 .IP 5. 4
 after the mount, a member the kernel reports missing
