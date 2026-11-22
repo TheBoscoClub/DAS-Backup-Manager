@@ -345,6 +345,25 @@ fn config_text_at(path: &Path) -> Result<String, fdo::Error> {
 /// DAS-Backup-Manager-lxw). Never waits: while a backup or setup holds it the
 /// call is refused with a message the GUI shows as it is, and nothing is
 /// written. Every method that saves the config goes through here.
+/// The polkit action of `RaidAcceptPreview` and `RaidAccept` (bd
+/// DAS-Backup-Manager-su1b.11): `auth_admin`, never kept.
+const RAID_ACCEPT_ACTION: &str = "org.dasbackup.raid.accept";
+
+/// The maintenance lock for a `raid accept` call, without waiting: held by a
+/// backup, scrub or another job is a refusal, nothing changed.
+fn raid_accept_maintenance(job: &str) -> fdo::Result<maintenance::MaintenanceHeld> {
+    let path = Path::new(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH);
+    match maintenance::MaintenanceHeld::try_acquire_at(path, job) {
+        Ok(Some(held)) => Ok(held),
+        Ok(None) => Err(fdo::Error::Failed(format!(
+            "Not accepted, nothing changed: {} holds {}",
+            maintenance::holder_of(path),
+            path.display()
+        ))),
+        Err(e) => Err(fdo::Error::Failed(e.to_string())),
+    }
+}
+
 fn edit_config<T>(edit: impl FnOnce() -> fdo::Result<T>) -> fdo::Result<T> {
     edit_config_at(Path::new(backup::BACKUP_LOCK_PATH), edit)
 }
@@ -2004,6 +2023,105 @@ impl HelperInterface {
         })
         .await
         .map_err(|e| fdo::Error::Failed(format!("Coverage accept task join failed: {e}")))?
+    }
+
+    /// What `btrdasd raid accept <label>` would show (bd
+    /// DAS-Backup-Manager-su1b.11): the explanation when the guard refuses the
+    /// RAID-1 target for split brain now, else an error saying why there is
+    /// nothing to accept. It probe-mounts the target read-only, so it takes
+    /// the maintenance lock, without waiting.
+    async fn raid_accept_preview(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, RAID_ACCEPT_ACTION).await?;
+        let config = load_config()?;
+        let db_path = config.general.db_path.clone();
+        let label = label.to_string();
+        tokio::task::spawn_blocking(move || {
+            let held = raid_accept_maintenance("btrdasd-helper RaidAcceptPreview")?;
+            mount::raid_accept_preview(
+                &config,
+                &label,
+                Path::new(&db_path),
+                &buttered_dasd::progress::NullProgress,
+                &held,
+            )
+            .map_err(fdo::Error::Failed)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("RaidAcceptPreview task join failed: {e}")))?
+    }
+
+    /// `btrdasd raid accept <label>` for the GUI (bd
+    /// DAS-Backup-Manager-su1b.11): `typed` is what the operator typed
+    /// after reading the preview, compared with the label here, exactly;
+    /// anything else accepts nothing. Under the backup singleton and the
+    /// maintenance lock, both taken without waiting, as `raid accept` does.
+    /// Its own polkit action, authenticated every time (`auth_admin`).
+    async fn raid_accept(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        label: &str,
+        typed: &str,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, RAID_ACCEPT_ACTION).await?;
+        let config = load_config()?;
+        let db_path = config.general.db_path.clone();
+        let (label, typed) = (label.to_string(), typed.to_string());
+        tokio::task::spawn_blocking(move || {
+            let job = "btrdasd-helper RaidAccept";
+            let singleton = match backup::SingletonHeld::try_acquire_at(
+                Path::new(backup::BACKUP_LOCK_PATH),
+                job,
+            ) {
+                Ok(Some(held)) => held,
+                Ok(None) => {
+                    return Err(fdo::Error::Failed(format!(
+                        "Not accepted, nothing changed: {} holds {}",
+                        maintenance::holder_of(Path::new(backup::BACKUP_LOCK_PATH)),
+                        backup::BACKUP_LOCK_PATH
+                    )));
+                }
+                Err(e) => return Err(fdo::Error::Failed(e.to_string())),
+            };
+            let held = raid_accept_maintenance(job)?;
+            let mut confirm = |_explanation: &str| Ok(typed.clone());
+            let done = mount::raid_accept(
+                &config,
+                &label,
+                Path::new(&db_path),
+                &mut confirm,
+                &buttered_dasd::progress::NullProgress,
+                &singleton,
+                &held,
+            )
+            .map_err(fdo::Error::Failed)?;
+            eprintln!(
+                "[warn] raid accept of target {label:?} by {sender}: accepted; {} rejected",
+                done.accepted.after.rejected.len()
+            );
+            let mut summary = format!(
+                "Accepted: target '{label}' now runs on {}. The drive given up is refused \
+                 until it is wiped or removed from the filesystem.",
+                done.accepted
+                    .after
+                    .members
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for w in &done.warnings {
+                summary.push_str(&format!("\nWarning: {w}"));
+            }
+            Ok(summary)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("RaidAccept task join failed: {e}")))?
     }
 
     /// Query system health and return a JSON report.
@@ -4342,6 +4460,36 @@ mod tests {
             at("run_script_merged("),
         );
         assert!(lock < check && check < mark && mark < run);
+    }
+
+    /// bd DAS-Backup-Manager-su1b.11: both raid-accept methods check their
+    /// own action before anything else, and the action is authenticated
+    /// every time.
+    #[test]
+    fn the_raid_accept_methods_check_their_polkit_action_first_and_it_is_never_kept() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for m in ["raid_accept_preview", "raid_accept"] {
+            let method = method_body(body, m);
+            let polkit = method
+                .find("check_polkit(&self.conn, &sender, RAID_ACCEPT_ACTION)")
+                .unwrap_or_else(|| panic!("{m} does not check its action"));
+            for e in ["load_config(", "spawn_blocking(", "mount::raid_accept"] {
+                let at = method.find(e).unwrap_or_else(|| panic!("{m}: no {e}"));
+                assert!(polkit < at, "{m}: {e} comes before check_polkit");
+            }
+        }
+        let policy = include_str!("../../../polkit/org.dasbackup.policy");
+        let at = policy
+            .find(&format!("action id=\"{RAID_ACCEPT_ACTION}\""))
+            .expect("action declared");
+        let block = &policy[at..policy[at..].find("</action>").unwrap() + at];
+        assert!(
+            block.contains("<allow_any>no</allow_any>")
+                && block.contains("<allow_inactive>no</allow_inactive>")
+                && block.contains("<allow_active>auth_admin</allow_active>"),
+            "{block}"
+        );
     }
 
     #[test]

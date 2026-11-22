@@ -1115,6 +1115,7 @@ mod tests {
                 since: 1,
                 last: 2,
                 rejoined: None,
+                rejected: Vec::new(),
             },
             true,
         )

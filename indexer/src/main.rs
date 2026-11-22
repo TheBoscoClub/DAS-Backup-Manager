@@ -398,6 +398,11 @@ enum Commands {
         #[command(subcommand)]
         action: ScrubAction,
     },
+    /// RAID-1 targets: what the guard decided (bd DAS-Backup-Manager-su1b.11)
+    Raid {
+        #[command(subcommand)]
+        action: RaidAction,
+    },
     /// Subvolume drift detector — find source subvolumes that exist on disk
     /// but aren't backed up (or config entries for subvolumes that no longer
     /// exist)
@@ -899,6 +904,31 @@ enum RecoveryOsAction {
         /// The whole disk, e.g. /dev/disk/by-id/ata-<model>_<serial>
         #[arg(long, value_name = "PATH")]
         device: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RaidAction {
+    /// Make the drive present the history of a RAID-1 target the guard refuses
+    /// for split brain (its other drive is dead), giving up what only the
+    /// absent drive holds. Root only. Shows what the present drive holds and
+    /// what is given up, then asks for the target's label, typed exactly, at
+    /// a terminal; there is no --yes. The absent drive is refused from then
+    /// on, alone or beside the other, until it is wiped or removed from the
+    /// filesystem.
+    ///
+    /// EXIT CODE: 0 accepted, 1 refused or not accepted (nothing changed,
+    /// unless it says the record was half written), 75 a backup, scrub or
+    /// configuration edit holds the locks.
+    Accept {
+        /// The target's label
+        label: String,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Path to the SQLite database (backup history; the accept log)
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
     },
 }
 
@@ -2063,6 +2093,114 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
     println!("{line}");
     code
+}
+
+/// `btrdasd raid accept <label>` (bd DAS-Backup-Manager-su1b.11): root only,
+/// under the backup singleton and the maintenance lock, both taken without
+/// waiting (held: exit 75). The label is read from a terminal; anything else
+/// accepts nothing.
+fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
+    use std::io::{BufRead, IsTerminal, Write};
+    // SAFETY: geteuid(2) takes nothing and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("Error: btrdasd raid accept must be run as root");
+        return 1;
+    }
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: cannot read {}: {e}", config.display());
+            return 1;
+        }
+    };
+    let job = "btrdasd raid accept";
+    let singleton_path = buttered_dasd::backup::config_edit_lock_path();
+    let singleton = match buttered_dasd::backup::SingletonHeld::try_acquire_at(&singleton_path, job)
+    {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            eprintln!(
+                "Not accepted, nothing changed: {} holds {}. Try again when it finishes.",
+                maintenance::holder_of(&singleton_path),
+                singleton_path.display()
+            );
+            return 75;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let maintenance_path = Path::new(scrub::MAINTENANCE_LOCK_PATH);
+    let held = match maintenance::MaintenanceHeld::try_acquire_at(maintenance_path, job) {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            eprintln!(
+                "Not accepted, nothing changed: {} holds {}. Try again when it finishes.",
+                maintenance::holder_of(maintenance_path),
+                maintenance_path.display()
+            );
+            return 75;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let mut confirm = |explanation: &str| -> Result<String, String> {
+        println!("{explanation}");
+        if !std::io::stdin().is_terminal() {
+            return Err(
+                "standard input is not a terminal: run it at a terminal and type the label                  (there is no --yes)"
+                    .into(),
+            );
+        }
+        print!("To accept, type the target label exactly ({label}): ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("cannot read the answer: {e}"))?;
+        Ok(line)
+    };
+    match mount::raid_accept(
+        &cfg,
+        label,
+        db,
+        &mut confirm,
+        &CliProgress,
+        &singleton,
+        &held,
+    ) {
+        Ok(done) => {
+            for w in &done.warnings {
+                eprintln!("WARNING: {w}");
+            }
+            println!(
+                "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed                  from the filesystem.",
+                done.accepted
+                    .after
+                    .members
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                done.accepted
+                    .after
+                    .rejected
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            0
+        }
+        Err(why) => {
+            eprintln!("Error: {why}");
+            1
+        }
+    }
 }
 
 /// `btrdasd walk`.
@@ -3556,6 +3694,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // ----- Scrub commands -----
+        Commands::Raid { action } => match action {
+            RaidAction::Accept { label, config, db } => {
+                std::process::exit(cmd_raid_accept(&label, &config, &db));
+            }
+        },
         Commands::Scrub { action } => match action {
             ScrubAction::Run { config } => {
                 let cfg = Config::load(&config)?;
@@ -3853,6 +3996,28 @@ mod tests {
     /// `backup run --sources/--targets` and what the run is handed (bd
     /// DAS-Backup-Manager-7tx): no flag is "all"; a flag is exactly what it
     /// names; a flag naming nothing real is a label nobody has, never "all".
+    /// bd DAS-Backup-Manager-su1b.11: `raid accept` takes the label and
+    /// nothing that answers for the operator — there is no `--yes`.
+    #[test]
+    fn raid_accept_takes_a_label_and_has_no_yes() {
+        match Cli::try_parse_from(["btrdasd", "raid", "accept", "primary"])
+            .unwrap()
+            .command
+        {
+            Commands::Raid {
+                action: RaidAction::Accept { label, .. },
+            } => assert_eq!(label, "primary"),
+            _ => panic!("not raid accept"),
+        }
+        for extra in ["--yes", "-y", "--force"] {
+            assert!(
+                Cli::try_parse_from(["btrdasd", "raid", "accept", "primary", extra]).is_err(),
+                "{extra} accepted"
+            );
+        }
+        assert!(Cli::try_parse_from(["btrdasd", "raid", "accept"]).is_err());
+    }
+
     #[test]
     fn backup_run_flags_become_a_selection_and_never_widen_to_all() {
         let selection = |extra: &[&str]| {

@@ -361,6 +361,202 @@ fn mount_guarded_with(
     )
 }
 
+/// What `btrdasd raid accept` did, and what could not be logged.
+#[derive(Debug)]
+pub struct RaidAccepted {
+    pub accepted: raid_guard::Accepted,
+    /// The journal line or the history row that could not be written: the
+    /// record is rewritten all the same (that is the act).
+    pub warnings: Vec<String>,
+}
+
+/// The RAID-1 target labelled `label`, its mount point ready (created when
+/// missing, never already a mount point), for `raid accept`. Returns whether
+/// the directory was created here.
+fn accept_target<'a>(
+    config: &'a Config,
+    label: &str,
+    probes: &MountProbes<'_>,
+) -> Result<(&'a Target, bool), String> {
+    let target = config
+        .targets
+        .iter()
+        .find(|t| t.label == label)
+        .ok_or_else(|| format!("no [[target]] labelled '{label}'"))?;
+    if !raid_guard::is_guarded(target) {
+        return Err(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let mount = Path::new(&target.mount);
+    if (probes.is_mountpoint)(mount) {
+        return Err(format!(
+            "{} is mounted: nothing can be accepted while a job uses the target",
+            target.mount
+        ));
+    }
+    let created = !mount.exists();
+    if created {
+        std::fs::create_dir_all(mount)
+            .map_err(|e| format!("cannot create {}: {e}", target.mount))?;
+    }
+    Ok((target, created))
+}
+
+fn accept_plan<'a>(
+    config: &'a Config,
+    target: &'a Target,
+    serials: &'a [String],
+    record_dir: &'a Path,
+) -> raid_guard::Plan<'a> {
+    raid_guard::Plan {
+        label: &target.label,
+        fsid: target.mount_uuid.as_deref().unwrap_or_default(),
+        mount: &target.mount,
+        serials,
+        mount_opts: &config.das.mount_opts,
+        wait: Duration::ZERO,
+        record_dir,
+        intent: raid_guard::Job::RaidAccept.intent(),
+    }
+}
+
+/// What `btrdasd raid accept <label>` would show, without asking or writing:
+/// the explanation when the guard refuses the target for split brain now,
+/// else why there is nothing to accept. It probe-mounts the target
+/// read-only, so `held` proves the maintenance lock.
+pub fn raid_accept_preview(
+    config: &Config,
+    label: &str,
+    db: &Path,
+    progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
+) -> Result<String, String> {
+    let (target, created) = accept_target(config, label, &HOST_PROBES)?;
+    let serials = target.effective_serials();
+    let record_dir = raid_guard::record_dir();
+    let plan = accept_plan(config, target, &serials, &record_dir);
+    let host = SystemMembers {
+        runner: &SystemRunner,
+        probes: &HOST_PROBES,
+    };
+    let result = raid_guard::split_brain_now(&host, &plan, progress).map(|found| {
+        raid_guard::accept_explanation(
+            label,
+            plan.fsid,
+            &found,
+            &crate::db::count_backup_runs_between_read_only(
+                db,
+                found.period.since,
+                found.period.last,
+            ),
+        )
+    });
+    if created {
+        remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
+    }
+    result
+}
+
+/// `btrdasd raid accept <label>` on this host (bd DAS-Backup-Manager-su1b.11):
+/// [`raid_guard::accept`], then one line to the journal (`logger -t btrdasd
+/// -p user.warning`) and one row in the database's `raid_accepted`. The
+/// caller holds the backup singleton (`_singleton`) and the maintenance lock
+/// (`_held`), as a configuration edit and a mount do. `confirm` is shown the
+/// explanation and returns what was typed; an `Err` (no terminal, no typed
+/// text) accepts nothing.
+pub fn raid_accept(
+    config: &Config,
+    label: &str,
+    db: &Path,
+    confirm: &mut dyn FnMut(&str) -> Result<String, String>,
+    progress: &dyn ProgressCallback,
+    _singleton: &crate::backup::SingletonHeld,
+    _held: &MaintenanceHeld,
+) -> Result<RaidAccepted, String> {
+    let (target, created) = accept_target(config, label, &HOST_PROBES)?;
+    let serials = target.effective_serials();
+    let record_dir = raid_guard::record_dir();
+    let plan = accept_plan(config, target, &serials, &record_dir);
+    let host = SystemMembers {
+        runner: &SystemRunner,
+        probes: &HOST_PROBES,
+    };
+    let runs = |from, to| crate::db::count_backup_runs_between_read_only(db, from, to);
+    let result = raid_guard::accept(&host, &plan, &runs, confirm, progress);
+    if created {
+        remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
+    }
+    let accepted = result?;
+    let mut warnings = Vec::new();
+    let list = |ms: &[raid_guard::PeriodMember]| {
+        ms.iter()
+            .map(|m| format!("{} {}", m.devid, m.dev_uuid))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let given_up: Vec<raid_guard::PeriodMember> = accepted
+        .after
+        .rejected
+        .iter()
+        .filter(|r| {
+            !accepted
+                .before
+                .rejected
+                .iter()
+                .any(|o| o.dev_uuid == r.dev_uuid)
+        })
+        .cloned()
+        .collect();
+    let line = format!(
+        "raid accept: target '{label}' (filesystem {}): devid(s) {} accepted as the history \
+         from {}; devid(s) {} given up, with the degraded period {} to {} that only they hold",
+        plan.fsid,
+        list(&accepted.after.members),
+        raid_guard::when(accepted.after.since),
+        list(&given_up),
+        raid_guard::when(accepted.before.since),
+        raid_guard::when(accepted.before.last),
+    );
+    match SystemRunner.status(
+        Command::new("logger")
+            .args(["-t", "btrdasd", "-p", "user.warning", "--"])
+            .arg(&line),
+    ) {
+        Ok(s) if s.success() => {}
+        Ok(s) => warnings.push(format!(
+            "the journal line was not written ({})",
+            exit_why("logger", s)
+        )),
+        Err(e) => warnings.push(format!("the journal line was not written (logger: {e})")),
+    }
+    let row = crate::db::RaidAcceptance {
+        accepted_at: accepted.after.since,
+        target: label.to_string(),
+        fsid: plan.fsid.to_string(),
+        accepted: list(&accepted.after.members),
+        rejected: list(&given_up),
+        period_since: accepted.before.since,
+        period_last: accepted.before.last,
+    };
+    match db.to_str().map(crate::db::Database::open) {
+        Some(Ok(database)) => {
+            if let Err(e) = database.record_raid_accept(&row) {
+                warnings.push(format!("the history row was not written ({e})"));
+            }
+        }
+        Some(Err(e)) => warnings.push(format!(
+            "the history row was not written ({}: {e})",
+            db.display()
+        )),
+        None => warnings.push(format!(
+            "the history row was not written ({} is not UTF-8)",
+            db.display()
+        )),
+    }
+    Ok(RaidAccepted { accepted, warnings })
+}
+
 /// RAII guard that unmounts targets on drop.
 ///
 /// Only the mount points that *this* guard mounted are tracked. Pre-existing

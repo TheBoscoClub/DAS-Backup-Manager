@@ -400,6 +400,8 @@ pub fn raid_findings(config: &Config, record_dir: &std::path::Path) -> Vec<RaidF
                             r.rejoined.unwrap_or(r.last)
                         ),
                     ),
+                    // Nothing owed; the members it refuses are the guard's.
+                    State::Settled => continue,
                 }
             }
         };
@@ -1283,6 +1285,7 @@ mod raid_record_tests {
             since: 1,
             last: 2,
             rejoined: Some(3),
+            rejected: Vec::new(),
         };
         let path = raid_guard::primary_path(dir.path(), FS);
         raid_guard::write_copy(&path, &owed, true).unwrap();

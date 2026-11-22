@@ -36,6 +36,16 @@
     </defaults>
   </action>
 
+  <action id="org.dasbackup.raid.accept">
+    <description>Give up a dead RAID-1 drive's history (raid accept)</description>
+    <message>Authentication is required to make the drive present a backup target's history and give up what only the absent drive holds</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
   <action id="org.dasbackup.config">
     <description>Modify backup configuration</description>
     <message>Authentication is required to modify backup configuration</message>

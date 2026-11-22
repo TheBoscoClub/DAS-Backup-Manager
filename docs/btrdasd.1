@@ -3074,6 +3074,59 @@ behind the path changed while it was being opened, the hold could not be
 announced on standard output, or
 .BR \-\-json .
 .\"
+.SS raid accept
+Make the drive present the history of a RAID\-1 target that the guard
+refuses for split brain, because the drive the last degraded period ran on is
+dead (bd DAS\-Backup\-Manager\-su1b.11). Root only. Valid only while the
+guard, looking once without waiting, refuses the target for that reason:
+fewer members present than the filesystem has, a configured drive absent, and
+the last degraded period run on members that are not present.
+.PP
+It shows the present drive (devid, device UUID, superblock generation), the
+period given up (from, to), how many backup runs the history records inside
+it
+.RB ( unknown
+when they cannot be counted, never 0), and the date the present drive's data
+stops; then it asks for the target's label, typed exactly. Standard input
+that is not a terminal accepts nothing; there is no
+.BR \-\-yes .
+Accepting writes the record
+.RI ( /var/lib/das\-backup/raid/<fsid>.record ,
+then the witness through a degraded read\-write mount of the present drive):
+a new degraded period on the present drive, and the absent drive listed as
+.BR rejected .
+It logs one line to the journal
+.RB ( "logger \-t btrdasd" )
+and one row in the database's
+.B raid_accepted
+table.
+.PP
+From then on the rejected drive is refused by every job, alone or beside the
+other, before it is registered with btrfs or mounted, until it is wiped
+.RB ( wipefs )
+or removed from the filesystem
+.RB ( "btrfs device remove" ,
+.BR "btrfs replace" ).
+The rejection outlives the scrub after a replacement joins (the record's
+state becomes
+.BR settled ).
+A run that wrote the record and not the witness says so; running it again
+finishes it. The GUI's target view offers the same action through the
+helper, which asks polkit
+.RB ( org.dasbackup.raid.accept ,
+authenticated every time) and compares the typed label itself.
+.PP
+Takes the backup singleton and the maintenance lock without waiting; either
+held exits 75, nothing changed. Exit status 0 accepted, 1 refused or not
+accepted.
+.PP
+.B btrdasd raid accept
+.I LABEL
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-db
+.IR PATH ]
+.\"
 .SS scrub run
 Run a full scrub pass now: acquire locks, mount each configured scrub
 target by filesystem UUID (a RAID\-1 target through the guard of

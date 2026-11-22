@@ -245,8 +245,30 @@ all num_devices present?
          still absent with every configured serial attached → REFUSE
 ```
 
-The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`,
-`member=<devid> <dev_uuid> <generation>`, `since`, `last`, `rejoined`) lives in
+A dead drive behind a split brain: `btrdasd raid accept <label>` (root; the
+GUI's target view through the helper's `RaidAccept`, polkit
+`org.dasbackup.raid.accept`, `auth_admin`), under the backup singleton and the
+maintenance lock:
+
+```text
+split_brain_now (one look, no wait)   → refused for split brain now? else nothing to accept
+explanation (present member, period given up, runs in it from backup_runs)
+typed label == target label?          → else nothing written
+accepted_record: degraded period on the present members from now,
+                 every member of the old period in rejected=
+write primary → mount <mount_opts>,degraded rw → write witness → unmount
+logger -t btrdasd; raid_accepted row (schema 9)
+```
+
+A rejected member is refused for every job, alone or beside the others: each
+superblock is read before its device is scanned, a rejected one is never
+scanned (primary copy); a rejection only the witness carries takes the normal
+mount straight down. The scrub that pays the debt after a replacement keeps
+the rejection (`state=settled`).
+
+The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`
+(`degraded`, `scrub-owed`, `settled`), `member=<devid> <dev_uuid>
+<generation>`, `rejected=` the same, `since`, `last`, `rejoined`) lives in
 `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`) and in
 `.das-backup-raid.record` at the target's top level. A completed scrub begun
 after `rejoined`, nothing uncorrectable, removes both (witness first);
