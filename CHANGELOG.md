@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - It waits with its singleton held and signals answered (a SIGTERM records `interrupted` and the pass dies of it, nothing mounted), takes the lock back once nobody claims, reads `config.toml` again, and runs `btrfs scrub resume` on the same filesystem, keeping its original start; the backup mounts the target afresh
   - A kernel scrub not seen to stop is left mounted and that filesystem is not resumed in the pass; a record older than the stopped segment is never read as its result; a claim probe that cannot look costs one pause
   - Only backups claim: `backup-run.sh` (4.21.0, dry runs included; fd 7, closed for every child it starts while waiting), `btrdasd backup run`, `snapshot`, `send` and the GUI's backup; never `walk`, `restore`, index jobs or `backup boot-archive`
+  - A claim lock that cannot be taken is a warning on both paths, and the backup waits as it always did
   - A claim nobody answers within 180 s is one warning naming the holder; the backup keeps waiting and its exit status does not change. The report gains a `Scrub yield` row (`OK  (scrub yielded after N s)`, `WARN`, or `N/A`)
   - A pass that yielded and then died reads `interrupted` (health FAIL) and the next pass resumes it
   - `sudo flock -s /run/das-maintenance-claim.lock <command>` pauses a pass for as long as the command runs; the waiting line of `walk` and `restore` says so

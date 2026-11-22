@@ -280,12 +280,27 @@ pub fn acquire_claiming_locks_at(
     // Singleton, then the claim, then maintenance: the scrub never waits on
     // the claim (its probe does not block), so this adds no wait to the
     // singleton → maintenance order.
-    let claimed = crate::maintenance::Claim::take_at(&claim.path, job)?;
+    // A claim that cannot be taken costs only the claim: the backup waits as
+    // it always did (as `backup-run.sh`'s `acquire_claim`). The claim decides
+    // how soon a scrub lets go, never whether this backup may run.
+    let claimed = match crate::maintenance::Claim::take_at(&claim.path, job) {
+        Ok(claimed) => Some(claimed),
+        Err(e) => {
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "could not claim the DAS maintenance lock ({e}): a scrub pass will not give \
+                     it up for this backup, which waits for it as before"
+                ),
+            );
+            None
+        }
+    };
     let asked = std::time::Instant::now();
     let warned = std::cell::Cell::new(false);
     // Said once, when no scrub answered in time; the wait goes on.
     let answer = || {
-        if !warned.get() && asked.elapsed() >= claim.answer_within {
+        if claimed.is_some() && !warned.get() && asked.elapsed() >= claim.answer_within {
             warned.set(true);
             progress.on_log(
                 LogLevel::Warning,
@@ -5220,6 +5235,37 @@ mod tests {
         );
         drop(vm);
         assert!(backup.join().unwrap());
+    }
+
+    /// A claim lock that cannot be opened costs the backup its claim, never
+    /// its run: a warning, and the backup waits as it always did — as
+    /// `backup-run.sh`'s `acquire_claim` does. The claim decides only how soon
+    /// a scrub lets go, never whether the backup may run.
+    #[test]
+    fn a_claim_that_cannot_be_taken_is_a_warning_and_the_backup_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        let site = ClaimSite {
+            path: dir.path().join("file").join("claim.lock"),
+            answer_within: std::time::Duration::from_secs(60),
+        };
+        let progress = TestProgress::new();
+        let attempt = acquire_claiming_locks_at(
+            &dir.path().join("backup.lock"),
+            &dir.path().join("m.lock"),
+            &site,
+            "btrdasd backup run",
+            &progress,
+        )
+        .expect("the backup still runs");
+        assert!(matches!(attempt, BackupLockAttempt::Acquired(_)));
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(|(level, m)| *level == LogLevel::Warning
+                && m.contains("could not claim")
+                && m.contains("claim.lock")),
+            "{logs:?}"
+        );
     }
 
     /// `backup boot-archive` is not a backup the operator lets pause a scrub:
