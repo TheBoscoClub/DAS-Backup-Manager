@@ -3717,6 +3717,19 @@ Generated udev rule that hides the backup targets from udisks, matched on the
 targets' drive serials and
 .BR mount_uuid .
 .TP
+.I /etc/udev/rules.d/99\-das\-backup\-io\-scheduler.rules
+Generated udev rule that pins
+.B [das].io_scheduler
+on each target's whole disk, matched on the drive serials, at every add and
+change event (re\-plug, enclosure power cycle, boot), so the scheduler holds
+between backups and overrides a host rule for rotational disks on those drives
+only. Not generated when
+.B io_scheduler
+is empty; the next
+.B "setup \-\-upgrade"
+then removes a rule an earlier run wrote.
+.BR "setup \-\-check" " reports it current, STALE or MISSING, and the scheduler each attached target drive runs now."
+.TP
 .I /var/lib/das\-backup/growth.log
 Disk usage growth log for trend monitoring, appended by
 .B backup\-run.sh

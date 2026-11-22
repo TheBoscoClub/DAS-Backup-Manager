@@ -407,7 +407,7 @@ Unmount it when you are done (`sudo umount {{primary_mount}}`), then `exit` the 
 
 #### Step 10: Update the config, bay map and CHANGELOG
 
-Replace the failed serial with the new one in the target's `serials` in `/etc/das-backup/config.toml`, then run `sudo btrdasd setup --upgrade` (it regenerates the udisks-ignore rule from the serials) and `sudo btrdasd setup --check`. The filesystem UUID, and so `mount_uuid`, does not change with a `btrfs replace`.
+Replace the failed serial with the new one in the target's `serials` in `/etc/das-backup/config.toml`, then run `sudo btrdasd setup --upgrade` (it regenerates the udisks-ignore and I/O-scheduler rules from the serials) and `sudo btrdasd setup --check`. The filesystem UUID, and so `mount_uuid`, does not change with a `btrfs replace`.
 
 Update your bay map with the new drive's serial, PARTUUID, and BTRFS UUID_SUB (from `sudo blkid "$NEW"-part1`). Update CHANGELOG.md to record the replacement date and the failure cause.
 

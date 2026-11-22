@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The configured I/O scheduler now holds on the DAS drives between backups** (bd `DAS-Backup-Manager-su1b.4`): `setup` generates `/etc/udev/rules.d/99-das-backup-io-scheduler.rules`, one `ACTION=="add|change"` line per distinct target serial that sets `queue/scheduler` to `[das].io_scheduler` on the whole disk, so a re-plug, an enclosure power cycle or a boot no longer leaves the drives on a host rule's scheduler (bfq) until the next run
+  - It sorts after a host's `61-*` rotational-disk rule and matches the configured serials only; the udisks rule's `ID_SERIAL_SHORT` key is reused
+  - An empty `io_scheduler` generates no rule, and the next `setup --upgrade` removes one an earlier run wrote; the uninstall removes it by the manifest
+  - `[das].io_scheduler` is now validated: `mq-deadline`, `bfq`, `kyber`, `none` or empty
+  - `setup --check` reports the rule current, STALE or MISSING, and the scheduler each attached target drive runs now, read from sysfs; `setup` re-applies the rule to the target drives with a `udevadm trigger` matched on their serials
 - **A backup no longer waits behind a scrub pass** (bd `DAS-Backup-Manager-su1b.2`, steps A5 and A6, operator decision 2026-11-01): a backup claims the maintenance lock, and a scrub pass holding it stops its scrub, unmounts, gives the lock up and resumes the same filesystem once the backup is done
   - The pass probes `/run/das-maintenance-claim.lock` before it first takes the lock, right after, before each mount and at every 5 s poll; on a claim it stops `btrfs scrub` with SIGTERM (reaped; the record stays `canceled:0 finished:0`), checks the kernel stopped, unmounts what it mounted, records the filesystem `yielded`, and only then lets the lock go
   - It waits with its singleton held and signals answered (a SIGTERM records `interrupted` and the pass dies of it, nothing mounted), takes the lock back once nobody claims, reads `config.toml` again, and runs `btrfs scrub resume` on the same filesystem, keeping its original start; the backup mounts the target afresh
