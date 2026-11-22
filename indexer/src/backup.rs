@@ -11089,6 +11089,7 @@ Legend:
             self.captured_filters.lock().unwrap().push(filters.to_vec());
             self.step("capture report");
             crate::report::ReportData {
+                raid_rows: Vec::new(),
                 capacity_and_smart: "\nDISK CAPACITY\n  primary-loop  1 GiB\n".into(),
                 latest_snapshots: "\nLATEST SNAPSHOTS\n  root-.20261002\n".into(),
             }
@@ -12807,6 +12808,7 @@ Legend:
         let result = result_with(false, 1, 1, 0);
 
         let data = crate::report::ReportData {
+            raid_rows: Vec::new(),
             capacity_and_smart: "\nDISK CAPACITY\n  t  CAPTURED\n".into(),
             latest_snapshots: "\nLATEST SNAPSHOTS\n  CAPTURED-SNAP\n".into(),
         };
@@ -12925,6 +12927,7 @@ Legend:
                 ..Default::default()
             };
             let data = crate::report::ReportData {
+                raid_rows: Vec::new(),
                 capacity_and_smart: String::new(),
                 latest_snapshots: String::new(),
             };
@@ -12980,6 +12983,7 @@ Legend:
             ..Default::default()
         };
         let data = crate::report::ReportData {
+            raid_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13021,6 +13025,7 @@ Legend:
             ..Default::default()
         };
         let data = crate::report::ReportData {
+            raid_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13727,6 +13732,7 @@ Legend:
             &format!("Recovery OS: WARN — {detail}")
         ));
         let data = crate::report::ReportData {
+            raid_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13761,6 +13767,7 @@ Legend:
             &format!("Recovery OS: FAIL — {detail}")
         ));
         let data = crate::report::ReportData {
+            raid_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };

@@ -98,7 +98,8 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 - A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
 - Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").
 - Every member back → normal mount, the record becomes scrub-owed (a WARN row, a doctor finding) until a completed scrub begun after the rejoin clears it.
-- After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` showing a member missing (unreadable included) is refused unless the guard itself mounted it degraded (`verify_write_targets`, `verify_targets_before_btrbk`).
+- After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` unreadable is refused on both paths; a member missing is refused by `verify_targets_before_btrbk` unless the guard mounted it degraded this run, and by `verify_write_targets` while every configured drive is attached.
+- A Rust run's report → one `RAID-1 <label>  WARN` row per record (`report::raid_rows`), the script's → the target's own row.
 - A refusal → `MountError::RaidRefused`: it fails the job, `walk` and `restore` included.
 - `nodev,nosuid,noexec` belong in `[das].mount_opts`: receive and restore keep device nodes and setuid bits intact, no job executes from a target (bd `20q`).
 - A target filesystem already mounted somewhere else keeps that mount's filesystem-wide options: a second `mount -o` returns 0 and applies none of them. Both paths WARN and go on (bd `804`).

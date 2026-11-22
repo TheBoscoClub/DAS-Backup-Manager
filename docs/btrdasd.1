@@ -1035,13 +1035,13 @@ Not for use by hand. A RAID\-1 target is one with a
 .B mount_uuid
 and two or more serials; every job that mounts one (backup, doctor, walk,
 restore, scrub, the GUI) uses the same guard:
-.IP \(bu 2
+.IP 1. 4
 its members are found by filesystem UUID
 .RB ( "blkid \-c /dev/null \-t UUID=" ),
 each registered by its own path
 .RB ( "btrfs device scan" " <path>;"
 never an unscoped scan) and identified by its own superblock;
-.IP \(bu 2
+.IP 2. 4
 it is mounted without
 .BR degraded ,
 whatever
@@ -1049,7 +1049,7 @@ whatever
 says; a member not present, or a mount that fails, is waited for
 .RB ( [das].member_wait_secs ,
 default 60), polling every 5 seconds and scanning again;
-.IP \(bu 2
+.IP 3. 4
 only when a configured drive is still absent after the wait is it mounted
 degraded: the period is recorded (the present members' device UUIDs and
 superblock generation) in
@@ -1058,14 +1058,14 @@ and in
 .I .das\-backup\-raid.record
 on the filesystem, both before anything writes, and every run says
 .BR DEGRADED ;
-.IP \(bu 2
+.IP 4. 4
 a degraded mount whose members are not all ones the last degraded period ran
 on is a split brain and is refused, as is one whose record cannot be read;
 every member present again mounts normally and the record says a scrub is
 owed
 .RB ( SCRUB\-OWED )
 until a completed scrub begun after the rejoin clears it;
-.IP \(bu 2
+.IP 5. 4
 after the mount, a member the kernel reports missing
 .RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
 while every member is attached is refused.
@@ -3065,7 +3065,9 @@ announced on standard output, or
 .\"
 .SS scrub run
 Run a full scrub pass now: acquire locks, mount each configured scrub
-target by filesystem UUID, run
+target by filesystem UUID (a RAID\-1 target through the guard of
+.BR "backup mount\-target" ;
+a refusal there is that target's error), run
 .BR "btrfs scrub start \-B" ,
 parse the result, unmount, persist state, and email a report \(em the
 same path the scheduled systemd timer uses. A filesystem whose last scrub was
@@ -3076,6 +3078,14 @@ instead, falling back to
 when there is nothing to resume. The targets are scrubbed one at a time, in
 .B [scrub].targets
 order.
+.PP
+A RAID\-1 target owed a scrub after a degraded period (its guard record says
+.BR scrub\-owed )
+is cleared by a scrub of it that finished with nothing uncorrectable and
+began after every member was present again, while the kernel shows no
+member missing: both copies of the record are removed, the witness first.
+Corrected errors are expected in that scrub \(em they are the stale copies
+being repaired.
 .PP
 A scrub runs at the highest I/O priority that cannot hold writes back
 without a bound (btrfs\-progs would otherwise run its per\-device workers in
@@ -3338,8 +3348,8 @@ delay a real backup or scrub for.
 means no drift was found, or the check deferred because a lock was held
 (never treated as a failure).
 .B 1
-means drift was found (missing or stale subvolumes, an undelivered pair, or a
-recovery OS its recorded reading judges stale). Unlike
+means drift was found (missing or stale subvolumes, an undelivered pair, a
+recovery OS its recorded reading judges stale, or a RAID\-1 record). Unlike
 .BR "btrdasd scrub run" ,
 this genuinely surfaces through the exit code, because a drift check has no
 watchdog multi-hour-retry hazard to protect against.
@@ -3372,6 +3382,21 @@ failed, of another filesystem, or more than 14 days old) is listed under
 .B RECOVERY OSES NOT CHECKED
 with the reason, is never counted current, and is not a failure (exit 0).
 A configuration with no mirror target has no such item.
+.PP
+.B RAID\-1 TARGETS
+(exit 1): each RAID\-1 target whose guard record
+.RI ( /var/lib/das\-backup/raid/<fsid>.record ;
+see
+.BR "backup mount\-target" )
+shows a degraded period
+.RB ( DEGRADED ),
+a scrub owed since every member came back
+.RB ( "SCRUB OWED" ),
+or cannot be read
+.RB ( UNREADABLE :
+a degraded mount of it is refused until it is fixed). Read after the
+delivery check's own mount, which turns a degraded record into a scrub owed
+when every member is present. Listed until a completed scrub clears it.
 .PP
 .B SCRUB TOOL
 (exit 1): every scrub start passes the I/O priority options

@@ -429,9 +429,10 @@ sudo btrfs rescue super-recover /dev/<surviving-drive>
 
 - **Backup targets** are mounted by the backup job only, by their filesystem UUID
   (`[[target]] mount_uuid`), else by drive serial — never by fstab, never by device
-  letter, and never by udisks (a generated udev rule hides them). A RAID-1 target with
-  `degraded` in `[das].mount_opts` keeps receiving backups on one leg; data written
-  while degraded lands as `single` chunks, so after the replace run a scrub and then
+  letter, and never by udisks (a generated udev rule hides them). A RAID-1 target keeps
+  receiving backups on one leg once a drive is still absent after `[das].member_wait_secs`
+  (the RAID-1 guard mounts it without `degraded` first, records the degraded period and
+  refuses the other leg alone later); data written while degraded lands as `single` chunks, so after the replace run a scrub and then
   `btrfs balance start -dconvert=raid1 -mconvert=raid1`. Do not hand-mount a target to
   work on it while a backup or scrub could start; stop and mask the timers first.
 - **Source volumes** that fail to mount or verify are not read by the subvolume sync:

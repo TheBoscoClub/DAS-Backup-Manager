@@ -238,7 +238,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 
 **Symptoms**:
 
-- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.16.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target {{primary_target}}  WARN  (RAID-1 degraded: … absent; …)` row under BACKUP OPERATIONS, and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
+- The backup log (`journalctl -u das-backup -u das-backup-full` — the Sunday full run logs under the second) says `primary: present=[…] missing=[…] — RAID-1 degraded, proceeding`. The emailed report (`backup-run.sh` v4.22.0 and later) reads `COMPLETED WITH WARNINGS`, has a `Target {{primary_target}}  WARN  (DEGRADED: RAID-1 MOUNTED DEGRADED: …; absent drive(s) …)` row under BACKUP OPERATIONS (v4.16.0 to v4.21.x: `WARN  (RAID-1 degraded: … absent; …)`), and shows the missing drive's serial as `ABSENT` under SMART STATUS. Earlier versions said nothing of it in the email: there, a clean-looking report does not prove both legs are present
 - `sudo btrfs filesystem show {{primary_uuid}}` says `*** Some devices missing` — ask by filesystem UUID: between backups the array is not mounted, and `btrfs filesystem show {{primary_mount}}` then answers only `not a valid btrfs filesystem`
 - Once it is mounted (Step 2), `sudo btrfs device stats {{primary_mount}}` shows non-zero error counters on one leg
 
@@ -246,7 +246,7 @@ See [Restoring to New Hardware](#restoring-to-new-hardware) for detailed steps.
 
 #### Why backups still work in degraded mode
 
-`/etc/das-backup/config.toml` sets `[das].mount_opts` to include `degraded`. The `backup-run.sh` script mounts the target with these options, so a missing leg does not abort the nightly backup. The downside: **any data written while degraded is allocated as `single` profile** (not redundant). After the failed leg is replaced, a balance restores RAID-1 across all chunks. Until then, only one copy of recent data exists.
+Every job mounts a RAID-1 target through its guard (`backup-run.sh` v4.22.0 and later; `btrdasd backup mount-target`): without `degraded` first, then, once a listed drive is still absent after `[das].member_wait_secs` (60 s by default), degraded on the surviving drive, so a missing leg does not abort the nightly backup. The guard records that period (`/var/lib/das-backup/raid/<uuid>.record`, and `.das-backup-raid.record` on the filesystem) and refuses to mount the OTHER drive alone later (`REFUSED  (split brain …)`, report ABORTED): that drive lacks everything written since. Once both are back the report says `SCRUB-OWED` and `btrdasd doctor` lists the target until a scrub started after the rejoin completes. The downside: **any data written while degraded is allocated as `single` profile** (not redundant). After the failed leg is replaced, a balance restores RAID-1 across all chunks. Until then, only one copy of recent data exists.
 
 #### Step 1: Confirm which leg failed
 
@@ -266,7 +266,7 @@ Cross-reference the device serial against your bay map (see `docs/DAS-BAY-MAPPIN
 
 #### Step 2: Mount the array degraded if it failed to mount
 
-The `backup-run.sh` script always mounts by UUID with `[das].mount_opts` (which include `degraded`), so scheduled backups continue. For interactive use, mount the same way:
+Scheduled backups mount it degraded themselves (above). A degraded mount by hand is not recorded by the guard, so prefer letting a backup make it; for interactive use, mount it this way:
 
 ```bash
 # Is a backup, scrub, restore, index, reconcile or doctor run, or a recovery-OS

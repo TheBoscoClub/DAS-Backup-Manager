@@ -240,9 +240,12 @@ The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`,
 `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`) and in
 `.das-backup-raid.record` at the target's top level. A completed scrub begun
 after `rejoined`, nothing uncorrectable, removes both (witness first);
-`btrdasd doctor` reports any record as drift (exit 1). After every mount,
-`verify_write_targets` and `verify_targets_before_btrbk` refuse a member the
-kernel shows missing unless the guard mounted the target degraded.
+`btrdasd doctor` reports any record as drift (exit 1), and a Rust run's
+report carries one `RAID-1 <label>  WARN` row per record. After every mount,
+an unreadable kernel view is refused; a member the kernel shows missing is
+refused by `verify_targets_before_btrbk` unless the guard mounted the target
+degraded this run, and by `verify_write_targets` while every configured drive
+is attached.
 
 ### Scrub Pipeline
 

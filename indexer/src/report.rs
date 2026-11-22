@@ -106,6 +106,26 @@ pub struct ReportData {
     pub capacity_and_smart: String,
     /// `LATEST SNAPSHOTS` section.
     pub latest_snapshots: String,
+    /// One `RAID-1 <label>  WARN  (…)` row per RAID-1 target whose record
+    /// shows a degraded period, a scrub owed or an unreadable record, read
+    /// after this run's mount wrote it (bd DAS-Backup-Manager-su1b.10).
+    pub raid_rows: Vec<String>,
+}
+
+/// The `BACKUP OPERATIONS` rows for the RAID-1 records under `record_dir`:
+/// the doctor's findings, as WARN rows.
+pub fn raid_rows(config: &Config, record_dir: &std::path::Path) -> Vec<String> {
+    crate::doctor::raid_findings(config, record_dir)
+        .into_iter()
+        .map(|f| {
+            format!(
+                "  {:<21} WARN  ({}: {})",
+                format!("RAID-1 {}", f.label),
+                f.status,
+                f.detail
+            )
+        })
+        .collect()
 }
 
 /// Capture [`ReportData`] from the live system. Call while mounted. Only
@@ -121,6 +141,7 @@ pub fn capture_report_data(config: &Config, filters: &[String]) -> ReportData {
     ReportData {
         capacity_and_smart: render_capacity_and_smart(health.as_ref()),
         latest_snapshots: render_latest_snapshots(latest.as_deref().map_err(String::as_str)),
+        raid_rows: raid_rows(config, &crate::raid_guard::record_dir()),
     }
 }
 
@@ -300,6 +321,7 @@ pub fn format_report_from(
         || result.recovery_os.has_warnings()
         || result.usb_link.has_warnings()
         || sync.is_some_and(|s| crate::coverage::has_warnings_or_missing(s.coverage.as_ref()))
+        || !data.raid_rows.is_empty()
     {
         "COMPLETED WITH WARNINGS"
     } else {
@@ -360,6 +382,10 @@ pub fn format_report_from(
         result.recovery_os.row()
     ));
     r.push_str(&format!("  Content indexer       {index_status}\n"));
+    for row in &data.raid_rows {
+        r.push_str(row);
+        r.push('\n');
+    }
     if let Some(sync) = sync {
         let status = if sync.failed { "FAIL" } else { "OK" };
         r.push_str(&format!("  Subvolume sync        {status}\n"));
@@ -1045,6 +1071,86 @@ mod tests {
         result.success = success;
         result.boot = crate::backup::BootStep::Ran(outcome);
         format_report(&result, &Config::default())
+    }
+
+    /// A RAID-1 target degraded or owed a scrub is a WARN row in every
+    /// report until the record is cleared (bd DAS-Backup-Manager-su1b.10).
+    #[test]
+    fn a_raid1_record_is_a_warn_row_and_completes_with_warnings() {
+        use crate::raid_guard::{self, PeriodMember, Record, State};
+        let fsid = "5eed0016-0000-4000-8000-000000000016";
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        let mut t = crate::config::Target {
+            label: "primary".into(),
+            serial: "SERIAL11".into(),
+            serials: vec!["SERIAL11".into(), "SERIAL12".into()],
+            mount_uuid: Some(fsid.into()),
+            mount: "/mnt/p".into(),
+            role: crate::config::TargetRole::Primary,
+            retention: crate::config::Retention {
+                daily: 1,
+                weekly: 0,
+                monthly: 0,
+                yearly: 0,
+            },
+            display_name: "p".into(),
+            esp_partuuid: None,
+        };
+        config.targets.push(t.clone());
+        assert!(
+            raid_rows(&config, dir.path()).is_empty(),
+            "no record, no row"
+        );
+        raid_guard::write_copy(
+            &raid_guard::primary_path(dir.path(), fsid),
+            &Record {
+                fsid: fsid.into(),
+                state: State::Degraded,
+                members: vec![PeriodMember {
+                    devid: 1,
+                    dev_uuid: "5eed00a1-0000-4000-8000-0000000000a1".into(),
+                    generation: 3,
+                }],
+                since: 1,
+                last: 2,
+                rejoined: None,
+            },
+            true,
+        )
+        .unwrap();
+        let rows = raid_rows(&config, dir.path());
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].starts_with("  RAID-1 primary        WARN  (DEGRADED: "),
+            "{}",
+            rows[0]
+        );
+        let result = result_with(Some(0), Some(0), 0, &[]);
+        let data = ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+            raid_rows: rows.clone(),
+        };
+        let text = format_report_from(&result, None, &data);
+        assert!(text.contains("Status: COMPLETED WITH WARNINGS"), "{text}");
+        assert!(text.contains(&rows[0]), "{text}");
+        let clean = format_report_from(
+            &result,
+            None,
+            &ReportData {
+                raid_rows: Vec::new(),
+                ..data
+            },
+        );
+        assert!(
+            clean.contains("Status: ALL OPERATIONS SUCCESSFUL"),
+            "{clean}"
+        );
+        // A single-device target has no record to read.
+        t.serials = vec!["SERIAL04".into()];
+        config.targets = vec![t];
+        assert!(raid_rows(&config, dir.path()).is_empty());
     }
 
     #[test]
