@@ -284,6 +284,26 @@ std::optional<QString> DBusClient::coverageAccept(const QString &volume,
     return reply.value();
 }
 
+DBusClient::RaidReply DBusClient::raidAcceptPreview(const QString &label)
+{
+    if (!m_available)
+        return {false, m_unavailableReason};
+    QDBusReply<QString> reply = m_slowInterface->call(QStringLiteral("RaidAcceptPreview"), label);
+    if (!reply.isValid())
+        return {false, mapDBusError(reply.error().name(), reply.error().message())};
+    return {true, reply.value()};
+}
+
+DBusClient::RaidReply DBusClient::raidAccept(const QString &label, const QString &typed)
+{
+    if (!m_available)
+        return {false, m_unavailableReason};
+    QDBusReply<QString> reply = m_slowInterface->call(QStringLiteral("RaidAccept"), label, typed);
+    if (!reply.isValid())
+        return {false, mapDBusError(reply.error().name(), reply.error().message())};
+    return {true, reply.value()};
+}
+
 bool DBusClient::jobCancel(const QString &jobId)
 {
     if (!m_available) return false;

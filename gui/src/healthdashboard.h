@@ -7,6 +7,7 @@ class QTableView;
 class QLabel;
 class QSplitter;
 class QChartView;
+class QPushButton;
 class DBusClient;
 
 class HealthDashboard : public QWidget
@@ -26,6 +27,7 @@ public Q_SLOTS:
 
 private Q_SLOTS:
     void onHealthResult(const QString &json);
+    void openRaidAccept();
     void onRefreshFailed(const QString &operation, const QString &reason);
 
 private:
@@ -44,6 +46,9 @@ private:
 
     // Drives tab
     QTableView *m_drivesView = nullptr;
+    // Opens the RAID-1 accept for the selected row's target (bd
+    // DAS-Backup-Manager-su1b.11).
+    QPushButton *m_raidAcceptButton = nullptr;
 
     // Growth tab
     QWidget *m_growthWidget = nullptr;

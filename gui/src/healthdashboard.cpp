@@ -2,17 +2,21 @@
 #include "statustext.h"
 #include "dbusclient.h"
 #include "filemodel.h"
+#include "raidacceptdialog.h"
 
 #include <KLocalizedString>
 
 #include <QColor>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QItemSelectionModel>
 #include <QLabel>
+#include <QPushButton>
 #include <QSplitter>
 #include <QStandardItem>
 #include <QSortFilterProxyModel>
@@ -150,8 +154,44 @@ void HealthDashboard::setupDrivesTab()
     hh->setSectionResizeMode(DrivesCol::Device, QHeaderView::Interactive);
     hh->setSectionResizeMode(DrivesCol::Label,  QHeaderView::Interactive);
 
-    m_tabs->addTab(m_drivesView, QIcon::fromTheme(QStringLiteral("drive-harddisk")),
+    auto *drivesPage = new QWidget(this);
+    auto *drivesLayout = new QVBoxLayout(drivesPage);
+    drivesLayout->setContentsMargins(0, 0, 0, 0);
+    drivesLayout->addWidget(m_drivesView, 1);
+    auto *drivesButtons = new QHBoxLayout();
+    m_raidAcceptButton = new QPushButton(QIcon::fromTheme(QStringLiteral("dialog-warning")),
+                                         i18n("Accept Surviving RAID-1 Drive…"), drivesPage);
+    m_raidAcceptButton->setObjectName(QStringLiteral("healthRaidAcceptButton"));
+    m_raidAcceptButton->setToolTip(
+        i18n("For the selected target: when the RAID-1 guard refuses it for split brain "
+             "because the other drive is dead, see what the drive present holds and accept it "
+             "as the target's history ('btrdasd raid accept')"));
+    m_raidAcceptButton->setEnabled(false);
+    drivesButtons->addStretch(1);
+    drivesButtons->addWidget(m_raidAcceptButton);
+    drivesLayout->addLayout(drivesButtons);
+    connect(m_drivesView->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+            [this]() {
+                m_raidAcceptButton->setEnabled(
+                    m_drivesView->selectionModel()->hasSelection());
+            });
+    connect(m_raidAcceptButton, &QPushButton::clicked, this, &HealthDashboard::openRaidAccept);
+
+    m_tabs->addTab(drivesPage, QIcon::fromTheme(QStringLiteral("drive-harddisk")),
                    i18n("Drives"));
+}
+
+void HealthDashboard::openRaidAccept()
+{
+    const QModelIndexList rows = m_drivesView->selectionModel()->selectedRows(DrivesCol::Label);
+    if (rows.isEmpty())
+        return;
+    const QString label = rows.first().data().toString();
+    if (label.isEmpty())
+        return;
+    auto *dlg = new RaidAcceptDialog(m_client, label, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
 }
 
 void HealthDashboard::setupGrowthTab()
