@@ -122,8 +122,10 @@ yearly = 0
 ```
 
 `serials` takes an array — a single-drive target lists one serial, a BTRFS RAID-1 target
-lists both member serials (operator advisory only: a missing member logs a warning but
-does not abort, since a degraded RAID-1 array still mounts from any present leg). Set
+lists both member serials. With `mount_uuid` and two or more serials the target is mounted
+only through the RAID-1 guard: without `degraded` first, degraded only when a listed drive is
+still absent after `[das].member_wait_secs`, with a WARN row every run (and refused when the
+drive left behind would split the pair's history). Set
 `mount_uuid` to mount by the filesystem's BTRFS UUID directly instead of resolving a device
 from `serials` — recommended for every target. With `mount_uuid` set, `backup-run.sh`,
 `btrdasd backup run` and the GUI all treat the target as present when any listed serial is

@@ -16,6 +16,7 @@ pub mod local_docs;
 pub mod maintenance;
 pub mod mount;
 pub mod progress;
+pub mod raid_guard;
 pub mod reconcile;
 pub mod recovery_os;
 pub mod report;

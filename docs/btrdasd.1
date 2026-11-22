@@ -1026,6 +1026,73 @@ Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
 .\"
+.SS backup mount\-target
+Mount one RAID\-1 target through the guard, for
+.BR backup\-run.sh ,
+which holds the maintenance lock and hands it down
+.RB ( DAS_MAINTENANCE_LOCK_FD ).
+Not for use by hand. A RAID\-1 target is one with a
+.B mount_uuid
+and two or more serials; every job that mounts one (backup, doctor, walk,
+restore, scrub, the GUI) uses the same guard:
+.IP \(bu 2
+its members are found by filesystem UUID
+.RB ( "blkid \-c /dev/null \-t UUID=" ),
+each registered by its own path
+.RB ( "btrfs device scan" " <path>;"
+never an unscoped scan) and identified by its own superblock;
+.IP \(bu 2
+it is mounted without
+.BR degraded ,
+whatever
+.B [das].mount_opts
+says; a member not present, or a mount that fails, is waited for
+.RB ( [das].member_wait_secs ,
+default 60), polling every 5 seconds and scanning again;
+.IP \(bu 2
+only when a configured drive is still absent after the wait is it mounted
+degraded: the period is recorded (the present members' device UUIDs and
+superblock generation) in
+.I /var/lib/das\-backup/raid/<fsid>.record
+and in
+.I .das\-backup\-raid.record
+on the filesystem, both before anything writes, and every run says
+.BR DEGRADED ;
+.IP \(bu 2
+a degraded mount whose members are not all ones the last degraded period ran
+on is a split brain and is refused, as is one whose record cannot be read;
+every member present again mounts normally and the record says a scrub is
+owed
+.RB ( SCRUB\-OWED )
+until a completed scrub begun after the rejoin clears it;
+.IP \(bu 2
+after the mount, a member the kernel reports missing
+.RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
+while every member is attached is refused.
+.PP
+It prints one line,
+.BI "RAID GUARD: " STATUS "  (" detail ) \fR,
+with
+.I STATUS
+one of
+.BR OK ,
+.BR WARN ,
+.BR SCRUB\-OWED ,
+.BR DEGRADED ,
+.BR NOT\-MOUNTED ,
+.B REFUSED
+or
+.BR CANNOT\-RUN .
+Exit status 0 mounted, 1 not mounted, 3 refused (the script aborts with 3),
+2 could not run (no handed\-down lock, an unknown or single\-device target, a
+mount point that is missing or already mounted). The mount is left for the
+script, which unmounts it.
+.PP
+.B btrdasd backup mount\-target \-\-label
+.I LABEL
+.RB [ \-\-config
+.IR PATH ]
+.\"
 .SS backup report
 Show the last backup reports from the database.
 A snapshot count the run could not take shows as
@@ -3462,6 +3529,12 @@ Override the scrub state file and the directory of btrfs scrub status
 records. Meant for tests only: they are read only by a test build, and a
 shipped binary ignores them.
 .TP
+.B DAS_RAID_RECORD_DIR
+Where the RAID\-1 guard keeps the primary copy of each target's
+degraded\-period record.
+Default:
+.IR /var/lib/das\-backup/raid .
+.TP
 .B DAS_MAINTENANCE_LOCK_FD
 The number of an open descriptor on
 .I /run/das\-maintenance.lock
@@ -3687,6 +3760,15 @@ sudo btrdasd setup \-\-force
 SQLite database with FTS5 content index, backup history and the subvolume
 coverage record (schema 5; each pair's subvolume by its own btrfs UUID
 since schema 7, each volume by its filesystem UUID since schema 8).
+.TP
+.I /var/lib/das\-backup/raid/<fsid>.record
+The RAID\-1 guard's record of a target's last degraded period, or of the scrub
+owed after it (see
+.BR "backup mount\-target" );
+its witness copy is
+.I .das\-backup\-raid.record
+at the top level of the target filesystem. Removed by a completed scrub begun
+after every member was present again; never edit either by hand.
 .TP
 .I /etc/das\-backup/config.toml
 Main configuration file for sources, targets, schedule, and email settings.

@@ -342,6 +342,74 @@ pub struct DriftReport {
     /// The installed `btrfs` no longer lists the `-c`/`-n` options every scrub
     /// argv carries, or could not be asked (bd DAS-Backup-Manager-su1b.3).
     pub scrub_tool: Option<ScrubToolFinding>,
+    /// RAID-1 targets whose record shows a degraded period, a scrub owed
+    /// after one, or a record that cannot be read (bd
+    /// DAS-Backup-Manager-su1b.10). Each is drift until a completed scrub
+    /// clears it.
+    pub raid_records: Vec<RaidFinding>,
+}
+
+/// One RAID-1 target's record, as the doctor reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaidFinding {
+    pub label: String,
+    /// `DEGRADED`, `SCRUB OWED` or `UNREADABLE`.
+    pub status: &'static str,
+    pub detail: String,
+}
+
+/// The RAID-1 record of every guarded target (`raid_guard::is_guarded`), read
+/// from its primary copy under `record_dir`. No record is no finding.
+pub fn raid_findings(config: &Config, record_dir: &std::path::Path) -> Vec<RaidFinding> {
+    use crate::raid_guard::{self, Copy, State};
+    let mut out = Vec::new();
+    for t in config.targets.iter().filter(|t| raid_guard::is_guarded(t)) {
+        let fsid = t.mount_uuid.as_deref().unwrap_or_default();
+        let path = raid_guard::primary_path(record_dir, fsid);
+        let (status, detail) = match raid_guard::read_copy(&path, fsid) {
+            Copy::Absent => continue,
+            Copy::Bad(e) => (
+                "UNREADABLE",
+                format!("{e} — a degraded mount of this target is refused until it is fixed"),
+            ),
+            Copy::Read(r) => {
+                let members = r
+                    .members
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match r.state {
+                    State::Degraded => (
+                        "DEGRADED",
+                        format!(
+                            "last mounted degraded on {members} (since {}, last {}): every write \
+                             since has one copy; replace or reattach the absent drive, then let \
+                             a scrub run",
+                            r.since, r.last
+                        ),
+                    ),
+                    State::ScrubOwed => (
+                        "SCRUB OWED",
+                        format!(
+                            "degraded on {members} from {} to {}, every member present again \
+                             since {}: the pair is not trusted until a scrub begun after that \
+                             completes ('btrdasd scrub run', or the monthly scrub)",
+                            r.since,
+                            r.last,
+                            r.rejoined.unwrap_or(r.last)
+                        ),
+                    ),
+                }
+            }
+        };
+        out.push(RaidFinding {
+            label: t.label.clone(),
+            status,
+            detail: format!("{detail} [{}]", path.display()),
+        });
+    }
+    out
 }
 
 /// Why the scrub tool check is a finding: what was read, and the `btrfs-progs`
@@ -377,6 +445,7 @@ impl DriftReport {
             || !self.undelivered.is_empty()
             || !self.recovery_os_stale.is_empty()
             || self.scrub_tool.is_some()
+            || !self.raid_records.is_empty()
     }
 
     /// Record what [`crate::recovery_os::judge_records`] found. Only the
@@ -806,6 +875,9 @@ fn perform_drift_check(
     perform_delivery_check(config, progress, held, &mut report);
     perform_recovery_os_check(config, &mut report);
     report.scrub_tool = scrub_tool_check(&crate::fsutil::SystemRunner);
+    // After the delivery check: its mount is the guarded one, which turns a
+    // degraded record into a scrub owed when every member is back.
+    report.raid_records = raid_findings(config, &crate::raid_guard::record_dir());
     report
 }
 
@@ -1128,6 +1200,15 @@ pub fn format_report(report: &DriftReport) -> String {
         );
     }
 
+    if !report.raid_records.is_empty() {
+        r.push_str(&format!(
+            "\nRAID-1 TARGETS — degraded periods and scrubs owed\n{thin}\n"
+        ));
+        for f in &report.raid_records {
+            r.push_str(&format!("  {}: {}: {}\n", f.label, f.status, f.detail));
+        }
+    }
+
     if !report.left_mounted.is_empty() {
         r.push_str(&format!(
             "\nLEFT MOUNTED — the check mounted these and could not unmount them\n{thin}\n"
@@ -1144,6 +1225,85 @@ pub fn format_report(report: &DriftReport) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod raid_record_tests {
+    use super::*;
+    use crate::config::{Retention, Target, TargetRole};
+    use crate::raid_guard::{self, PeriodMember, Record, State};
+
+    const FS: &str = "5eed0016-0000-4000-8000-000000000016";
+
+    fn config() -> Config {
+        let t = Target {
+            label: "primary".into(),
+            serial: "SERIAL11".into(),
+            serials: vec!["SERIAL11".into(), "SERIAL12".into()],
+            mount_uuid: Some(FS.into()),
+            mount: "/mnt/p".into(),
+            role: TargetRole::Primary,
+            retention: Retention {
+                daily: 1,
+                weekly: 0,
+                monthly: 0,
+                yearly: 0,
+            },
+            display_name: "p".into(),
+            esp_partuuid: None,
+        };
+        let mut single = t.clone();
+        single.label = "recovery".into();
+        single.serials = vec!["SERIAL04".into()];
+        Config {
+            targets: vec![t, single],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn a_scrub_owed_or_an_unreadable_record_is_drift_until_cleared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            raid_findings(&config(), dir.path()).is_empty(),
+            "no record, no finding"
+        );
+        let owed = Record {
+            fsid: FS.into(),
+            state: State::ScrubOwed,
+            members: vec![PeriodMember {
+                devid: 1,
+                dev_uuid: "5eed00a1-0000-4000-8000-0000000000a1".into(),
+                generation: 3,
+            }],
+            since: 1,
+            last: 2,
+            rejoined: Some(3),
+        };
+        let path = raid_guard::primary_path(dir.path(), FS);
+        raid_guard::write_copy(&path, &owed, true).unwrap();
+        let found = raid_findings(&config(), dir.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].label.as_str(), found[0].status),
+            ("primary", "SCRUB OWED")
+        );
+        let report = DriftReport {
+            volumes_checked: 1,
+            raid_records: found,
+            ..DriftReport::default()
+        };
+        assert!(report.has_drift() && report.not_clean());
+        let text = format_report(&report);
+        assert!(
+            text.contains("RAID-1 TARGETS") && text.contains("SCRUB OWED"),
+            "{text}"
+        );
+        std::fs::write(&path, "junk").unwrap();
+        assert_eq!(raid_findings(&config(), dir.path())[0].status, "UNREADABLE");
+        std::fs::remove_file(&path).unwrap();
+        assert!(raid_findings(&config(), dir.path()).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

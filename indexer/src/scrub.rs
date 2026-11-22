@@ -2215,10 +2215,14 @@ fn scrub_one_target(
     let mount_point = target.mount.clone();
 
     // --- mount ------------------------------------------------------------
+    // A RAID-1 target is mounted only through the guard (bd
+    // DAS-Backup-Manager-su1b.10): never `degraded` as configured.
+    let guarded = crate::raid_guard::is_guarded(target).then_some((config, target));
     match ensure_mounted(
         &mount_point,
         &fsuuid,
         &config.das.mount_opts,
+        guarded,
         progress,
         held,
     ) {
@@ -2357,6 +2361,39 @@ fn scrub_one_target(
         result.finished_epoch = now_epoch();
     }
 
+    // --- a scrub owed after a degraded period (bd DAS-Backup-Manager-su1b.10)
+    // A completed scrub with nothing uncorrectable, begun after every member
+    // was present again, pays it: both record copies go, while the
+    // filesystem is still mounted (the witness is on it). Corrected errors
+    // are expected here — they are the stale copies being repaired.
+    if guarded.is_some()
+        && result.errors.is_empty()
+        && result.interrupted_by.is_none()
+        && result.outcome == Some(ScrubOutcome::Finished)
+        && result.counters.uncorrectable_errors == 0
+    {
+        match crate::raid_guard::clear_after_scrub(
+            &crate::raid_guard::record_dir(),
+            &mount_point,
+            &fsuuid,
+            result.started_epoch,
+            crate::raid_guard::missing_devids(&fsuuid),
+        ) {
+            Ok(Some(_)) => progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "{label}: the scrub owed after its degraded period is done — RAID record \
+                     cleared; the pair is trusted again"
+                ),
+            ),
+            Ok(None) => {}
+            Err(e) => progress.on_log(
+                LogLevel::Warning,
+                &format!("{label}: the RAID record was not cleared: {e}"),
+            ),
+        }
+    }
+
     // --- unmount ----------------------------------------------------------
     if result.mounted_by_engine {
         if let Err(e) = unmount(&mount_point, progress) {
@@ -2390,6 +2427,7 @@ fn ensure_mounted(
     mount_point: &str,
     fsuuid: &str,
     mount_opts: &str,
+    guarded: Option<(&Config, &crate::config::Target)>,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<bool, String> {
@@ -2458,6 +2496,33 @@ fn ensure_mounted(
         }
     };
 
+    if let Some((config, target)) = guarded {
+        match crate::mount::mount_guarded_target(config, target, progress, held) {
+            Ok(_) => {}
+            Err(crate::raid_guard::Failure::Refused { why, left_mounted }) => {
+                if !left_mounted {
+                    cleanup_dir(progress);
+                }
+                return Err(format!(
+                    "RAID-1 mount of {fsuuid} refused: {why}{}",
+                    if left_mounted {
+                        format!(" ({mount_point} is still mounted)")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            Err(other) => {
+                cleanup_dir(progress);
+                return Err(format!(
+                    "RAID-1 mount of {fsuuid} → {mount_point} failed: {}",
+                    other.why()
+                ));
+            }
+        }
+        return verify_engine_mount(mount_point, fsuuid, progress, cleanup_dir);
+    }
+
     let mut cmd = Command::new("mount");
     cmd.args(["-t", "btrfs"]);
     if !mount_opts.is_empty() {
@@ -2480,8 +2545,18 @@ fn ensure_mounted(
         ));
     }
 
-    // Verify what actually landed there. A successful mount of the wrong
-    // filesystem is the exact class of bug this module exists to prevent.
+    verify_engine_mount(mount_point, fsuuid, progress, cleanup_dir)
+}
+
+/// Verify what actually landed at `mount_point` after the engine mounted it.
+/// A successful mount of the wrong filesystem is the exact class of bug this
+/// module exists to prevent.
+fn verify_engine_mount(
+    mount_point: &str,
+    fsuuid: &str,
+    progress: &dyn ProgressCallback,
+    cleanup_dir: impl Fn(&dyn ProgressCallback),
+) -> Result<bool, String> {
     match mounted_fs_uuid(mount_point) {
         Some(found) if found.eq_ignore_ascii_case(fsuuid) => {
             progress.on_log(

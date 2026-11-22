@@ -20,6 +20,7 @@ use crate::config::{Config, Target, TargetRole};
 use crate::health;
 use crate::maintenance::MaintenanceHeld;
 use crate::progress::ProgressCallback;
+use crate::raid_guard;
 
 /// Errors that can occur during the mount lifecycle.
 #[derive(Debug)]
@@ -48,6 +49,10 @@ pub enum MountError {
         mount: String,
         detail: String,
     },
+    /// A RAID-1 target's guarded mount refused (bd DAS-Backup-Manager-su1b.10):
+    /// a split brain, an unreadable record, or the kernel missing a member
+    /// while every drive is attached. Never a target merely skipped.
+    RaidRefused { label: String, detail: String },
 }
 
 impl fmt::Display for MountError {
@@ -90,6 +95,9 @@ impl fmt::Display for MountError {
                 "Target '{label}': {mount} is mounted but is not this target ({detail}) — \
                  refusing to run; it is not this job's to unmount"
             ),
+            Self::RaidRefused { label, detail } => {
+                write!(f, "Target '{label}': RAID-1 mount refused: {detail}")
+            }
         }
     }
 }
@@ -158,6 +166,9 @@ struct MountProbes<'a> {
     device_from_serial: &'a dyn Fn(&str) -> Option<String>,
     /// A device holding the filesystem with this UUID (`blkid -U`).
     device_for_uuid: &'a dyn Fn(&str) -> Option<String>,
+    /// The devids the kernel marks missing for a mounted filesystem
+    /// (`raid_guard::missing_devids`).
+    missing_devids: &'a dyn Fn(&str) -> Result<Vec<u64>, String>,
 }
 
 const HOST_PROBES: MountProbes<'static> = MountProbes {
@@ -165,7 +176,186 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
     find_mount_for_device: &health::find_mount_for_device,
     device_from_serial: &health::device_from_serial,
     device_for_uuid: &health::device_for_fs_uuid,
+    missing_devids: &raid_guard::missing_devids,
 };
+
+/// The guarded mount's host on this machine: this module's runner and
+/// probes (bd DAS-Backup-Manager-su1b.10).
+struct SystemMembers<'a> {
+    runner: &'a dyn CommandRunner,
+    probes: &'a MountProbes<'a>,
+}
+
+impl SystemMembers<'_> {
+    fn run(&self, cmd: &mut Command) -> Result<Output, String> {
+        let what = format!("{cmd:?}");
+        self.runner
+            .output(cmd)
+            .map_err(|e| format!("{what} could not be run: {e}"))
+    }
+}
+
+fn failed(what: &str, out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    format!(
+        "{what} exited with code {}{}",
+        out.status.code().unwrap_or(-1),
+        if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr.trim())
+        }
+    )
+}
+
+impl raid_guard::MemberHost for SystemMembers<'_> {
+    fn members(&self, fsid: &str) -> Result<Vec<String>, String> {
+        // `-c /dev/null`: read the disks now, never a cache.
+        let out = self.run(Command::new("blkid").args([
+            "-c",
+            "/dev/null",
+            "-t",
+            &format!("UUID={fsid}"),
+            "-o",
+            "device",
+        ]))?;
+        match out.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()),
+            // blkid's "nothing matched".
+            Some(2) => Ok(Vec::new()),
+            _ => Err(failed("blkid", &out)),
+        }
+    }
+
+    fn scan(&self, path: &str) -> Result<(), String> {
+        let out = self.run(Command::new("btrfs").args(["device", "scan", path]))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed("btrfs device scan", &out))
+        }
+    }
+
+    fn read_super(&self, path: &str) -> Result<String, String> {
+        let out = self.run(Command::new("btrfs").args(["inspect-internal", "dump-super", path]))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(failed("btrfs inspect-internal dump-super", &out))
+        }
+    }
+
+    fn serial_attached(&self, serial: &str) -> bool {
+        (self.probes.device_from_serial)(serial).is_some()
+    }
+
+    fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String> {
+        let mut cmd = Command::new("mount");
+        cmd.args(["-t", "btrfs"]);
+        if !opts.is_empty() {
+            cmd.args(["-o", opts]);
+        }
+        cmd.arg(format!("UUID={fsid}")).arg(mount);
+        let out = self.run(&mut cmd)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let why = failed("mount", &out);
+        // A mount helper that failed after the kernel mounted (bd 1fpw): take
+        // it back down so the guard's next step starts from nothing.
+        if (self.probes.is_mountpoint)(Path::new(mount))
+            && let Err(u) = umount_retrying(self.runner, mount, |_| {})
+        {
+            return Err(format!(
+                "{why}; it is mounted anyway and will not unmount: {u}"
+            ));
+        }
+        Err(why)
+    }
+
+    fn umount(&self, mount: &str) -> Result<(), String> {
+        umount_retrying(self.runner, mount, |_| {})
+    }
+
+    fn missing_devids(&self, fsid: &str) -> Result<Vec<u64>, String> {
+        (self.probes.missing_devids)(fsid)
+    }
+
+    fn read_witness(&self, mount: &str, fsid: &str) -> raid_guard::Copy {
+        raid_guard::read_copy(&raid_guard::witness_path(mount), fsid)
+    }
+
+    fn write_witness(&self, mount: &str, record: &raid_guard::Record) -> Result<(), String> {
+        raid_guard::write_copy(&raid_guard::witness_path(mount), record, false)
+    }
+
+    fn pause(&self, how_long: Duration) {
+        self.runner.pause(how_long);
+    }
+
+    fn now(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+/// The guarded mount of one RAID-1 target (`raid_guard::is_guarded`) on this
+/// host, at its configured path, which must exist and not be a mount point.
+/// For a job that mounts a target by its own code (the scrub engine,
+/// `btrdasd target mount` for `backup-run.sh`); the caller owns the unmount.
+/// `held` proves the maintenance lock, as for [`ensure_targets_mounted`].
+pub fn mount_guarded_target(
+    config: &Config,
+    target: &Target,
+    progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
+) -> Result<raid_guard::Outcome, raid_guard::Failure> {
+    mount_guarded_with(
+        config,
+        target,
+        &raid_guard::record_dir(),
+        progress,
+        &HOST_PROBES,
+        &SystemRunner,
+    )
+}
+
+fn mount_guarded_with(
+    config: &Config,
+    target: &Target,
+    record_dir: &Path,
+    progress: &dyn ProgressCallback,
+    probes: &MountProbes<'_>,
+    runner: &dyn CommandRunner,
+) -> Result<raid_guard::Outcome, raid_guard::Failure> {
+    let Some(fsid) = target.mount_uuid.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(raid_guard::Failure::MountFailed(
+            "no mount_uuid: not a RAID-1 target".into(),
+        ));
+    };
+    let serials = target.effective_serials();
+    let host = SystemMembers { runner, probes };
+    raid_guard::mount_guarded(
+        &host,
+        &raid_guard::Plan {
+            label: &target.label,
+            fsid,
+            mount: &target.mount,
+            serials: &serials,
+            mount_opts: &config.das.mount_opts,
+            wait: Duration::from_secs(config.das.member_wait_secs.into()),
+            record_dir,
+        },
+        progress,
+    )
+}
 
 /// RAII guard that unmounts targets on drop.
 ///
@@ -576,7 +766,14 @@ pub fn ensure_targets_mounted(
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_with(config, progress, held, &HOST_PROBES, Arc::new(SystemRunner))
+    ensure_targets_mounted_with(
+        config,
+        progress,
+        held,
+        &HOST_PROBES,
+        Arc::new(SystemRunner),
+        &raid_guard::record_dir(),
+    )
 }
 
 /// Where a target's drive is, found the way [`ensure_targets_mounted`] mounts
@@ -633,6 +830,7 @@ fn ensure_targets_mounted_with(
     held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
+    raid_dir: &Path,
 ) -> Result<MountGuard, MountError> {
     let mut guard = MountGuard::new(runner);
     let mut any_available = false;
@@ -828,6 +1026,72 @@ fn ensure_targets_mounted_with(
                     target.label, target.mount
                 ),
             );
+            continue;
+        }
+
+        // A RAID-1 target: the guarded mount, never `degraded` as configured
+        // and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
+        if raid_guard::is_guarded(target) {
+            match mount_guarded_with(config, target, raid_dir, progress, probes, &*guard.runner) {
+                Ok(outcome) => {
+                    any_available = true;
+                    guard.newly_mounted.push(target.mount.clone());
+                    let (status, _) = outcome.status_line();
+                    progress.on_progress(
+                        (i + 1) as u64,
+                        total,
+                        &format!(
+                            "Mounted {} at {} (UUID={}){}",
+                            target.label,
+                            target.mount,
+                            target.mount_uuid.as_deref().unwrap_or_default(),
+                            if status == "OK" {
+                                String::new()
+                            } else {
+                                format!(" — {status}")
+                            }
+                        ),
+                    );
+                }
+                Err(raid_guard::Failure::Refused { why, left_mounted }) => {
+                    if left_mounted {
+                        guard.newly_mounted.push(target.mount.clone());
+                    } else if created {
+                        remove_created_mount_point(
+                            &format!("Target '{}'", target.label),
+                            &target.mount,
+                            progress,
+                        );
+                    }
+                    return Err(MountError::RaidRefused {
+                        label: target.label.clone(),
+                        detail: why,
+                    });
+                }
+                Err(failure) => {
+                    progress.on_log(
+                        crate::progress::LogLevel::Warning,
+                        &format!(
+                            "Target '{}': {} — skipping, this target is NOT available",
+                            target.label,
+                            failure.why()
+                        ),
+                    );
+                    guard.take_back_failed_mount(
+                        probes.is_mountpoint,
+                        &target.mount,
+                        &format!("Target '{}'", target.label),
+                        progress,
+                    );
+                    if created {
+                        remove_created_mount_point(
+                            &format!("Target '{}'", target.label),
+                            &target.mount,
+                            progress,
+                        );
+                    }
+                }
+            }
             continue;
         }
 
@@ -1371,6 +1635,25 @@ fn verify_write_targets_with(
         // mounted degraded from a single leg, which a device check would not.
         if let Some(expected) = target.mount_uuid.as_deref().filter(|u| !u.is_empty()) {
             match filesystem_uuid_with(runner, &target.mount) {
+                Some(actual) if actual == expected && raid_guard::is_guarded(target) => {
+                    match raid_member_check(target, expected, probes) {
+                        Ok(note) => progress.on_log(
+                            if note.is_some() {
+                                crate::progress::LogLevel::Warning
+                            } else {
+                                crate::progress::LogLevel::Info
+                            },
+                            &format!(
+                                "  {}: OK ({} → UUID={}){}",
+                                target.label,
+                                target.mount,
+                                actual,
+                                note.map(|n| format!(" — {n}")).unwrap_or_default()
+                            ),
+                        ),
+                        Err(violation) => violations.push(violation),
+                    }
+                }
                 Some(actual) if actual == expected => {
                     progress.on_log(
                         crate::progress::LogLevel::Info,
@@ -1412,6 +1695,48 @@ fn verify_write_targets_with(
             violations.join("\n  - ")
         ))
     }
+}
+
+/// Step 7 of the RAID-1 guard (bd DAS-Backup-Manager-su1b.10), for a mount
+/// made by anyone: the kernel reporting a member missing while every
+/// configured drive is attached is the 2026-11-21 incident — refused. A
+/// member missing with a drive truly absent is a degraded mount, said
+/// (`Ok(Some)`). Unreadable is refused.
+fn raid_member_check(
+    target: &Target,
+    fsid: &str,
+    probes: &MountProbes<'_>,
+) -> Result<Option<String>, String> {
+    let missing = (probes.missing_devids)(fsid).map_err(|e| {
+        format!(
+            "{}: cannot tell whether a member of its RAID-1 is missing ({e})",
+            target.label
+        )
+    })?;
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let serials = target.effective_serials();
+    let absent: Vec<&String> = serials
+        .iter()
+        .filter(|s| (probes.device_from_serial)(s).is_none())
+        .collect();
+    if absent.is_empty() {
+        return Err(format!(
+            "{}: mounted with devid(s) {missing:?} missing while every configured drive ({}) is \
+             attached — a degraded mount nothing guarded (bd DAS-Backup-Manager-su1b.10)",
+            target.label,
+            serials.join(", ")
+        ));
+    }
+    Ok(Some(format!(
+        "RAID-1 DEGRADED: devid(s) {missing:?} missing, drive(s) {} absent",
+        absent
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 
 /// Where a recovery drive's ESP is mounted while it is read: one directory
@@ -1636,6 +1961,9 @@ mod tests {
         /// Exits 32, yet the mount took effect: a mount helper that failed
         /// after the kernel had mounted (bd DAS-Backup-Manager-1fpw).
         FailMounting,
+        /// Exits with this code, printing this (built at run time: a path
+        /// under the test's scratch directory).
+        Out(i32, String),
     }
 
     impl Reply {
@@ -1733,7 +2061,7 @@ mod tests {
                 Some((_, reply)) => reply.clone(),
                 None => Reply::ok(),
             };
-            if (matches!(reply, Reply::Exit { code: 0, .. })
+            if (matches!(reply, Reply::Exit { code: 0, .. } | Reply::Out(0, _))
                 || (matches!(reply, Reply::FailMounting) && argv[0] == "mount"))
                 && let Some(mount_point) = argv.last()
             {
@@ -1758,6 +2086,11 @@ mod tests {
                     status: ExitStatus::from_raw(code << 8),
                     stdout: stdout.as_bytes().to_vec(),
                     stderr: stderr.as_bytes().to_vec(),
+                }),
+                Reply::Out(code, stdout) => Ok(Output {
+                    status: ExitStatus::from_raw(code << 8),
+                    stdout: stdout.into_bytes(),
+                    stderr: Vec::new(),
                 }),
                 Reply::Seq(_) => unreachable!("resolved to an exit above"),
                 Reply::CannotRun => Err(io::Error::new(
@@ -1808,6 +2141,10 @@ mod tests {
         devices: Vec<(String, String)>,
         /// filesystem UUID → a device holding it (`blkid -U`)
         uuids: Vec<(String, String)>,
+        /// filesystem UUID → the devids the kernel marks missing
+        missing: Vec<(String, Vec<u64>)>,
+        /// Where a guarded mount keeps its record; never the host's.
+        raid_dir: Option<PathBuf>,
     }
 
     impl Host {
@@ -1849,11 +2186,20 @@ mod tests {
                     .find(|(u, _)| u == uuid)
                     .map(|(_, dev)| dev.clone())
             };
+            let missing_devids = |uuid: &str| {
+                Ok(self
+                    .missing
+                    .iter()
+                    .find(|(u, _)| u == uuid)
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_default())
+            };
             f(&MountProbes {
                 is_mountpoint: &is_mountpoint,
                 find_mount_for_device: &find_mount_for_device,
                 device_from_serial: &device_from_serial,
                 device_for_uuid: &device_for_uuid,
+                missing_devids: &missing_devids,
             })
         }
 
@@ -1873,8 +2219,12 @@ mod tests {
             runner: &Arc<ScriptedRunner>,
             held: &MaintenanceHeld,
         ) -> Result<MountGuard, MountError> {
+            let raid_dir = self
+                .raid_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent/das-raid-test-record-dir"));
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(config, progress, held, p, runner.clone())
+                ensure_targets_mounted_with(config, progress, held, p, runner.clone(), &raid_dir)
             })
         }
 
@@ -2925,6 +3275,175 @@ mod tests {
             vec![output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt])]
         );
         assert_eq!(guard.count(), 1);
+    }
+
+    /// `btrfs inspect-internal dump-super` of one member of a two-device
+    /// filesystem, as btrfs-progs prints it (first token the key).
+    fn super_of(fsid: &str, devid: u64, dev_uuid: &str, generation: u64) -> String {
+        format!(
+            "superblock: bytenr=65536, device=/dev/x\n\
+             ---------------------------------------------------------\n\
+             csum_type\t\t0 (crc32c)\n\
+             magic\t\t\t_BHRfS_M [match]\n\
+             fsid\t\t\t{fsid}\n\
+             metadata_uuid\t\t00000000-0000-0000-0000-000000000000\n\
+             generation\t\t{generation}\n\
+             chunk_root_generation\t{generation}\n\
+             num_devices\t\t2\n\
+             cache_generation\t0\n\
+             uuid_tree_generation\t{generation}\n\
+             dev_item.uuid\t\t{dev_uuid}\n\
+             dev_item.fsid\t\t{fsid} [match]\n\
+             dev_item.devid\t\t{devid}\n\
+             dev_item.generation\t0\n"
+        )
+    }
+
+    /// A RAID-1 target (a filesystem UUID and two serials) with both drives
+    /// attached is mounted WITHOUT `degraded`, after each member found by its
+    /// filesystem UUID was registered with btrfs by its own path — never an
+    /// unscoped scan (bd DAS-Backup-Manager-su1b.10: a kernel that had
+    /// forgotten one leg let `mount -o degraded` come up on the other).
+    #[test]
+    fn a_raid1_target_with_both_drives_attached_is_scanned_and_mounted_without_degraded() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part_b, mnt) = attached_primary(&scratch);
+        let part_c = scratch.touch("dev/sdc1");
+        config.targets[0].mount_uuid = Some("u-p".into());
+        config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+        config.das.mount_opts = "noatime,degraded,compress=zstd".into();
+        host.devices.push(("SER-Q".into(), scratch.path("dev/sdc")));
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n{part_c}\n"))),
+            (
+                &part_b,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 1, "5eed00a1-0000-4000-8000-0000000000a1", 40),
+                ),
+            ),
+            (
+                &part_c,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 2, "5eed00a2-0000-4000-8000-0000000000a2", 40),
+                ),
+            ),
+        ]);
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        let calls = runner.calls();
+        for part in [&part_b, &part_c] {
+            assert!(
+                calls.contains(&output_call(&["btrfs", "device", "scan", part])),
+                "{part} not scanned by path: {calls:?}"
+            );
+        }
+        assert!(
+            calls.contains(&output_call(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "noatime,compress=zstd",
+                "UUID=u-p",
+                &mnt
+            ])),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.argv[0] == "mount" && c.argv.iter().any(|a| a.contains("degraded"))),
+            "mounted degraded with both members attached: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.argv == ["btrfs", "device", "scan"]
+                    || c.argv.iter().any(|a| a == "--forget")),
+            "an unscoped scan or a forget: {calls:?}"
+        );
+        assert_eq!(guard.count(), 1);
+    }
+
+    /// One leg absent after the wait: mounted degraded, the period recorded
+    /// under the guard's record directory. The other leg alone on a later run
+    /// is a split brain: the whole job is refused, never a skipped target.
+    #[test]
+    fn a_raid1_target_on_one_leg_mounts_degraded_and_the_other_leg_alone_is_refused() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part_b, mnt) = attached_primary(&scratch);
+        let part_c = scratch.touch("dev/sdc1");
+        config.targets[0].mount_uuid = Some("u-p".into());
+        config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+        config.das.mount_opts = "noatime,degraded".into();
+        config.das.member_wait_secs = 10;
+        host.raid_dir = Some(PathBuf::from(scratch.path("raid")));
+        let dx = "5eed00a1-0000-4000-8000-0000000000a1";
+        let dy = "5eed00a2-0000-4000-8000-0000000000a2";
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n"))),
+            (&part_b, Reply::Out(0, super_of("u-p", 1, dx, 40))),
+        ]);
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert_eq!(guard.count(), 1);
+        let calls = runner.calls();
+        assert!(
+            calls.contains(&output_call(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "noatime,degraded",
+                "UUID=u-p",
+                &mnt
+            ])),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.argv[0] == "blkid").count(),
+            3,
+            "looked at once, and after each 5 s pause of the 10 s wait"
+        );
+        let record = std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap();
+        assert!(record.contains(&format!("member=1 {dx} 40")), "{record}");
+        assert!(
+            std::fs::read_to_string(raid_guard::witness_path(&mnt))
+                .unwrap()
+                .contains(dx),
+            "the witness is on the filesystem"
+        );
+        drop(guard);
+
+        // The other leg alone.
+        host.devices = vec![("SER-Q".into(), scratch.path("dev/sdc"))];
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_c}\n"))),
+            (&part_c, Reply::Out(0, super_of("u-p", 2, dy, 38))),
+        ]);
+        std::fs::remove_file(raid_guard::witness_path(&mnt)).unwrap();
+        let err = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(&err, MountError::RaidRefused { detail, .. } if detail.contains("split brain")),
+            "{err}"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" && c.argv.iter().any(|a| a == "noatime,degraded")),
+            "the stale leg was mounted writable: {:?}",
+            runner.calls()
+        );
     }
 
     /// Any configured serial counts, not only the first — a RAID-1 pair with
@@ -4212,6 +4731,63 @@ mod tests {
                 LogLevel::Info,
                 format!("  primary-22tb: OK ({mnt} → UUID={EXPECTED_UUID})")
             )]
+        );
+    }
+
+    /// The 2026-11-21 shape, whoever mounted it: a RAID-1 target holding the
+    /// right filesystem, both drives attached, and the kernel reporting
+    /// devid 2 missing — refused, never OK (bd DAS-Backup-Manager-su1b.10).
+    /// With a drive truly absent it is a degraded mount, said, not refused.
+    #[test]
+    fn verify_refuses_a_raid1_target_missing_a_member_while_both_drives_are_attached() {
+        let scratch = Scratch::new();
+        let (mut targets, mut host, mnt) = mounted_write_target(&scratch, Some(EXPECTED_UUID));
+        targets[0].serials = vec!["SERIAL11".into(), "SERIAL12".into()];
+        host.devices = vec![
+            ("SERIAL11".into(), "/dev/sdb".into()),
+            ("SERIAL12".into(), "/dev/sdc".into()),
+        ];
+        host.missing = vec![(EXPECTED_UUID.into(), vec![2])];
+        let runner = || {
+            ScriptedRunner::with_rules(&[(
+                &mnt,
+                Reply::Exit {
+                    code: 0,
+                    stdout: EXPECTED_UUID_LINE,
+                    stderr: "",
+                },
+            )])
+        };
+
+        let err = host
+            .verify(&targets, &["primary-22tb"], &Recorder::default(), &runner())
+            .unwrap_err();
+        assert!(
+            err.contains("[2] missing while every configured drive"),
+            "{err}"
+        );
+
+        host.devices.pop();
+        let progress = Recorder::default();
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &progress, &runner()),
+            Ok(())
+        );
+        assert!(
+            progress
+                .logs()
+                .iter()
+                .any(|(l, m)| *l == LogLevel::Warning && m.contains("RAID-1 DEGRADED")),
+            "{:?}",
+            progress.logs()
+        );
+
+        host.devices.push(("SERIAL12".into(), "/dev/sdc".into()));
+        host.missing.clear();
+        assert_eq!(
+            host.verify(&targets, &["primary-22tb"], &Recorder::default(), &runner()),
+            Ok(()),
+            "nothing missing"
         );
     }
 

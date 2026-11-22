@@ -109,6 +109,8 @@ The system has six major components:
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
          │                                   (a target an earlier job left mounted: identity checked, unmounted — 5 tries, then umount -f — and mounted
          │                                    afresh; one that will not come down, or is not the target, aborts with 3 before btrbk, bd jgm)
+         │                                   (a RAID-1 target — mount_uuid and two or more serials — is mounted by `btrdasd backup
+         │                                    mount-target` with fd 8 handed down: the guard, below; REFUSED aborts with 3, bd su1b.10)
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
          ├──▶ btrdasd backup static        → sends the `[[source.static]]` subvolumes (read-only subvolumes somebody else made) to the primary targets as they are, while the targets are still mounted; nothing is written on the source (a dry run prints the plan)
@@ -205,6 +207,42 @@ a *member*, not a filesystem. The remedy is a config change (declare them by `UU
 not a code change; until then the mountpoint check is their only guarantee — and it is
 the one that catches the defect this guard was written for
 (`bd DAS-Backup-Manager-zlv`).
+
+### RAID-1 Target Mount (bd su1b.10)
+
+One implementation, `raid_guard::mount_guarded`, for every job that mounts a
+RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
+(backup run, doctor, walk, restore, the GUI helper), the scrub engine, and
+`backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
+`RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
+refused, 2 could not run). Single-device targets are mounted as before.
+
+```text
+blkid -c /dev/null -t UUID=<fsid> -o device   → the members, never found by serial alone
+btrfs device scan <each member path>          → never unscoped, never --forget
+dump-super <each member>                      → fsid, devid, dev_uuid, generation, num_devices
+all num_devices present?
+   yes → mount -o <mount_opts minus degraded> UUID=<fsid>
+           ok   → devinfo/*/missing all 0, else unmount and REFUSE
+                  record degraded → scrub-owed (both copies); scrub-owed → WARN
+           fail → keep polling (below); still failing with all present → REFUSE
+   no  → poll every 5 s for [das].member_wait_secs, rescanning
+         still absent, a configured serial absent:
+           mount ro,degraded,rescue=nologreplay → read the witness → unmount
+           split-brain verdict (primary + witness):
+             present ⊄ last period's members, or a copy unreadable → REFUSE
+           write primary record → mount <mount_opts>,degraded → write witness → DEGRADED (WARN)
+         still absent with every configured serial attached → REFUSE
+```
+
+The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`,
+`member=<devid> <dev_uuid> <generation>`, `since`, `last`, `rejoined`) lives in
+`/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`) and in
+`.das-backup-raid.record` at the target's top level. A completed scrub begun
+after `rejoined`, nothing uncorrectable, removes both (witness first);
+`btrdasd doctor` reports any record as drift (exit 1). After every mount,
+`verify_write_targets` and `verify_targets_before_btrbk` refuse a member the
+kernel shows missing unless the guard mounted the target degraded.
 
 ### Scrub Pipeline
 
@@ -558,7 +596,7 @@ only through `SetupHost`, so tests drive every mode on a scratch tree.
 | `general` | version, install_prefix, db_path, log_file, growth_log, last_report, btrbk_conf | Global settings |
 | `init` | system (systemd/sysvinit/openrc) | Init system selection |
 | `schedule` | incremental, full, randomized_delay_min | Backup timing |
-| `das` | model_pattern, expected_link_mbit_s, io_scheduler, nr_requests, mount_opts | DAS enclosure match, I/O scheduler and request queue size, target mount options |
+| `das` | model_pattern, expected_link_mbit_s, io_scheduler, nr_requests, mount_opts, member_wait_secs | DAS enclosure match, I/O scheduler and request queue size, target mount options, the RAID-1 guard's wait for a late member |
 | `boot` | enabled, subvolumes[], archive_retention_days | Boot subvolume archival + pruning (`boot-archive-cleanup.sh`) |
 | `scrub` | enabled, on_calendar, targets[], warn_age_days, fail_age_days | Scheduled BTRFS scrub (`btrdasd scrub`, `das-scrub.timer`) |
 | `doctor` | exclude[], max_snapshot_age_days | Older exclusion list, still read and merged with `[subvolumes].exclude`; the delivery check's age limit (default 3) |
@@ -803,7 +841,8 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `health` | `src/health.rs` | ~2250 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `maintenance` | `src/maintenance.rs` | ~1500 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
-| `mount` | `src/mount.rs` | ~4900 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()`, the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`) |
+| `mount` | `src/mount.rs` | ~6000 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` (with the RAID-1 kernel-view check), the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`), and the host side of the RAID-1 guard (`SystemMembers`, `mount_guarded_target`) |
+| `raid_guard` | `src/raid_guard.rs` | ~2000 | The guarded mount of a multi-device (RAID-1) target (bd su1b.10): members by filesystem UUID, scanned by path, mounted without `degraded`, a bounded wait for a late member, degraded only on a drive truly absent, the degraded-period record (primary under `/var/lib/das-backup/raid`, witness on the filesystem), the split-brain refusal, the scrub owed after a rejoin and its clearing, the kernel's devinfo view |
 | `progress` | `src/progress.rs` | ~770 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~650 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `recovery_os` | `src/recovery_os.rs` | ~6400 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |

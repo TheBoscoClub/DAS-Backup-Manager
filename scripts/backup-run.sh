@@ -1,9 +1,22 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.21.2
+# Version: 4.22.0
 # Date: 2026-11-22
 #
 # Features:
+#   - A RAID-1 target is mounted only through the guard (v4.22.0, bd
+#     DAS-Backup-Manager-su1b.10): a target with mount_uuid and more than one
+#     serial is mounted by `btrdasd backup mount-target` (guarded_mount),
+#     handed the maintenance lock on fd 8, never by `mount -o
+#     <[das].mount_opts>` with its `degraded`. The guard scans each member
+#     found by filesystem UUID by its own path, mounts without degraded,
+#     waits [das].member_wait_secs for a late member, mounts degraded only on
+#     a drive truly absent (a WARN row every run, the period recorded) and
+#     refuses a split brain (exit 3, ABORTED). verify_targets_before_btrbk
+#     then refuses any member the kernel shows missing unless the guard
+#     itself mounted the target degraded: the 2026-11-21 incident, where a
+#     forgotten leg let doctor and the nightly backup mount degraded on one
+#     drive with both attached and both say OK.
 #   - The configured request queue size follows the scheduler (v4.21.2, bd
 #     DAS-Backup-Manager-su1b.8): a scheduler switch resets nr_requests.
 #   - The I/O scheduler reaches every disk of a target (v4.21.1, bd
@@ -2389,6 +2402,112 @@ warn_mounted_elsewhere() {
     log_warn "  $label: its filesystem is already mounted at $list by another program: [das].mount_opts ($DAS_MOUNT_OPTS) will not be applied — that mount's own options stay in force"
 }
 
+# A RAID-1 target: a filesystem UUID and more than one configured serial —
+# the same test as raid_guard::is_guarded in the binary (bd
+# DAS-Backup-Manager-su1b.10).
+is_guarded_target() { # is_guarded_target <label>
+    local label="$1"
+    local -a serials
+    read -r -a serials <<<"${DAS_SERIALS_LIST[$label]:-}"
+    [[ -n "${TARGET_MOUNT_UUIDS[$label]:-}" ]] && ((${#serials[@]} > 1))
+}
+
+# What the guard said for each RAID-1 target this run: OK, WARN, SCRUB-OWED or
+# DEGRADED. verify_targets_before_btrbk reads it: a member the kernel shows
+# missing is a FAIL unless the guard itself mounted the target degraded.
+declare -gA RAID_GUARD_STATUS=()
+
+# The guarded mount of one RAID-1 target (bd DAS-Backup-Manager-su1b.10): one
+# rule, in one place — `btrdasd backup mount-target`, the code the Rust jobs
+# mount with — handed this run's maintenance lock (DAS_MAINTENANCE_LOCK_FD=8,
+# as for `btrdasd walk`). It finds the members by filesystem UUID, scans each
+# by its own path, mounts without `degraded`, waits [das].member_wait_secs for
+# a late member, mounts degraded only on a member truly absent (recording the
+# period, refusing a split brain) and checks the kernel's view after. It
+# prints one line, `RAID GUARD: <STATUS>  (<detail>)`: 0 mounted, 1 not
+# mounted (verify_targets_before_btrbk then refuses the run), 3 refused and
+# anything else could not run — both abort, exit 3.
+guarded_mount() { # guarded_mount <label>
+    local label="$1" out last line rc status detail
+    out="$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" backup mount-target --label "$label" \
+        --config "$DAS_CONFIG" && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    if [[ "$last" == status=* ]]; then
+        rc="${last#status=}"
+    else
+        rc="uncaptured"
+    fi
+    line="$(grep -m1 '^RAID GUARD: ' <<<"$out" || true)"
+    status="${line#RAID GUARD: }"
+    status="${status%%  (*}"
+    detail="${line#*  (}"
+    detail="${detail%)}"
+    case "$rc:$status" in
+    0:OK)
+        RAID_GUARD_STATUS[$label]="OK"
+        # A drive check_das_connected did not see was waited for and came:
+        # its serial is looked up again for SMART STATUS, and the row says
+        # what the guard found, not "degraded".
+        refresh_serial_devs "$label"
+        log_info "  Mounted $label at ${TARGET_MOUNTS[$label]} — $detail"
+        record_op "target_${label}" "OK" "$detail"
+        ;;
+    0:WARN | 0:SCRUB-OWED | 0:DEGRADED)
+        RAID_GUARD_STATUS[$label]="$status"
+        [[ "$status" == DEGRADED ]] || refresh_serial_devs "$label"
+        log_warn "  $label: $status — $detail"
+        record_op "target_${label}" "WARN" "$status: $detail"
+        ;;
+    1:NOT-MOUNTED)
+        log_warn "  Could not mount $label: $detail — the run will refuse to invoke btrbk (verify_targets_before_btrbk)"
+        ;;
+    3:REFUSED)
+        log_error "ABORTING: RAID-1 target $label refused: $detail"
+        record_op "target_${label}" "FAIL" "RAID-1 mount refused: $detail"
+        abort_reason "a RAID-1 target's mount" "$label: $detail"
+        exit 3
+        ;;
+    *)
+        local why="$label: the guarded mount could not run (exit $rc): ${line:-no RAID GUARD line}"
+        log_error "ABORTING: $why"
+        record_op "target_${label}" "FAIL" "$why"
+        abort_reason "a RAID-1 target's mount" "$why"
+        exit 3
+        ;;
+    esac
+}
+
+# Look every configured serial of <label> up again, into TARGET_SERIAL_DEVS.
+refresh_serial_devs() { # refresh_serial_devs <label>
+    local label="$1" serial dev devs=""
+    for serial in ${DAS_SERIALS_LIST[$label]:-}; do
+        dev=$(find_device_by_serial "$serial") || dev=""
+        devs+="${devs:+ }$serial=$dev"
+    done
+    TARGET_SERIAL_DEVS[$label]="$devs"
+}
+
+# The devids the kernel marks missing for mounted filesystem <uuid>, one per
+# line, from <sysfs>/<uuid>/devinfo/<devid>/missing. 1 when that cannot be
+# read: never "none missing".
+DAS_SYSFS_BTRFS="${DAS_SYSFS_BTRFS:-/sys/fs/btrfs}"
+raid_missing_devids() { # raid_missing_devids <uuid>
+    local dir="$DAS_SYSFS_BTRFS/$1/devinfo" d flag seen=0
+    [[ -d "$dir" ]] || return 1
+    for d in "$dir"/*/; do
+        d="${d%/}"
+        [[ "${d##*/}" =~ ^[[:digit:]]+$ ]] || continue
+        seen=1
+        flag="$(<"$d/missing")" || return 1
+        case "$flag" in
+        0) ;;
+        1) printf '%s\n' "${d##*/}" ;;
+        *) return 1 ;;
+        esac
+    done
+    ((seen))
+}
+
 mount_targets() {
     log_info "Mounting backup targets..."
 
@@ -2406,10 +2525,15 @@ mount_targets() {
             take_down_leftover "$label"
         fi
 
-        # Prefer mount-by-UUID when configured. BTRFS auto-discovers all
-        # present members from any single one's superblock, so a degraded
-        # RAID-1 (one leg missing) still mounts cleanly. The DAS_MOUNT_OPTS
-        # config value is expected to include `degraded` for RAID-1 targets.
+        # A RAID-1 target: the guarded mount, never `degraded` as configured
+        # and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
+        if is_guarded_target "$label"; then
+            warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
+            guarded_mount "$label"
+            continue
+        fi
+
+        # Prefer mount-by-UUID when configured (a single-device target here).
         if [[ -n "$uuid" ]]; then
             warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
             if mount -t btrfs -o "$DAS_MOUNT_OPTS" "UUID=$uuid" "$mnt"; then
@@ -2646,6 +2770,21 @@ verify_targets_before_btrbk() {
         if ! mounted_is_target "$label"; then
             violations+=("$IDENTITY_WHY")
             continue
+        fi
+        # A RAID-1 target: the kernel must show no member missing, unless
+        # the guard itself mounted it degraded this run. A member missing on
+        # any other mount is the 2026-11-21 incident (bd
+        # DAS-Backup-Manager-su1b.10); unreadable is refused too.
+        if is_guarded_target "$label"; then
+            local missing
+            if ! missing="$(raid_missing_devids "${TARGET_MOUNT_UUIDS[$label]}")"; then
+                violations+=("$label: cannot read whether a member of its RAID-1 is missing ($DAS_SYSFS_BTRFS/${TARGET_MOUNT_UUIDS[$label]}/devinfo)")
+                continue
+            fi
+            if [[ -n "$missing" && "${RAID_GUARD_STATUS[$label]:-}" != DEGRADED ]]; then
+                violations+=("$label: mounted with devid(s) $(tr '\n' ' ' <<<"$missing")missing, though the guard did not mount it degraded — a degraded mount nothing guarded")
+                continue
+            fi
         fi
         log_info "  $label: OK ($IDENTITY_OK)"
     done
@@ -4278,7 +4417,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.21.2
+  backup-run.sh v4.22.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

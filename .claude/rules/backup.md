@@ -91,7 +91,15 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 
 ## Mount Options for a RAID-1 Primary Target
 
-- `[das].mount_opts` includes `degraded`, so one failed leg does not block backup or restore.
+- A RAID-1 target (`mount_uuid` and more than one serial, `raid_guard::is_guarded`) → mounted only by `raid_guard::mount_guarded`: the Rust jobs through `mount.rs`, the script through `btrdasd backup mount-target` (fd 8 handed down); never `mount -o` with `[das].mount_opts`' `degraded` (bd `su1b.10`).
+- Members → found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each `btrfs device scan <its path>`; never an unscoped scan, never `--forget`, in code, tests or proofs.
+- The mount → without `degraded` first; a member not present, or a plain mount that fails → poll every 5 s for `[das].member_wait_secs` (60), rescanning.
+- Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
+- A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
+- Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").
+- Every member back → normal mount, the record becomes scrub-owed (a WARN row, a doctor finding) until a completed scrub begun after the rejoin clears it.
+- After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` showing a member missing (unreadable included) is refused unless the guard itself mounted it degraded (`verify_write_targets`, `verify_targets_before_btrbk`).
+- A refusal → `MountError::RaidRefused`: it fails the job, `walk` and `restore` included.
 - `nodev,nosuid,noexec` belong in `[das].mount_opts`: receive and restore keep device nodes and setuid bits intact, no job executes from a target (bd `20q`).
 - A target filesystem already mounted somewhere else keeps that mount's filesystem-wide options: a second `mount -o` returns 0 and applies none of them. Both paths WARN and go on (bd `804`).
 - Data written degraded lands as `single` chunks. After replacing the leg: `btrfs scrub`, then
@@ -157,7 +165,7 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
   - `btrdasd backup boot-archive` (CLI): **0** clean or declined (a backup holds the lock), **3** the
     step, the unmount after it, or the mount once its locks were held failed, **1** only when it could not
     start (config, locks).
-  - `btrdasd doctor`: **0** clean or deferred, **1** drift found (an undelivered pair, bd `sp78.7`, or a stale recovery OS by its recorded reading, bd `xd3`, included),
+  - `btrdasd doctor`: **0** clean or deferred, **1** drift found (an undelivered pair, bd `sp78.7`, or a stale recovery OS by its recorded reading, bd `xd3`, or a RAID-1 target degraded, owed a scrub or with an unreadable record, bd `su1b.10`, included),
     **2** could not run, **3** some volume or target failed to mount/list/unmount (outranks 1). `das-backup-doctor.service` carries
     `SuccessExitStatus=1`; that line is load-bearing.
   - `das-recovery-os-update-*.service` carries `SuccessExitStatus=1 3 4 5 6 7`; that line is load-bearing.

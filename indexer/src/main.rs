@@ -532,6 +532,16 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, DEGRADED), 1 not mounted, 3 refused, 2 could not run.
+    #[command(hide = true)]
+    MountTarget {
+        /// The target's label
+        #[arg(long)]
+        label: String,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Print the boot subvolumes a full run refreshes, with their btrbk snapshot names and target subdirectories (tab-separated; read by backup-run.sh)
     BootPlan {
         /// Path to config.toml
@@ -1989,6 +1999,61 @@ fn hold_for_cli(
     }
 }
 
+/// `btrdasd backup mount-target`: the guarded mount of one RAID-1 target,
+/// for `backup-run.sh`. Only under a handed-down maintenance lock, at a mount
+/// point that exists and is not mounted (the script's own leftover check ran
+/// first). The mount is left for the script, which unmounts it.
+fn cmd_mount_target(label: &str, config: &Path) -> i32 {
+    let cant = |why: String| {
+        println!("RAID GUARD: CANNOT-RUN  ({why})");
+        2
+    };
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => return cant(format!("cannot read {}: {e}", config.display())),
+    };
+    let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
+        return cant(format!("no [[target]] labelled '{label}'"));
+    };
+    if !buttered_dasd::raid_guard::is_guarded(target) {
+        return cant(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let lock = CliLock::production();
+    let Some(raw) = &lock.delegated else {
+        return cant(format!(
+            "only under a maintenance lock handed down by {}",
+            maintenance::DELEGATED_FD_ENV
+        ));
+    };
+    let held = match raw
+        .to_str()
+        .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{}={raw:?} is not a descriptor number",
+                maintenance::DELEGATED_FD_ENV
+            )
+        })
+        .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
+    {
+        Ok(h) => h,
+        Err(e) => return cant(e),
+    };
+    let mount_path = Path::new(&target.mount);
+    if !mount_path.is_dir() {
+        return cant(format!("{} is not a directory", target.mount));
+    }
+    if health::is_mountpoint(mount_path) {
+        return cant(format!("{} is already a mount point", target.mount));
+    }
+    let result = mount::mount_guarded_target(&cfg, target, &CliProgress, &held);
+    let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
+    println!("{line}");
+    code
+}
+
 /// `btrdasd walk`.
 fn cmd_walk(
     target: &Path,
@@ -2846,6 +2911,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(code) = step.exit_code(released.is_ok()) {
                     std::process::exit(code);
                 }
+            }
+            BackupAction::MountTarget { label, config } => {
+                std::process::exit(cmd_mount_target(&label, &config));
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {

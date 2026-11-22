@@ -364,8 +364,20 @@ pub struct Das {
     /// [`NR_REQUESTS_MIN`]..=[`NR_REQUESTS_MAX`].
     #[serde(default = "default_nr_requests")]
     pub nr_requests: u32,
+    /// Mount options for every target. `degraded` here is never used as
+    /// given on a RAID-1 target (`mount_uuid` and more than one serial): it is
+    /// mounted without it, and with it only when a member is still absent
+    /// after [`Das::member_wait_secs`] (bd DAS-Backup-Manager-su1b.10,
+    /// `raid_guard`).
     #[serde(default)]
     pub mount_opts: String,
+    /// How long, in seconds, a RAID-1 target's mount waits for a member that
+    /// is configured but not yet present (late USB enumeration after the
+    /// enclosure powers on) before it decides the member is absent and mounts
+    /// degraded. 60 by default; 0 decides at once; at most
+    /// [`MEMBER_WAIT_SECS_MAX`].
+    #[serde(default = "default_member_wait_secs")]
+    pub member_wait_secs: u32,
 }
 
 impl Default for Das {
@@ -376,6 +388,7 @@ impl Default for Das {
             io_scheduler: default_io_scheduler(),
             nr_requests: default_nr_requests(),
             mount_opts: String::new(),
+            member_wait_secs: default_member_wait_secs(),
         }
     }
 }
@@ -391,6 +404,14 @@ fn default_io_scheduler() -> String {
 fn default_nr_requests() -> u32 {
     64
 }
+
+fn default_member_wait_secs() -> u32 {
+    60
+}
+
+/// The longest `[das].member_wait_secs` accepted: a backup or scrub waits this
+/// long per RAID-1 target at most.
+pub const MEMBER_WAIT_SECS_MAX: u32 = 900;
 
 /// The kernel's floor for `queue/nr_requests` (`BLKDEV_MIN_RQ`): a smaller
 /// write is silently raised to it, so config refuses one.
@@ -3461,6 +3482,13 @@ impl Config {
             ));
         }
 
+        if self.das.member_wait_secs > MEMBER_WAIT_SECS_MAX {
+            errors.push(format!(
+                "das.member_wait_secs {} must be at most {MEMBER_WAIT_SECS_MAX}",
+                self.das.member_wait_secs
+            ));
+        }
+
         if self.doctor.max_snapshot_age_days == 0 {
             errors.push(
                 "doctor.max_snapshot_age_days must be at least 1 (0 would mark every pair \
@@ -4968,6 +4996,28 @@ mod tests {
 
     /// bd su1b.4: the scheduler is written into a udev rule and a sysfs file,
     /// so only the kernel's known names pass; empty is "leave the drives alone".
+    #[test]
+    fn member_wait_secs_defaults_to_60_and_is_bounded() {
+        assert_eq!(Config::default().das.member_wait_secs, 60);
+        let parsed: Das = toml::from_str("mount_opts = \"noatime\"").unwrap();
+        assert_eq!(parsed.member_wait_secs, 60, "an absent key is the default");
+        for (secs, ok) in [
+            (0, true),
+            (MEMBER_WAIT_SECS_MAX, true),
+            (MEMBER_WAIT_SECS_MAX + 1, false),
+        ] {
+            let mut cfg = Config::default();
+            cfg.das.member_wait_secs = secs;
+            assert_eq!(
+                !cfg.validate()
+                    .iter()
+                    .any(|e| e.contains("das.member_wait_secs")),
+                ok,
+                "{secs}"
+            );
+        }
+    }
+
     #[test]
     fn validate_accepts_nr_requests_zero_or_in_the_kernel_range() {
         let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();

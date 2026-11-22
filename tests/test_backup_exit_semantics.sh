@@ -258,6 +258,38 @@ case "$1 ${2:-}" in
 "backup static")
     exit "$(knob static_rc 0)"
     ;;
+"backup mount-target")
+    # The RAID-1 guard (bd su1b.10). It mounts through the mount stub, as the
+    # real one mounts by UUID without degraded, so the mount table and the
+    # mount knobs (mount_fails, wrong_fs_at) behave as before. Knobs:
+    # guard_rc (default 0) and guard_line (the line it prints); a nonzero
+    # guard_rc mounts nothing unless guard_leaves_mounted is set.
+    printf '%s\n' "${DAS_MAINTENANCE_LOCK_FD:-unset}" >>"$S/calls/guard_fd"
+    label=""
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" == --label ]] && label="$2"
+        shift
+    done
+    # shellcheck source=/dev/null
+    source "$S/env"
+    mnt="" uuid=""
+    for ((i = 0; i < DAS_TARGET_COUNT; i++)); do
+        v="DAS_TARGET_${i}_LABEL"
+        [[ "${!v}" == "$label" ]] || continue
+        v="DAS_TARGET_${i}_MOUNT" && mnt="${!v}"
+        v="DAS_TARGET_${i}_MOUNT_UUID" && uuid="${!v}"
+    done
+    [[ -n "$mnt" ]] || { echo "RAID GUARD: CANNOT-RUN  (stub: no target $label)"; exit 2; }
+    rc="$(knob guard_rc 0)"
+    if [[ "$rc" == 0 || -f "$S/knobs/guard_leaves_mounted" ]]; then
+        if ! mount -t btrfs -o noatime "UUID=$uuid" "$mnt" 2>&1; then
+            echo "RAID GUARD: NOT-MOUNTED  (the mount without degraded failed (stub))"
+            exit 1
+        fi
+    fi
+    printf '%s\n' "$(knob guard_line 'RAID GUARD: OK  (all 2 members present (stub))')"
+    exit "$rc"
+    ;;
 "backup boot-plan")
     # The plan btrbk.conf gives: @ and @home on the nvme volume.
     printf '@\troot-\tnvme\n@home\thome\tnvme\n'
@@ -610,6 +642,12 @@ fresh() {
     : >"$WORK/etc/btrbk.conf"
     printf '%s\n' "$REAL_FLOCK" >"$STATE/real_flock"
     printf '%s\n' primary-uuid recovery-a-uuid >"$STATE/knobs/present_uuids"
+    # The kernel's view of the RAID-1 primary once mounted: both devids
+    # present (bd su1b.10). A case writes 1 into one to say it is missing.
+    rm -rf "${WORK:?}/sysfs"
+    mkdir -p "$WORK/sysfs/primary-uuid/devinfo/1" "$WORK/sysfs/primary-uuid/devinfo/2"
+    echo 0 >"$WORK/sysfs/primary-uuid/devinfo/1/missing"
+    echo 0 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
     write_env
 }
 knob() { printf '%s\n' "$2" >"$STATE/knobs/$1"; }
@@ -633,6 +671,7 @@ run_cmd() {
         BTRDASD_BIN="$RUN_BTRDASD" DAS_CONFIG="$WORK/etc/config.toml"
         BOOT_ARCHIVE_CLEANUP_BIN="$BIN/boot-archive-cleanup.sh"
         DAS_RECOVERY_OS_STATE="$WORK/lib/recovery-os.json"
+        DAS_SYSFS_BTRFS="$WORK/sysfs"
         "${host_env[@]}"
         "$BASH" "$COPY" "$@")
 }
@@ -1303,6 +1342,76 @@ check "a target that fails to mount: the ABORTED report carries SUBVOLUME SYNC" 
     "$(grep -c '^SUBVOLUME SYNC$' "$WORK/lib/last-report.txt" 2>/dev/null || true)" "1"
 check "a target that fails to mount: and its coverage row" \
     "$(grep -c '^SUBVOLUME COVERAGE: ' "$WORK/lib/last-report.txt" 2>/dev/null || true)" "1"
+
+# The RAID-1 primary goes through the guard (bd DAS-Backup-Manager-su1b.10):
+# `btrdasd backup mount-target`, handed this run's maintenance lock on fd 8,
+# never `mount -o noatime,degraded` by the script itself.
+fresh
+run_backup
+check "RAID-1 guard: the run completes" "$RC" "0"
+check "RAID-1 guard: the primary was mounted by the guard, with the lock handed down" \
+    "$(cat "$STATE/calls/guard_fd" 2>/dev/null)" "8"
+check "RAID-1 guard: the script never mounted it with degraded" \
+    "$(grep -c -- "degraded.*UUID=primary-uuid" "$STATE/calls/mount")" "0"
+check "RAID-1 guard: the recovery drive is mounted as before" \
+    "$(grep -c -- "-o noatime,degraded UUID=recovery-a-uuid $RECOVERY_MNT" "$STATE/calls/mount")" "1"
+check "RAID-1 guard: the primary's row says what the guard found" \
+    "$(grep -c '^  Target primary-22tb  *OK  (all 2 members present (stub))$' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+knob guard_line 'RAID GUARD: DEGRADED  (RAID-1 MOUNTED DEGRADED: 1 of 2 members present (stub); absent drive(s) SERIALP2)'
+echo 1 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
+run_backup
+expect_completed "RAID-1 guard, a member absent: backs up degraded" 0 "COMPLETED WITH WARNINGS" "success"
+check "RAID-1 guard, a member absent: a WARN row every run, naming the absent drive" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (DEGRADED: RAID-1 MOUNTED DEGRADED: .*SERIALP2)$' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+knob guard_line 'RAID GUARD: SCRUB-OWED  (all 2 members present; a scrub is owed before the pair is trusted (stub))'
+run_backup
+expect_completed "RAID-1 guard, a scrub owed: WARN" 0 "COMPLETED WITH WARNINGS" "success"
+
+fresh
+knob guard_rc 3
+knob guard_line 'RAID GUARD: REFUSED  (split brain: the last degraded period ran on member X (stub))'
+run_backup
+expect_aborted "RAID-1 guard refuses (split brain)" "ABORTING: RAID-1 target primary-22tb refused" \
+    "a RAID-1 target's mount" "primary-22tb: split brain: the last degraded period ran on member X (stub)"
+
+fresh
+knob guard_rc 3
+knob guard_leaves_mounted 1
+knob guard_line 'RAID GUARD: REFUSED  (the witness record cannot be written (stub) (still mounted))'
+run_backup
+expect_aborted "RAID-1 guard refuses, its mount left up" "ABORTING: RAID-1 target primary-22tb refused" \
+    "a RAID-1 target's mount" "the witness record cannot be written"
+
+fresh
+knob guard_rc 2
+knob guard_line 'RAID GUARD: CANNOT-RUN  (stub)'
+run_backup
+expect_aborted "RAID-1 guard cannot run" "the guarded mount could not run (exit 2)" \
+    "a RAID-1 target's mount" "primary-22tb: the guarded mount could not run (exit 2)"
+
+fresh
+knob guard_line 'no line at all'
+run_backup
+expect_aborted "RAID-1 guard prints no line" "the guarded mount could not run (exit 0)" \
+    "a RAID-1 target's mount" "no RAID GUARD line"
+
+# The 2026-11-21 shape, whoever made the mount: the guard reported a normal
+# mount, and the kernel shows devid 2 missing. Never OK.
+fresh
+echo 1 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
+run_backup
+expect_aborted "a member missing after a normal mount" "ABORTING — refusing to invoke btrbk" \
+    "target verification" "primary-22tb: mounted with devid(s) 2 missing, though the guard did not mount it degraded"
+
+fresh
+rm -rf "${WORK:?}/sysfs/primary-uuid"
+run_backup
+expect_aborted "the kernel's view unreadable" "ABORTING — refusing to invoke btrbk" \
+    "target verification" "primary-22tb: cannot read whether a member of its RAID-1 is missing"
 
 fresh
 printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
