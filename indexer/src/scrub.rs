@@ -186,6 +186,10 @@
 //!   this boot, `interrupted` otherwise. The pass writes it as it gives the
 //!   lock up, for the filesystem it paused (or, for a pause before a mount,
 //!   the one next in line), and replaces it with `running` on resuming.
+//!   `paused` (bd DAS-Backup-Manager-su1b.15) is a scrub ended by
+//!   `btrdasd scrub pause`: `yielded_to` names who asked and `yielded_epoch`
+//!   when it paused. It is not in progress, never read as `interrupted`, and
+//!   not a failure; `btrdasd scrub resume` resumes it.
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
 //! * `last_success_epoch` is carried forward across failed passes — it is the
@@ -236,6 +240,13 @@ pub const BTRFS_STATUS_DIR: &str = "/var/lib/btrfs";
 pub const SCRUB_STATE_PATH: &str = "/var/lib/das-backup/scrub-state.json";
 /// Schema version written to (and expected in) the state file.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
+/// The pause request `btrdasd scrub pause` leaves (bd DAS-Backup-Manager-su1b.15):
+/// while it exists a running pass yields and ends `paused`, and a pass that
+/// starts does not run. Only `btrdasd scrub resume` (or a reboot, which empties
+/// `/run`) takes it away; the `paused` record in the state file stays either way.
+pub const SCRUB_PAUSE_REQUEST_PATH: &str = "/run/das-scrub-pause";
+/// How long `btrdasd scrub pause` waits for the pass to end before it says so.
+pub const PAUSE_ANSWER_SECS: u64 = 240;
 
 /// How long to wait on the maintenance lock before announcing the wait.
 const LOCK_WAIT_ANNOUNCE_SECS: u64 = 5;
@@ -726,6 +737,11 @@ fn claim_lock_path() -> PathBuf {
     overridable("DAS_CLAIM_LOCK", crate::maintenance::CLAIM_LOCK_PATH)
 }
 
+/// The pause request ([`SCRUB_PAUSE_REQUEST_PATH`], overridable for tests).
+pub fn pause_request_path() -> PathBuf {
+    overridable("DAS_SCRUB_PAUSE_REQUEST", SCRUB_PAUSE_REQUEST_PATH)
+}
+
 /// Directory holding the btrfs status records (overridable for tests).
 fn btrfs_status_dir() -> PathBuf {
     overridable("DAS_BTRFS_STATUS_DIR", BTRFS_STATUS_DIR)
@@ -1194,9 +1210,14 @@ fn acquire_locks_at(
         &|| claim.still_waiting(progress),
         &|| claim.wants_lock(progress),
         &|| None,
+        // The pass's start never waits on a pause request: one in place
+        // before the locks ends the pass earlier (`paused_at_start`), and a
+        // later one is met at the first checkpoint.
+        &|| None,
         progress,
     )? {
         Retake::Held(held) => held,
+        Retake::Paused(_) => unreachable!("the start's wait is given no pause request"),
         // `stop` never answers here: the handlers are not installed yet, so
         // a signal ends the process as it always did, holding nothing.
         Retake::Interrupted(signal) => {
@@ -1280,8 +1301,10 @@ pub struct PassSummary {
 /// Result of the most recent scrub attempt on one filesystem.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptState {
-    /// `running`, `yielded`, `finished`, `canceled`, `aborted`,
-    /// `interrupted`, or `error`.
+    /// `running`, `yielded`, `paused`, `finished`, `canceled`, `aborted`,
+    /// `interrupted`, or `error`. `paused` (bd DAS-Backup-Manager-su1b.15) is
+    /// a scrub ended by `btrdasd scrub pause`: resumable, never in progress,
+    /// never a failure.
     pub outcome: String,
     /// Authoritative pass/fail bit for this filesystem.
     pub ok: bool,
@@ -1305,11 +1328,13 @@ pub struct AttemptState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     /// On a `yielded` record: the holder record of the claim the pass gave
+    /// (on a `paused` one: who asked for the pause, bd DAS-Backup-Manager-su1b.15)
     /// the maintenance lock up for (`backup-run.sh pid 1234`), as the
     /// claimant wrote it. Display only; free text from a lock file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yielded_to: Option<String>,
-    /// On a `yielded` record: when the pass gave the lock up. Absent means
+    /// On a `yielded` record: when the pass gave the lock up (on a `paused`
+    /// one: when the pass ended paused). Absent means
     /// unknown, never "at the epoch".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yielded_epoch: Option<i64>,
@@ -1536,11 +1561,15 @@ fn merge_result_into_state(
                 mountpoint: result.mountpoint.clone(),
                 last_success_epoch,
                 last_attempt: AttemptState {
-                    outcome: match (result.interrupted_by, result.outcome) {
-                        (Some(_), _) => "interrupted".to_string(),
-                        (None, Some(o)) => o.as_str().to_string(),
-                        (None, None) => "error".to_string(),
+                    outcome: match (&result.paused, result.interrupted_by, result.outcome) {
+                        (Some(_), _, _) => "paused".to_string(),
+                        (None, Some(_), _) => "interrupted".to_string(),
+                        (None, None, Some(o)) => o.as_str().to_string(),
+                        (None, None, None) => "error".to_string(),
                     },
+                    yielded_to: result.paused.as_ref().map(|p| p.by.clone()),
+                    yielded_epoch: result.paused.as_ref().map(|p| p.at_epoch),
+                    yields: result.paused.as_ref().map(|_| result.yields.len() as u32),
                     signal: result.interrupted_by.map(signal_name),
                     ok,
                     started_epoch: result.started_epoch,
@@ -1570,6 +1599,20 @@ pub enum PassStatus {
     /// it after the pass waited [`SETUP_WAIT_SECS`] — nothing was scrubbed,
     /// and no state was written.
     Skipped,
+    /// The scrub is paused by hand (bd DAS-Backup-Manager-su1b.15): a pause
+    /// request ended the pass, its filesystem recorded `paused`, or the pass
+    /// started while one was in place and did not run. Not a failure.
+    Paused,
+}
+
+/// A filesystem's scrub ended by `btrdasd scrub pause` (bd
+/// DAS-Backup-Manager-su1b.15): resumable, never a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausedBy {
+    /// Who asked, as the pause request names it.
+    pub by: String,
+    /// When the pass ended paused.
+    pub at_epoch: i64,
 }
 
 /// Outcome of scrubbing one filesystem.
@@ -1619,6 +1662,9 @@ pub struct ScrubFsResult {
     /// waiting backup (bd DAS-Backup-Manager-su1b.2, step A5): the pass gives
     /// the maintenance lock up next. Never persisted; the pass loop takes it.
     pub pending_yield: Option<PendingYield>,
+    /// Set when a pause request ended the pass while this filesystem's scrub
+    /// was stopped for it: filed `paused`, not counted as a failure.
+    pub paused: Option<PausedBy>,
 }
 
 /// What a scrub segment that stopped for a waiting backup asks of the pass
@@ -1661,6 +1707,7 @@ impl ScrubFsResult {
             interrupted_by: None,
             yields: Vec::new(),
             pending_yield: None,
+            paused: None,
         }
     }
 
@@ -1676,6 +1723,8 @@ impl ScrubFsResult {
     pub fn status_word(&self) -> &'static str {
         if self.ok() {
             "OK"
+        } else if self.paused.is_some() {
+            "PAUSED"
         } else if self.interrupted_by.is_some() {
             "INTERRUPTED"
         } else if !self.errors.is_empty() {
@@ -1707,7 +1756,17 @@ pub struct ScrubPass {
 impl ScrubPass {
     /// Number of filesystems that did not pass.
     pub fn failed_count(&self) -> usize {
-        self.results.iter().filter(|r| !r.ok()).count()
+        // A filesystem paused by hand is not a failure (bd DAS-Backup-Manager-su1b.15).
+        self.results
+            .iter()
+            .filter(|r| !r.ok() && r.paused.is_none())
+            .count()
+    }
+
+    /// How many filesystems scrubbed cleanly: a paused one is neither clean
+    /// nor failed (bd DAS-Backup-Manager-su1b.15).
+    pub fn clean_count(&self) -> usize {
+        self.results.iter().filter(|r| r.ok()).count()
     }
 
     /// Whether every scrubbed filesystem passed and the pass hit no
@@ -2014,6 +2073,10 @@ pub fn run_scrub_pass(
 
     let started_epoch = now_epoch();
 
+    if let Some(pass) = paused_at_start(&pause_request_path(), started_epoch, progress) {
+        return Ok(pass);
+    }
+
     let attempt = acquire_locks(progress)?;
     let ScrubLockAttempt::Taken(mut locks) = attempt else {
         let (level, line, summary) = skipped_lines(&attempt);
@@ -2047,7 +2110,7 @@ pub fn run_scrub_pass(
     // caught for the rest of the pass: the scrub is stopped, the stop is
     // recorded, the filesystem is unmounted; the caller then dies of the signal.
     let _termination = catch_termination();
-    let claim = ClaimWatch::new(&claim_lock_path());
+    let claim = ClaimWatch::new(&claim_lock_path()).with_pause_request(&pause_request_path());
     let state = state_path();
     let results = scrub_targets_yielding(
         config,
@@ -2063,8 +2126,16 @@ pub fn run_scrub_pass(
         },
     );
 
+    let paused = results.iter().any(|r| r.paused.is_some());
+    if !paused {
+        lift_unmet_pause_request(&pause_request_path(), progress);
+    }
     let mut pass = ScrubPass {
-        status: PassStatus::Completed,
+        status: if paused {
+            PassStatus::Paused
+        } else {
+            PassStatus::Completed
+        },
         started_epoch,
         finished_epoch: now_epoch(),
         results,
@@ -2091,12 +2162,12 @@ pub fn run_scrub_pass(
         Some(signal) => format!(
             "Interrupted by {} — {} of {} filesystems scrubbed cleanly before it",
             signal_name(signal),
-            pass.results.len() - pass.failed_count(),
+            pass.clean_count(),
             pass.results.len()
         ),
         None => format!(
             "{} of {} filesystems scrubbed cleanly",
-            pass.results.len() - pass.failed_count(),
+            pass.clean_count(),
             pass.results.len()
         ),
     };
@@ -3113,6 +3184,8 @@ fn run_scrub_child(
 pub(crate) struct ClaimWatch {
     path: PathBuf,
     broken: std::cell::Cell<bool>,
+    /// The pause request file the pass also obeys (bd DAS-Backup-Manager-su1b.15).
+    pause_request: Option<PathBuf>,
 }
 
 impl ClaimWatch {
@@ -3120,7 +3193,27 @@ impl ClaimWatch {
         Self {
             path: path.to_path_buf(),
             broken: std::cell::Cell::new(false),
+            pause_request: None,
         }
+    }
+
+    /// Watch the pause request at `path` as well.
+    pub(crate) fn with_pause_request(mut self, path: &Path) -> Self {
+        self.pause_request = Some(path.to_path_buf());
+        self
+    }
+
+    /// The pause request, when one is in place.
+    pub(crate) fn pause_request(&self) -> Option<PauseRequest> {
+        self.pause_request.as_deref().and_then(read_pause_request)
+    }
+
+    /// At checkpoints 3 and 4: a backup wants the lock, or a pause was asked
+    /// for — either way the pass yields. The pause file is not part of the
+    /// waits for the lock ([`take_maintenance_behind_claims`]): a pass never
+    /// waits on it, it ends on it.
+    pub(crate) fn wants_lock_or_pause(&self, progress: &dyn ProgressCallback) -> bool {
+        self.wants_lock(progress) || self.pause_request().is_some()
     }
 
     /// One probe: `Some(held)` when it could look (and the probe works
@@ -3171,6 +3264,264 @@ impl ClaimWatch {
     pub(crate) fn holder(&self) -> String {
         crate::maintenance::holder_of(&self.path)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pause and resume by hand (bd DAS-Backup-Manager-su1b.15)
+// ---------------------------------------------------------------------------
+
+/// A pause asked for by `btrdasd scrub pause`, as its file records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseRequest {
+    /// Who asked (`btrdasd scrub pause pid 4242, by user`). Display only.
+    pub by: String,
+    /// When it was asked; `None` when the file does not say.
+    pub epoch: Option<i64>,
+}
+
+/// The pause request at `path`, when the file exists. A file that exists but
+/// cannot be read or parsed is still a request (the cautious reading: the
+/// pass pauses), naming what was wrong in `by`.
+pub fn read_pause_request(path: &Path) -> Option<PauseRequest> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        _ => {}
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            return Some(PauseRequest {
+                by: format!("an unreadable pause request {} ({e})", path.display()),
+                epoch: None,
+            });
+        }
+    };
+    let mut by = None;
+    let mut epoch = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("requested_by ") {
+            by = Some(v.chars().filter(|c| !c.is_control()).take(200).collect());
+        } else if let Some(v) = line.strip_prefix("requested_epoch ") {
+            epoch = v.trim().parse().ok();
+        }
+    }
+    Some(PauseRequest {
+        by: by.unwrap_or_else(|| format!("a pause request {} that names nobody", path.display())),
+        epoch,
+    })
+}
+
+/// Write the pause request at `path`, mode 0600, never through a link.
+pub fn write_pause_request(path: &Path, by: &str, epoch: i64) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    writeln!(file, "requested_by {by}")?;
+    writeln!(file, "requested_epoch {epoch}")?;
+    file.sync_all()
+}
+
+/// Remove the pause request at `path`: `Ok(true)` when one was there.
+pub fn remove_pause_request(path: &Path) -> std::io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The paths and timings `btrdasd scrub pause` and `resume` work with.
+#[derive(Debug, Clone)]
+pub struct PausePaths {
+    /// The scrub singleton (`/run/das-scrub.lock`).
+    pub singleton: PathBuf,
+    /// The claim lock (`/run/das-maintenance-claim.lock`).
+    pub claim: PathBuf,
+    /// The pause request (`/run/das-scrub-pause`).
+    pub request: PathBuf,
+    /// The scrub state file.
+    pub state: PathBuf,
+}
+
+impl PausePaths {
+    /// The installed paths.
+    pub fn production() -> Self {
+        Self {
+            singleton: overridable("DAS_SCRUB_LOCK", SCRUB_LOCK_PATH),
+            claim: claim_lock_path(),
+            request: pause_request_path(),
+            state: state_path(),
+        }
+    }
+}
+
+/// Who holds the scrub singleton now: `None` when nobody does (looked at by
+/// taking it and letting go at once, as `scrub cancel` does).
+fn singleton_holder(path: &Path) -> Result<Option<String>, ScrubError> {
+    match FileLock::try_acquire(path)? {
+        Some(_free) => Ok(None),
+        None => Ok(Some(crate::maintenance::holder_of(path))),
+    }
+}
+
+/// How `btrdasd scrub pause` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseOutcome {
+    /// No pass was running: nothing written, nothing to pause.
+    NotRunning,
+    /// `btrdasd setup` holds the singleton, not a pass: nothing written.
+    SetupHolds(String),
+    /// The pass ended, these filesystems recorded `paused`.
+    Paused(Vec<String>),
+    /// The pass ended without pausing anything (it finished first): the
+    /// request was taken away again, so the next pass runs.
+    EndedUnpaused,
+    /// The pass did not end within the bound; the request stays, so it
+    /// pauses at its next look (every few seconds while it scrubs).
+    NoAnswer(String),
+}
+
+/// `btrdasd scrub pause`: write the request, then claim the maintenance lock
+/// as a backup does, so the running pass stops its scrub resumably,
+/// unmounts and yields; seeing the request it ends `paused`. Waits up to
+/// `bound`, looking every `poll`, for the singleton to be let go; the claim
+/// is let go at the end either way. Kills nothing.
+pub fn pause_pass_at(
+    paths: &PausePaths,
+    by: &str,
+    bound: Duration,
+    poll: Duration,
+) -> Result<PauseOutcome, ScrubError> {
+    let Some(holder) = singleton_holder(&paths.singleton)? else {
+        return Ok(PauseOutcome::NotRunning);
+    };
+    if holder_is_setup(&holder) {
+        return Ok(PauseOutcome::SetupHolds(holder));
+    }
+    write_pause_request(&paths.request, by, now_epoch()).map_err(|e| ScrubError::Lock {
+        path: paths.request.display().to_string(),
+        detail: format!("cannot write the pause request: {e}"),
+    })?;
+    let claim = crate::maintenance::Claim::take_at(&paths.claim, "btrdasd scrub pause")?;
+    let deadline = Instant::now() + bound;
+    let ended = loop {
+        if singleton_holder(&paths.singleton)?.is_none() {
+            break true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break false;
+        }
+        std::thread::sleep(poll.min(deadline - now));
+    };
+    drop(claim);
+    if !ended {
+        return Ok(PauseOutcome::NoAnswer(crate::maintenance::holder_of(
+            &paths.singleton,
+        )));
+    }
+    let paused: Vec<String> = load_state_from(&paths.state)
+        .map(|s| {
+            s.filesystems
+                .values()
+                .filter(|f| f.last_attempt.outcome == "paused")
+                .map(|f| f.target_label.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if paused.is_empty() {
+        remove_pause_request(&paths.request).map_err(|e| ScrubError::Lock {
+            path: paths.request.display().to_string(),
+            detail: format!("cannot remove the pause request: {e}"),
+        })?;
+        return Ok(PauseOutcome::EndedUnpaused);
+    }
+    Ok(PauseOutcome::Paused(paused))
+}
+
+/// How `btrdasd scrub resume` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// A pass (or setup) holds the singleton: nothing removed, nothing started.
+    AlreadyRunning(String),
+    /// The request (if any: `removed`) is gone and the pass was started.
+    Started { removed: bool },
+}
+
+/// `btrdasd scrub resume`: refuse while anything holds the singleton; else
+/// remove the pause request and `start` the pass (production: `systemctl
+/// start --no-block das-scrub.service`), which resumes a filesystem whose
+/// btrfs record is resumable ([`decide_scrub_start_mode`]).
+pub fn resume_pass_at(
+    paths: &PausePaths,
+    start: &dyn Fn() -> Result<(), String>,
+) -> Result<ResumeOutcome, String> {
+    if let Some(holder) = singleton_holder(&paths.singleton).map_err(|e| e.to_string())? {
+        return Ok(ResumeOutcome::AlreadyRunning(holder));
+    }
+    let removed = remove_pause_request(&paths.request).map_err(|e| {
+        format!(
+            "cannot remove the pause request {}: {e}",
+            paths.request.display()
+        )
+    })?;
+    start()?;
+    Ok(ResumeOutcome::Started { removed })
+}
+
+/// A pass that ran to its end with a pause request it never met (one that
+/// came after its last checkpoint) takes it away, so the next pass is not
+/// left paused with no `paused` record to show for it.
+fn lift_unmet_pause_request(request: &Path, progress: &dyn ProgressCallback) {
+    match remove_pause_request(request) {
+        Ok(true) => progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "The pass ended before it could pause: the pause request {} is taken away",
+                request.display()
+            ),
+        ),
+        Ok(false) => {}
+        Err(e) => progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "The pass ended before it could pause, and the pause request {} could not be \
+                 taken away ({e}): the next pass will not run until `btrdasd scrub resume`",
+                request.display()
+            ),
+        ),
+    }
+}
+
+/// A pass that starts while a pause request is in place does not run
+/// (bd DAS-Backup-Manager-su1b.15): it takes no lock, removes nothing and
+/// writes nothing; a paused scrub stays paused until `btrdasd scrub resume`.
+fn paused_at_start(
+    request: &Path,
+    started_epoch: i64,
+    progress: &dyn ProgressCallback,
+) -> Option<ScrubPass> {
+    let req = read_pause_request(request)?;
+    let line = format!(
+        "The scrub is paused ({}, by {}): this pass does not run — `btrdasd scrub resume` \
+         lifts the pause and starts it",
+        request.display(),
+        req.by
+    );
+    progress.on_log(LogLevel::Warning, &line);
+    progress.on_complete(true, "Scrub paused — not run");
+    Some(ScrubPass {
+        status: PassStatus::Paused,
+        started_epoch,
+        finished_epoch: now_epoch(),
+        results: Vec::new(),
+        errors: Vec::new(),
+    })
 }
 
 /// What the stopped segment's state allows, once its child is reaped.
@@ -3266,6 +3617,9 @@ impl MaintenanceSlot {
 enum Retake {
     Held(MaintenanceHeld),
     Interrupted(i32),
+    /// A pause request is in place (bd DAS-Backup-Manager-su1b.15): the pass
+    /// ends `paused` instead of waiting to resume.
+    Paused(PauseRequest),
 }
 
 /// Take the maintenance lock at `path` for the pass, behind any backup that
@@ -3281,6 +3635,7 @@ fn take_maintenance_behind_claims(
     still_waiting: &dyn Fn() -> bool,
     wants_lock: &dyn Fn() -> bool,
     stop: &dyn Fn() -> Option<i32>,
+    paused: &dyn Fn() -> Option<PauseRequest>,
     progress: &dyn ProgressCallback,
 ) -> Result<Retake, ScrubError> {
     let started = Instant::now();
@@ -3289,6 +3644,9 @@ fn take_maintenance_behind_claims(
     loop {
         if let Some(signal) = stop() {
             return Ok(Retake::Interrupted(signal));
+        }
+        if let Some(request) = paused() {
+            return Ok(Retake::Paused(request));
         }
         let claimed = still_waiting();
         if !claimed && let Some(held) = MaintenanceHeld::try_acquire_at(path, SCRUB_JOB)? {
@@ -3459,6 +3817,8 @@ enum PauseEnd {
     Resumed(u64),
     Interrupted(i32),
     LockFailed(String),
+    /// A pause request ends the pass (bd DAS-Backup-Manager-su1b.15).
+    Paused(PauseRequest),
 }
 
 /// Give the lock up for the claimant (its record cleared, then unlocked),
@@ -3477,6 +3837,7 @@ fn pause_for_claim(
         &|| claim.still_waiting(progress),
         &|| claim.wants_lock(progress),
         stop,
+        &|| claim.pause_request(),
         progress,
     ) {
         Ok(Retake::Held(held)) => {
@@ -3484,6 +3845,7 @@ fn pause_for_claim(
             PauseEnd::Resumed(started.elapsed().as_secs())
         }
         Ok(Retake::Interrupted(signal)) => PauseEnd::Interrupted(signal),
+        Ok(Retake::Paused(request)) => PauseEnd::Paused(request),
         Err(e) => PauseEnd::LockFailed(e.to_string()),
     }
 }
@@ -3562,7 +3924,7 @@ fn scrub_targets_yielding(
         }
 
         // Checkpoint 3: a claim before the mount pauses with nothing mounted.
-        let pause_now = claim.wants_lock(progress);
+        let pause_now = claim.wants_lock_or_pause(progress);
         let result = if pause_now {
             None
         } else {
@@ -3577,7 +3939,7 @@ fn scrub_targets_yielding(
                 break;
             };
             Some((hooks.scrub_one)(&config, &label, progress, held, &|| {
-                claim.wants_lock(progress)
+                claim.wants_lock_or_pause(progress)
             }))
         };
 
@@ -3672,6 +4034,38 @@ fn scrub_targets_yielding(
         let end = pause_for_claim(slot, claim, hooks.stop, progress);
         let paused = match end {
             PauseEnd::Resumed(secs) => secs,
+            PauseEnd::Paused(request) => {
+                // Paused by hand (bd DAS-Backup-Manager-su1b.15): the
+                // filesystem cut (or, after an A-F8 filing, the next one) is
+                // filed `paused` - resumable, not a failure - and the pass
+                // ends without waiting, holding no maintenance lock.
+                let Some(label) = cut
+                    .as_ref()
+                    .map(|s| s.label.clone())
+                    .or_else(|| queue.front().cloned())
+                else {
+                    break;
+                };
+                let mut r = match cut.take() {
+                    Some(s) => s.finish(ScrubFsResult::new(&label)),
+                    None => Segments::for_label(&label, &config).finish(ScrubFsResult::new(&label)),
+                };
+                r.paused = Some(PausedBy {
+                    by: request.by.clone(),
+                    at_epoch: now_epoch(),
+                });
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "{label}: scrub PAUSED at the request of {} - the pass ends here; \
+                         `btrdasd scrub resume` resumes it",
+                        request.by
+                    ),
+                );
+                (hooks.file_result)(&r);
+                results.push(r);
+                break;
+            }
             PauseEnd::Interrupted(signal) => {
                 let mut r = match cut.take() {
                     Some(s) => {
@@ -4073,6 +4467,8 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 
     let overall = if pass.status == PassStatus::Skipped {
         "SKIPPED (another scrub was running)"
+    } else if pass.status == PassStatus::Paused && pass.success() {
+        "PAUSED (resumes on `btrdasd scrub resume`)"
     } else if pass.success() {
         "ALL SCRUBS COMPLETED CLEANLY"
     } else {
@@ -4122,7 +4518,13 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 
     let mut problems: Vec<String> = pass.errors.clone();
     for result in &pass.results {
-        if !result.ok() {
+        if let Some(p) = &result.paused {
+            problems.push(format!(
+                "{}: paused at the request of {} — not a failure; `btrdasd scrub resume` \
+                 resumes it",
+                result.target_label, p.by
+            ));
+        } else if !result.ok() {
             problems.push(format!(
                 "{}: {}",
                 result.target_label,
@@ -7009,6 +7411,7 @@ mod yield_tests {
                 &|| watch.still_waiting(&NullProgress),
                 &|| watch.wants_lock(&NullProgress),
                 &|| None,
+                &|| None,
                 &NullProgress,
             )
             .map(|r| matches!(r, Retake::Held(_)))
@@ -7035,6 +7438,7 @@ mod yield_tests {
             &|| false,
             &|| wants.fetch_add(1, Ordering::SeqCst) == 0,
             &|| None,
+            &|| None,
             &NullProgress,
         )
         .unwrap();
@@ -7060,6 +7464,7 @@ mod yield_tests {
             &|| false,
             &|| false,
             &|| (calls.fetch_add(1, Ordering::SeqCst) >= 3).then_some(libc::SIGTERM),
+            &|| None,
             &NullProgress,
         )
         .unwrap();
@@ -7568,5 +7973,325 @@ mod yield_tests {
         );
         drop(claimed);
         assert!(pass.join().unwrap());
+    }
+
+    // --- pause and resume by hand (bd DAS-Backup-Manager-su1b.15) ----------
+
+    fn request_in(s: &Scratch) -> PathBuf {
+        s.claim.with_file_name("das-scrub-pause")
+    }
+
+    /// The pause during a target: the segment stops for the claim the pause
+    /// command takes, the pass sees the request in its wait and ends at once
+    /// (the claim still held), filing the cut target `paused` — not a
+    /// failure — and never scrubbing the next one.
+    #[test]
+    fn a_pause_request_during_a_target_ends_the_pass_paused_without_waiting() {
+        let s = scratch();
+        let request = request_in(&s);
+        let claimed = Mutex::new(None);
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim).with_pause_request(&request);
+        let calls = AtomicUsize::new(0);
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         wants: &dyn Fn() -> bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert!(!wants(), "nothing asked yet");
+            // `btrdasd scrub pause`, mid-scrub: the request, then the claim.
+            write_pause_request(&request, "tester pid 1", 1_000).unwrap();
+            *claimed.lock().unwrap() =
+                Some(Claim::take_at(&s.claim, "btrdasd scrub pause").unwrap());
+            assert!(wants(), "the scrub sees the pause");
+            paused(label, true)
+        };
+        let f = filed();
+        let started = Instant::now();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| panic!("a paused pass reads nothing again"),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "it waited");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the next target was begun");
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.target_label, "first");
+        assert_eq!(
+            r.paused.as_ref().map(|p| p.by.as_str()),
+            Some("tester pid 1")
+        );
+        assert_eq!(r.status_word(), "PAUSED");
+        assert!(r.scrub_launched);
+        assert_eq!(r.fsuuid, "u-first");
+        assert_eq!(*f.results.lock().unwrap(), ["first"]);
+        assert_eq!(
+            f.yields.lock().unwrap().len(),
+            1,
+            "the yield is recorded first"
+        );
+        assert!(
+            slot.held().is_none(),
+            "a paused pass holds no maintenance lock"
+        );
+        assert!(lock_is_free(&s.maintenance));
+        let pass = ScrubPass {
+            status: PassStatus::Paused,
+            started_epoch: 0,
+            finished_epoch: 0,
+            results,
+            errors: Vec::new(),
+        };
+        assert_eq!(pass.failed_count(), 0, "a pause is not a failure");
+        assert_eq!(pass.clean_count(), 0, "nor is it a clean scrub");
+        assert!(pass.success());
+        let report = format_scrub_report(&pass, &config());
+        assert!(report.contains("Status: PAUSED"), "{report}");
+        assert!(!report.contains("FAILURES"), "{report}");
+        drop(claimed);
+    }
+
+    /// The request alone, with no claim (the pause command's bound ran out and
+    /// it let its claim go): the pass still yields at its next look — here
+    /// before the first mount — and ends paused, nothing scrubbed.
+    #[test]
+    fn a_pause_request_without_a_claim_pauses_at_the_next_checkpoint() {
+        let s = scratch();
+        let request = request_in(&s);
+        write_pause_request(&request, "tester pid 2", 1_000).unwrap();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim).with_pause_request(&request);
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         _: &dyn Fn() -> bool|
+         -> ScrubFsResult {
+            panic!("{label} was mounted while a pause was asked for")
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| panic!("a paused pass reads nothing again"),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target_label, "first");
+        assert!(results[0].paused.is_some());
+        assert!(!results[0].scrub_launched);
+        assert_eq!(results[0].fsuuid, "u-first", "filed under its UUID");
+    }
+
+    /// A paused result is filed `paused`: not in progress, not interrupted,
+    /// naming who asked and when, the last success kept.
+    #[test]
+    fn a_paused_result_is_filed_paused_and_keeps_the_last_success() {
+        let mut state = ScrubState::default();
+        merge_result_into_state(&mut state, &clean("first"), 2_000);
+        state
+            .filesystems
+            .get_mut("u-first")
+            .unwrap()
+            .last_success_epoch = Some(500);
+        let mut r = paused("first", true);
+        r.pending_yield = None;
+        r.yields.push(ScrubYield {
+            at_epoch: 1_100,
+            holder: "btrdasd scrub pause pid 9".into(),
+            paused_secs: None,
+        });
+        r.paused = Some(PausedBy {
+            by: "btrdasd scrub pause pid 9".into(),
+            at_epoch: 1_200,
+        });
+        merge_result_into_state(&mut state, &r, 2_000);
+        let fs = &state.filesystems["u-first"];
+        assert_eq!(fs.last_success_epoch, Some(500));
+        let a = &fs.last_attempt;
+        assert_eq!(a.outcome, "paused");
+        assert!(!a.is_in_progress());
+        assert_eq!(a.effective_outcome(), "paused");
+        assert_eq!(a.yielded_to.as_deref(), Some("btrdasd scrub pause pid 9"));
+        assert_eq!(a.yielded_epoch, Some(1_200));
+        assert_eq!(a.yields, Some(1));
+        assert_eq!(a.signal, None);
+    }
+
+    #[test]
+    fn the_pause_request_file_is_root_s_alone_and_reads_back() {
+        let s = scratch();
+        let request = request_in(&s);
+        assert_eq!(read_pause_request(&request), None);
+        write_pause_request(&request, "btrdasd scrub pause pid 7, by user", 1_234).unwrap();
+        let mode = fs::metadata(&request).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            read_pause_request(&request),
+            Some(PauseRequest {
+                by: "btrdasd scrub pause pid 7, by user".into(),
+                epoch: Some(1_234),
+            })
+        );
+        fs::write(&request, "garbage\n").unwrap();
+        let odd = read_pause_request(&request).expect("an odd file is still a request");
+        assert!(odd.by.contains("names nobody"), "{}", odd.by);
+        assert!(remove_pause_request(&request).unwrap());
+        assert!(!remove_pause_request(&request).unwrap());
+    }
+
+    /// A pass started while a request is in place does not run, removes
+    /// nothing, and reads as paused, not as a failure to start.
+    #[test]
+    fn a_pass_started_while_paused_does_not_run_and_keeps_the_request() {
+        let s = scratch();
+        let request = request_in(&s);
+        assert!(paused_at_start(&request, 1, &NullProgress).is_none());
+        write_pause_request(&request, "tester", 1).unwrap();
+        let progress = TestProgress::new();
+        let pass = paused_at_start(&request, 1, &progress).expect("paused");
+        assert_eq!(pass.status, PassStatus::Paused);
+        assert!(pass.results.is_empty());
+        assert!(request.exists(), "the request stays until resume");
+    }
+
+    fn pause_paths(s: &Scratch) -> PausePaths {
+        PausePaths {
+            singleton: s.claim.with_file_name("scrub.lock"),
+            claim: s.claim.clone(),
+            request: request_in(s),
+            state: s.claim.with_file_name("scrub-state.json"),
+        }
+    }
+
+    #[test]
+    fn pause_with_no_pass_running_writes_nothing() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        assert_eq!(
+            pause_pass_at(&p, "tester", Duration::from_secs(1), POLL).unwrap(),
+            PauseOutcome::NotRunning
+        );
+        assert!(!p.request.exists());
+    }
+
+    #[test]
+    fn pause_while_setup_holds_the_singleton_writes_nothing() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        let _setup = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, "btrdasd setup")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            pause_pass_at(&p, "tester", Duration::from_secs(1), POLL).unwrap(),
+            PauseOutcome::SetupHolds(_)
+        ));
+        assert!(!p.request.exists());
+    }
+
+    /// A pass that never answers: the pause gives up after its bound, names
+    /// it, lets its claim go and leaves the request for the pass's next look.
+    #[test]
+    fn a_pass_that_does_not_answer_keeps_the_request_and_frees_the_claim() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        let _pass = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, SCRUB_JOB)
+            .unwrap()
+            .unwrap();
+        let outcome = pause_pass_at(&p, "tester", Duration::from_millis(100), POLL).unwrap();
+        assert!(
+            matches!(&outcome, PauseOutcome::NoAnswer(h) if h.contains(SCRUB_JOB)),
+            "{outcome:?}"
+        );
+        assert!(p.request.exists());
+        assert!(!claim_is_held(&p.claim).unwrap(), "the claim was let go");
+    }
+
+    /// The whole hand-off with a stand-in pass: it waits for the claim, files
+    /// `paused`, lets the singleton go; the pause reports it and keeps the
+    /// request. A pass that ends without pausing anything has the request
+    /// taken away.
+    #[test]
+    fn pause_reports_the_paused_filesystem_once_the_pass_ends() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        for pauses in [true, false] {
+            let held = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, SCRUB_JOB)
+                .unwrap()
+                .unwrap();
+            let (claim, state) = (p.claim.clone(), p.state.clone());
+            let pass = std::thread::spawn(move || {
+                wait_until(Duration::from_secs(5), "the claim", || {
+                    claim_is_held(&claim).unwrap()
+                });
+                let mut st = ScrubState::default();
+                let mut r = clean("first");
+                if pauses {
+                    r.outcome = None;
+                    r.paused = Some(PausedBy {
+                        by: "tester".into(),
+                        at_epoch: 5,
+                    });
+                }
+                merge_result_into_state(&mut st, &r, 10);
+                save_state_to(&st, &state).unwrap();
+                drop(held);
+            });
+            let outcome = pause_pass_at(&p, "tester", Duration::from_secs(5), POLL).unwrap();
+            pass.join().unwrap();
+            if pauses {
+                assert_eq!(outcome, PauseOutcome::Paused(vec!["first".into()]));
+                assert!(p.request.exists());
+            } else {
+                assert_eq!(outcome, PauseOutcome::EndedUnpaused);
+                assert!(!p.request.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn resume_refuses_while_a_pass_runs_and_otherwise_lifts_and_starts() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        write_pause_request(&p.request, "tester", 1).unwrap();
+        let starts = AtomicUsize::new(0);
+        let start = || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let pass = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, SCRUB_JOB)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            resume_pass_at(&p, &start).unwrap(),
+            ResumeOutcome::AlreadyRunning(_)
+        ));
+        assert!(p.request.exists(), "nothing changed while it runs");
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        drop(pass);
+        assert_eq!(
+            resume_pass_at(&p, &start).unwrap(),
+            ResumeOutcome::Started { removed: true }
+        );
+        assert!(!p.request.exists());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(resume_pass_at(&p, &|| Err("no systemd".into())).is_err());
     }
 }

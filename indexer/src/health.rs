@@ -188,6 +188,9 @@ pub struct ScrubHealth {
     pub last_ok: Option<bool>,
     pub error_total: Option<u64>,
     pub resolve_error: Option<String>,
+    /// When the latest attempt is `paused` (bd DAS-Backup-Manager-su1b.15):
+    /// when it paused and who asked. A pause is a WARN, never a failure.
+    pub paused: Option<(Option<i64>, String)>,
 }
 
 impl ScrubHealth {
@@ -201,6 +204,7 @@ impl ScrubHealth {
             last_ok: None,
             error_total: None,
             resolve_error: None,
+            paused: None,
         }
     }
 
@@ -253,6 +257,31 @@ pub fn scrub_health_for(
     // more is an interrupted pass (bd DAS-Backup-Manager-weo) and fails like an
     // aborted one.
     let running_now = attempt.is_live();
+    if attempt.outcome == "paused" {
+        // Paused by hand (bd DAS-Backup-Manager-su1b.15): resumable, never a
+        // failure. A WARN while it lasts; only the age of the last success
+        // can make it a FAIL, as it would any other day.
+        let age = fs
+            .last_success_epoch
+            .map(|t| age_days_between(now_epoch, t));
+        return ScrubHealth {
+            status: match age {
+                Some(a) if a > i64::from(fail_age_days) => ScrubHealthStatus::Fail,
+                _ => ScrubHealthStatus::Warn,
+            },
+            fsuuid: None,
+            last_success_epoch: fs.last_success_epoch,
+            age_days: age,
+            last_outcome: Some("paused".to_string()),
+            last_ok: None,
+            error_total: Some(attempt.error_total),
+            resolve_error: None,
+            paused: Some((
+                attempt.yielded_epoch,
+                attempt.yielded_to.clone().unwrap_or_default(),
+            )),
+        };
+    }
     if !attempt.ok && !running_now {
         // Immediate fail: the latest attempt is aborted/canceled/errored, or
         // carries nonzero error counters (`ok` already folds both cases —
@@ -273,6 +302,7 @@ pub fn scrub_health_for(
             last_ok: Some(false),
             error_total: Some(attempt.error_total),
             resolve_error: None,
+            paused: None,
         };
     }
 
@@ -303,7 +333,31 @@ pub fn scrub_health_for(
         last_ok: if running_now { None } else { Some(true) },
         error_total: Some(attempt.error_total),
         resolve_error: None,
+        paused: None,
     }
+}
+
+/// The health line of a scrub paused by hand (bd DAS-Backup-Manager-su1b.15):
+/// since when, for how long, by whom, and how to resume it.
+pub fn paused_scrub_line(label: &str, health: &ScrubHealth, now_epoch: i64) -> String {
+    let (since, by) = health.paused.clone().unwrap_or_default();
+    let since = match since {
+        Some(t) => {
+            let at = crate::caldate::local_datetime(t).unwrap_or_else(|| t.to_string());
+            let hours = (now_epoch - t).max(0) / 3600;
+            format!(" since {at} ({hours} h)")
+        }
+        None => String::new(),
+    };
+    let by = if by.is_empty() {
+        String::new()
+    } else {
+        format!(" by {by}")
+    };
+    format!(
+        "Target '{label}': scrub PAUSED{since}{by} — resumable, not a failure; \
+         `btrdasd scrub resume` resumes it"
+    )
 }
 
 /// Compute a target's scrub health, folding in config applicability
@@ -1256,6 +1310,9 @@ pub fn get_health_with(
                 "Target '{}': never scrubbed — no successful scrub recorded yet",
                 target.label
             )),
+            ScrubHealthStatus::Warn if scrub_health.paused.is_some() => {
+                warnings.push(paused_scrub_line(&target.label, &scrub_health, now_epoch))
+            }
             ScrubHealthStatus::Warn => warnings.push(format!(
                 "Target '{}': last successful scrub is {} day(s) old (warn threshold {}d)",
                 target.label,
@@ -2333,6 +2390,29 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         assert_eq!(
             scrub_health_for(Some(&fresh), NOW, 45, 75).status,
             ScrubHealthStatus::Ok
+        );
+    }
+
+    /// bd DAS-Backup-Manager-su1b.15: a scrub paused by hand is resumable,
+    /// never a failure: a WARN while it lasts (whatever the age), and a FAIL
+    /// only when the last success is past the fail threshold.
+    #[test]
+    fn scrub_health_paused_record_is_a_warn_not_a_fail() {
+        let mut fs = fs_state_running(None, None, 10);
+        fs.last_attempt.outcome = "paused".into();
+        fs.last_attempt.yielded_to = Some("btrdasd scrub pause pid 9".into());
+        fs.last_attempt.yielded_epoch = Some(NOW - 7_200);
+        let h = scrub_health_for(Some(&fs), NOW, 45, 75);
+        assert_eq!(h.status, ScrubHealthStatus::Warn);
+        assert_eq!(h.last_outcome.as_deref(), Some("paused"));
+        assert_ne!(h.last_ok, Some(false));
+        assert_eq!(h.age_days, Some(10));
+        let mut stale = fs_state_running(None, None, 80);
+        stale.last_attempt.outcome = "paused".into();
+        assert_eq!(
+            scrub_health_for(Some(&stale), NOW, 45, 75).status,
+            ScrubHealthStatus::Fail,
+            "the age of the last success still decides past the fail threshold"
         );
     }
 

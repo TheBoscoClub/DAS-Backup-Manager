@@ -949,6 +949,24 @@ enum ScrubAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Pause the running scrub pass so it can resume later (root)
+    ///
+    /// Leaves a pause request (/run/das-scrub-pause) and claims the DAS
+    /// maintenance lock as a backup does: the pass stops its scrub resumably
+    /// (btrfs keeps the position), unmounts, records the filesystem `paused`
+    /// and ends with exit 0, so das-scrub.service ends inactive, not failed.
+    /// Waits up to 240 s for the pass to end. No pass running: nothing to do,
+    /// exit 0. A pass that does not answer in time: exit 1, the request left
+    /// in place so it pauses at its next look. Kills nothing. While the
+    /// request is in place a pass that starts (the timer) does not run.
+    Pause,
+    /// Lift a pause and start the scrub pass again (root)
+    ///
+    /// Removes the pause request and starts das-scrub.service (the unit the
+    /// timer starts, `systemctl start --no-block`), which resumes a
+    /// filesystem whose btrfs record is resumable. A pass already running:
+    /// says so and changes nothing, exit 0.
+    Resume,
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1026,7 @@ impl ScrubTargetView {
             _ => match (self.ok, self.outcome.as_deref()) {
                 (_, Some("running")) => "RUNNING",
                 (_, Some("yielded")) => "YIELDED",
+                (_, Some("paused")) => "PAUSED",
                 (_, Some("interrupted")) => "INTERRUPTED",
                 (Some(true), _) => "OK",
                 (Some(false), Some("aborted")) => "ABORTED",
@@ -1091,6 +1110,23 @@ fn yielded_detail(attempt: &scrub::AttemptState) -> String {
     format!("yielded to {holder}{at}, resumes when it finishes")
 }
 
+/// The status line of a scrub paused by hand (bd DAS-Backup-Manager-su1b.15):
+/// since when and by whom, as the `paused` record says.
+fn paused_detail(attempt: &scrub::AttemptState) -> String {
+    let since = attempt
+        .yielded_epoch
+        .and_then(buttered_dasd::caldate::local_datetime)
+        .map(|t| format!(" since {t}"))
+        .unwrap_or_default();
+    let by = attempt
+        .yielded_to
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .map(|h| format!(" by {h}"))
+        .unwrap_or_default();
+    format!("paused{since}{by}; `btrdasd scrub resume` resumes it")
+}
+
 /// Build one target's status view. `state` is the already-loaded engine
 /// state (or `None` if it could not be loaded at all — a warning about that
 /// is the caller's job, once, not per-target).
@@ -1123,6 +1159,11 @@ fn build_scrub_target_view(
             if live && fs.last_attempt.outcome == "yielded" {
                 view.detail = Some(yielded_detail(&fs.last_attempt));
             }
+        } else if fs.last_attempt.outcome == "paused" {
+            // Paused by hand (bd DAS-Backup-Manager-su1b.15): no result yet,
+            // and not a failure either.
+            view.ok = None;
+            view.detail = Some(paused_detail(&fs.last_attempt));
         } else {
             view.ok = Some(fs.last_attempt.ok);
             view.finished_epoch = Some(fs.last_attempt.finished_epoch);
@@ -1363,6 +1404,153 @@ fn cancel_running_scrub_at(lock: &Path, config: &Config) -> Result<String, Strin
     }
 }
 
+/// Who `btrdasd scrub pause` says asked: this process, and the user behind
+/// sudo when there is one.
+fn pause_requester() -> String {
+    let me = format!("btrdasd scrub pause pid {}", std::process::id());
+    match std::env::var("SUDO_USER") {
+        Ok(u) if !u.is_empty() => format!("{me}, by {u}"),
+        _ => me,
+    }
+}
+
+/// Print `msg` as text or as `{"status":…,"message":…}`.
+fn say(json: bool, status: &str, msg: &str) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "status": status, "message": msg })
+        );
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// `btrdasd scrub pause` (bd DAS-Backup-Manager-su1b.15): the exit status.
+fn run_scrub_pause(json: bool) -> i32 {
+    let paths = scrub::PausePaths::production();
+    let bound = std::time::Duration::from_secs(scrub::PAUSE_ANSWER_SECS);
+    if !json {
+        println!(
+            "Asking the scrub pass to pause (waiting up to {} s for it to end) …",
+            bound.as_secs()
+        );
+    }
+    match scrub::pause_pass_at(
+        &paths,
+        &pause_requester(),
+        bound,
+        std::time::Duration::from_secs(1),
+    ) {
+        Ok(scrub::PauseOutcome::NotRunning) => {
+            say(
+                json,
+                "not-running",
+                "No scrub pass is running — nothing to pause.",
+            );
+            0
+        }
+        Ok(scrub::PauseOutcome::SetupHolds(holder)) => {
+            say(
+                json,
+                "setup",
+                &format!(
+                    "{} is held by {holder}, not a scrub pass — nothing to pause.",
+                    paths.singleton.display()
+                ),
+            );
+            0
+        }
+        Ok(scrub::PauseOutcome::Paused(labels)) => {
+            say(
+                json,
+                "paused",
+                &format!(
+                    "Scrub paused: {} — the pass has ended, the unit is not failed. \
+                     `btrdasd scrub resume` resumes it; until then a pass that starts does \
+                     not run.",
+                    labels.join(", ")
+                ),
+            );
+            0
+        }
+        Ok(scrub::PauseOutcome::EndedUnpaused) => {
+            say(
+                json,
+                "ended",
+                "The scrub pass ended before it could pause (it finished): nothing is paused, \
+                 and the pause request was taken away.",
+            );
+            0
+        }
+        Ok(scrub::PauseOutcome::NoAnswer(holder)) => {
+            say(
+                json,
+                "no-answer",
+                &format!(
+                    "The scrub pass ({holder}) did not end within {} s. The pause request {} \
+                     stays: the pass pauses at its next look. Nothing was killed.",
+                    bound.as_secs(),
+                    paths.request.display()
+                ),
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            1
+        }
+    }
+}
+
+/// `btrdasd scrub resume` (bd DAS-Backup-Manager-su1b.15): the exit status.
+fn run_scrub_resume(json: bool) -> i32 {
+    let paths = scrub::PausePaths::production();
+    let start = || {
+        let out = std::process::Command::new("systemctl")
+            .args(["start", "--no-block", "das-scrub.service"])
+            .output()
+            .map_err(|e| format!("cannot run systemctl: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "systemctl start --no-block das-scrub.service failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+    match scrub::resume_pass_at(&paths, &start) {
+        Ok(scrub::ResumeOutcome::AlreadyRunning(holder)) => {
+            say(
+                json,
+                "running",
+                &format!(
+                    "{} is held by {holder}: a pass is already running — nothing changed.",
+                    paths.singleton.display()
+                ),
+            );
+            0
+        }
+        Ok(scrub::ResumeOutcome::Started { removed }) => {
+            say(
+                json,
+                "started",
+                &format!(
+                    "{}das-scrub.service started: it resumes a filesystem whose scrub was \
+                     stopped part-way. `btrdasd scrub status` shows its progress.",
+                    if removed { "Pause lifted; " } else { "" }
+                ),
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            1
+        }
+    }
+}
+
 /// Map a completed (or skipped) scrub pass to `btrdasd scrub run`'s process
 /// exit code (`bd DAS-Backup-Manager-18p`).
 ///
@@ -1420,6 +1608,11 @@ fn cancel_running_scrub_at(lock: &Path, config: &Config) -> Result<String, Strin
 /// run" outcome for that class of failure too.
 pub fn exit_code_for_pass(pass: &scrub::ScrubPass) -> i32 {
     if pass.status == scrub::PassStatus::Skipped {
+        return 0;
+    }
+    // Paused by hand (bd DAS-Backup-Manager-su1b.15), maybe before any scrub
+    // was launched: the unit ends inactive, never failed.
+    if pass.status == scrub::PassStatus::Paused || pass.results.iter().any(|r| r.paused.is_some()) {
         return 0;
     }
     let any_scrub_launched = pass.results.iter().any(|r| r.scrub_launched);
@@ -3534,6 +3727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (_, Some(_)) => "interrupted",
                     (scrub::PassStatus::Completed, None) => "completed",
                     (scrub::PassStatus::Skipped, None) => "skipped",
+                    (scrub::PassStatus::Paused, None) => "paused",
                 };
                 if json {
                     println!(
@@ -3546,7 +3740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!(
                         "Scrub pass {status_word}: {} of {} filesystems clean",
-                        pass.results.len() - pass.failed_count(),
+                        pass.clean_count(),
                         pass.results.len()
                     );
                     if !pass.success() && exit_code == 0 {
@@ -3589,6 +3783,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("{}", format_scrub_status(&views, &cfg));
                 }
             }
+            ScrubAction::Pause => std::process::exit(run_scrub_pause(json)),
+            ScrubAction::Resume => std::process::exit(run_scrub_resume(json)),
             ScrubAction::Cancel { config } => {
                 let cfg = Config::load(&config)?;
                 match cancel_running_scrub(&cfg) {
@@ -4240,6 +4436,37 @@ mod tests {
         assert_eq!(v.outcome.as_deref(), Some("running"));
     }
 
+    /// bd DAS-Backup-Manager-su1b.15: a scrub paused by hand says PAUSED with
+    /// since/by, and is not counted as a failure or shown with figures.
+    #[test]
+    fn status_reads_a_paused_record_as_paused() {
+        let uuid = "55555555-5555-5555-5555-555555555555";
+        let config = test_config(&[("paused-target", uuid)]);
+        let mut state = scrub::ScrubState::default();
+        state.filesystems.insert(
+            uuid.into(),
+            scrub::FsState {
+                target_label: "paused-target".into(),
+                mountpoint: "/mnt/paused-target".into(),
+                last_success_epoch: Some(1_784_000_000),
+                last_attempt: scrub::AttemptState {
+                    outcome: "paused".into(),
+                    started_epoch: 1_785_000_000,
+                    yielded_to: Some("btrdasd scrub pause pid 9".into()),
+                    yielded_epoch: Some(1_785_003_600),
+                    yields: Some(1),
+                    ..Default::default()
+                },
+            },
+        );
+        let v = build_scrub_target_view(&config, "paused-target", Some(&state));
+        assert_eq!(v.status_word(), "PAUSED");
+        assert_eq!(v.ok, None, "a pause is neither a pass nor a failure");
+        let detail = v.detail.clone().unwrap_or_default();
+        assert!(detail.contains("by btrdasd scrub pause pid 9"), "{detail}");
+        assert!(detail.contains("since "), "{detail}");
+    }
+
     /// bd DAS-Backup-Manager-su1b.2 (step A3): a pass paused for a backup
     /// says YIELDED, names whom it yielded to and when, and shows none of
     /// the earlier pass's figures as its own. One whose process died while
@@ -4555,6 +4782,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             interrupted_by: None,
             yields: Vec::new(),
             pending_yield: None,
+            paused: None,
         }
     }
 
@@ -4666,6 +4894,21 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         scrubbed.outcome = Some(scrub::ScrubOutcome::Finished);
         let pass = fake_pass(scrub::PassStatus::Completed, vec![unresolved, scrubbed]);
         assert_eq!(exit_code_for_pass(&pass), 0);
+    }
+
+    /// bd DAS-Backup-Manager-su1b.15: a pass paused by hand, even before
+    /// any scrub was launched, ends 0 so the unit ends inactive, not failed.
+    #[test]
+    fn exit_code_for_pass_paused_is_zero_even_with_nothing_launched() {
+        let mut result = fake_result(false);
+        result.paused = Some(scrub::PausedBy {
+            by: "btrdasd scrub pause pid 9".into(),
+            at_epoch: 1,
+        });
+        let pass = fake_pass(scrub::PassStatus::Paused, vec![result]);
+        assert_eq!(exit_code_for_pass(&pass), 0);
+        let started_paused = fake_pass(scrub::PassStatus::Paused, Vec::new());
+        assert_eq!(exit_code_for_pass(&started_paused), 0);
     }
 
     #[test]

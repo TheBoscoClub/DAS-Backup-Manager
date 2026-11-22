@@ -3234,6 +3234,10 @@ or
 .B yielded
 record outlived it (the earlier finished pass is never shown as the
 current one; its age still counts from the last success).
+.B PAUSED
+is a scrub ended by
+.BR "btrdasd scrub pause" :
+the line says since when and by whom; it is resumable and not a failure.
 .PP
 .B btrdasd scrub status
 .RB [ \-\-config
@@ -3266,6 +3270,52 @@ is held by
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.\"
+.SS scrub pause
+Pause the running scrub pass so that it can resume later (root).
+.PP
+Writes the pause request
+.I /run/das\-scrub\-pause
+(mode 0600, naming the requester and the time) and claims the DAS maintenance
+lock as a backup does. The pass stops its scrub resumably (btrfs keeps the
+position: its record reads
+.BR "canceled:0 finished:0" ),
+unmounts, records the filesystem
+.BR paused ,
+and ends with exit status 0, so
+.B das\-scrub.service
+ends inactive, not failed. The command waits up to 240 seconds for the pass
+to end, then says what happened. While the request is in place a pass that
+starts (the timer included) does not run. Nothing is ever killed.
+.PP
+Exit status 0: paused; or no pass was running (nothing is written); or
+.B btrdasd setup
+holds the scrub lock (nothing is written); or the pass finished before it
+could pause (the request is taken away). Exit status 1: the pass did not end
+within the bound \(em it is named, and the request is left so the pass pauses
+at its next look.
+.PP
+.B btrdasd scrub pause
+.\"
+.SS scrub resume
+Lift a pause and start the scrub pass again (root).
+.PP
+Removes the pause request and runs
+.BR "systemctl start \-\-no\-block das\-scrub.service" ,
+the unit the timer starts; the pass resumes a filesystem whose btrfs record
+is resumable. If a pass (or
+.BR "btrdasd setup" )
+holds
+.IR /run/das\-scrub.lock ,
+it says so and changes nothing, exit status 0. Exit status 1 when the
+request cannot be removed or the unit cannot be started. A reboot empties
+.IR /run ,
+so after one the request is gone and the next start runs; the
+.B paused
+record stays until then. The pass starts again from the first scrub target,
+so a filesystem that finished before the pause is scrubbed again.
+.PP
+.B btrdasd scrub resume
 .\"
 .SS doctor
 Subvolume drift detector \(em find source subvolumes that exist on disk but

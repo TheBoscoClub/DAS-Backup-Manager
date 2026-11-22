@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`btrdasd scrub pause` and `btrdasd scrub resume`** (bd `DAS-Backup-Manager-su1b.15`): on 2026-11-22 a pass had to be paused by hand for an install and a reboot — a held claim, then `systemctl stop`, which left the unit failed and the pass `interrupted` (FAIL)
+  - `pause` writes `/run/das-scrub-pause` (0600, requester and time) only while a pass runs, then claims the maintenance lock as a backup does: the pass yields as for a backup (scrub stopped resumably, `canceled:0 finished:0`; unmounted), files the filesystem `paused`, and ends 0 — `das-scrub.service` ends inactive, not failed
+  - The command waits up to 240 s (`PAUSE_ANSWER_SECS`) and kills nothing: no pass running → nothing written, exit 0; the pass finished first → the request taken away, exit 0; no answer → exit 1 naming the holder, the request left so the pass pauses at its next look
+  - While the request is in place a pass that starts (the timer) does not run, exit 0; `resume` refuses while a pass runs, else removes the request and runs `systemctl start --no-block das-scrub.service`, which resumes the filesystem by its btrfs record
+  - `paused` is resumable and never a failure: `scrub status` shows `PAUSED` with since and by, health a WARN naming since, how long and by whom (FAIL only past `fail_age_days`), the report `Status: PAUSED`, `scrub run` exit 0
+
 - **A RAID-1 target is mounted only through a guard that will not mount it degraded with both drives attached** (bd `DAS-Backup-Manager-su1b.10`): on 2026-11-21/22 the kernel had forgotten one leg of the primary, and doctor and the nightly backup mounted it `degraded` on the other — both drives attached, both jobs saying OK, every write single-copy until a scrub corrected 9593 stale blocks
   - A target with `mount_uuid` and two or more serials is mounted by `raid_guard::mount_guarded`, one implementation for the Rust jobs (backup, doctor, walk, restore, scrub, the GUI helper) and for `backup-run.sh` (4.22.0), which calls the new hidden `btrdasd backup mount-target` with the maintenance lock handed down on fd 8
   - Its members are found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each scanned by its own path (`btrfs device scan <path>`; never unscoped, never `--forget`) and identified by its own superblock (`fsid`, `dev_item.devid`, `dev_item.uuid`, `generation`, `num_devices`)

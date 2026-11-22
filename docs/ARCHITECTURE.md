@@ -371,6 +371,36 @@ unmounts — but a scrub pass hands the key back when a backup knocks:
 - By hand: `sudo flock -s /run/das-maintenance-claim.lock <command>` pauses a pass for as long as the
   command runs.
 
+**Pause and resume by hand** (bd `DAS-Backup-Manager-su1b.15`, operator 2026-11-22: pause the scrub,
+install, reboot, resume). `btrdasd scrub pause` rides the yield above and then ends the pass instead
+of letting it wait:
+
+- *The request* is a file, `/run/das-scrub-pause` (0600 root, `requested_by …`, `requested_epoch …`),
+  written only while a pass holds `/run/das-scrub.lock` (no pass, or `btrdasd setup` holding it: nothing
+  is written). The command then takes the claim shared, as a backup does.
+- *The pass* yields exactly as for a backup (child stopped by SIGTERM, so btrfs keeps a resumable
+  `canceled:0 finished:0` record; unmount; `yielded`), and at the top of its wait sees the request: it
+  files the cut filesystem `paused` (who asked, when; the last success kept), skips the rest, and ends
+  0, its locks released — `das-scrub.service` ends inactive, not failed. The request alone also makes a
+  pass yield at checkpoints 3 and 4, so a request left behind still pauses it at its next look; the
+  waits for the maintenance lock never wait on the file.
+- *The command* holds the claim until the scrub singleton is free, up to `PAUSE_ANSWER_SECS` (240 s);
+  then it reads the state: a filesystem `paused` → done, exit 0; none (the pass finished first) → the
+  request is taken away, exit 0; not ended in time → exit 1 naming the holder, the request left. It
+  never kills anything.
+- *While paused* a pass that starts (the timer) does not run: it removes nothing, writes nothing, and
+  ends 0 as `paused`. A pass that ran to its end without meeting a request removes it.
+- *`btrdasd scrub resume`* refuses while anything holds the singleton (exit 0, nothing changed),
+  else removes the request and runs `systemctl start --no-block das-scrub.service`; the pass resumes the
+  paused filesystem by its btrfs record (`decide_scrub_start_mode`). A reboot empties `/run`, so after
+  one the request is gone and the next start (resume or the timer) runs; the `paused` record stays
+  until then.
+- *Reading it*: `paused` is not in progress and never `interrupted`; `scrub status` shows `PAUSED`
+  with since and by; health is a WARN naming since, how long and by whom (a FAIL only when the last
+  success is older than `fail_age_days`); the report's status line reads `PAUSED`. The resumed pass
+  starts from the first `[scrub].targets` entry, so a filesystem that finished before the pause is
+  scrubbed again.
+
 **Health integration** (`indexer/src/health.rs`, bd `DAS-Backup-Manager-5kb`): `TargetHealth::scrub`
 reports per-filesystem age (days since the last `finished`, zero-error scrub), WARN/FAIL against
 `[scrub].warn_age_days` / `fail_age_days`, and an immediate FAIL for any aborted/canceled/errored
