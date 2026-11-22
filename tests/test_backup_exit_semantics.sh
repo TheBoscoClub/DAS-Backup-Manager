@@ -1432,6 +1432,19 @@ expect_completed "RAID-1 end check that cannot run" 0 "COMPLETED WITH WARNINGS" 
 check "RAID-1 end check that cannot run: a WARN row, never silent" \
     "$(grep -c '^  Target primary-22tb  *WARN  (.*the end-of-run RAID check could not run (exit 2)' "$WORK/lib/last-report.txt")" "1"
 
+# A mount the guard made degraded shows the absent member missing all run
+# long: its period is open and recorded already, so it is not checked again.
+fresh
+knob guard_line 'RAID GUARD: DEGRADED  (RAID-1 MOUNTED DEGRADED: 1 of 2 members present (stub); absent drive(s) SERIALP2)'
+echo 1 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
+knob raid_check_line 'RAID CHECK: RECORDED  (the kernel shows devid(s) [2] missing at the end of the job (stub))'
+run_backup
+check "RAID-1 end check, a degraded mount: exit status" "$RC" "0"
+check "RAID-1 end check, a degraded mount: not checked again" \
+    "$(cat "$STATE/calls/raid_check" 2>/dev/null)" ""
+check "RAID-1 end check, a degraded mount: the row is the guard's alone" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (DEGRADED: RAID-1 MOUNTED DEGRADED: 1 of 2 members present (stub); absent drive(s) SERIALP2)$' "$WORK/lib/last-report.txt")" "1"
+
 # The rejoin: the owed scrub starts once the run has let its locks go.
 fresh
 knob guard_line 'RAID GUARD: REJOINED  (all 2 members present; a scrub is owed before the pair is trusted (stub); the scrub starts once this job has ended)'

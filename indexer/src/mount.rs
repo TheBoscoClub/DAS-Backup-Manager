@@ -1359,10 +1359,12 @@ fn ensure_targets_mounted_with(
                 Ok(outcome) => {
                     any_available = true;
                     guard.newly_mounted.push(target.mount.clone());
-                    // A read-write mount is checked for a dropped member at
-                    // its end (bd DAS-Backup-Manager-su1b.14); a read-only one
-                    // writes nothing and has nothing to record.
-                    if !matches!(outcome, raid_guard::Outcome::StaleReadOnly { .. })
+                    // A normal read-write mount is checked for a dropped
+                    // member at its end (bd DAS-Backup-Manager-su1b.14). A
+                    // degraded one shows its absent member missing all its
+                    // life, its period recorded at the mount; a read-only one
+                    // writes nothing: neither has anything to record.
+                    if matches!(outcome, raid_guard::Outcome::Normal { .. })
                         && !raid_guard::is_read_only(&config.das.mount_opts)
                     {
                         guard.guarded.push(GuardedMount {
@@ -3801,6 +3803,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A mount the guard made degraded shows its absent member missing for
+    /// its whole life; the period is already open and recorded at the mount,
+    /// so the end-of-job check is not run on it (no WARN every degraded run).
+    #[test]
+    fn a_degraded_raid1_mount_is_not_rechecked_at_its_unmount() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part_b, _mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+        config.das.mount_opts = "noatime,degraded".into();
+        config.das.member_wait_secs = 0;
+        host.raid_dir = Some(PathBuf::from(scratch.path("raid")));
+        host.missing_at_end = vec![("u-p".into(), vec![2])];
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n"))),
+            (
+                &part_b,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 1, "5eed00a1-0000-4000-8000-0000000000a1", 40),
+                ),
+            ),
+        ]);
+        let progress = Recorder::default();
+        let mut guard = host.mount_targets(&config, &progress, &runner).unwrap();
+        let record = std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap();
+        assert!(guard.unmount(&progress).is_empty());
+        let logs = progress.logs.lock().unwrap().clone();
+        assert!(
+            !logs.iter().any(|(_, m)| m.contains("RAID CHECK")),
+            "{logs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap(),
+            record,
+            "the record as the mount left it"
+        );
     }
 
     /// One leg absent after the wait: mounted degraded, the period recorded

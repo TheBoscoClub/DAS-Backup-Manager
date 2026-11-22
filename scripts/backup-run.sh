@@ -6,7 +6,8 @@
 # Features:
 #   - A RAID-1 member that drops during the run is recorded, and an owed
 #     scrub starts by itself (v4.23.0, bd DAS-Backup-Manager-su1b.14): before
-#     unmount_all() unmounts a target the guard mounted, raid_end_check runs
+#     unmount_all() unmounts a target the guard mounted (not one it mounted
+#     degraded: its period is recorded at the mount), raid_end_check runs
 #     `btrdasd backup raid-check` (fd 8 handed down), which reads the kernel's
 #     view and records a degraded period on the members still present when
 #     one is missing or the view cannot be read (the target's row turns
@@ -3731,9 +3732,12 @@ unmount_all() {
             mounted)
                 # A RAID-1 target the guard mounted this run: was a member
                 # lost while it was mounted (bd DAS-Backup-Manager-su1b.14)?
+                # Not one it mounted degraded: that shows its absent member
+                # missing all run long, the period recorded at the mount.
                 local lbl
                 for lbl in "${!RAID_GUARD_STATUS[@]}"; do
-                    [[ "${TARGET_MOUNTS[$lbl]:-}" == "$mnt" ]] && raid_end_check "$lbl"
+                    [[ "${TARGET_MOUNTS[$lbl]:-}" == "$mnt" ]] || continue
+                    [[ "${RAID_GUARD_STATUS[$lbl]}" == DEGRADED ]] || raid_end_check "$lbl"
                 done
                 if ! umount_with_retry "$mnt"; then
                     log_error "  Failed to unmount $mnt"

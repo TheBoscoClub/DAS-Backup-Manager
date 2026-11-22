@@ -223,7 +223,8 @@ contents (restore file, restore snapshot, browse, the doctor's report);
 scrub, and walk, index walk, reindex, reconcile and the recovery-OS reading,
 which write the index or a state file from what they read.
 
-At the end of every job that mounted a RAID-1 target read-write, before the
+At the end of every job that mounted a RAID-1 target read-write and not
+degraded, before the
 unmount (`MountGuard`, the scrub engine, `backup-run.sh` through hidden
 `btrdasd backup raid-check`), the kernel's view is read again: a member missing,
 or a view that cannot be read, is recorded as a degraded period on the members
