@@ -298,7 +298,14 @@ impl Drop for MaintenanceHeld {
                 lock.path().display()
             );
         }
-        // The `FileLock` is dropped after this, which releases the lock.
+        // Release a lock this process took, then start any scrub a RAID-1
+        // rejoin made owed while it was held (bd DAS-Backup-Manager-su1b.14):
+        // after the release, so the scrub never waits on this job's lock. A
+        // delegated hold is the parent's to release; it starts its own.
+        if let How::Owned(_) = &self.how {
+            drop(std::mem::replace(&mut self.how, How::Delegated));
+            crate::raid_guard::after_maintenance_released();
+        }
     }
 }
 

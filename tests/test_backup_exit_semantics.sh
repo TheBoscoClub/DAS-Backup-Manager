@@ -290,6 +290,30 @@ case "$1 ${2:-}" in
     printf '%s\n' "$(knob guard_line 'RAID GUARD: OK  (all 2 members present (stub))')"
     exit "$rc"
     ;;
+"backup raid-check")
+    # The end-of-run RAID-1 check (bd su1b.14): what it was handed, and
+    # whether the target was still mounted when it ran. Knobs:
+    # raid_check_line, raid_check_rc.
+    label=""
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" == --label ]] && label="$2"
+        shift
+    done
+    # shellcheck source=/dev/null
+    source "$S/env"
+    mnt=""
+    for ((i = 0; i < DAS_TARGET_COUNT; i++)); do
+        v="DAS_TARGET_${i}_LABEL"
+        [[ "${!v}" == "$label" ]] || continue
+        v="DAS_TARGET_${i}_MOUNT" && mnt="${!v}"
+    done
+    still=no
+    awk -F'\t' -v m="$mnt" '$1 == m { f = 1 } END { exit !f }' "$S/mounted" && still=yes
+    printf '%s fd=%s mounted=%s\n' "$label" "${DAS_MAINTENANCE_LOCK_FD:-unset}" "$still" \
+        >>"$S/calls/raid_check"
+    printf '%s\n' "$(knob raid_check_line 'RAID CHECK: OK  (no member missing at the end of the job)')"
+    exit "$(knob raid_check_rc 0)"
+    ;;
 "backup boot-plan")
     # The plan btrbk.conf gives: @ and @home on the nvme volume.
     printf '@\troot-\tnvme\n@home\thome\tnvme\n'
@@ -525,6 +549,17 @@ EOF
 # service runs (measured, bd hyvh); knob timer_next gives the value, knob
 # timer_fails makes it exit 1.
 stub systemctl <<'EOF'
+# `systemctl start --no-block das-scrub.service` (bd su1b.14): recorded with
+# whether the run's lock descriptors were still open; knob scrub_start_rc.
+if [[ "$1" == start ]]; then
+    fd8=closed fd9=closed
+    { true >&8; } 2>/dev/null && fd8=open
+    { true >&9; } 2>/dev/null && fd9=open
+    printf '%s fd8=%s fd9=%s\n' "$*" "$fd8" "$fd9" >>"$S/calls/systemctl_start"
+    rc="$(knob scrub_start_rc 0)"
+    ((rc == 0)) || echo "Failed to start das-scrub.service: Access denied (stub)" >&2
+    exit "$rc"
+fi
 if [[ -f "$S/knobs/timer_fails" ]]; then exit 1; fi
 printf '%s\n' "$(knob timer_next '')"
 EOF
@@ -1370,6 +1405,59 @@ fresh
 knob guard_line 'RAID GUARD: SCRUB-OWED  (all 2 members present; a scrub is owed before the pair is trusted (stub))'
 run_backup
 expect_completed "RAID-1 guard, a scrub owed: WARN" 0 "COMPLETED WITH WARNINGS" "success"
+
+# The end-of-run check (bd DAS-Backup-Manager-su1b.14): before the primary
+# is unmounted, with the lock handed down, once.
+fresh
+run_backup
+check "RAID-1 end check: run once, on fd 8, while the primary is still mounted" \
+    "$(cat "$STATE/calls/raid_check" 2>/dev/null)" "primary-22tb fd=8 mounted=yes"
+check "RAID-1 end check: a whole pair leaves the row OK" \
+    "$(grep -c '^  Target primary-22tb  *OK  (all 2 members present (stub))$' "$WORK/lib/last-report.txt")" "1"
+check "RAID-1 end check: no rejoin, no scrub started" \
+    "$(cat "$STATE/calls/systemctl_start" 2>/dev/null)" ""
+
+fresh
+knob raid_check_line 'RAID CHECK: RECORDED  (the kernel shows devid(s) [2] missing at the end of the job (stub))'
+run_backup
+expect_completed "RAID-1 end check, a member dropped during the run" 0 "COMPLETED WITH WARNINGS" "success"
+check "RAID-1 end check, a member dropped: the target's row says so after the guard's word" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (all 2 members present (stub); at the end of the run: RAID CHECK RECORDED: the kernel shows devid(s) \[2\] missing' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+knob raid_check_rc 2
+knob raid_check_line 'RAID CHECK: CANNOT-RUN  (stub)'
+run_backup
+expect_completed "RAID-1 end check that cannot run" 0 "COMPLETED WITH WARNINGS" "success"
+check "RAID-1 end check that cannot run: a WARN row, never silent" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (.*the end-of-run RAID check could not run (exit 2)' "$WORK/lib/last-report.txt")" "1"
+
+# The rejoin: the owed scrub starts once the run has let its locks go.
+fresh
+knob guard_line 'RAID GUARD: REJOINED  (all 2 members present; a scrub is owed before the pair is trusted (stub); the scrub starts once this job has ended)'
+run_backup
+expect_completed "RAID-1 rejoin" 0 "COMPLETED WITH WARNINGS" "success"
+check "RAID-1 rejoin: das-scrub.service started without waiting, after fds 8 and 9 closed" \
+    "$(cat "$STATE/calls/systemctl_start" 2>/dev/null)" "start --no-block das-scrub.service fd8=closed fd9=closed"
+check "RAID-1 rejoin: and said" \
+    "$(grep -c 'rejoined: das-scrub.service started (not waited for)' "$STATE/out")" "1"
+
+fresh
+knob guard_line 'RAID GUARD: REJOINED  (a scrub is owed (stub))'
+knob scrub_start_rc 1
+run_backup
+expect_completed "RAID-1 rejoin, the scrub start refused" 0 "COMPLETED WITH WARNINGS" "success"
+check "RAID-1 rejoin, the scrub start refused: a WARN, the status unchanged" \
+    "$(grep -c 'the owed scrub was not started (systemctl status=1: Failed to start das-scrub.service: Access denied (stub))' "$STATE/out")" "1"
+
+fresh
+knob guard_line 'RAID GUARD: REJOINED  (a scrub is owed (stub))'
+run_backup --dryrun
+check "RAID-1 rejoin in a dry run: exit status" "$RC" "0"
+check "RAID-1 rejoin in a dry run: nothing started" \
+    "$(cat "$STATE/calls/systemctl_start" 2>/dev/null)" ""
+check "RAID-1 rejoin in a dry run: said" \
+    "$(grep -c 'a scrub is owed (dry run: not started)' "$STATE/out")" "1"
 
 fresh
 knob guard_rc 3

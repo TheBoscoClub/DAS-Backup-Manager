@@ -542,9 +542,19 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, DEGRADED), 1 not mounted, 3 refused, 2 could not run.
+    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, REJOINED — this mount was the rejoin, the caller starts the owed scrub once it has let its locks go — DEGRADED), 1 not mounted, 3 refused, 2 could not run.
     #[command(hide = true)]
     MountTarget {
+        /// The target's label
+        #[arg(long)]
+        label: String,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// At the end of backup-run.sh's run, before it unmounts a RAID-1 target it mounted through the guard (bd DAS-Backup-Manager-su1b.14): a member the kernel shows missing, or a view that cannot be read, is recorded as a degraded period on the members present. Under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID CHECK: <STATUS>  (<detail>)`, STATUS OK, RECORDED or WARN. EXIT CODE: 0 checked, 2 could not run.
+    #[command(hide = true)]
+    RaidCheck {
         /// The target's label
         #[arg(long)]
         label: String,
@@ -2095,6 +2105,55 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     code
 }
 
+/// `btrdasd backup raid-check`: the end-of-job check of one RAID-1 target
+/// `backup-run.sh` mounted, before it unmounts it (bd
+/// DAS-Backup-Manager-su1b.14). Only under a handed-down maintenance lock,
+/// with the target mounted at its path.
+fn cmd_raid_check(label: &str, config: &Path) -> i32 {
+    let cant = |why: String| {
+        println!("RAID CHECK: CANNOT-RUN  ({why})");
+        2
+    };
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => return cant(format!("cannot read {}: {e}", config.display())),
+    };
+    let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
+        return cant(format!("no [[target]] labelled '{label}'"));
+    };
+    if !buttered_dasd::raid_guard::is_guarded(target) {
+        return cant(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let lock = CliLock::production();
+    let Some(raw) = &lock.delegated else {
+        return cant(format!(
+            "only under a maintenance lock handed down by {}",
+            maintenance::DELEGATED_FD_ENV
+        ));
+    };
+    if let Err(e) = raw
+        .to_str()
+        .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{}={raw:?} is not a descriptor number",
+                maintenance::DELEGATED_FD_ENV
+            )
+        })
+        .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
+    {
+        return cant(e);
+    }
+    if !health::is_mountpoint(Path::new(&target.mount)) {
+        return cant(format!("{} is not mounted", target.mount));
+    }
+    let check = mount::raid_end_check(&cfg, target);
+    println!("{}", buttered_dasd::raid_guard::end_check_line(&check));
+    0
+}
+
 /// `btrdasd raid accept <label>` (bd DAS-Backup-Manager-su1b.11): root only,
 /// under the backup singleton and the maintenance lock, both taken without
 /// waiting (held: exit 75). The label is read from a terminal; anything else
@@ -3097,6 +3156,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BackupAction::MountTarget { label, config } => {
                 std::process::exit(cmd_mount_target(&label, &config));
+            }
+            BackupAction::RaidCheck { label, config } => {
+                std::process::exit(cmd_raid_check(&label, &config));
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {

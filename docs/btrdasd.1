@@ -1089,6 +1089,10 @@ one of
 .BR OK ,
 .BR WARN ,
 .BR SCRUB\-OWED ,
+.B REJOINED
+(a scrub is owed and this mount is the rejoin: the script starts
+.B das\-scrub.service
+once it has let its locks go),
 .BR DEGRADED ,
 .BR NOT\-MOUNTED ,
 .B REFUSED
@@ -1100,6 +1104,35 @@ mount point that is missing or already mounted). The mount is left for the
 script, which unmounts it.
 .PP
 .B btrdasd backup mount\-target \-\-label
+.I LABEL
+.RB [ \-\-config
+.IR PATH ]
+.\"
+.SS backup raid\-check
+The end\-of\-run check of one RAID\-1 target
+.B backup\-run.sh
+mounted through the guard, before it unmounts it (bd
+DAS\-Backup\-Manager\-su1b.14). Not for use by hand: only under the
+maintenance lock handed down
+.RB ( DAS_MAINTENANCE_LOCK_FD ),
+with the target mounted. A member the kernel shows missing
+.RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
+\(em it dropped while the run had the target mounted \(em or a view that
+cannot be read is recorded as a degraded period on the members present, so
+the next mount with every member owes a scrub. Every Rust job and the scrub
+make the same check before their own unmounts. It prints one line,
+.BI "RAID CHECK: " STATUS "  (" detail ) \fR,
+with
+.I STATUS
+one of
+.BR OK ,
+.B RECORDED
+or
+.BR WARN
+(a member missing and nothing could be recorded); exit status 0, or 2 when it
+could not run.
+.PP
+.B btrdasd backup raid\-check \-\-label
 .I LABEL
 .RB [ \-\-config
 .IR PATH ]

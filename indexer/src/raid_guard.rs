@@ -839,6 +839,8 @@ pub enum Rejoin {
         record: Record,
         write_primary: bool,
         write_witness: bool,
+        /// The record was degraded: this mount is the rejoin.
+        rejoined_now: bool,
     },
     /// A copy could not be read: nothing is changed.
     Unreadable(String),
@@ -851,6 +853,7 @@ pub fn rejoin(primary: &Copy, witness: &Copy, now: i64) -> Rejoin {
         Ok(Some(r)) => r,
         Err(e) => return Rejoin::Unreadable(e),
     };
+    let rejoined_now = record.state == State::Degraded;
     let record = match record.state {
         State::Degraded => Record {
             state: State::ScrubOwed,
@@ -861,6 +864,7 @@ pub fn rejoin(primary: &Copy, witness: &Copy, now: i64) -> Rejoin {
         State::Settled => return Rejoin::Clean,
     };
     Rejoin::Owed {
+        rejoined_now,
         write_primary: *primary != Copy::Read(record.clone()),
         write_witness: *witness != Copy::Read(record.clone()),
         record,
@@ -1019,6 +1023,10 @@ pub enum Outcome {
         /// A record copy that could not be read or written (WARN; nothing
         /// changed).
         record_problem: Option<String>,
+        /// This mount turned a degraded record into scrub-owed (the rejoin):
+        /// the job that made it starts the owed scrub once it has let its
+        /// locks go (bd DAS-Backup-Manager-su1b.14).
+        rejoined_now: bool,
     },
     /// Split brain, for a read-only job: mounted read-only
     /// ([`STALE_READ_OPTS`]) on `members`, which lack the writes of the
@@ -1050,6 +1058,7 @@ impl Outcome {
                 waited,
                 owed,
                 record_problem,
+                rejoined_now,
             } => {
                 let base = format!(
                     "all {} members present ({}){}",
@@ -1065,14 +1074,23 @@ impl Outcome {
                     ("WARN", format!("{base}; RAID record problem: {problem}"))
                 } else if let Some(r) = owed {
                     (
-                        "SCRUB-OWED",
+                        if *rejoined_now {
+                            "REJOINED"
+                        } else {
+                            "SCRUB-OWED"
+                        },
                         format!(
                             "{base}; a scrub is owed before the pair is trusted: degraded on {} \
-                             from {} to {}, rejoined {}",
+                             from {} to {}, rejoined {}{}",
                             names(&r.dev_uuids()),
                             r.since,
                             r.last,
-                            r.rejoined.unwrap_or(r.last)
+                            r.rejoined.unwrap_or(r.last),
+                            if *rejoined_now {
+                                "; the scrub starts once this job has ended"
+                            } else {
+                                ""
+                            }
                         ),
                     )
                 } else {
@@ -1181,7 +1199,9 @@ impl Failure {
 
 /// The one line `btrdasd backup mount-target` prints for `backup-run.sh`, and
 /// its exit status: `RAID GUARD: <STATUS>  (<detail>)`, two spaces, with
-/// STATUS one of `OK`, `WARN`, `SCRUB-OWED`, `DEGRADED` (exit 0: mounted),
+/// STATUS one of `OK`, `WARN`, `SCRUB-OWED`, `REJOINED` (a scrub is owed and
+/// this mount is the rejoin: the caller starts it once it has let its locks
+/// go), `DEGRADED`, `STALE-READ-ONLY` (exit 0: mounted),
 /// `NOT-MOUNTED` (exit 1) or `REFUSED` (exit 3; `left_mounted` adds
 /// `still mounted` to the detail).
 pub fn cli_line(result: &Result<Outcome, Failure>) -> (String, i32) {
@@ -1430,16 +1450,18 @@ fn after_normal_mount(
             return Err(take_down(why));
         }
     }
-    let (owed, record_problem) = match rejoin(&primary, &witness, host.now()) {
-        Rejoin::Clean => (None, None),
-        Rejoin::Unreadable(e) => (None, Some(format!("{e}; nothing changed"))),
+    let (owed, record_problem, rejoined_now) = match rejoin(&primary, &witness, host.now()) {
+        Rejoin::Clean => (None, None, false),
+        Rejoin::Unreadable(e) => (None, Some(format!("{e}; nothing changed")), false),
         Rejoin::Owed {
             record,
             write_primary,
             write_witness,
+            rejoined_now,
         } => {
             let mut problems = Vec::new();
-            if !is_read_only(plan.mount_opts) {
+            let read_only = is_read_only(plan.mount_opts);
+            if !read_only {
                 if write_primary && let Err(e) = write_copy(&primary_path, &record, true) {
                     problems.push(e);
                 }
@@ -1447,9 +1469,13 @@ fn after_normal_mount(
                     problems.push(e);
                 }
             }
+            // The rejoin counts only once it is recorded: a scrub begun
+            // after it then pays the debt.
+            let recorded = !read_only && problems.is_empty();
             (
                 Some(record),
                 (!problems.is_empty()).then(|| problems.join("; ")),
+                rejoined_now && recorded,
             )
         }
     };
@@ -1458,6 +1484,7 @@ fn after_normal_mount(
         waited,
         owed,
         record_problem,
+        rejoined_now,
     };
     let (status, detail) = outcome.status_line();
     progress.on_log(
@@ -1542,6 +1569,214 @@ fn mount_degraded(
         &format!("Target '{}': {status}: {detail}", plan.label),
     );
     Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// The end of a job (bd DAS-Backup-Manager-su1b.14)
+// ---------------------------------------------------------------------------
+
+/// What [`check_before_unmount`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndCheck {
+    /// No member missing: nothing to record.
+    Whole,
+    /// A member is missing, or may be: a degraded period is recorded for the
+    /// present members (`why` says which, and why).
+    Recorded { record: Record, why: String },
+    /// A member is missing, or may be, and nothing could be recorded.
+    Problem(String),
+}
+
+/// At the end of a job that mounted `plan`'s target read-write, before it is
+/// unmounted: the kernel's view (`missing_devids`). A member missing — it
+/// dropped while the job ran, and every write since went to the others alone
+/// — or a view that cannot be read (possibly dropped: the cautious reading) is
+/// recorded as a degraded period on the members still present, both copies,
+/// as the guard records a degraded mount, so the next mount with every member
+/// owes a scrub. The members present are found by filesystem UUID and read by
+/// their superblocks; nothing is scanned or mounted. A record naming other
+/// members (their period not yet scrubbed) is replaced by a period on the
+/// present ones — the writes just made exist only there — and said. A copy
+/// that cannot be read is a [`EndCheck::Problem`], never overwritten.
+pub fn check_before_unmount(host: &dyn MemberHost, plan: &Plan<'_>) -> EndCheck {
+    let (missing, why) = match host.missing_devids(plan.fsid) {
+        Ok(m) if m.is_empty() => return EndCheck::Whole,
+        Ok(m) => (
+            Some(m.clone()),
+            format!("the kernel shows devid(s) {m:?} missing at the end of the job"),
+        ),
+        Err(e) => (
+            None,
+            format!(
+                "whether a member dropped during the job cannot be read ({e}); taken as \
+                 possibly dropped"
+            ),
+        ),
+    };
+    let paths = match host.members(plan.fsid) {
+        Ok(p) => p,
+        Err(e) => {
+            return EndCheck::Problem(format!(
+                "{why}, and the members cannot be listed ({e}): nothing recorded"
+            ));
+        }
+    };
+    let present: Vec<Member> = paths
+        .iter()
+        .filter_map(|path| {
+            host.read_super(path)
+                .and_then(|t| parse_super(path, &t, plan.fsid))
+                .ok()
+        })
+        .filter(|m| missing.as_ref().is_none_or(|ms| !ms.contains(&m.devid)))
+        .fold(Vec::new(), |mut acc: Vec<Member>, m| {
+            if !acc.iter().any(|o| o.devid == m.devid) {
+                acc.push(m);
+            }
+            acc
+        });
+    if present.is_empty() {
+        return EndCheck::Problem(format!(
+            "{why}, and no present member can be identified: nothing recorded"
+        ));
+    }
+    let primary_path = primary_path(plan.record_dir, plan.fsid);
+    let primary = read_copy(&primary_path, plan.fsid);
+    let witness = host.read_witness(plan.mount, plan.fsid);
+    let now = host.now();
+    let (record, why) = match degraded_verdict(plan.fsid, &primary, &witness, &present, now) {
+        Verdict::Allow(r) => (r, why),
+        Verdict::SplitBrain { record, .. } => (
+            Record {
+                fsid: plan.fsid.to_ascii_lowercase(),
+                state: State::Degraded,
+                members: present
+                    .iter()
+                    .map(|m| PeriodMember {
+                        devid: m.devid,
+                        dev_uuid: m.dev_uuid.clone(),
+                        generation: m.generation,
+                    })
+                    .collect(),
+                since: now,
+                last: now,
+                rejoined: None,
+                rejected: record.rejected.clone(),
+            },
+            format!(
+                "{why}; the earlier degraded period on {} was not yet scrubbed, so both \
+                 drives now hold writes the other lacks",
+                names(&record.dev_uuids())
+            ),
+        ),
+        Verdict::Refuse(e) => {
+            return EndCheck::Problem(format!("{why}, and {e}: nothing recorded"));
+        }
+    };
+    if let Err(e) = write_copy(&primary_path, &record, true) {
+        return EndCheck::Problem(format!("{why}, and the record cannot be written ({e})"));
+    }
+    if let Err(e) = host.write_witness(plan.mount, &record) {
+        return EndCheck::Problem(format!(
+            "{why}; the record is written, the witness is not ({e})"
+        ));
+    }
+    EndCheck::Recorded { record, why }
+}
+
+/// The one line `btrdasd backup raid-check` prints for `backup-run.sh`:
+/// `RAID CHECK: <STATUS>  (<detail>)`, STATUS `OK`, `RECORDED` or `WARN`.
+pub fn end_check_line(check: &EndCheck) -> String {
+    let (status, detail) = match check {
+        EndCheck::Whole => ("OK", "no member missing at the end of the job".to_string()),
+        EndCheck::Recorded { record, why } => (
+            "RECORDED",
+            format!(
+                "{why}: a degraded period is recorded on {} — a scrub is owed once every \
+                 member is back",
+                names(&record.dev_uuids())
+            ),
+        ),
+        EndCheck::Problem(why) => ("WARN", why.clone()),
+    };
+    format!("RAID CHECK: {status}  ({})", detail.replace('\n', " "))
+}
+
+// ---------------------------------------------------------------------------
+// The owed scrub, started after the job (bd DAS-Backup-Manager-su1b.14)
+// ---------------------------------------------------------------------------
+
+/// The unit an owed scrub is started with. It scrubs every `[scrub].targets`
+/// filesystem in order (`btrdasd scrub run` takes no target): the owed one is
+/// among them.
+pub const SCRUB_UNIT: &str = "das-scrub.service";
+
+/// Targets whose mount in this process was the rejoin ([`Outcome::Normal`]
+/// `rejoined_now`), waiting for the job's maintenance lock to be released.
+static OWED_SCRUB: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Note that `label`'s mount was the rejoin: the scrub owed starts once this
+/// process lets the maintenance lock go ([`after_maintenance_released`]).
+pub fn note_owed_scrub(label: &str) {
+    let mut owed = OWED_SCRUB.lock().unwrap_or_else(|e| e.into_inner());
+    if !owed.iter().any(|l| l == label) {
+        owed.push(label.to_string());
+    }
+}
+
+/// The targets noted and not yet started for, taken.
+pub fn take_owed_scrub() -> Vec<String> {
+    std::mem::take(&mut *OWED_SCRUB.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `systemctl start --no-block das-scrub.service`: queued, never waited for,
+/// so nothing here can wait on the locks the scrub needs. A backup still
+/// preempts it through the claim. Refused in a test build: a test never
+/// starts a real unit.
+pub fn start_owed_scrub() -> Result<(), String> {
+    if cfg!(test) || cfg!(feature = "test-overrides") {
+        return Err(format!(
+            "refused in a test build: a test never starts {SCRUB_UNIT}"
+        ));
+    }
+    let out = std::process::Command::new("systemctl")
+        .args(["start", "--no-block", SCRUB_UNIT])
+        .output()
+        .map_err(|e| format!("systemctl could not be run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl start --no-block {SCRUB_UNIT} exited with code {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Called by [`crate::maintenance::MaintenanceHeld`] right after it releases
+/// a lock this process took: starts the owed scrub for anything noted, and
+/// says so on stderr (the journal of a unit or the helper). A start that
+/// fails is a warning, never an error. Returns what it said, for tests.
+pub fn after_maintenance_released() -> Option<String> {
+    let owed = take_owed_scrub();
+    if owed.is_empty() {
+        return None;
+    }
+    let line = match start_owed_scrub() {
+        Ok(()) => format!(
+            "info: RAID-1 target(s) {} rejoined: {SCRUB_UNIT} started (not waited for) to pay \
+             the scrub owed",
+            owed.join(", ")
+        ),
+        Err(e) => format!(
+            "warning: RAID-1 target(s) {} rejoined, and the owed scrub was not started ({e}); \
+             run 'btrdasd scrub run' or wait for the scheduled one",
+            owed.join(", ")
+        ),
+    };
+    eprintln!("{line}");
+    Some(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -2773,6 +3008,144 @@ mod tests {
         assert_eq!(case.primary(), Copy::Read(after));
     }
 
+    /// bd DAS-Backup-Manager-su1b.14: only the mount that turns a degraded
+    /// record into scrub-owed is the rejoin; the next one owes the same scrub
+    /// and is not.
+    #[test]
+    fn only_the_mount_that_rejoins_says_so() {
+        let case = Case::new();
+        assert!(case.run(&only_x()).0.is_ok());
+        let first = case.run(&both()).0;
+        assert!(
+            matches!(
+                first,
+                Ok(Outcome::Normal {
+                    rejoined_now: true,
+                    owed: Some(_),
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        let (line, code) = cli_line(&first);
+        assert!(line.starts_with("RAID GUARD: REJOINED  ("), "{line}");
+        assert_eq!(code, 0);
+        let again = case.run(&both()).0;
+        assert!(
+            matches!(
+                again,
+                Ok(Outcome::Normal {
+                    rejoined_now: false,
+                    owed: Some(_),
+                    ..
+                })
+            ),
+            "{again:?}"
+        );
+        assert!(cli_line(&again).0.starts_with("RAID GUARD: SCRUB-OWED  ("));
+    }
+
+    /// A member that drops while a job has the target mounted (bd
+    /// DAS-Backup-Manager-su1b.14): the end-of-job check records a degraded
+    /// period on the members still present, so the next mount with both owes
+    /// a scrub.
+    #[test]
+    fn a_member_that_drops_during_a_job_is_recorded_before_the_unmount() {
+        let case = Case::new();
+        let host = both();
+        assert!(matches!(
+            case.run(&host).0,
+            Ok(Outcome::Normal { owed: None, .. })
+        ));
+        assert_eq!(
+            check_before_unmount(&host, &plan_for(&case)),
+            EndCheck::Whole
+        );
+        assert_eq!(case.primary(), Copy::Absent, "nothing to record");
+        *host.missing.borrow_mut() = Ok(vec![2]);
+        host.now.set(5000);
+        let record = match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Recorded { record, why } => {
+                assert!(why.contains("devid(s) [2]"), "{why}");
+                record
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(record.state, State::Degraded);
+        assert_eq!(record.dev_uuids(), BTreeSet::from([DX]));
+        assert_eq!((record.since, record.last), (5000, 5000));
+        assert_eq!(case.primary(), Copy::Read(record.clone()));
+        assert_eq!(
+            host.witness.borrow().get(&format!("{DX}+{DY}")),
+            Some(&Copy::Read(record.clone()))
+        );
+        // The next mount with both present is the rejoin.
+        assert!(matches!(
+            case.run(&both()).0,
+            Ok(Outcome::Normal {
+                rejoined_now: true,
+                ..
+            })
+        ));
+    }
+
+    /// The kernel's view unreadable at the end: possibly dropped, so a period
+    /// is recorded on every member found — the cautious answer, a scrub owed
+    /// at the next mount.
+    #[test]
+    fn an_unreadable_view_at_the_end_records_a_period_on_every_member_found() {
+        let case = Case::new();
+        let host = both();
+        assert!(case.run(&host).0.is_ok());
+        *host.missing.borrow_mut() = Err("no such directory".into());
+        match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Recorded { record, why } => {
+                assert!(why.contains("cannot be read"), "{why}");
+                assert_eq!(record.dev_uuids(), BTreeSet::from([DX, DY]));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(case.primary(), Copy::Read(_)));
+    }
+
+    /// An unreadable record at the end: a member missing and nothing can be
+    /// written over it — said, never a silent "recorded".
+    #[test]
+    fn a_drop_with_an_unreadable_record_is_a_problem_not_a_record() {
+        let case = Case::new();
+        let host = both();
+        assert!(case.run(&host).0.is_ok());
+        fs::write(primary_path(case.dir.path(), FS), "junk\n").unwrap();
+        *host.missing.borrow_mut() = Ok(vec![1]);
+        match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Problem(why) => assert!(why.contains("unreadable"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// bd DAS-Backup-Manager-su1b.14: a rejoin noted in this process starts
+    /// the owed scrub once the lock is let go — and a test build never starts
+    /// the real unit.
+    #[test]
+    fn the_owed_scrub_is_started_after_release_and_never_by_a_test_build() {
+        let label = "owed-scrub-test-target";
+        note_owed_scrub(label);
+        note_owed_scrub(label);
+        let said = after_maintenance_released();
+        // Another test's release may have taken it first; either way it is
+        // gone and nothing real was started.
+        if let Some(line) = said {
+            assert!(line.contains("refused in a test build"), "{line}");
+            assert!(line.starts_with("warning: "), "{line}");
+        }
+        assert!(!take_owed_scrub().iter().any(|l| l == label));
+        assert!(
+            start_owed_scrub()
+                .unwrap_err()
+                .contains("refused in a test build")
+        );
+    }
+
     #[test]
     fn x_alone_again_continues_the_same_period() {
         let case = Case::new();
@@ -2817,7 +3190,11 @@ mod tests {
             host.witness.borrow().get(&format!("{DX}+{DY}")),
             Some(&Copy::Read(owed.clone()))
         );
-        assert!(warnings(&progress).iter().any(|w| w.contains("SCRUB-OWED")));
+        assert!(
+            warnings(&progress)
+                .iter()
+                .any(|w| w.contains("REJOINED") && w.contains("a scrub is owed"))
+        );
         assert!(!scrub_clears(&owed, 8999) && !scrub_clears(&owed, 9000));
         assert!(scrub_clears(&owed, 9001));
     }

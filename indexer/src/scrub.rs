@@ -2302,6 +2302,11 @@ fn scrub_one_target(
                     progress.on_log(LogLevel::Warning, &format!("{label}: {note}"));
                 }
                 if result.mounted_by_engine
+                    && let Some((config, target)) = guarded
+                {
+                    raid_end_check_logged(config, target, label, progress);
+                }
+                if result.mounted_by_engine
                     && let Err(e) = unmount(&mount_point, progress)
                 {
                     // A-F10: the backup's leftover check takes it down, or
@@ -2359,6 +2364,15 @@ fn scrub_one_target(
 
     if result.finished_epoch == 0 {
         result.finished_epoch = now_epoch();
+    }
+
+    // --- a member that dropped during the pass (bd DAS-Backup-Manager-su1b.14)
+    // Recorded before anything is cleared or unmounted: a scrub that lost a
+    // member pays no debt, and the next mount with both owes one again.
+    if result.mounted_by_engine
+        && let Some((config, target)) = guarded
+    {
+        raid_end_check_logged(config, target, label, progress);
     }
 
     // --- a scrub owed after a degraded period (bd DAS-Backup-Manager-su1b.10)
@@ -2585,6 +2599,26 @@ fn verify_engine_mount(
 
 /// Unmount, retrying once — USB targets occasionally report EBUSY while the
 /// kernel finishes writeback.
+/// The end-of-job check of a RAID-1 target the pass mounted, said: a recorded
+/// drop or a problem as a warning (bd DAS-Backup-Manager-su1b.14).
+fn raid_end_check_logged(
+    config: &Config,
+    target: &crate::config::Target,
+    label: &str,
+    progress: &dyn ProgressCallback,
+) {
+    let check = crate::mount::raid_end_check(config, target);
+    let level = if matches!(check, crate::raid_guard::EndCheck::Whole) {
+        LogLevel::Info
+    } else {
+        LogLevel::Warning
+    };
+    progress.on_log(
+        level,
+        &format!("{label}: {}", crate::raid_guard::end_check_line(&check)),
+    );
+}
+
 fn unmount(mount_point: &str, progress: &dyn ProgressCallback) -> Result<(), String> {
     for attempt in 1..=2 {
         let out = Command::new("umount")

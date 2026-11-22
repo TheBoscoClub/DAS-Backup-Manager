@@ -1,9 +1,21 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.22.0
+# Version: 4.23.0
 # Date: 2026-11-22
 #
 # Features:
+#   - A RAID-1 member that drops during the run is recorded, and an owed
+#     scrub starts by itself (v4.23.0, bd DAS-Backup-Manager-su1b.14): before
+#     unmount_all() unmounts a target the guard mounted, raid_end_check runs
+#     `btrdasd backup raid-check` (fd 8 handed down), which reads the kernel's
+#     view and records a degraded period on the members still present when
+#     one is missing or the view cannot be read (the target's row turns
+#     WARN). A guard line `REJOINED` (this run's mount turned a degraded
+#     record into scrub-owed) makes start_owed_scrub, once the run has
+#     closed fds 7, 8 and 9 on its way out, run `systemctl start --no-block
+#     das-scrub.service` (a real run only; a failed start is a WARN in the
+#     log). The pass scrubs every [scrub].targets filesystem; a backup still
+#     preempts it through the claim.
 #   - A RAID-1 target is mounted only through the guard (v4.22.0, bd
 #     DAS-Backup-Manager-su1b.10): a target with mount_uuid and more than one
 #     serial is mounted by `btrdasd backup mount-target` (guarded_mount),
@@ -2416,6 +2428,13 @@ is_guarded_target() { # is_guarded_target <label>
 # DEGRADED. verify_targets_before_btrbk reads it: a member the kernel shows
 # missing is a FAIL unless the guard itself mounted the target degraded.
 declare -gA RAID_GUARD_STATUS=()
+# The RAID-1 targets whose mount this run was the rejoin (guard status
+# REJOINED, bd DAS-Backup-Manager-su1b.14): start_owed_scrub starts the scrub
+# owed once the run has let its locks go.
+declare -ga RAID_SCRUB_OWED_NOW=()
+# The RAID-1 targets whose end-of-run check has run (unmount_all can run
+# twice: main(), then cleanup()).
+declare -gA RAID_END_CHECKED=()
 
 # The guarded mount of one RAID-1 target (bd DAS-Backup-Manager-su1b.10): one
 # rule, in one place — `btrdasd backup mount-target`, the code the Rust jobs
@@ -2452,8 +2471,9 @@ guarded_mount() { # guarded_mount <label>
         log_info "  Mounted $label at ${TARGET_MOUNTS[$label]} — $detail"
         record_op "target_${label}" "OK" "$detail"
         ;;
-    0:WARN | 0:SCRUB-OWED | 0:DEGRADED)
+    0:WARN | 0:SCRUB-OWED | 0:REJOINED | 0:DEGRADED)
         RAID_GUARD_STATUS[$label]="$status"
+        [[ "$status" == REJOINED ]] && RAID_SCRUB_OWED_NOW+=("$label")
         [[ "$status" == DEGRADED ]] || refresh_serial_devs "$label"
         log_warn "  $label: $status — $detail"
         record_op "target_${label}" "WARN" "$status: $detail"
@@ -2475,6 +2495,84 @@ guarded_mount() { # guarded_mount <label>
         exit 3
         ;;
     esac
+}
+
+# The end-of-run check of one RAID-1 target this run mounted through the guard
+# (bd DAS-Backup-Manager-su1b.14), before unmount_all() unmounts it: `btrdasd
+# backup raid-check`, handed the maintenance lock on fd 8, reads the kernel's
+# view (devinfo/*/missing) and, when a member dropped during the run or the
+# view cannot be read, records a degraded period on the members present (the
+# primary record and the witness), so the next mount with both owes a scrub.
+# One line, `RAID CHECK: <STATUS>  (<detail>)`: OK, RECORDED or WARN (exit
+# 0); anything else could not run. A RECORDED or WARN, or a check that could
+# not run, turns the target's row WARN; the run's exit status does not
+# change. Once per target.
+raid_end_check() { # raid_end_check <label>
+    local label="$1" out last rc line status detail
+    [[ -z "${RAID_END_CHECKED[$label]:-}" ]] || return 0
+    RAID_END_CHECKED[$label]=1
+    out="$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" backup raid-check --label "$label" \
+        --config "$DAS_CONFIG" && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    if [[ "$last" == status=* ]]; then
+        rc="${last#status=}"
+    else
+        rc="uncaptured"
+    fi
+    line="$(grep -m1 '^RAID CHECK: ' <<<"$out" || true)"
+    status="${line#RAID CHECK: }"
+    status="${status%%  (*}"
+    detail="${line#*  (}"
+    detail="${detail%)}"
+    case "$rc:$status" in
+    0:OK)
+        log_info "  $label: RAID CHECK OK — $detail"
+        return 0
+        ;;
+    0:RECORDED | 0:WARN)
+        log_warn "  $label: RAID CHECK $status — $detail"
+        detail="RAID CHECK $status: $detail"
+        ;;
+    *)
+        detail="the end-of-run RAID check could not run (exit $rc): ${line:-no RAID CHECK line}"
+        log_warn "  $label: $detail"
+        ;;
+    esac
+    # One row per target: what the guard said at the mount, then this.
+    local before="${OP_STATUS[target_${label}_detail]:-}"
+    record_op "target_${label}" "WARN" "${before:+$before; }at the end of the run: $detail"
+}
+
+# Start the scrub a rejoin made owed (bd DAS-Backup-Manager-su1b.14), on the
+# run's way out: after unmount_all(), with fds 7, 8 and 9 closed, so the scrub
+# never waits on this run's locks and nothing this run started can still hold
+# them. `systemctl start --no-block das-scrub.service` queues it and returns;
+# the pass scrubs every [scrub].targets filesystem (`btrdasd scrub run` takes
+# no target), and a backup preempts it through the claim. A dry run starts
+# nothing. A failed start is a WARN in the log, never an error: the record
+# keeps the debt, and the monthly scrub or `btrdasd scrub run` pays it.
+# Called only by cleanup(), the EXIT trap (SC2329: see clear_maintenance_holder).
+# shellcheck disable=SC2329
+start_owed_scrub() {
+    ((${#RAID_SCRUB_OWED_NOW[@]})) || return 0
+    local owed="${RAID_SCRUB_OWED_NOW[*]}" out last err
+    if [[ "$BACKUP_MODE_REAL" != "true" ]]; then
+        log_info "RAID-1 target(s) $owed rejoined: a scrub is owed (dry run: not started)"
+        return 0
+    fi
+    exec 7>&- 8>&- 9>&-
+    out="$(systemctl start --no-block das-scrub.service 2>&1 && printf '\nstatus=0' ||
+        printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    # What systemctl said, on one line.
+    err="${out%$'\n'*}"
+    err="${err%$'\n'}"
+    err="${err//$'\n'/ }"
+    if [[ "$last" == status=0 ]]; then
+        log_info "RAID-1 target(s) $owed rejoined: das-scrub.service started (not waited for) to pay the scrub owed"
+    else
+        log_warn "RAID-1 target(s) $owed rejoined, and the owed scrub was not started (systemctl ${last:-uncaptured}: $err) — run 'btrdasd scrub run' or wait for the scheduled scrub"
+    fi
 }
 
 # Look every configured serial of <label> up again, into TARGET_SERIAL_DEVS.
@@ -3631,6 +3729,12 @@ unmount_all() {
         why="$PROBE_WHY"
         case "$PROBE_STATE" in
             mounted)
+                # A RAID-1 target the guard mounted this run: was a member
+                # lost while it was mounted (bd DAS-Backup-Manager-su1b.14)?
+                local lbl
+                for lbl in "${!RAID_GUARD_STATUS[@]}"; do
+                    [[ "${TARGET_MOUNTS[$lbl]:-}" == "$mnt" ]] && raid_end_check "$lbl"
+                done
                 if ! umount_with_retry "$mnt"; then
                     log_error "  Failed to unmount $mnt"
                     still_mounted+=("$mnt")
@@ -4417,7 +4521,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.22.0
+  backup-run.sh v4.23.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -5120,6 +5224,7 @@ cleanup() {
             clear_maintenance_holder
         fi
         clear_singleton_holder
+        start_owed_scrub
         exit "$rc"
     fi
 
@@ -5185,6 +5290,7 @@ cleanup() {
     unmount_all
     clear_maintenance_holder
     clear_singleton_holder
+    start_owed_scrub
 
     # Explicit exit, not fallthrough: the run's status ($status) is the
     # process's final exit code, never whatever unmount_all's last internal

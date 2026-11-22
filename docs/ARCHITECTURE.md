@@ -223,6 +223,17 @@ contents (restore file, restore snapshot, browse, the doctor's report);
 scrub, and walk, index walk, reindex, reconcile and the recovery-OS reading,
 which write the index or a state file from what they read.
 
+At the end of every job that mounted a RAID-1 target read-write, before the
+unmount (`MountGuard`, the scrub engine, `backup-run.sh` through hidden
+`btrdasd backup raid-check`), the kernel's view is read again: a member missing,
+or a view that cannot be read, is recorded as a degraded period on the members
+present, so the next mount with both owes a scrub. A mount that turns a
+degraded record into scrub-owed reports `REJOINED`, and the job that made it
+starts `das-scrub.service` (`systemctl start --no-block`) once its maintenance
+lock is released (`MaintenanceHeld`'s drop; the script's `start_owed_scrub`
+after closing fds 7, 8 and 9); the pass scrubs every `[scrub].targets`
+filesystem, and a backup preempts it by the claim.
+
 ```text
 blkid -c /dev/null -t UUID=<fsid> -o device   → the members, never found by serial alone
 btrfs device scan <each member path>          → never unscoped, never --forget
@@ -246,7 +257,7 @@ all num_devices present?
 ```
 
 A dead drive behind a split brain: `btrdasd raid accept <label>` (root; the
-GUI's target view through the helper's `RaidAccept`, polkit
+GUI's Health dashboard (Drives tab) through the helper's `RaidAccept`, polkit
 `org.dasbackup.raid.accept`, `auth_admin`), under the backup singleton and the
 maintenance lock:
 
@@ -498,7 +509,9 @@ btrdasd-gui
          │         ├──▶ ConfigCheck()          → ConfigDialog (unknown-key warnings before a save)
          │         ├──▶ ConfigGet()            → ConfigDialog (the file's text, as it is)
          │         ├──▶ CoverageList()         → CoverageDialog (pairs no longer backed up; org.dasbackup.index.read)
-         │         └──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
+         │         ├──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
+         │         ├──▶ RaidAcceptPreview(l)   → RaidAcceptDialog (what `raid accept` would show; org.dasbackup.raid.accept)
+         │         └──▶ RaidAccept(l, typed)   → RaidAcceptDialog (the typed label compared again; org.dasbackup.raid.accept, auth_admin)
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
          ├──▶ SnapshotWatcher             QFileSystemWatcher → auto-detect new snapshots
