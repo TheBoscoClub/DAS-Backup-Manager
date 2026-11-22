@@ -324,6 +324,33 @@ t_resumed:0|duration:0|canceled:0|finished:0\n",
         self.dm_name = Some(name.clone());
         format!("/dev/mapper/{name}")
     }
+
+    /// Change the per-read delay of the device from [`Rig::attach_slow_device`]
+    /// in place (suspend, reload, resume), so a resume after the stop does not
+    /// crawl through the delay the stop needed.
+    fn set_slow_delay(&self, delay_ms: u32) {
+        let name = self.dm_name.as_deref().expect("no slow device attached");
+        let sectors = must("blockdev", &["--getsz", &self.loop_dev])
+            .trim()
+            .to_string();
+        must("dmsetup", &["suspend", name]);
+        must(
+            "dmsetup",
+            &[
+                "reload",
+                name,
+                "--table",
+                &format!("0 {sectors} delay {} 0 {delay_ms}", self.loop_dev),
+            ],
+        );
+        must("dmsetup", &["resume", name]);
+    }
+
+    /// The progress socket `btrfs scrub start` creates beside the record. A
+    /// scrub process killed by a signal it does not handle leaves it behind.
+    fn progress_socket(&self) -> PathBuf {
+        PathBuf::from(format!("/var/lib/btrfs/scrub.progress.{}", self.uuid))
+    }
 }
 
 impl Drop for Rig {
@@ -350,6 +377,7 @@ impl Drop for Rig {
         let _ = run("losetup", &["-d", &self.loop_dev]);
         // Do not leave a record for a UUID that no longer exists.
         let _ = std::fs::remove_file(self.status_record());
+        let _ = std::fs::remove_file(self.progress_socket());
         let _ = std::fs::remove_file(&self.image);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -751,3 +779,392 @@ fn live_scrub_is_never_force_restarted() {
 // spawn failed". `exit_code_for_pass_spawn_failure_on_all_targets_is_nonzero`
 // in `indexer/src/main.rs` is the unit-test proof instead, per the
 // reviewer's own explicit fallback for exactly this case.
+
+// ---------------------------------------------------------------------------
+// Which stop leaves a resumable record (bd DAS-Backup-Manager-su1b.2, step A1)
+// ---------------------------------------------------------------------------
+//
+// A scrub that yields to a backup must be stopped in a way that leaves a record
+// `btrfs scrub resume` continues from. Each test below stops a real
+// `btrfs scrub start -B -c 2 -n 0` (the engine's own invocation, as a direct
+// child: the process `stop_child` signals) by one method, unmounts, remounts,
+// and resumes. The assertions pin what was observed on kernel 7.3.5 with
+// btrfs-progs v7.3; another kernel or progs version may differ, and every
+// message carries the raw records so a red run says how.
+
+/// How the running scrub is stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopMethod {
+    /// SIGINT to the `btrfs scrub start -B` process.
+    Sigint,
+    /// SIGTERM to it (what `stop_child` sends first).
+    Sigterm,
+    /// `btrfs scrub cancel <mnt>` from another process.
+    Cancel,
+}
+
+/// Everything one stop-then-resume run observed.
+#[derive(Debug)]
+struct StopObservation {
+    method: StopMethod,
+    /// How the scrub process ended: `exit=N` or `signal=N`.
+    child_end: String,
+    /// Stop request to reap, in milliseconds.
+    stop_ms: u128,
+    /// `btrfs scrub status` liveness after the reap, before the unmount.
+    live_after_reap: LiveScrubState,
+    record_at_stop: String,
+    canceled_at_stop: Option<u64>,
+    finished_at_stop: Option<u64>,
+    bytes_at_stop: u64,
+    last_physical_at_stop: u64,
+    t_start_at_stop: Option<u64>,
+    /// The record is byte-identical before and after the unmount.
+    record_survived_unmount: bool,
+    progress_socket_left: bool,
+    /// `decide_scrub_start_mode` chose `Resume` after the remount.
+    decision_resume: bool,
+    resume_ok: bool,
+    resume_output: String,
+    record_after: String,
+    canceled_after: Option<u64>,
+    finished_after: Option<u64>,
+    bytes_after: u64,
+    t_start_after: Option<u64>,
+    /// `data_bytes_scrubbed` of a clean full pass of the same image.
+    baseline_bytes: u64,
+}
+
+impl StopObservation {
+    fn line(&self) -> String {
+        format!(
+            "A1-RESULT method={:?} child_end={} stop_ms={} live_after_reap={:?} \
+             at_stop[canceled={:?} finished={:?} bytes={} last_physical={} t_start={:?}] \
+             survived_unmount={} progress_socket_left={} decide={} resume_ok={} \
+             after[canceled={:?} finished={:?} bytes={} t_start={:?}] baseline={} \
+             over_baseline={}",
+            self.method,
+            self.child_end,
+            self.stop_ms,
+            self.live_after_reap,
+            self.canceled_at_stop,
+            self.finished_at_stop,
+            self.bytes_at_stop,
+            self.last_physical_at_stop,
+            self.t_start_at_stop,
+            self.record_survived_unmount,
+            self.progress_socket_left,
+            if self.decision_resume {
+                "Resume"
+            } else {
+                "Normal"
+            },
+            self.resume_ok,
+            self.canceled_after,
+            self.finished_after,
+            self.bytes_after,
+            self.t_start_after,
+            self.baseline_bytes,
+            self.bytes_after as i64 - self.baseline_bytes as i64,
+        )
+    }
+
+    /// The result line plus the raw records, for assertion messages.
+    fn records(&self) -> String {
+        format!(
+            "{}\nrecord at stop:\n{}\nresume output:\n{}\nrecord after resume:\n{}",
+            self.line(),
+            self.record_at_stop,
+            self.resume_output,
+            self.record_after
+        )
+    }
+
+    /// The resume continued from the stop: it finished, kept the original
+    /// start time, covered at least a full pass, and counted clearly less than
+    /// a restart from zero on top of the stopped segment would have.
+    fn resume_continued(&self) -> bool {
+        self.resume_ok
+            && self.finished_after == Some(1)
+            && self.canceled_after == Some(0)
+            && self.t_start_after.is_some()
+            && self.t_start_after == self.t_start_at_stop
+            && self.bytes_after >= self.baseline_bytes
+            && self.bytes_after < self.baseline_bytes + self.bytes_at_stop / 2
+    }
+}
+
+/// Per-read delay while the scrub that is stopped runs.
+const STOP_READ_DELAY_MS: u32 = 100;
+/// Data the stopped pass must have recorded before the stop: well past the
+/// first data chunk, and well short of the whole 2.3 GiB pass.
+const STOP_AFTER_BYTES: u64 = 1280 * 1024 * 1024;
+/// Longest wait for the stopped scrub process to be reaped.
+const STOP_REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn record_u64(record: &str, key: &str) -> Option<u64> {
+    record
+        .split('|')
+        .find_map(|f| f.trim().strip_prefix(&format!("{key}:")))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Stop a running engine-shaped scrub by `method`, unmount, remount, resume
+/// with the engine's resume invocation, and report what each step saw.
+fn stop_then_resume(method: StopMethod, tag: &str) -> StopObservation {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    let mut rig = Rig::new_sized(tag, 3);
+    rig.fill_incompressible_gib(2);
+    let mnt = rig.mount_point.to_string_lossy().to_string();
+
+    // A clean full pass of the image, undelayed: the yardstick a resumed pass
+    // must reach (never less: nothing skipped).
+    must("mount", &[&rig.loop_dev, &mnt]);
+    must("btrfs", &["scrub", "start", "-B", &mnt]);
+    let baseline_bytes = rig.bytes_scrubbed();
+    rig.umount_when_idle();
+    // The baseline's finished record must not pass for the stopped pass's
+    // progress below; the stopped pass starts with no record at all.
+    std::fs::remove_file(rig.status_record()).expect("remove the baseline record");
+    assert!(
+        baseline_bytes > 2 * 1024 * 1024 * 1024,
+        "baseline pass scrubbed only {baseline_bytes} bytes"
+    );
+
+    let slow_dev = rig.attach_slow_device(STOP_READ_DELAY_MS);
+    must("mount", &[&slow_dev, &mnt]);
+
+    let stderr = std::fs::File::create(rig.dir.join("scrub.stderr")).expect("stderr file");
+    let mut child = Command::new("btrfs")
+        .args(["scrub", "start", "-B", "-c", "2", "-n", "0", &mnt])
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn btrfs scrub start -B");
+
+    // Stop on evidence: this pass's record shows a position and more data
+    // scrubbed than one chunk, so a resume that continued and one that
+    // restarted from zero differ by more than the re-scrubbed chunk.
+    let begun = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let rec = rig.read_record();
+        if record_u64(&rec, "data_bytes_scrubbed").unwrap_or(0) >= STOP_AFTER_BYTES
+            && record_u64(&rec, "last_physical").unwrap_or(0) > 0
+            && record_u64(&rec, "finished") == Some(0)
+            && record_u64(&rec, "t_start").is_some_and(|t| t >= begun)
+        {
+            break;
+        }
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the scrub ended before it recorded {STOP_AFTER_BYTES} bytes:\n{rec}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{STOP_AFTER_BYTES} bytes not recorded in 180 s:\n{rec}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the scrub finished before the stop:\n{}",
+        rig.read_record()
+    );
+    assert_eq!(
+        live_scrub_state(&mnt, &rig.uuid),
+        LiveScrubState::Running,
+        "the scrub must be running when it is stopped"
+    );
+
+    let stopped_at = Instant::now();
+    match method {
+        StopMethod::Sigint | StopMethod::Sigterm => {
+            let sig = if method == StopMethod::Sigint {
+                libc::SIGINT
+            } else {
+                libc::SIGTERM
+            };
+            // SAFETY: signalling a child this test started and has not reaped.
+            let rc = unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+            assert_eq!(rc, 0, "kill failed");
+        }
+        StopMethod::Cancel => {
+            let (ok, text) = run("btrfs", &["scrub", "cancel", &mnt]);
+            assert!(ok, "btrfs scrub cancel failed: {text}");
+        }
+    }
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if stopped_at.elapsed() > STOP_REAP_LIMIT {
+            let _ = child.kill();
+            let s = child.wait().expect("wait");
+            panic!("the scrub process outlived the stop by 60 s and was killed ({s:?})");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stop_ms = stopped_at.elapsed().as_millis();
+    let child_end = match (status.code(), status.signal()) {
+        (Some(c), _) => format!("exit={c}"),
+        (None, Some(s)) => format!("signal={s}"),
+        _ => "unknown".to_string(),
+    };
+
+    // The kernel scrub must have stopped before anything unmounts.
+    let mut live_after_reap = LiveScrubState::Unknown;
+    for _ in 0..120 {
+        live_after_reap = live_scrub_state(&mnt, &rig.uuid);
+        if live_after_reap == LiveScrubState::NotRunning {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        rig.wait_mount_idle(Duration::from_secs(60)),
+        "something still holds {mnt} after the stop"
+    );
+
+    let record_at_stop = rig.read_record();
+    let progress_socket_left = rig.progress_socket().exists();
+
+    // The DAS case: the target is unmounted between the stop and the resume.
+    rig.umount_when_idle();
+    let record_survived_unmount = rig.read_record() == record_at_stop;
+    rig.set_slow_delay(0);
+    must("mount", &[&slow_dev, &mnt]);
+    let decision_resume = matches!(
+        scrub::decide_scrub_start_mode(&rig.uuid, &mnt),
+        ScrubStartMode::Resume { .. }
+    );
+    let (resume_ok, resume_output) = run(
+        "btrfs",
+        &["scrub", "resume", "-B", "-c", "2", "-n", "0", &mnt],
+    );
+    let record_after = rig.read_record();
+
+    let obs = StopObservation {
+        method,
+        child_end,
+        stop_ms,
+        live_after_reap,
+        canceled_at_stop: record_u64(&record_at_stop, "canceled"),
+        finished_at_stop: record_u64(&record_at_stop, "finished"),
+        bytes_at_stop: record_u64(&record_at_stop, "data_bytes_scrubbed").unwrap_or(0),
+        last_physical_at_stop: record_u64(&record_at_stop, "last_physical").unwrap_or(0),
+        t_start_at_stop: record_u64(&record_at_stop, "t_start"),
+        record_survived_unmount,
+        progress_socket_left,
+        decision_resume,
+        resume_ok,
+        resume_output: resume_output.trim().to_string(),
+        canceled_after: record_u64(&record_after, "canceled"),
+        finished_after: record_u64(&record_after, "finished"),
+        bytes_after: record_u64(&record_after, "data_bytes_scrubbed").unwrap_or(0),
+        t_start_after: record_u64(&record_after, "t_start"),
+        record_after,
+        record_at_stop,
+        baseline_bytes,
+    };
+    println!("{}", obs.line());
+    rig.umount_when_idle();
+    obs
+}
+
+/// What every stop method must meet whatever record it leaves: the process is
+/// reaped well inside `stop_child`'s 30 s grace, the kernel scrub has stopped
+/// before the unmount, the stop landed mid-pass, and the unmount leaves the
+/// record as it was.
+fn assert_clean_stop(obs: &StopObservation) {
+    let all = obs.records();
+    assert!(obs.stop_ms < 30_000, "stop took {} ms\n{all}", obs.stop_ms);
+    assert_eq!(
+        obs.live_after_reap,
+        LiveScrubState::NotRunning,
+        "kernel scrub still live after the reap\n{all}"
+    );
+    assert!(
+        obs.bytes_at_stop >= STOP_AFTER_BYTES
+            && obs.bytes_at_stop + 256 * 1024 * 1024 < obs.baseline_bytes,
+        "the stop must land mid-pass\n{all}"
+    );
+    assert!(
+        obs.record_survived_unmount,
+        "the unmount changed the record\n{all}"
+    );
+}
+
+/// What SIGINT and `btrfs scrub cancel` were both seen to leave: progs is
+/// alive to write a final record and writes the cancelled shape
+/// `canceled:1 finished:1`, exiting 1. `decide_scrub_start_mode` then chooses
+/// a fresh start (bd DAS-Backup-Manager-su1b.2: the engine would throw the
+/// position away), although `btrfs scrub resume` itself continues from it.
+fn assert_cancel_shaped(obs: &StopObservation) {
+    let all = obs.records();
+    assert_eq!(obs.child_end, "exit=1", "{all}");
+    assert_eq!(obs.canceled_at_stop, Some(1), "{all}");
+    assert_eq!(obs.finished_at_stop, Some(1), "{all}");
+    assert!(!obs.progress_socket_left, "{all}");
+    assert!(
+        !obs.decision_resume,
+        "the engine resumes only canceled:0 finished:0\n{all}"
+    );
+    assert!(
+        obs.resume_continued(),
+        "btrfs scrub resume did not continue a cancelled record\n{all}"
+    );
+}
+
+/// SIGINT: progs's own handler cancels the kernel scrub and records it as
+/// cancelled, the same record as `btrfs scrub cancel`.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn stop_by_sigint_then_resume() {
+    assert!(is_root(), "must run as root");
+    let obs = stop_then_resume(StopMethod::Sigint, "a1-int");
+    assert_clean_stop(&obs);
+    assert_cancel_shaped(&obs);
+}
+
+/// SIGTERM (what `stop_child` sends first): fatal to progs, the kernel scrub
+/// stops with the process, and the record keeps its last periodic write,
+/// `canceled:0 finished:0`. The one stop the engine resumes; it leaves the
+/// progress socket behind, which neither `btrfs scrub status` nor the resume
+/// minds.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn stop_by_sigterm_then_resume() {
+    assert!(is_root(), "must run as root");
+    let obs = stop_then_resume(StopMethod::Sigterm, "a1-term");
+    assert_clean_stop(&obs);
+    let all = obs.records();
+    assert_eq!(obs.child_end, "signal=15", "{all}");
+    assert_eq!(obs.canceled_at_stop, Some(0), "{all}");
+    assert_eq!(obs.finished_at_stop, Some(0), "{all}");
+    assert!(obs.last_physical_at_stop > 0, "{all}");
+    assert!(obs.progress_socket_left, "{all}");
+    assert!(
+        obs.decision_resume,
+        "the engine must resume a SIGTERM-stopped scrub\n{all}"
+    );
+    assert!(
+        obs.resume_continued(),
+        "btrfs scrub resume did not continue the SIGTERM-stopped scrub\n{all}"
+    );
+}
+
+/// `btrfs scrub cancel` from another process: see [`assert_cancel_shaped`].
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn stop_by_scrub_cancel_then_resume() {
+    assert!(is_root(), "must run as root");
+    let obs = stop_then_resume(StopMethod::Cancel, "a1-cancel");
+    assert_clean_stop(&obs);
+    assert_cancel_shaped(&obs);
+}
