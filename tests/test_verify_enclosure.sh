@@ -8,7 +8,7 @@
 #
 # backup-verify.sh's detect_das_drives() picks the DAS disks by
 # [das].model_pattern (bd DAS-Backup-Manager-zk89). Since bd yi8m the pattern
-# is a SUBSTRING of the disk's model (blanks removed), as backup-run.sh matches
+# is a SUBSTRING of the disk's model (blanks removed from both), as backup-run.sh matches
 # the USB product string, and an empty pattern is no filter. It was an exact
 # match, which a configured product string never was; an enclosure's model is
 # not the string an operator copies from `lsusb`.
@@ -83,6 +83,12 @@ result() {
 
 check "substring of the model picks the enclosure's disk" "$(result 'DAS-X6')" "sda status=0"
 check "the whole model (blanks removed) picks it too" "$(result 'AcmeDAS-X6')" "sda status=0"
+# bd DAS-Backup-Manager-2kb1.15: the model has its blanks removed, so the
+# pattern has them removed too (docs/INSTALL.md: "spaces removed"); a pattern
+# written as the model is spelled, with its blank, used to match nothing.
+check "a pattern with a blank (as sysfs spells the model) picks the disk" "$(result 'Acme DAS-X6')" "sda status=0"
+check "a blank inside a substring is ignored the same way" "$(result 'e DAS')" "sda status=0"
+check "a pattern of blanks only is an empty pattern: every USB disk" "$(result '  ')" "sda,sdb status=0"
 check "a substring of another USB disk's model picks that disk" "$(result 'Stick')" "sdb status=0"
 check "a pattern in no disk's model picks nothing and fails" "$(result 'NoSuchEnclosure')" "status=1"
 check "...and says the enclosure was not found, not 'all disks'" "$(grep -c 'No DAS drives detected' "$WORK/log")" "1"

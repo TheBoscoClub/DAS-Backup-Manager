@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`backup-run.sh` and `backup-verify.sh` read a drive's serial by the partition script's strict rule** (bd `DAS-Backup-Manager-2kb1.17`): both took awk's third field of `Serial Number:` only, so a SAS/SCSI drive (`Serial number:`) was never identified, a value with a blank matched on its first word, and a `smartctl` that could not open the drive was believed
+  - Exactly one `Serial Number:` or `Serial number:` line, the whole trimmed value, `smartctl`'s failure bits (exit status 1 and 2) refused; a faithful `parse_drive_serial` copy in each script (no shared library), named for the partition script's
+  - `backup-run.sh` (4.20.2): a target found by serial (no `mount_uuid`) whose serial cannot be read, or reads ambiguously, now refuses the btrbk run (`mounted_is_target`); `find_device_by_serial` returns no device for a serial on two nodes
+  - `backup-verify.sh` (3.3.0): an unreadable or ambiguous serial is the empty string
+  - `tests/test_serial_identity.sh` (CTest `shell-serial-identity`)
+- **`[das].model_pattern` has its blanks removed on both sides** (bd `DAS-Backup-Manager-2kb1.15`): `backup-verify.sh` removed them from the disk's model but not from the pattern, so a pattern written with a space matched nothing; `backup-run.sh`'s USB link probe removed them from neither, and now from both, as `docs/INSTALL.md` says
+
 - **Recovery panel polish** (bd `DAS-Backup-Manager-v173`, `DAS-Backup-Manager-3gzs.5`): small honesty fixes in the GUI's recovery drive panel and notifications
   - End session is enabled only for a holder named `other:`; any other holder is refused with the reason, and a document with no drives disables every action
   - A `JobFinished` that arrives before the method's reply is kept with its summary (by job id) and shown when the reply names the job; the held entries are dropped when the request resolves, so unrelated finishes no longer pile up

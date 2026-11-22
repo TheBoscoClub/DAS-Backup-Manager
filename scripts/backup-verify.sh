@@ -1,7 +1,14 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.2.1
-# Date: 2026-11-21
+# Version: 3.3.0
+# Date: 2026-11-22
+#
+# 3.3.0: a drive's serial is read by one strict rule (read_drive_serial() over
+# parse_drive_serial(), the partition script's): one "Serial Number:" or SAS
+# "Serial number:" line, the whole value, smartctl's failure bits refused (bd
+# DAS-Backup-Manager-2kb1.17). [das].model_pattern has its blanks removed as
+# the model has (docs/INSTALL.md), so a pattern written with a space matches
+# (bd DAS-Backup-Manager-2kb1.15).
 #
 # 3.2.1: the skip line for a held maintenance lock names the holder from its
 # record in the lock file, or says plainly that the record is empty or cannot
@@ -243,8 +250,12 @@ detect_das_drives() {
                 # disk), never "match nothing".
                 local model
                 model=$(cat "$dev/device/model" 2>/dev/null | tr -d ' ' || true)
+                # Blanks are removed from the pattern as from the model
+                # (docs/INSTALL.md; bd DAS-Backup-Manager-2kb1.15).
+                local pattern="${DAS_MODEL_PATTERN:-}"
+                pattern="${pattern//[[:space:]]/}"
 
-                if [[ -z "${DAS_MODEL_PATTERN:-}" || "$model" == *"$DAS_MODEL_PATTERN"* ]]; then
+                if [[ -z "$pattern" || "$model" == *"$pattern"* ]]; then
                     DAS_DEVICES+=("/dev/$name")
                 fi
             fi
@@ -266,6 +277,63 @@ detect_das_drives() {
     done
 }
 
+# parse_drive_serial <smartctl -i output> <its exit status>
+# Returns 0 only when the output carries exactly one drive serial: one line
+# that starts "Serial Number:" (ATA, NVMe) or "Serial number:" (SCSI, SAS),
+# smartctl 7.5's own labels, with a non-empty value. Sets DRIVE_SERIAL to it
+# and, on a refusal, DRIVE_SERIAL_PROBLEM to why. DRIVE_SERIALS_SEEN holds
+# every non-empty value found either way, so a refusal can tell whether a
+# listed drive was among them (bd DAS-Backup-Manager-tjph).
+#
+# A faithful copy of parse_drive_serial in
+# scripts/das-wipe-all-drives-and-partition-from-scratch.sh (the scripts share
+# no sourced library, so each ships its own; keep them in step, bd
+# DAS-Backup-Manager-2kb1.17). Here it decides whether btrbk may write to a
+# target found by serial: anything unreadable or ambiguous is a refusal.
+#
+# The identity rule: the whole value, with the blanks smartctl pads it with
+# trimmed from both ends, compared byte for byte and case-sensitively. Before
+# this rule the match was awk's third field of "Serial Number:" only: a SAS
+# drive's "Serial number:" never matched, a value with a blank matched on its
+# first word alone, and a smartctl that could not open the drive was believed.
+parse_drive_serial() {
+    local out="$1" rc="$2" nl=$'\n' rest line value count=0
+    DRIVE_SERIAL="" DRIVE_SERIAL_PROBLEM="" DRIVE_SERIALS_SEEN=()
+
+    # Line by line in bash itself: no pipe, no file, no subshell.
+    rest="$out"
+    while [[ -n $rest ]]; do
+        line="${rest%%"$nl"*}"
+        if [[ $rest == *"$nl"* ]]; then rest="${rest#*"$nl"}"; else rest=""; fi
+        [[ $line == "Serial Number:"* || $line == "Serial number:"* ]] || continue
+        value="${line#Serial [Nn]umber:}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        count=$((count + 1))
+        [[ -z $value ]] || DRIVE_SERIALS_SEEN+=("$value")
+    done
+
+    # smartctl's exit status is a bitmask (smartctl(8), EXIT STATUS). Bits
+    # 0-1: it could not parse its command line or open the drive, so nothing
+    # it printed is the drive's identity. 127 (no smartctl) sets both. Other
+    # bits are SMART findings, which leave the identity readable; the SMART
+    # gate judges those.
+    if ((rc & 3)); then
+        DRIVE_SERIAL_PROBLEM="smartctl could not read its identity (exit $rc)"
+        return 1
+    fi
+    if ((count > 1)); then
+        DRIVE_SERIAL_PROBLEM="more than one serial line in smartctl's output (${DRIVE_SERIALS_SEEN[*]})"
+        return 1
+    fi
+    if ((${#DRIVE_SERIALS_SEEN[@]} != 1)); then
+        DRIVE_SERIAL_PROBLEM="no serial in smartctl's output"
+        return 1
+    fi
+    DRIVE_SERIAL="${DRIVE_SERIALS_SEEN[0]}"
+    return 0
+}
+
 # Read one drive's serial, or the empty string.
 #
 # The previous shape was:
@@ -275,6 +343,10 @@ detect_das_drives() {
 # script's `set -o pipefail` that fails the whole pipeline -- so `|| echo
 # "unknown"` fired and APPENDED a second line AFTER awk had already printed the
 # real serial. Measured on this host: serial=[SERIAL02\nunknown].
+#
+# Strict since 3.3.0 (bd DAS-Backup-Manager-2kb1.17): parse_drive_serial's rule,
+# so a SAS "Serial number:" is read, a value is whole, and an unreadable or
+# ambiguous serial is the empty string (never a guess).
 #
 # Two live consequences, both of which had been true for the entire life of the
 # script: every drive rendered as "Unknown" instead of its configured display
@@ -286,9 +358,13 @@ detect_das_drives() {
 # Capture first, filter second: nothing can SIGPIPE a producer that has already
 # finished, so the pipeline status means what it appears to mean.
 read_drive_serial() {
-    local dev="$1" info
-    info=$(smartctl -i "$dev" 2>/dev/null) || true
-    printf '%s' "$(awk '/Serial Number:/{print $3; exit}' <<<"$info")"
+    local dev="$1" out rc=0
+    # shellcheck disable=SC2034 # DRIVE_SERIAL_PROBLEM is set by parse_drive_serial, unused here
+    local DRIVE_SERIAL DRIVE_SERIAL_PROBLEM DRIVE_SERIALS_SEEN
+    out="$(smartctl -i "$dev" 2>&1)" || rc=$?
+    if parse_drive_serial "$out" "$rc"; then
+        printf '%s' "$DRIVE_SERIAL"
+    fi
 }
 
 check_smart_health() {

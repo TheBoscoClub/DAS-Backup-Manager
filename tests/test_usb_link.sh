@@ -115,6 +115,17 @@ run
 has "a pattern no device matches: unknown" "$(cat "$WORK/tp.jsonl")" '"usb_link_mbit_s":"unknown"'
 has "a pattern no device matches: usb_link WARN, naming the pattern" "$(cat "$WORK/ops")" "usb_link WARN no USB device's product contains 'Nothing Like It'"
 
+# bd DAS-Backup-Manager-2kb1.15: blanks are removed from the product string and
+# from the pattern alike (docs/INSTALL.md), as backup-verify.sh does.
+device 4-1 "Spaced   Enclosure X" 480
+DAS_MODEL_PATTERN="SpacedEnclosure"
+run
+has "pattern without the blank finds a product that has one" "$(cat "$WORK/tp.jsonl")" '"usb_link_mbit_s":"480"'
+DAS_MODEL_PATTERN="Spaced Enclosure"
+run
+has "pattern with one blank finds a product with three" "$(cat "$WORK/tp.jsonl")" '"usb_link_mbit_s":"480"'
+rm -r "${WORK:?}/usb/4-1"
+
 # The report carries the row, so a FAIL says why in the email, not only the journal.
 # shellcheck disable=SC2016 # matched as written
 has "the report has a USB link row" "$(cat "$SCRIPT")" 'USB link              ${OP_STATUS[usb_link]:-N/A}'

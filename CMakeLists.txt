@@ -411,6 +411,12 @@ if(BUILD_TESTING)
         NAME shell-verify-rewrite
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_rewrite.sh
     )
+    # A drive's serial is read by one strict rule in backup-run.sh and
+    # backup-verify.sh (bd DAS-Backup-Manager-2kb1.17).
+    add_test(
+        NAME shell-serial-identity
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_serial_identity.sh
+    )
     add_test(
         NAME shell-verify-enclosure
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_enclosure.sh

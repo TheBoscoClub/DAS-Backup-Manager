@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.20.1
-# Date: 2026-11-12
+# Version: 4.20.2
+# Date: 2026-11-22
 #
 # Features:
+#   - A drive's serial is read by one strict rule (v4.20.2, bd
+#     DAS-Backup-Manager-2kb1.17): parse_drive_serial() takes exactly one
+#     "Serial Number:" (ATA, NVMe) or "Serial number:" (SCSI, SAS) line, the
+#     whole trimmed value, and refuses smartctl's failure bits. A target
+#     identified by serial (no mount_uuid) whose serial cannot be read, or
+#     reads ambiguously, now REFUSES the btrbk run. The USB link probe removes
+#     blanks from the product string and from [das].model_pattern alike
+#     (bd DAS-Backup-Manager-2kb1.15).
 #   - An unmount that could not run is not an unmount (v4.20.1, bd
 #     DAS-Backup-Manager-tzwf): umount_with_retry() read `if err="$(umount …)"`,
 #     which bash calls true, running nothing, when it has no descriptor free
@@ -1196,20 +1204,92 @@ parent_disk() { # parent_disk <block device>
     esac
 }
 
-# Find device by serial number
+# parse_drive_serial <smartctl -i output> <its exit status>
+# Returns 0 only when the output carries exactly one drive serial: one line
+# that starts "Serial Number:" (ATA, NVMe) or "Serial number:" (SCSI, SAS),
+# smartctl 7.5's own labels, with a non-empty value. Sets DRIVE_SERIAL to it
+# and, on a refusal, DRIVE_SERIAL_PROBLEM to why. DRIVE_SERIALS_SEEN holds
+# every non-empty value found either way, so a refusal can tell whether a
+# listed drive was among them (bd DAS-Backup-Manager-tjph).
+#
+# A faithful copy of parse_drive_serial in
+# scripts/das-wipe-all-drives-and-partition-from-scratch.sh (the scripts share
+# no sourced library, so each ships its own; keep them in step, bd
+# DAS-Backup-Manager-2kb1.17). Here it decides whether btrbk may write to a
+# target found by serial: anything unreadable or ambiguous is a refusal.
+#
+# The identity rule: the whole value, with the blanks smartctl pads it with
+# trimmed from both ends, compared byte for byte and case-sensitively. Before
+# this rule the match was awk's third field of "Serial Number:" only: a SAS
+# drive's "Serial number:" never matched, a value with a blank matched on its
+# first word alone, and a smartctl that could not open the drive was believed.
+parse_drive_serial() {
+    local out="$1" rc="$2" nl=$'\n' rest line value count=0
+    DRIVE_SERIAL="" DRIVE_SERIAL_PROBLEM="" DRIVE_SERIALS_SEEN=()
+
+    # Line by line in bash itself: no pipe, no file, no subshell.
+    rest="$out"
+    while [[ -n $rest ]]; do
+        line="${rest%%"$nl"*}"
+        if [[ $rest == *"$nl"* ]]; then rest="${rest#*"$nl"}"; else rest=""; fi
+        [[ $line == "Serial Number:"* || $line == "Serial number:"* ]] || continue
+        value="${line#Serial [Nn]umber:}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        count=$((count + 1))
+        [[ -z $value ]] || DRIVE_SERIALS_SEEN+=("$value")
+    done
+
+    # smartctl's exit status is a bitmask (smartctl(8), EXIT STATUS). Bits
+    # 0-1: it could not parse its command line or open the drive, so nothing
+    # it printed is the drive's identity. 127 (no smartctl) sets both. Other
+    # bits are SMART findings, which leave the identity readable; the SMART
+    # gate judges those.
+    if ((rc & 3)); then
+        DRIVE_SERIAL_PROBLEM="smartctl could not read its identity (exit $rc)"
+        return 1
+    fi
+    if ((count > 1)); then
+        DRIVE_SERIAL_PROBLEM="more than one serial line in smartctl's output (${DRIVE_SERIALS_SEEN[*]})"
+        return 1
+    fi
+    if ((${#DRIVE_SERIALS_SEEN[@]} != 1)); then
+        DRIVE_SERIAL_PROBLEM="no serial in smartctl's output"
+        return 1
+    fi
+    DRIVE_SERIAL="${DRIVE_SERIALS_SEEN[0]}"
+    return 0
+}
+
+# read_drive_serial <device>: smartctl's output and exit status, apart, through
+# parse_drive_serial. 0 with DRIVE_SERIAL set; 1 with DRIVE_SERIAL_PROBLEM set.
+# A capture bash cannot make prints nothing: no serial, refused. Callers
+# declare DRIVE_SERIAL, DRIVE_SERIAL_PROBLEM and DRIVE_SERIALS_SEEN local.
+read_drive_serial() {
+    local out rc=0
+    out="$(smartctl -i "$1" 2>&1)" || rc=$?
+    parse_drive_serial "$out" "$rc"
+}
+
+# Find the device carrying <serial>. Succeeds only when exactly one device
+# reads as that serial; a node whose serial cannot be read, or reads
+# ambiguously, never matches, and a serial on two nodes is "cannot be told"
+# (no device), never the first (bd DAS-Backup-Manager-2kb1.17).
 find_device_by_serial() {
     local serial="$1"
-    local dev dev_serial
+    local dev found=""
+    local DRIVE_SERIAL DRIVE_SERIAL_PROBLEM DRIVE_SERIALS_SEEN
     for dev in /dev/sd[a-z] /dev/sd[a-z][a-z]; do
         if [[ -b "$dev" ]]; then
-            dev_serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}')
-            if [[ "$dev_serial" == "$serial" ]]; then
-                echo "$dev"
-                return 0
+            read_drive_serial "$dev" || continue
+            if [[ "$DRIVE_SERIAL" == "$serial" ]]; then
+                [[ -z "$found" ]] || return 1
+                found="$dev"
             fi
         fi
     done
-    return 1
+    [[ -n "$found" ]] || return 1
+    echo "$found"
 }
 
 check_das_connected() {
@@ -2383,15 +2463,21 @@ mounted_is_target() {
         IDENTITY_WHY="$label: $mnt is mounted from $mount_src, whose disk lsblk could not resolve -- cannot check its serial"
         return 1
     fi
-    local got_serial expected
-    got_serial=$(smartctl -i "$mount_dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || true)
+    # An unreadable or ambiguous serial refuses (bd DAS-Backup-Manager-2kb1.17):
+    # it is never a pass, never read as "some other serial".
+    local expected
+    local DRIVE_SERIAL DRIVE_SERIAL_PROBLEM DRIVE_SERIALS_SEEN
+    if ! read_drive_serial "$mount_dev"; then
+        IDENTITY_WHY="$label: $mnt mounted from $mount_src: $DRIVE_SERIAL_PROBLEM -- cannot check its serial"
+        return 1
+    fi
     for expected in $serials_list; do
-        if [[ "$got_serial" == "$expected" ]]; then
-            IDENTITY_OK="$mnt → $mount_src, serial=$got_serial"
+        if [[ "$DRIVE_SERIAL" == "$expected" ]]; then
+            IDENTITY_OK="$mnt → $mount_src, serial=$DRIVE_SERIAL"
             return 0
         fi
     done
-    IDENTITY_WHY="$label: $mnt mounted from $mount_src (serial='${got_serial:-?}'), expected one of: $serials_list"
+    IDENTITY_WHY="$label: $mnt mounted from $mount_src (serial='$DRIVE_SERIAL'), expected one of: $serials_list"
     return 1
 }
 
@@ -3557,13 +3643,19 @@ log_throughput() {
     # matches is a WARN: the enclosure's link went unread.
     local expected="${DAS_EXPECTED_LINK_MBIT_S:-10000}"
     local link_speed="unknown"
-    local d speed
-    if [[ -z "${DAS_MODEL_PATTERN:-}" ]]; then
+    local d speed product
+    # Blanks are removed from the product string and the pattern alike
+    # (docs/INSTALL.md; backup-verify.sh does the same, bd 2kb1.15).
+    local pattern="${DAS_MODEL_PATTERN:-}"
+    pattern="${pattern//[[:space:]]/}"
+    if [[ -z "$pattern" ]]; then
         log_info "  DAS USB link speed not checked: no [das].model_pattern is configured (your enclosure's USB product string)"
     else
         for d in /sys/bus/usb/devices/*/; do
             [[ -f "$d/speed" && -f "$d/product" ]] || continue
-            [[ "$(cat "$d/product" 2>/dev/null)" == *"$DAS_MODEL_PATTERN"* ]] || continue
+            product="$(cat "$d/product" 2>/dev/null)" || product=""
+            product="${product//[[:space:]]/}"
+            [[ "$product" == *"$pattern"* ]] || continue
             speed="$(cat "$d/speed" 2>/dev/null)" || speed=""
             case "$speed" in '' | *[!0123456789]*) continue ;; esac
             if [[ "$link_speed" == "unknown" ]] || (( speed < link_speed )); then
@@ -3722,7 +3814,8 @@ get_smart_summary() {
     hours=$(smartctl -A "$dev" 2>/dev/null | awk '/Power_On_Hours/{print $10}' || echo "?")
     # Some drives report the raw value as 19195h+28m+10.893s: the hours only.
     hours="${hours%%h*}"
-    serial=$(smartctl -i "$dev" 2>/dev/null | awk '/Serial Number:/{print $3}' || echo "?")
+    local DRIVE_SERIAL DRIVE_SERIAL_PROBLEM DRIVE_SERIALS_SEEN
+    if read_drive_serial "$dev"; then serial="$DRIVE_SERIAL"; else serial="?"; fi
 
     echo "${health}|${temp}|${hours}|${serial}"
 }
