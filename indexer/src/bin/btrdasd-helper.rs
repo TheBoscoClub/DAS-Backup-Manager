@@ -2723,8 +2723,13 @@ fn index_walk_job(
     progress: &OrderedProgress,
 ) -> Result<String, String> {
     let held = maintenance::hold_for_job(site, "btrdasd-helper IndexWalk job", progress)?;
-    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
-        .map_err(|e| format!("Mount failed: {e}"))?;
+    let mut guard = mount::ensure_targets_mounted(
+        config,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )
+    .map_err(|e| format!("Mount failed: {e}"))?;
 
     let db = Database::open(&config.general.db_path).map_err(|e| format!("DB open failed: {e}"))?;
 
@@ -2805,8 +2810,13 @@ fn restore_files_job(
     progress: &OrderedProgress,
 ) -> Result<(bool, String), String> {
     let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreFiles job", progress)?;
-    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
-        .map_err(|e| format!("Mount failed: {e}"))?;
+    let mut guard = mount::ensure_targets_mounted(
+        config,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )
+    .map_err(|e| format!("Mount failed: {e}"))?;
 
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     // A boundary: mounted, nothing restored yet.
@@ -2856,8 +2866,13 @@ fn restore_snapshot_job(
     progress: &OrderedProgress,
 ) -> Result<(bool, String), String> {
     let held = maintenance::hold_for_job(site, "btrdasd-helper RestoreSnapshot job", progress)?;
-    let mut guard = mount::ensure_targets_mounted(config, progress, &held)
-        .map_err(|e| format!("Mount failed: {e}"))?;
+    let mut guard = mount::ensure_targets_mounted(
+        config,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )
+    .map_err(|e| format!("Mount failed: {e}"))?;
 
     // A boundary: mounted, nothing restored yet.
     let res = if progress::stop_requested(progress) {

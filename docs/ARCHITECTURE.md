@@ -215,7 +215,11 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 (backup run, doctor, walk, restore, the GUI helper), the scrub engine, and
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
-refused, 2 could not run). Single-device targets are mounted as before.
+refused, 2 could not run). Single-device targets are mounted as before. Every
+caller says what its job does to the target (`raid_guard::Intent`, never
+inferred): `Write` for backups, boot archiving, forget/purge, the scrub;
+`ReadOnly` for walk, reindex, reconcile, restore, browse, the doctor and the
+recovery-OS reading.
 
 ```text
 blkid -c /dev/null -t UUID=<fsid> -o device   → the members, never found by serial alone
@@ -230,7 +234,11 @@ all num_devices present?
          still absent, a configured serial absent:
            mount ro,degraded,rescue=nologreplay → read the witness → unmount
            split-brain verdict (primary + witness):
-             present ⊄ last period's members, or a copy unreadable → REFUSE
+             a copy unreadable → REFUSE (every job)
+             present ⊄ last period's members (split brain):
+               Intent::Write    → REFUSE
+               Intent::ReadOnly → mount <mount_opts>,ro,degraded,rescue=nologreplay,
+                                  nothing written → STALE-READ-ONLY (WARN, data date)
            write primary record → mount <mount_opts>,degraded → write witness → DEGRADED (WARN)
          still absent with every configured serial attached → REFUSE
 ```

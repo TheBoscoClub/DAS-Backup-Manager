@@ -32,6 +32,13 @@
 //!    closed). Only "no such file" is "no record".
 //! 7. After a normal mount the kernel's own view (`/sys/fs/btrfs/<fsid>/
 //!    devinfo/<devid>/missing`) must show no member missing.
+//! 8. What the job will do to the target is the caller's to say, never
+//!    inferred ([`Intent`], bd DAS-Backup-Manager-su1b.11, operator
+//!    2026-11-22): a job that only reads it (walk, restore, browsing, the
+//!    doctor) is given the split-brain member read-only —
+//!    [`STALE_READ_OPTS`], nothing replayed, no record changed — with a
+//!    warning naming the date its data stops; a job that writes stays
+//!    refused.
 //!
 //! Single-device targets never come here.
 
@@ -58,6 +65,21 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// The read-only probe mount that reads the witness before a degraded mount
 /// is decided: nothing is written to the member, log replay included.
 pub const PROBE_OPTS: &str = "ro,degraded,rescue=nologreplay";
+/// What a read-only job's mount of a split-brain member adds to the
+/// configured options (`degraded` and any `rw` taken out first).
+pub const STALE_READ_OPTS: &str = "ro,degraded,rescue=nologreplay";
+
+/// What the job that asks for a mount will do to the target. Every caller
+/// says it; nothing infers it from the mount options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// The job writes the target: backups (run, snapshot, send, static),
+    /// boot archiving, the state pass, forget and purge, the scrub, setup.
+    Write,
+    /// The job only reads the target: walk, reindex, reconcile, restore,
+    /// browsing, the doctor, the recovery-OS reading.
+    ReadOnly,
+}
 /// The first line of every record copy.
 const FORMAT_LINE: &str = "format=das-backup-raid-record 1";
 
@@ -111,6 +133,25 @@ pub fn with_degraded(opts: &str) -> String {
     } else {
         format!("{base},degraded")
     }
+}
+
+/// `opts` for a read-only job's mount of a split-brain member: the configured
+/// options without `degraded`, `rw` or `ro`, then [`STALE_READ_OPTS`].
+pub fn stale_read_opts(opts: &str) -> String {
+    let base: Vec<&str> = tokens(opts)
+        .filter(|o| !matches!(*o, "degraded" | "rw" | "ro"))
+        .collect();
+    if base.is_empty() {
+        STALE_READ_OPTS.into()
+    } else {
+        format!("{},{STALE_READ_OPTS}", base.join(","))
+    }
+}
+
+/// `epoch` as the host's local date and time, or the bare number when the C
+/// library cannot convert it.
+pub fn when(epoch: i64) -> String {
+    crate::caldate::local_datetime(epoch).unwrap_or_else(|| format!("epoch {epoch}"))
 }
 
 /// Whether `opts` asks for a read-only mount.
@@ -504,6 +545,11 @@ fn names(set: &BTreeSet<&str>) -> String {
 pub enum Verdict {
     /// Yes; this is the record to write before it is used.
     Allow(Record),
+    /// No: the present members lack the writes of the last degraded period,
+    /// which ran on others (`record`). Refused for writing, whatever the
+    /// state; a read-only job may read them ([`Intent::ReadOnly`]).
+    SplitBrain { record: Record, why: String },
+    /// No, for any job: a copy unreadable, or the copies disagree.
     Refuse(String),
 }
 
@@ -551,7 +597,7 @@ pub fn degraded_verdict(
         .map(|m| format!("devid {} ({})", m.devid, m.dev_uuid))
         .collect();
     if !strangers.is_empty() {
-        return Verdict::Refuse(format!(
+        let why = format!(
             "split brain: the last degraded period (since {}) ran on {}, and {} — which \
              lacks that period's writes — is the only member present{}; mounting it degraded \
              would give the filesystem two diverging histories",
@@ -563,7 +609,8 @@ pub fn degraded_verdict(
             } else {
                 ""
             }
-        ));
+        );
+        return Verdict::SplitBrain { record, why };
     }
     let members = record
         .members
@@ -740,6 +787,8 @@ pub struct Plan<'a> {
     pub mount_opts: &'a str,
     pub wait: Duration,
     pub record_dir: &'a Path,
+    /// What the job will do to the target; never inferred.
+    pub intent: Intent,
 }
 
 /// How a guarded mount came up.
@@ -756,6 +805,15 @@ pub enum Outcome {
         /// changed).
         record_problem: Option<String>,
     },
+    /// Split brain, for a read-only job: mounted read-only
+    /// ([`STALE_READ_OPTS`]) on `members`, which lack the writes of the
+    /// degraded period in `record` (unchanged). Nothing is written to it.
+    StaleReadOnly {
+        members: Vec<Member>,
+        absent_serials: Vec<String>,
+        expected: u64,
+        record: Record,
+    },
     /// A member is absent: mounted degraded on `members`.
     Degraded {
         members: Vec<Member>,
@@ -768,8 +826,8 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The one-line status this mount reports: `OK`, `SCRUB-OWED` or
-    /// `DEGRADED`, and the detail.
+    /// The one-line status this mount reports: `OK`, `SCRUB-OWED`,
+    /// `DEGRADED` or `STALE-READ-ONLY`, and the detail.
     pub fn status_line(&self) -> (&'static str, String) {
         match self {
             Self::Normal {
@@ -806,6 +864,45 @@ impl Outcome {
                     ("OK", base)
                 }
             }
+            Self::StaleReadOnly {
+                members,
+                absent_serials,
+                expected,
+                record,
+            } => (
+                "STALE-READ-ONLY",
+                format!(
+                    "split brain, mounted READ-ONLY ({STALE_READ_OPTS}) for a job that only \
+                     reads: {} of {expected} members present ({}), which lack the writes of the \
+                     last degraded period — it ran on {} from {} to {}{} — so the data here \
+                     stops no later than {}; absent drive(s) {}; nothing is written to it and \
+                     the record is unchanged; every job that writes the target stays refused \
+                     until that drive returns (or 'btrdasd raid accept')",
+                    members.len(),
+                    members
+                        .iter()
+                        .map(|m| format!(
+                            "devid {} {} {}, superblock generation {}",
+                            m.devid, m.dev_uuid, m.path, m.generation
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    names(&record.dev_uuids()),
+                    when(record.since),
+                    when(record.last),
+                    if record.state == State::ScrubOwed {
+                        ", rejoined and not yet scrubbed"
+                    } else {
+                        ""
+                    },
+                    when(record.since),
+                    if absent_serials.is_empty() {
+                        "unknown (no serial configured)".to_string()
+                    } else {
+                        absent_serials.join(", ")
+                    },
+                ),
+            ),
             Self::Degraded {
                 members,
                 absent_serials,
@@ -1133,6 +1230,14 @@ fn mount_degraded(
     let primary = read_copy(&primary_path, plan.fsid);
     let record = match degraded_verdict(plan.fsid, &primary, &witness, &s.members, host.now()) {
         Verdict::Allow(r) => r,
+        Verdict::SplitBrain { record, why } => {
+            return match plan.intent {
+                Intent::Write => Err(refused(why)),
+                Intent::ReadOnly => {
+                    mount_stale_read_only(host, plan, s, absent_serials, record, progress)
+                }
+            };
+        }
         Verdict::Refuse(why) => return Err(refused(why)),
     };
     let read_only = is_read_only(plan.mount_opts);
@@ -1164,6 +1269,32 @@ fn mount_degraded(
         expected: s.expected,
         record,
         recorded: !read_only,
+    };
+    let (status, detail) = outcome.status_line();
+    progress.on_log(
+        LogLevel::Warning,
+        &format!("Target '{}': {status}: {detail}", plan.label),
+    );
+    Ok(outcome)
+}
+
+/// A read-only job's mount of a split-brain member: [`stale_read_opts`],
+/// nothing written, the record left as it is.
+fn mount_stale_read_only(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: Survey,
+    absent_serials: Vec<String>,
+    record: Record,
+    progress: &dyn ProgressCallback,
+) -> Result<Outcome, Failure> {
+    host.mount(&stale_read_opts(plan.mount_opts), plan.fsid, plan.mount)
+        .map_err(|e| Failure::MountFailed(format!("the read-only mount failed: {e}")))?;
+    let outcome = Outcome::StaleReadOnly {
+        members: s.members,
+        absent_serials,
+        expected: s.expected,
+        record,
     };
     let (status, detail) = outcome.status_line();
     progress.on_log(
@@ -1369,6 +1500,13 @@ mod tests {
             }
         }
         fn run(&self, host: &FakeHost) -> (Result<Outcome, Failure>, TestProgress) {
+            self.run_as(host, Intent::Write)
+        }
+        fn run_as(
+            &self,
+            host: &FakeHost,
+            intent: Intent,
+        ) -> (Result<Outcome, Failure>, TestProgress) {
             let progress = TestProgress::default();
             let plan = Plan {
                 label: "primary",
@@ -1378,6 +1516,7 @@ mod tests {
                 mount_opts: "noatime,degraded,compress=zstd",
                 wait: Duration::from_secs(60),
                 record_dir: self.dir.path(),
+                intent,
             };
             (mount_guarded(host, &plan, &progress), progress)
         }
@@ -1542,6 +1681,68 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("mount") && !c.contains(PROBE_OPTS)),
             "Y was mounted writable: {:?}",
+            host.calls()
+        );
+    }
+
+    /// Operator 2026-11-22 (bd DAS-Backup-Manager-su1b.11): a job that never
+    /// writes the target may read the member that lacks the last degraded
+    /// period's writes — read-only, nothing replayed, nothing recorded — and
+    /// says the date its data stops.
+    #[test]
+    fn a_read_only_job_mounts_the_stale_member_read_only_and_records_nothing() {
+        let case = Case::new();
+        let period = match case.run(&only_x()).0 {
+            Ok(Outcome::Degraded { record, .. }) => record,
+            other => panic!("{other:?}"),
+        };
+        let before = case.primary();
+        let host = only_y();
+        let (r, progress) = case.run_as(&host, Intent::ReadOnly);
+        match r {
+            Ok(Outcome::StaleReadOnly {
+                record, members, ..
+            }) => {
+                assert_eq!(record, period, "the record as it was");
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].dev_uuid, DY);
+            }
+            other => panic!("{other:?}"),
+        }
+        let calls = host.calls();
+        assert_eq!(
+            calls.last().unwrap(),
+            &format!("mount noatime,compress=zstd,ro,degraded,rescue=nologreplay {FS} /mnt/p"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c == "write witness"), "{calls:?}");
+        assert_eq!(case.primary(), before, "no record change");
+        let when = crate::caldate::local_datetime(period.since).unwrap();
+        assert!(
+            warnings(&progress)
+                .iter()
+                .any(|w| w.contains("STALE-READ-ONLY") && w.contains(&when) && w.contains(DX)),
+            "{:?}",
+            warnings(&progress)
+        );
+        // A writing job is still refused the same member.
+        let why = refusal(case.run_as(&only_y(), Intent::Write).0);
+        assert!(why.contains("split brain"), "{why}");
+    }
+
+    #[test]
+    fn a_read_only_job_is_still_refused_when_the_record_cannot_be_read() {
+        let case = Case::new();
+        fs::write(primary_path(case.dir.path(), FS), "garbage\n").unwrap();
+        let host = only_y();
+        let why = refusal(case.run_as(&host, Intent::ReadOnly).0);
+        assert!(why.contains("unreadable"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount") && !c.contains(PROBE_OPTS)),
+            "{:?}",
             host.calls()
         );
     }
@@ -1771,6 +1972,7 @@ mod tests {
             mount_opts: "noatime,ro",
             wait: Duration::ZERO,
             record_dir: case.dir.path(),
+            intent: Intent::ReadOnly,
         };
         match mount_guarded(&host, &plan, &progress) {
             Ok(Outcome::Degraded {

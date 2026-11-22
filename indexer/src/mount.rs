@@ -314,12 +314,14 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
 pub fn mount_guarded_target(
     config: &Config,
     target: &Target,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     _held: &MaintenanceHeld,
 ) -> Result<raid_guard::Outcome, raid_guard::Failure> {
     mount_guarded_with(
         config,
         target,
+        intent,
         &raid_guard::record_dir(),
         progress,
         &HOST_PROBES,
@@ -330,6 +332,7 @@ pub fn mount_guarded_target(
 fn mount_guarded_with(
     config: &Config,
     target: &Target,
+    intent: raid_guard::Intent,
     record_dir: &Path,
     progress: &dyn ProgressCallback,
     probes: &MountProbes<'_>,
@@ -352,6 +355,7 @@ fn mount_guarded_with(
             mount_opts: &config.das.mount_opts,
             wait: Duration::from_secs(config.das.member_wait_secs.into()),
             record_dir,
+            intent,
         },
         progress,
     )
@@ -763,11 +767,13 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// (bd DAS-Backup-Manager-frb). Release the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
     ensure_targets_mounted_with(
         config,
+        intent,
         progress,
         held,
         &HOST_PROBES,
@@ -826,6 +832,7 @@ fn target_attached_with(target: &Target, probes: &MountProbes<'_>) -> bool {
 /// is mounted and where the drives are, `runner` executes `mount`.
 fn ensure_targets_mounted_with(
     config: &Config,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
@@ -1032,7 +1039,15 @@ fn ensure_targets_mounted_with(
         // A RAID-1 target: the guarded mount, never `degraded` as configured
         // and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
         if raid_guard::is_guarded(target) {
-            match mount_guarded_with(config, target, raid_dir, progress, probes, &*guard.runner) {
+            match mount_guarded_with(
+                config,
+                target,
+                intent,
+                raid_dir,
+                progress,
+                probes,
+                &*guard.runner,
+            ) {
                 Ok(outcome) => {
                     any_available = true;
                     guard.newly_mounted.push(target.mount.clone());
@@ -2145,6 +2160,8 @@ mod tests {
         missing: Vec<(String, Vec<u64>)>,
         /// Where a guarded mount keeps its record; never the host's.
         raid_dir: Option<PathBuf>,
+        /// The intent the targets are mounted with (none: a writing job).
+        intent: Option<raid_guard::Intent>,
     }
 
     impl Host {
@@ -2224,7 +2241,15 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/das-raid-test-record-dir"));
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(config, progress, held, p, runner.clone(), &raid_dir)
+                ensure_targets_mounted_with(
+                    config,
+                    self.intent.unwrap_or(raid_guard::Intent::Write),
+                    progress,
+                    held,
+                    p,
+                    runner.clone(),
+                    &raid_dir,
+                )
             })
         }
 
@@ -3444,6 +3469,37 @@ mod tests {
             "the stale leg was mounted writable: {:?}",
             runner.calls()
         );
+
+        // A job that only reads (walk, restore) is given it read-only, and
+        // the record is left as it was (bd DAS-Backup-Manager-su1b.11).
+        let record_before = std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap();
+        host.intent = Some(raid_guard::Intent::ReadOnly);
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_c}\n"))),
+            (&part_c, Reply::Out(0, super_of("u-p", 2, dy, 38))),
+        ]);
+        let guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .expect("mounted read-only");
+        assert_eq!(guard.count(), 1);
+        assert!(
+            runner.calls().contains(&output_call(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "noatime,ro,degraded,rescue=nologreplay",
+                "UUID=u-p",
+                &mnt
+            ])),
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap(),
+            record_before
+        );
+        assert!(!raid_guard::witness_path(&mnt).exists(), "nothing written");
     }
 
     /// Any configured serial counts, not only the first — a RAID-1 pair with
@@ -5403,7 +5459,12 @@ mod tests {
 
         let config = Config::default();
         let progress = NullProgress;
-        let result = ensure_targets_mounted(&config, &progress, &MaintenanceHeld::assumed());
+        let result = ensure_targets_mounted(
+            &config,
+            raid_guard::Intent::Write,
+            &progress,
+            &MaintenanceHeld::assumed(),
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().count(), 0);
     }

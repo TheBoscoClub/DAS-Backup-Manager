@@ -2497,7 +2497,13 @@ fn ensure_mounted(
     };
 
     if let Some((config, target)) = guarded {
-        match crate::mount::mount_guarded_target(config, target, progress, held) {
+        match crate::mount::mount_guarded_target(
+            config,
+            target,
+            crate::raid_guard::Intent::Write,
+            progress,
+            held,
+        ) {
             Ok(_) => {}
             Err(crate::raid_guard::Failure::Refused { why, left_mounted }) => {
                 if !left_mounted {

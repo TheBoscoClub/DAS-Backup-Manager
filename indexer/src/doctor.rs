@@ -944,7 +944,12 @@ fn perform_delivery_check(
         "Checking that every target holds a recent snapshot of each pair",
         1,
     );
-    let mut guard = match mount::ensure_targets_mounted(config, progress, held) {
+    let mut guard = match mount::ensure_targets_mounted(
+        config,
+        crate::raid_guard::Intent::ReadOnly,
+        progress,
+        held,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             (report.targets_failed, report.targets_absent) =

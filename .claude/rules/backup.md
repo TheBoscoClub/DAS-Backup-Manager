@@ -97,10 +97,14 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 - Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
 - A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
 - Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").
+- Every caller of `ensure_targets_mounted` / `mount_guarded_target` passes `raid_guard::Intent` explicitly; never infer it from the mount options.
+- `Intent::Write` → backups (run, snapshot, send, static), boot archiving, forget and purge, the scrub, `backup mount-target`.
+- `Intent::ReadOnly` → walk, reindex, reconcile, restore, browse, the GUI helper's index and restore jobs, the doctor, the recovery-OS reading.
+- Split brain with `Intent::ReadOnly` → mounted `<mount_opts>,ro,degraded,rescue=nologreplay`, a `STALE-READ-ONLY` WARN naming the date its data stops, no record change (operator 2026-11-22, bd `su1b.11`); an unreadable record stays refused for every job.
 - Every member back → normal mount, the record becomes scrub-owed (a WARN row, a doctor finding) until a completed scrub begun after the rejoin clears it.
 - After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` unreadable is refused on both paths; a member missing is refused by `verify_targets_before_btrbk` unless the guard mounted it degraded this run, and by `verify_write_targets` while every configured drive is attached.
 - A Rust run's report → one `RAID-1 <label>  WARN` row per record (`report::raid_rows`), the script's → the target's own row.
-- A refusal → `MountError::RaidRefused`: it fails the job, `walk` and `restore` included.
+- A refusal → `MountError::RaidRefused`: it fails the job, `walk` and `restore` included (their split-brain case is the read-only mount above).
 - `nodev,nosuid,noexec` belong in `[das].mount_opts`: receive and restore keep device nodes and setuid bits intact, no job executes from a target (bd `20q`).
 - A target filesystem already mounted somewhere else keeps that mount's filesystem-wide options: a second `mount -o` returns 0 and applies none of them. Both paths WARN and go on (bd `804`).
 - Data written degraded lands as `single` chunks. After replacing the leg: `btrfs scrub`, then

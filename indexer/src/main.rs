@@ -122,7 +122,12 @@ where
     };
 
     let progress = CliProgress;
-    let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Intent::Write,
+        &progress,
+        locks.maintenance(),
+    )?;
     let database = Database::open(db)?;
 
     let outcome =
@@ -2048,7 +2053,13 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     if health::is_mountpoint(mount_path) {
         return cant(format!("{} is already a mount point", target.mount));
     }
-    let result = mount::mount_guarded_target(&cfg, target, &CliProgress, &held);
+    let result = mount::mount_guarded_target(
+        &cfg,
+        target,
+        buttered_dasd::raid_guard::Intent::Write,
+        &CliProgress,
+        &held,
+    );
     let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
     println!("{line}");
     code
@@ -2066,7 +2077,12 @@ fn cmd_walk(
     let Some(held) = hold_for_cli("btrdasd walk", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )?;
     let database = Database::open(db)?;
     // A mount point is not an identity: the root must be the configured
     // filesystem's top level before anything is read from or pruned under it.
@@ -2183,7 +2199,12 @@ fn cmd_restore_file(
     let Some(held) = hold_for_cli("btrdasd restore file", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )?;
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let result = restore::restore_files(
         snapshot,
@@ -2216,7 +2237,12 @@ fn cmd_restore_snapshot(
     let Some(held) = hold_for_cli("btrdasd restore snapshot", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )?;
     let result = restore::restore_snapshot(
         snapshot,
         dest,
@@ -2247,7 +2273,12 @@ fn cmd_restore_browse(
     let Some(held) = hold_for_cli("btrdasd restore browse", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Intent::ReadOnly,
+        progress,
+        &held,
+    )?;
     let entries = restore::browse_snapshot(snapshot, prefix);
     let still_mounted = guard.unmount(progress);
     print!("{}", browse_listing(json, &entries?));
@@ -2384,7 +2415,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+            let mut guard = mount::ensure_targets_mounted(
+                &cfg,
+                buttered_dasd::raid_guard::Intent::ReadOnly,
+                &progress,
+                locks.maintenance(),
+            )?;
             let database = Database::open(&db)?;
             let verified = checked_roots(&cfg);
 
@@ -2487,7 +2523,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+            let mut guard = mount::ensure_targets_mounted(
+                &cfg,
+                buttered_dasd::raid_guard::Intent::ReadOnly,
+                &progress,
+                locks.maintenance(),
+            )?;
             let database = Database::open(&db)?;
 
             // Failures that must fail the command, but only after the targets
@@ -2882,14 +2923,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The locks are held, so the command has begun: targets that
                 // will not mount are a target's state, 3 as `backup run`
                 // classifies it, not 1 ("could not start").
-                let mut guard =
-                    match mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance()) {
-                        Ok(guard) => guard,
-                        Err(why) => {
-                            eprintln!("Error: {why}");
-                            std::process::exit(backup::BootStep::mount_failure_exit_code());
-                        }
-                    };
+                let mut guard = match mount::ensure_targets_mounted(
+                    &cfg,
+                    buttered_dasd::raid_guard::Intent::Write,
+                    &progress,
+                    locks.maintenance(),
+                ) {
+                    Ok(guard) => guard,
+                    Err(why) => {
+                        eprintln!("Error: {why}");
+                        std::process::exit(backup::BootStep::mount_failure_exit_code());
+                    }
+                };
                 let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 println!("Boot subvolumes: {}", step.row());
