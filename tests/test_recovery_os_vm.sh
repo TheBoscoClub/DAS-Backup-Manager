@@ -3007,6 +3007,14 @@ lacks "guard: ...(channel)" "$(file "$S/defined.xml")" "org.dasbackup.guard"
 lacks "guard: ...(smbios)" "$(file "$S/defined.xml")" "smbios"
 check "guard: nothing of it left in the session's directory" "$(ls -A "$STATE")" ""
 check "guard: never destroyed" "$(file "$S/forbidden")" ""
+# The last report, and the domain's start and stop, kept beside the session
+# history once the session's own files are gone (bd yvcs).
+KEPT="$T/var/lib/das-backup/recovery-os-vm-guard"
+has "guard: its last report kept beside the history" "$(file "$KEPT/system-recovery-A-2tb.report")" "$ENG4 seq 1 boot $BOOT_A"
+matches "guard: ...with when the domain was resumed" "$(file "$KEPT/system-recovery-A-2tb.state")" "(^|"$'\n'")resumed=[[:digit:]]+("$'\n'"|$)"
+matches "guard: ...and when it was seen off" "$(file "$KEPT/system-recovery-A-2tb.state")" "(^|"$'\n'")stopped=[[:digit:]]+("$'\n'"|$)"
+check "guard: the kept report root's only" "$(stat -c %a "$KEPT/system-recovery-A-2tb.report" 2>/dev/null)" "600"
+has "guard: where it is kept, said" "$OUT" "the session guard's last report is kept in $KEPT/system-recovery-A-2tb.report"
 
 fixture
 GUARD_SECS=default run_driver session A --dry-run
@@ -3125,7 +3133,7 @@ touch "$S/guard_silent"
 printf 'shut off\n' >"$S/states.running"
 POLL=2 GUARD_SECS=300 run_interrupted session A
 check "interrupted as it powers off, no report, may: exit 6" "$RC" "6"
-has "interrupted as it powers off, no report, may: said" "$OUT" "but the session guard did not confirm on a \"may\" record (the recovery OS powered off without reporting)"
+has "interrupted as it powers off, no report, may: said" "$OUT" "but the session guard did not confirm on a \"may\" record (the recovery OS powered off without reporting, 0h 00m"
 check "interrupted as it powers off, no report, may: the disk given back" "$(file "$S/attached.xml")" ""
 check "interrupted as it powers off, no report, may: lock free" "$(lock_state)" "free"
 fixture
@@ -3242,6 +3250,7 @@ touch "$S/guard_silent"
 GUARD_SECS=300 run_driver session A
 check "guard, off before it reported, may: exit 6" "$RC" "6"
 has "guard, off before it reported, may: said" "$OUT" "the recovery OS powered off without reporting"
+matches "guard, off before it reported, may: how long it ran, said (bd yvcs)" "$OUT" "the recovery OS powered off without reporting, 0h 00m [[:digit:]]{2}s after its start"
 lacks "guard, off before it reported, may: nothing to shut down" "$(events)" "virsh shutdown"
 
 fixture
@@ -3437,6 +3446,47 @@ printf 'shut off\n' >"$S/states"
 run_driver session-end A
 check "session-end, no report from a domain that ran: exit 6" "$RC" "6"
 has "session-end, no report from a domain that ran: said" "$OUT" "session guard: NOT engaged: no report from a recovery OS that ran"
+has "session-end, no report, no libvirt log: how long it ran is not known, said (bd yvcs)" "$OUT" "how long it ran before it powered off is not known: its session had ended, and libvirt's log of recovery-os-updater-system-recovery-A-2tb has no shutdown after its start"
+KEPT="$T/var/lib/das-backup/recovery-os-vm-guard"
+check "session-end, no report: an empty report kept" "$(stat -c %s "$KEPT/system-recovery-A-2tb.report" 2>/dev/null)" "0"
+matches "session-end, no report: its start kept" "$(file "$KEPT/system-recovery-A-2tb.state")" "(^|"$'\n'")resumed=[[:digit:]]+("$'\n'"|$)"
+lacks "session-end, no report: no stop it does not know" "$(file "$KEPT/system-recovery-A-2tb.state")" "stopped="
+check "session-end, no report: the session's own files gone" "$(ls -A "$STATE")" ""
+
+# The same, with libvirt's log of the domain saying when it shut down: a
+# shutdown 42 s after the start -- in the middle of a boot -- is said so.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+check "no report, libvirt's log: kept (exit 3)" "$RC" "3"
+t0=$(($(date +%s) - 600))
+echo "resumed=$t0" >>"$STATE/system-recovery-A-2tb.guard.state" 2>/dev/null || :
+mkdir -p "$T/var/log/libvirt/qemu"
+{
+    printf '%s: starting up libvirt version: 11.9.0\n' "$(date -u -d "@$t0" '+%Y-%m-%d %H:%M:%S.123+0000')"
+    printf '%s: shutting down, reason=shutdown\n' "$(date -u -d "@$((t0 - 7200))" '+%Y-%m-%d %H:%M:%S.000+0000')"
+    printf '%s: shutting down, reason=shutdown\n' "$(date -u -d "@$((t0 + 42))" '+%Y-%m-%d %H:%M:%S.456+0000')"
+} >"$T/var/log/libvirt/qemu/recovery-os-updater-system-recovery-A-2tb.log"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+check "session-end, no report, libvirt's log: exit 6" "$RC" "6"
+has "session-end, no report, libvirt's log: how long it ran, said" "$OUT" "session guard: NOT engaged: no report from a recovery OS that ran; it ran 0h 00m 42s from its start before it powered off (libvirt's log of recovery-os-updater-system-recovery-A-2tb)"
+has "session-end, no report, libvirt's log: the stop kept with the report" "$(file "$T/var/lib/das-backup/recovery-os-vm-guard/system-recovery-A-2tb.state")" "stopped=$((t0 + 42))"
+# A shutdown line from before this start is not this run's: unknown.
+fixture
+write_state 3 "$(record_json system-recovery-A-2tb may)"
+touch "$S/guard_silent"
+for ((i = 0; i < 4000; i++)); do echo running; done >"$S/states.running"
+GUARD_SECS=300 run_interrupted session A
+t0=$(($(date +%s) - 600))
+echo "resumed=$t0" >>"$STATE/system-recovery-A-2tb.guard.state" 2>/dev/null || :
+mkdir -p "$T/var/log/libvirt/qemu"
+printf '%s: shutting down, reason=shutdown\n' "$(date -u -d "@$((t0 - 7200))" '+%Y-%m-%d %H:%M:%S.000+0000')" >"$T/var/log/libvirt/qemu/recovery-os-updater-system-recovery-A-2tb.log"
+printf 'shut off\n' >"$S/states"
+run_driver session-end A
+has "session-end, no report, only an older shutdown in libvirt's log: not known, said" "$OUT" "how long it ran before it powered off is not known"
 
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"

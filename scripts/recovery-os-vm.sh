@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.4.2
+# Version: 2.5.0
 # Date: 2026-11-22
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -113,6 +113,10 @@
 #          removes anything, with the resets the session saw (one unanswered
 #          is pending, then NOT confirmed) -- and status counts silence too,
 #          since it cannot see a reset made after the session ended.
+#          Before the report goes, it is kept beside the session history
+#          (recovery-os-vm-guard/<label>.report and .state: when the domain
+#          started, resumed and, where known, powered off); a recovery OS
+#          that never reported is said with how long it ran (bd yvcs).
 #   - This script never destroys a running recovery OS -- it could be in the
 #     middle of an update. Every stop is an ACPI request (virsh shutdown),
 #     sent again until it is off, and bounded (exit 3 at the bound). The one
@@ -467,6 +471,11 @@ readonly MAINTENANCE_LOCK="$TEST_ROOT/run/das-maintenance.lock"
 # -- always that order, never the reverse (bd DAS-Backup-Manager-o1re).
 readonly BACKUP_LOCK="$TEST_ROOT/run/das-backup.lock"
 readonly STATE_DIR="$TEST_ROOT/run/das-recovery-os-vm"
+# libvirt's log of each domain (qemu:///system): a line at each start and
+# each stop, "<UTC time>+0000: shutting down, reason=...". Read only for when
+# a recovery OS that never reported powered off (bd DAS-Backup-Manager-yvcs).
+readonly QEMU_LOG_DIR="$TEST_ROOT/var/log/libvirt/qemu"
+readonly LIBVIRT_STOP_RE='^([[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2} [[:digit:]]{2}:[[:digit:]]{2}:[[:digit:]]{2})(\.[[:digit:]]+)?\+0000: shutting down'
 # The egress rule's subnet, while a rule this script put in place is there.
 readonly EGRESS_FILE="$STATE_DIR/egress.rule"
 readonly BY_ID="$TEST_ROOT/dev/disk/by-id"
@@ -693,6 +702,7 @@ SILENCES=0        # how many times it went silent
 SILENCE_LONGEST=0
 G_WATCH_DOWN_AT=0      # GCLOCK when the reset watch was found stopped
 G_LIFTS_SAID=0         # lifts already said
+G_OFF_AT=""            # when this session saw the domain off (seconds since the epoch)
 REPORT_LOSSES=()       # what of the report was lost (cut, or gone before it was read)
 SHUTDOWN_ASKED=0       # how often the recovery OS was asked to shut down
 SHUTDOWN_SECS=0        # ...over how long
@@ -725,6 +735,7 @@ EGRESS_OWNED=false # this process put the egress rule in place (or took one over
 EGRESS_SUBNET="" EGRESS_COUNT=0 EGRESS_FAILURE=""
 EGRESS_RESULT="not needed"
 HISTORY_FILE=""     # the session history, beside the boot record
+GUARD_KEEP_DIR=""   # each drive's last guard report and its times, beside it
 HISTORY_ARMED=false # this session took the lock: its end is written there
 HISTORY_FAILURE="" HISTORY_LINES=""
 # An attended session of a "will" drive (decision 3 of bd 8249).
@@ -1626,6 +1637,7 @@ resolve_os_state() {
     fi
     SESSIONS_FILE="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-sessions"
     HISTORY_FILE="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-history.jsonl"
+    GUARD_KEEP_DIR="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-guard"
 }
 
 # Read this drive's boot record and go on only when it does not say btrbk
@@ -2159,11 +2171,12 @@ write_guard_state() {
 }
 
 # Read a guard state file ($1) into GS_VERDICT, GS_ENGAGED, GS_LIFTED (and
-# their short forms GS_ENGAGED_C, GS_LIFTED_C), GS_STARTED, GS_RESUMED. 1
+# their short forms GS_ENGAGED_C, GS_LIFTED_C), GS_STARTED, GS_RESUMED and
+# GS_STOPPED (when the session saw the domain off; empty when it did not). 1
 # when it is missing, unreadable, or incomplete.
 read_guard_state() {
     local k v
-    GS_VERDICT="" GS_ENGAGED="" GS_LIFTED="" GS_ENGAGED_C="" GS_LIFTED_C="" GS_STARTED="" GS_RESUMED=""
+    GS_VERDICT="" GS_ENGAGED="" GS_LIFTED="" GS_ENGAGED_C="" GS_LIFTED_C="" GS_STARTED="" GS_RESUMED="" GS_STOPPED=""
     [[ -f "$1" && ! -L "$1" ]] || return 1
     while IFS='=' read -r k v; do
         case "$k" in
@@ -2174,6 +2187,7 @@ read_guard_state() {
             lifted_short) GS_LIFTED_C=$v ;;
             started) GS_STARTED=$v ;;
             resumed) GS_RESUMED=$v ;;
+            stopped) GS_STOPPED=$v ;;
         esac
     done 2>/dev/null <"$1" || return 1
     [[ "$GS_VERDICT" =~ ^(will|may|no)$ && "$GS_ENGAGED" == "das-vm-guard engaged "* && "$GS_LIFTED" == "das-vm-guard lifted "* &&
@@ -2186,6 +2200,100 @@ read_guard_state() {
 rm_guard_rotations() {
     [[ -d "${STATE_DIR:?}" ]] || return 0
     find "${STATE_DIR:?}" -maxdepth 1 ! -type d -name "${LABEL:?}.guard.[0-9]*" -delete
+}
+
+# When the domain last powered off, from libvirt's log of it: LIBVIRT_STOP_AT
+# (seconds since the epoch), only when that last stop is at or after $1 (this
+# session's resume) -- an older one is another run's. 1 when the log is not
+# there, says nothing of a stop, or its last stop is older.
+libvirt_stop_epoch() {
+    local f="$QEMU_LOG_DIR/$DOMAIN.log" log_lines=() i t
+    LIBVIRT_STOP_AT=""
+    [[ -f "$f" && ! -L "$f" && "$1" =~ ^[[:digit:]]+$ ]] || return 1
+    mapfile -t log_lines <"$f" 2>/dev/null || return 1
+    for ((i = ${#log_lines[@]} - 1; i >= 0; i--)); do
+        [[ "${log_lines[$i]}" =~ $LIBVIRT_STOP_RE ]] || continue
+        t="$(date -u -d "${BASH_REMATCH[1]}" +%s 2>/dev/null)" || return 1
+        [[ "$t" =~ ^[[:digit:]]+$ ]] && ((t >= $1)) || return 1
+        LIBVIRT_STOP_AT=$t
+        return 0
+    done
+    return 1
+}
+
+# For a recovery OS that ran and never reported: how long it ran before it
+# powered off, from GS_RESUMED and the stop -- the session's own sighting
+# (GS_STOPPED), else libvirt's log of the domain -- so that a shutdown in the
+# middle of a boot (seconds, a few minutes) can be told from an OS that ran
+# long enough to be up. Said as not known, never computed, without a stop.
+ran_before_off_text() {
+    local stop how
+    [[ "$GS_RESUMED" =~ ^[[:digit:]]+$ ]] || return 0
+    if [[ "$GS_STOPPED" =~ ^[[:digit:]]+$ ]] && ((GS_STOPPED >= GS_RESUMED)); then
+        stop=$GS_STOPPED how="seen by its session"
+    elif libvirt_stop_epoch "$GS_RESUMED"; then
+        stop=$LIBVIRT_STOP_AT how="libvirt's log of $DOMAIN"
+    else
+        printf "; how long it ran before it powered off is not known: its session had ended, and libvirt's log of %s has no shutdown after its start %s ago" "$DOMAIN" "$(format_duration $(($(date +%s) - GS_RESUMED)))"
+        return 0
+    fi
+    printf '; it ran %s from its start before it powered off (%s)' "$(format_duration $((stop - GS_RESUMED)))" "$how"
+}
+
+# The last value of key $2 in the guard state file $1; nothing when there is
+# none (or the file cannot be read: then nothing is known of it).
+guard_state_value() {
+    sed -n "s/^$2=//p" -- "$1" 2>/dev/null | tail -n 1
+}
+
+# Keep the session guard's last report beside the session history, before
+# the session's own copy in /run goes (bd DAS-Backup-Manager-yvcs): a report
+# that is wrong or never came would otherwise leave the host nothing to
+# explain it. GUARD_KEEP_DIR/<label>.report is the report as one file
+# (virtlogd's rotations first, the oldest first; empty when nothing came),
+# and <label>.state the session's guard state -- when the domain was started
+# and resumed, and when it powered off where that is known (the session's
+# sighting, else libvirt's log of it) -- and when it was kept. Each session's
+# end replaces the last. Best effort: a failure is said, and changes nothing
+# else.
+keep_guard_report() {
+    local base f n rot=() sorted=() resumed stop_lines=""
+    [[ -n "$GUARD_KEEP_DIR" ]] || return 0
+    [[ -e "$GUARD_STATE_FILE" || -e "$GUARD_FILE" ]] || return 0
+    base="$GUARD_KEEP_DIR/$LABEL"
+    for f in "$GUARD_FILE".*; do
+        n=${f##*.}
+        if [[ -f "$f" && "$n" =~ ^[[:digit:]]+$ ]]; then
+            rot+=("$n")
+        fi
+    done
+    if ((${#rot[@]} > 0)); then
+        mapfile -t sorted < <(printf '%s\n' "${rot[@]}" | sort -rn)
+    fi
+    if [[ -z "$(guard_state_value "$GUARD_STATE_FILE" stopped)" ]]; then
+        resumed="$(guard_state_value "$GUARD_STATE_FILE" resumed)"
+        if libvirt_stop_epoch "$resumed"; then
+            stop_lines="stopped=$LIBVIRT_STOP_AT"$'\n'"stopped_from=libvirt's log of $DOMAIN"$'\n'
+        fi
+    fi
+    if ! (
+        umask 077 && mkdir -p -- "$GUARD_KEEP_DIR" &&
+            {
+                for n in "${sorted[@]}"; do cat -- "$GUARD_FILE.$n"; done
+                if [[ -f "$GUARD_FILE" ]]; then cat -- "$GUARD_FILE"; fi
+            } >"$base.report.new" &&
+            {
+                if [[ -f "$GUARD_STATE_FILE" ]]; then cat -- "$GUARD_STATE_FILE"; fi
+                printf '%s' "$stop_lines"
+                printf 'kept=%(%s)T\n' -1
+            } >"$base.state.new" &&
+            mv -f -- "$base.report.new" "$base.report" && mv -f -- "$base.state.new" "$base.state"
+    ) 2>/dev/null; then
+        rm -f -- "${base:?}.report.new" "${base:?}.state.new"
+        warn "could not keep the session guard's last report in $GUARD_KEEP_DIR (its copy in $STATE_DIR goes with the session)"
+        return 0
+    fi
+    log "the session guard's last report is kept in $base.report (when the domain ran, in $base.state)"
 }
 
 # Define the domain with the guard, and prove the definition carries it.
@@ -2238,6 +2346,7 @@ remove_guard() {
         # The reset watch goes before its file: it writes there, and a line
         # it wrote after this would leave the file behind (bd lorz).
         stop_reset_watch
+        keep_guard_report
         rm -f -- "${GUARD_XML_FILE:?}" "${GUARD_FILE:?}" "${GUARD_STATE_FILE:?}" "${RESET_FILE:?}"
         rm_guard_rotations
         log "took the session guard out of $DOMAIN's definition (defined from $DOMAIN_TEMPLATE again)"
@@ -2538,7 +2647,7 @@ guard_clock_tick() {
 guard_watch_begin() {
     judge_start "$GUARD_EXPECT" "$GUARD_EXPECT_C" "$GUARD_EXPECT_LIFTED" "$GUARD_EXPECT_LIFTED_C"
     report_reader_start
-    GCLOCK=0 G_TICK_AT=$SECONDS G_LAST_LINE=0 G_LIFTS_SAID=0
+    GCLOCK=0 G_TICK_AT=$SECONDS G_LAST_LINE=0 G_LIFTS_SAID=0 G_OFF_AT=""
     # A new reset file starts at its first line (provision's second start).
     RESETS=0 RESET_LINES_READ=0
     PROOF_WHY=start PROOF_POS=0 PROOF_DEADLINE=$GUARD_SECS
@@ -2663,6 +2772,13 @@ guard_reset_seen() {
 #   - Final: a deadline already passed fails (guard_failed never acts then).
 check_guard() {
     local mode=$1 state=${2:-} partial="" silent resets
+    # When it was seen off, for the guard's state and the report kept after
+    # the session (keep_guard_report). Not recorded is not known, which is
+    # what status and session-end then say: nothing is decided by it.
+    if [[ "$mode" == off && -z "$G_OFF_AT" ]]; then
+        printf -v G_OFF_AT '%(%s)T' -1
+        printf 'stopped=%s\n' "$G_OFF_AT" 2>/dev/null >>"$GUARD_STATE_FILE" || :
+    fi
     if [[ "$GUARD_FAILED" == true ]]; then
         return 0
     fi
@@ -2699,7 +2815,7 @@ check_guard() {
     case "$mode" in
         off)
             if ((J_LINES == 0)); then
-                guard_failed "the recovery OS powered off without reporting$partial" off
+                guard_failed "the recovery OS powered off without reporting, $(format_duration "$GCLOCK") after its start$partial" off
             elif [[ "$PROOF_WHY" == reset ]]; then
                 guard_failed "the recovery OS was reset, and powered off before a boot after that reported its guard engaged$(late_reset_text)$partial -- a boot that came without the guard says nothing (or it never got as far as its OS)" off
             elif [[ "$R_PART" == "das-vm-guard N"* ]]; then
@@ -2822,6 +2938,9 @@ judge_saved_guard() {
         return 0
     else
         GJ_TEXT="NOT engaged: no report from a recovery OS that ran$partial"
+        if [[ "$3" == "shut off" ]]; then
+            GJ_TEXT+="$(ran_before_off_text)"
+        fi
     fi
     GJ_STATUS=6
     if [[ "$GS_VERDICT" == no ]]; then
@@ -6037,6 +6156,7 @@ cmd_session_end() {
     fi
     if [[ -z "$DISK" && ${#attached[@]} -eq 0 ]]; then
         if [[ "$GUARDED" != true ]]; then
+            keep_guard_report
             rm -f -- "${GUARD_XML_FILE:?}" "${GUARD_FILE:?}" "${GUARD_STATE_FILE:?}" "${RESET_FILE:?}"
             rm_guard_rotations
         elif remove_guard; then
