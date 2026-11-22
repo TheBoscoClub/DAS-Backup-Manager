@@ -237,6 +237,95 @@ pub fn acquire_manual_locks_at(
     })))
 }
 
+/// Where a backup claims the maintenance lock — asks a scrub pass that holds
+/// it to let the backup go first (bd DAS-Backup-Manager-su1b.2) — and how long
+/// it waits for that answer before it says nobody gave one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimSite {
+    pub path: std::path::PathBuf,
+    pub answer_within: std::time::Duration,
+}
+
+impl ClaimSite {
+    /// `/run/das-maintenance-claim.lock`, answered within
+    /// [`crate::maintenance::YIELD_ANSWER_SECS`].
+    pub fn production() -> Self {
+        Self {
+            path: crate::maintenance::CLAIM_LOCK_PATH.into(),
+            answer_within: std::time::Duration::from_secs(crate::maintenance::YIELD_ANSWER_SECS),
+        }
+    }
+}
+
+/// [`acquire_manual_locks_at`] for a job that may make a scrub pause: a
+/// backup — `btrdasd backup run`, `snapshot` and `send`, and the helper's
+/// `BackupRun`, dry runs included (operator 2026-11-22). Between the singleton
+/// and the maintenance lock it holds the claim at `claim` shared
+/// ([`crate::maintenance::Claim`]), for as long as it waits; once it holds the
+/// maintenance lock it lets the claim go, so nothing it does afterwards keeps
+/// a scrub paused. A cancelled wait lets it go with the singleton. A claim
+/// nobody answers within `claim.answer_within` is said once, as a warning,
+/// naming the holder; the backup keeps waiting (defer, never skip), and the
+/// warning changes no exit status.
+pub fn acquire_claiming_locks_at(
+    singleton_path: &Path,
+    maintenance_path: &Path,
+    claim: &ClaimSite,
+    job: &str,
+    progress: &dyn ProgressCallback,
+) -> Result<BackupLockAttempt, scrub::ScrubError> {
+    let Some(singleton) = SingletonHeld::try_acquire_at(singleton_path, job)? else {
+        return Ok(BackupLockAttempt::AlreadyRunning);
+    };
+    // Singleton, then the claim, then maintenance: the scrub never waits on
+    // the claim (its probe does not block), so this adds no wait to the
+    // singleton → maintenance order.
+    let claimed = crate::maintenance::Claim::take_at(&claim.path, job)?;
+    let asked = std::time::Instant::now();
+    let warned = std::cell::Cell::new(false);
+    // Said once, when no scrub answered in time; the wait goes on.
+    let answer = || {
+        if !warned.get() && asked.elapsed() >= claim.answer_within {
+            warned.set(true);
+            progress.on_log(
+                LogLevel::Warning,
+                &format!(
+                    "the DAS maintenance lock {} is still held by {} {}s after this backup \
+                     claimed it ({}): a scrub pass gives it up within about a minute, so its \
+                     holder is not one that answers a claim (an older scrub, a recovery-OS VM \
+                     session, doctor); this backup keeps waiting",
+                    maintenance_path.display(),
+                    crate::maintenance::holder_of(maintenance_path),
+                    asked.elapsed().as_secs(),
+                    claim.path.display()
+                ),
+            );
+        }
+    };
+    let token = progress.cancel_token();
+    let maintenance = MaintenanceHeld::acquire_until_at(
+        maintenance_path,
+        job,
+        progress,
+        &|| {
+            answer();
+            token.as_ref().is_some_and(|t| t.stop_here())
+        },
+        CANCELLABLE_LOCK_POLL,
+    )?
+    .ok_or_else(|| scrub::ScrubError::Lock {
+        path: maintenance_path.display().to_string(),
+        detail: CANCELLED_WAITING.into(),
+    })?;
+    // Held: the claim has done its work. Let it go before anything else
+    // runs, so no step of this backup keeps a scrub paused.
+    drop(claimed);
+    Ok(BackupLockAttempt::Acquired(Box::new(BackupLocks {
+        maintenance,
+        _singleton: singleton,
+    })))
+}
+
 /// What the CLI says when it declines because the singleton at `path` is held,
 /// naming the holder as it recorded itself (bd DAS-Backup-Manager-al9): the
 /// holder is not always a backup — `btrdasd setup` and a configuration edit
@@ -4284,6 +4373,9 @@ pub struct SystemBackupHost {
     pub config_path: std::path::PathBuf,
     pub singleton_lock: std::path::PathBuf,
     pub maintenance_lock: std::path::PathBuf,
+    /// Where the job claims the maintenance lock, so a scrub pass lets it go
+    /// first (bd DAS-Backup-Manager-su1b.2).
+    pub claim: ClaimSite,
     /// Who runs the job — `btrdasd backup run`, or the GUI's — recorded in
     /// the maintenance lock file while it holds the lock.
     pub job: String,
@@ -4302,6 +4394,7 @@ impl SystemBackupHost {
             config_path: config_path.to_path_buf(),
             singleton_lock: BACKUP_LOCK_PATH.into(),
             maintenance_lock: scrub::MAINTENANCE_LOCK_PATH.into(),
+            claim: ClaimSite::production(),
             job: job.to_string(),
             mailer: std::sync::Arc::new(crate::report::MAILX),
         }
@@ -4313,9 +4406,10 @@ impl BackupJobHost for SystemBackupHost {
         &self,
         progress: &dyn ProgressCallback,
     ) -> Result<Option<Box<dyn HoldsMaintenance>>, String> {
-        match acquire_manual_locks_at(
+        match acquire_claiming_locks_at(
             &self.singleton_lock,
             &self.maintenance_lock,
+            &self.claim,
             &self.job,
             progress,
         ) {
@@ -4888,6 +4982,10 @@ mod tests {
             config_path: dir.path().join("config.toml"),
             singleton_lock: dir.path().join("backup.lock"),
             maintenance_lock: dir.path().join("maintenance.lock"),
+            claim: ClaimSite {
+                path: dir.path().join("claim.lock"),
+                answer_within: std::time::Duration::from_secs(180),
+            },
             job: "btrdasd-helper BackupRun job".into(),
             mailer: std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
         };
@@ -4965,6 +5063,206 @@ mod tests {
         );
         drop(locks);
         assert_eq!(std::fs::read_to_string(&singleton).unwrap(), "");
+    }
+
+    // --- the claim (bd DAS-Backup-Manager-su1b.2, step A6) ----------------
+
+    fn claim_site(dir: &Path, answer_within: std::time::Duration) -> ClaimSite {
+        ClaimSite {
+            path: dir.join("claim.lock"),
+            answer_within,
+        }
+    }
+
+    fn wait_for(limit: std::time::Duration, what: &str, f: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        while !f() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A backup that finds the maintenance lock held claims it for as long
+    /// as it waits, records itself in the claim, and lets the claim go the
+    /// moment it holds the lock: nothing it does afterwards keeps a scrub
+    /// paused.
+    #[test]
+    fn a_waiting_backup_claims_the_lock_and_lets_the_claim_go_once_it_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (singleton, maintenance) = (dir.path().join("backup.lock"), dir.path().join("m.lock"));
+        let site = claim_site(dir.path(), std::time::Duration::from_secs(60));
+        let scrub = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let (s2, m2, c2) = (singleton.clone(), maintenance.clone(), site.clone());
+        let backup = std::thread::spawn(move || {
+            let progress = crate::progress::NullProgress;
+            match acquire_claiming_locks_at(&s2, &m2, &c2, "btrdasd backup run", &progress).unwrap()
+            {
+                BackupLockAttempt::Acquired(locks) => {
+                    let claimed = crate::maintenance::claim_is_held(&c2.path).unwrap();
+                    drop(locks);
+                    claimed
+                }
+                BackupLockAttempt::AlreadyRunning => panic!("nothing else runs"),
+            }
+        });
+        wait_for(std::time::Duration::from_secs(5), "the claim", || {
+            crate::maintenance::claim_is_held(&site.path).unwrap()
+        });
+        assert_eq!(
+            std::fs::read_to_string(&site.path).unwrap(),
+            format!("btrdasd backup run pid {}\n", std::process::id())
+        );
+        drop(scrub);
+        assert!(
+            !backup.join().unwrap(),
+            "the claim is let go once the maintenance lock is held"
+        );
+        assert!(!crate::maintenance::claim_is_held(&site.path).unwrap());
+    }
+
+    /// A free lock: claimed and let go at once, never left behind.
+    #[test]
+    fn a_backup_that_finds_the_lock_free_leaves_no_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = claim_site(dir.path(), std::time::Duration::from_secs(60));
+        let attempt = acquire_claiming_locks_at(
+            &dir.path().join("backup.lock"),
+            &dir.path().join("m.lock"),
+            &site,
+            "btrdasd backup send",
+            &crate::progress::NullProgress,
+        )
+        .unwrap();
+        assert!(matches!(attempt, BackupLockAttempt::Acquired(_)));
+        assert!(site.path.exists(), "the claim was taken");
+        assert!(!crate::maintenance::claim_is_held(&site.path).unwrap());
+    }
+
+    /// A GUI job cancelled while it waits lets the claim go with the
+    /// singleton: a cancelled job never keeps a scrub paused.
+    #[test]
+    fn a_cancelled_wait_lets_the_claim_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (singleton, maintenance) = (dir.path().join("backup.lock"), dir.path().join("m.lock"));
+        let site = claim_site(dir.path(), std::time::Duration::from_secs(60));
+        let _scrub = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let progress = std::sync::Arc::new(TestProgress::cancellable());
+        let (s2, m2, c2, p2) = (
+            singleton.clone(),
+            maintenance.clone(),
+            site.clone(),
+            progress.clone(),
+        );
+        let backup = std::thread::spawn(move || {
+            acquire_claiming_locks_at(&s2, &m2, &c2, "btrdasd-helper BackupRun job", &*p2).is_err()
+        });
+        wait_for(std::time::Duration::from_secs(5), "the claim", || {
+            crate::maintenance::claim_is_held(&site.path).unwrap()
+        });
+        progress.cancel.as_ref().unwrap().cancel();
+        assert!(
+            backup.join().unwrap(),
+            "a cancelled wait is an error, as before"
+        );
+        assert!(!crate::maintenance::claim_is_held(&site.path).unwrap());
+        assert!(scrub::FileLock::try_acquire(&singleton).unwrap().is_some());
+    }
+
+    /// A claim nobody answers (the holder is not a scrub that yields): one
+    /// warning naming the holder after the interval, and the backup keeps
+    /// waiting, then runs once the lock is free.
+    #[test]
+    fn an_unanswered_claim_warns_once_and_the_backup_keeps_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (singleton, maintenance) = (dir.path().join("backup.lock"), dir.path().join("m.lock"));
+        let site = claim_site(dir.path(), std::time::Duration::from_millis(100));
+        let vm = MaintenanceHeld::try_acquire_at(&maintenance, "recovery-os-vm.sh session")
+            .unwrap()
+            .unwrap();
+        let progress = std::sync::Arc::new(TestProgress::new());
+        let (s2, m2, c2, p2) = (
+            singleton.clone(),
+            maintenance.clone(),
+            site.clone(),
+            progress.clone(),
+        );
+        let backup = std::thread::spawn(move || {
+            matches!(
+                acquire_claiming_locks_at(&s2, &m2, &c2, "btrdasd backup run", &*p2).unwrap(),
+                BackupLockAttempt::Acquired(_)
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(!backup.is_finished(), "it keeps waiting");
+        let warnings: Vec<String> = progress
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == LogLevel::Warning)
+            .map(|(_, m)| m.clone())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!(
+                "recovery-os-vm.sh session pid {}",
+                std::process::id()
+            )),
+            "{}",
+            warnings[0]
+        );
+        drop(vm);
+        assert!(backup.join().unwrap());
+    }
+
+    /// `backup boot-archive` is not a backup the operator lets pause a scrub:
+    /// the plain locks never claim.
+    #[test]
+    fn the_plain_manual_locks_never_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (singleton, maintenance) = (dir.path().join("backup.lock"), dir.path().join("m.lock"));
+        let claim = dir.path().join("claim.lock");
+        let scrub = MaintenanceHeld::try_acquire_at(&maintenance, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let (s2, m2) = (singleton.clone(), maintenance.clone());
+        let backup = std::thread::spawn(move || {
+            let progress = crate::progress::NullProgress;
+            matches!(
+                acquire_manual_locks_at(&s2, &m2, "btrdasd backup boot-archive", &progress)
+                    .unwrap(),
+                BackupLockAttempt::Acquired(_)
+            )
+        });
+        wait_for(std::time::Duration::from_secs(5), "the waiter", || {
+            scrub::FileLock::try_acquire(&singleton).unwrap().is_none()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!claim.exists(), "no claim is ever opened");
+        drop(scrub);
+        assert!(backup.join().unwrap());
+    }
+
+    /// The host a CLI or GUI backup runs on claims the production claim lock.
+    #[test]
+    fn the_backup_host_claims_the_production_claim_lock() {
+        let host = SystemBackupHost::new(Path::new("/etc/das-backup/config.toml"), "x");
+        assert_eq!(host.claim, ClaimSite::production());
+        assert_eq!(
+            ClaimSite::production().path,
+            Path::new("/run/das-maintenance-claim.lock")
+        );
+        assert_eq!(
+            ClaimSite::production().answer_within,
+            std::time::Duration::from_secs(180)
+        );
     }
 
     #[test]
@@ -11198,6 +11496,10 @@ Legend:
             config_path: dir.path().join("config.toml"),
             singleton_lock: dir.path().join("backup.lock"),
             maintenance_lock: dir.path().join("maintenance.lock"),
+            claim: ClaimSite {
+                path: dir.path().join("claim.lock"),
+                answer_within: std::time::Duration::from_secs(180),
+            },
             job: "btrdasd-helper BackupRun job".into(),
             mailer: std::sync::Arc::new(crate::report::RecordingMailer::accepting()),
         };
@@ -12322,6 +12624,10 @@ Legend:
             config_path: dir.join("config.toml"),
             singleton_lock: dir.join("backup.lock"),
             maintenance_lock: dir.join("maintenance.lock"),
+            claim: ClaimSite {
+                path: dir.join("claim.lock"),
+                answer_within: std::time::Duration::from_secs(180),
+            },
             job: "btrdasd backup run".into(),
             mailer,
         }

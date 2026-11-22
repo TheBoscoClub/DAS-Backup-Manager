@@ -545,6 +545,13 @@ pub fn deferred_line(path: &Path, holder: &str) -> String {
 /// (step A6) are later steps.
 pub const CLAIM_LOCK_PATH: &str = "/run/das-maintenance-claim.lock";
 
+/// How long a backup that claims the maintenance lock waits for a scrub to
+/// give it up before it warns that nobody answered (operator 2026-11-22, Q5):
+/// three times the worst ordinary yield (one 5 s poll, the 30 s stop grace,
+/// two unmount tries). The backup keeps waiting after the warning, and its
+/// exit status does not change. `backup-run.sh` carries the same number.
+pub const YIELD_ANSWER_SECS: u64 = 180;
+
 /// Proof that this process claims the maintenance lock: it holds the claim
 /// lock shared, with its record (`<job> pid <pid>`) in the file, until the
 /// value is dropped. Drop it as soon as the maintenance lock is held.
