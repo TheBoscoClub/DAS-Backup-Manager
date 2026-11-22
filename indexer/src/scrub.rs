@@ -2218,11 +2218,16 @@ fn scrub_one_target(
     // A RAID-1 target is mounted only through the guard (bd
     // DAS-Backup-Manager-su1b.10): never `degraded` as configured.
     let guarded = crate::raid_guard::is_guarded(target).then_some((config, target));
+    // Whether the guard mounted it normally: only such a mount gets the
+    // end-of-pass check (a degraded one shows its absent member missing all
+    // its life, its period recorded at the mount; bd su1b.14, review note 1).
+    let mut guard_normal = false;
     match ensure_mounted(
         &mount_point,
         &fsuuid,
         &config.das.mount_opts,
         guarded,
+        &mut guard_normal,
         progress,
         held,
     ) {
@@ -2302,6 +2307,7 @@ fn scrub_one_target(
                     progress.on_log(LogLevel::Warning, &format!("{label}: {note}"));
                 }
                 if result.mounted_by_engine
+                    && guard_normal
                     && let Some((config, target)) = guarded
                 {
                     raid_end_check_logged(config, target, label, progress);
@@ -2370,6 +2376,7 @@ fn scrub_one_target(
     // Recorded before anything is cleared or unmounted: a scrub that lost a
     // member pays no debt, and the next mount with both owes one again.
     if result.mounted_by_engine
+        && guard_normal
         && let Some((config, target)) = guarded
     {
         raid_end_check_logged(config, target, label, progress);
@@ -2442,6 +2449,7 @@ fn ensure_mounted(
     fsuuid: &str,
     mount_opts: &str,
     guarded: Option<(&Config, &crate::config::Target)>,
+    guard_normal: &mut bool,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<bool, String> {
@@ -2518,7 +2526,9 @@ fn ensure_mounted(
             progress,
             held,
         ) {
-            Ok(_) => {}
+            Ok(outcome) => {
+                *guard_normal = matches!(outcome, crate::raid_guard::Outcome::Normal { .. });
+            }
             Err(crate::raid_guard::Failure::Refused { why, left_mounted }) => {
                 if !left_mounted {
                     cleanup_dir(progress);

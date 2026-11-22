@@ -1072,6 +1072,9 @@ split\-brain member read\-only instead
 status
 .BR STALE\-READ\-ONLY ),
 with a warning naming the date its data stops and no change to the record;
+an unreadable record, or every member present with differing superblock
+generations and no record, gives such a job the same read\-only mount
+.RB ( READ\-ONLY );
 every job that writes the target, or writes the index or a state file from
 what it reads (walk, reindex, reconcile, the GUI's index walk, the
 recovery\-OS reading), stays refused (see
@@ -3123,7 +3126,10 @@ when they cannot be counted, never 0), and the date the present drive's data
 stops; then it asks for the target's label, typed exactly. Standard input
 that is not a terminal accepts nothing; there is no
 .BR \-\-yes .
-Accepting writes the record
+After the label is typed the members are looked at again: any drive other than
+the present one attached (one plugged in meanwhile) refuses, and so does the
+mounted filesystem showing another member present (it is unmounted at once);
+nothing is written until both pass. Accepting writes the record
 .RI ( /var/lib/das\-backup/raid/<fsid>.record ,
 then the witness through a degraded read\-write mount of the present drive):
 a new degraded period on the present drive, and the absent drive listed as

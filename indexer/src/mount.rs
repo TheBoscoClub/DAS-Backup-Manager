@@ -286,6 +286,10 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         (self.probes.missing_devids)(fsid)
     }
 
+    fn devinfo(&self, fsid: &str) -> Result<Vec<(u64, bool)>, String> {
+        raid_guard::devinfo_under(Path::new("/sys/fs/btrfs"), fsid)
+    }
+
     fn read_witness(&self, mount: &str, fsid: &str) -> raid_guard::Copy {
         raid_guard::read_copy(&raid_guard::witness_path(mount), fsid)
     }

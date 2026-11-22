@@ -2210,7 +2210,7 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
         println!("{explanation}");
         if !std::io::stdin().is_terminal() {
             return Err(
-                "standard input is not a terminal: run it at a terminal and type the label                  (there is no --yes)"
+                "standard input is not a terminal: run it at a terminal and type the label (there is no --yes)"
                     .into(),
             );
         }
@@ -2237,7 +2237,7 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
                 eprintln!("WARNING: {w}");
             }
             println!(
-                "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed                  from the filesystem.",
+                "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed from the filesystem.",
                 done.accepted
                     .after
                     .members
