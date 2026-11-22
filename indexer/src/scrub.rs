@@ -105,10 +105,20 @@
 //!   takes it while it writes the installed files (bd DAS-Backup-Manager-su1b.2),
 //!   the pass waits up to [`SETUP_WAIT_SECS`] for it, saying so, and skips with
 //!   a WARN that it did NOT run if setup still holds it.
-//! * `/run/das-maintenance.lock` — blocking, shared with `backup-run.sh`. Held
-//!   for the entire pass, including this module's own mounts and unmounts, so a
-//!   backup can never unmount a filesystem out from under a running scrub.
-//!   Contention defers the scrub, it never cancels it.
+//! * `/run/das-maintenance.lock` — shared with `backup-run.sh` and every job
+//!   that mounts a target; only its holder mounts or unmounts. The pass holds
+//!   it while it scrubs, and **gives it up to a backup that claims it**
+//!   (bd DAS-Backup-Manager-su1b.2): a backup waiting for the lock holds
+//!   `/run/das-maintenance-claim.lock` shared ([`crate::maintenance::Claim`]),
+//!   and the pass, which probes that file at every poll and before every
+//!   mount, stops its `btrfs scrub` child (SIGTERM, reaped, so the record
+//!   stays resumable), confirms the kernel stopped, unmounts what it mounted,
+//!   writes a `yielded` record, and only then lets the lock go. It waits
+//!   (the singleton still held) until nobody claims, takes the lock again,
+//!   reads `config.toml` again, and resumes the same filesystem with
+//!   `btrfs scrub resume`. A claim seen before the pass first takes the lock
+//!   lets the backup go first. A backup never waits a whole pass; the pass
+//!   ends later by the backups' length. Nothing else makes it yield.
 //!
 //! Both locks live in the engine, not in the systemd unit, so a manual
 //! `btrdasd scrub run` is covered identically. `/run` is tmpfs, so no lock can
@@ -173,8 +183,9 @@
 //!   optional `yielded_to` (the claim's holder record), `yielded_epoch`,
 //!   `yields` (count this pass) and `paused_secs` (total before this yield).
 //!   Readers treat it as `running`: in progress while its process lives in
-//!   this boot, `interrupted` otherwise. Readers know it; no pass writes it
-//!   yet (that is step A5).
+//!   this boot, `interrupted` otherwise. The pass writes it as it gives the
+//!   lock up, for the filesystem it paused (or, for a pause before a mount,
+//!   the one next in line), and replaces it with `running` on resuming.
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
 //! * `last_success_epoch` is carried forward across failed passes — it is the
@@ -209,7 +220,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::maintenance::{HoldsMaintenance, MaintenanceHeld};
+use crate::maintenance::MaintenanceHeld;
 use crate::mount::partition_device;
 use crate::progress::{LogLevel, ProgressCallback};
 
@@ -277,6 +288,8 @@ pub enum ScrubError {
     StatusNoDevices { fsuuid: String },
     /// A device row could not be parsed.
     StatusMalformed { detail: String },
+    /// `config.toml` could not be read again once the pass held its locks.
+    ConfigReload { detail: String },
 }
 
 impl fmt::Display for ScrubError {
@@ -313,6 +326,10 @@ impl fmt::Display for ScrubError {
             Self::StatusMalformed { detail } => {
                 write!(f, "Malformed scrub status record: {detail}")
             }
+            Self::ConfigReload { detail } => write!(
+                f,
+                "config.toml could not be read again once the scrub locks were held: {detail}"
+            ),
         }
     }
 }
@@ -703,6 +720,12 @@ fn overridable(var: &str, default: &str) -> PathBuf {
     }
 }
 
+/// The claim lock a backup takes to ask a pass to let it go first
+/// ([`crate::maintenance::CLAIM_LOCK_PATH`], overridable for tests).
+fn claim_lock_path() -> PathBuf {
+    overridable("DAS_CLAIM_LOCK", crate::maintenance::CLAIM_LOCK_PATH)
+}
+
 /// Directory holding the btrfs status records (overridable for tests).
 fn btrfs_status_dir() -> PathBuf {
     overridable("DAS_BTRFS_STATUS_DIR", BTRFS_STATUS_DIR)
@@ -1017,22 +1040,25 @@ impl Drop for FileLock {
 /// emptied while still held as the value drops, as the backup singleton's
 /// does — so `btrdasd setup` and `scrub cancel` can tell a pass from setup's
 /// own hold (bd DAS-Backup-Manager-su1b.2).
+///
+/// The maintenance hold is a [`MaintenanceSlot`]: the pass gives it up to a
+/// backup that claims it and takes it back, holding the singleton (and its
+/// termination handlers) throughout (bd DAS-Backup-Manager-su1b.2).
 #[derive(Debug)]
 pub struct ScrubLocks {
-    maintenance: MaintenanceHeld,
+    maintenance: MaintenanceSlot,
     singleton: crate::backup::SingletonHeld,
 }
 
 impl ScrubLocks {
-    /// Paths of the held locks, in acquisition order.
+    /// Paths of the locks, in acquisition order.
     pub fn paths(&self) -> (&Path, &Path) {
         (self.singleton.path(), self.maintenance.path())
     }
-}
 
-impl HoldsMaintenance for ScrubLocks {
-    fn maintenance(&self) -> &MaintenanceHeld {
-        &self.maintenance
+    /// The maintenance hold, while the pass has it.
+    pub fn maintenance(&self) -> Option<&MaintenanceHeld> {
+        self.maintenance.held()
     }
 }
 
@@ -1117,6 +1143,7 @@ fn wait_words(wait: Duration) -> String {
 fn acquire_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
+    claim_path: &Path,
     progress: &dyn ProgressCallback,
     setup_wait: Duration,
     poll: Duration,
@@ -1159,9 +1186,32 @@ fn acquire_locks_at(
             }
         }
     };
-    let maintenance = MaintenanceHeld::acquire_blocking_at(maintenance_path, SCRUB_JOB, progress)?;
+    // Checkpoints 1 and 2: a backup that claims the lock goes first.
+    let claim = ClaimWatch::new(claim_path);
+    let held = match take_maintenance_behind_claims(
+        maintenance_path,
+        poll,
+        &|| claim.still_waiting(progress),
+        &|| claim.wants_lock(progress),
+        &|| None,
+        progress,
+    )? {
+        Retake::Held(held) => held,
+        // `stop` never answers here: the handlers are not installed yet, so
+        // a signal ends the process as it always did, holding nothing.
+        Retake::Interrupted(signal) => {
+            return Err(ScrubError::Lock {
+                path: maintenance_path.display().to_string(),
+                detail: format!("interrupted by {}", signal_name(signal)),
+            });
+        }
+    };
     Ok(ScrubLockAttempt::Taken(ScrubLocks {
-        maintenance,
+        maintenance: MaintenanceSlot {
+            path: maintenance_path.to_path_buf(),
+            poll,
+            held: Some(held),
+        },
         singleton,
     }))
 }
@@ -1169,8 +1219,9 @@ fn acquire_locks_at(
 /// Acquire the production scrub locks.
 pub fn acquire_locks(progress: &dyn ProgressCallback) -> Result<ScrubLockAttempt, ScrubError> {
     acquire_locks_at(
-        Path::new(SCRUB_LOCK_PATH),
-        Path::new(MAINTENANCE_LOCK_PATH),
+        &overridable("DAS_SCRUB_LOCK", SCRUB_LOCK_PATH),
+        &overridable("DAS_MAINTENANCE_LOCK", MAINTENANCE_LOCK_PATH),
+        &claim_lock_path(),
         progress,
         Duration::from_secs(SETUP_WAIT_SECS),
         SETUP_WAIT_POLL,
@@ -1564,6 +1615,20 @@ pub struct ScrubFsResult {
     /// Information for the report, never an error: a target that yielded
     /// and then finished clean is a clean pass.
     pub yields: Vec<ScrubYield>,
+    /// Set by a segment of this filesystem's scrub that stopped for a
+    /// waiting backup (bd DAS-Backup-Manager-su1b.2, step A5): the pass gives
+    /// the maintenance lock up next. Never persisted; the pass loop takes it.
+    pub pending_yield: Option<PendingYield>,
+}
+
+/// What a scrub segment that stopped for a waiting backup asks of the pass
+/// loop, its unmount already attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingYield {
+    /// Resume this filesystem once the lock is back (`false`: the kernel was
+    /// not seen to stop its scrub, so the mount was left and this filesystem
+    /// is not scrubbed again in this pass).
+    pub resume: bool,
 }
 
 /// One pause of a filesystem's scrub for a backup, as the report lists it.
@@ -1595,6 +1660,7 @@ impl ScrubFsResult {
             scrub_launched: false,
             interrupted_by: None,
             yields: Vec::new(),
+            pending_yield: None,
         }
     }
 
@@ -1933,8 +1999,13 @@ fn now_epoch() -> i64 {
 /// The report is mailed through [`crate::report::MAILX`]: no caller can hand
 /// a pass another mailer (bd DAS-Backup-Manager-1x76); `email_scrub_report`
 /// is what tests drive.
+/// `reload` reads `config.toml` again: once the locks are held (a wait for
+/// setup or for the maintenance lock may have outlived the file the caller
+/// read), and after every pause for a backup, before anything is mounted
+/// (bd DAS-Backup-Manager-su1b.2).
 pub fn run_scrub_pass(
     config: &Config,
+    reload: &dyn Fn() -> Result<Config, String>,
     progress: &dyn ProgressCallback,
 ) -> Result<ScrubPass, ScrubError> {
     if config.scrub_target_labels().is_empty() {
@@ -1944,7 +2015,7 @@ pub fn run_scrub_pass(
     let started_epoch = now_epoch();
 
     let attempt = acquire_locks(progress)?;
-    let ScrubLockAttempt::Taken(locks) = attempt else {
+    let ScrubLockAttempt::Taken(mut locks) = attempt else {
         let (level, line, summary) = skipped_lines(&attempt);
         progress.on_log(level, &line);
         // Close the progress lifecycle on this path too, so a caller driving a
@@ -1959,6 +2030,12 @@ pub fn run_scrub_pass(
         });
     };
 
+    // The file may have changed while this pass waited for its locks.
+    let config = &reload().map_err(|detail| ScrubError::ConfigReload { detail })?;
+    if config.scrub_target_labels().is_empty() {
+        return Err(ScrubError::NoTargets);
+    }
+
     if !config.scrub.enabled {
         progress.on_log(
             LogLevel::Warning,
@@ -1970,18 +2047,20 @@ pub fn run_scrub_pass(
     // caught for the rest of the pass: the scrub is stopped, the stop is
     // recorded, the filesystem is unmounted; the caller then dies of the signal.
     let _termination = catch_termination();
-    let scrub_and_file =
-        |config: &Config, label: &str, progress: &dyn ProgressCallback, held: &MaintenanceHeld| {
-            let result = scrub_one_target(config, label, progress, held);
-            record_result_logged(&state_path(), &result, progress);
-            result
-        };
-    let results = scrub_targets_with(
+    let claim = ClaimWatch::new(&claim_lock_path());
+    let state = state_path();
+    let results = scrub_targets_yielding(
         config,
         progress,
-        locks.maintenance(),
-        &pending_signal,
-        &scrub_and_file,
+        &mut locks.maintenance,
+        &claim,
+        &PassHooks {
+            stop: &pending_signal,
+            reload,
+            scrub_one: &scrub_one_target,
+            file_result: &|result| record_result_logged(&state, result, progress),
+            file_yield: &|mark| record_yielded_logged(&state, mark, progress),
+        },
     );
 
     let mut pass = ScrubPass {
@@ -2042,69 +2121,6 @@ fn email_scrub_report(
             &format!("Could not send scrub report email: {e}"),
         ),
     }
-}
-
-/// Scrub every `[scrub].targets` entry in turn, under the maintenance lock
-/// `held` proves, with a progress step and a result line for each. `scrub_one`
-/// scrubs one target: [`scrub_one_target`] in production, a scripted result in
-/// tests.
-fn scrub_targets_with(
-    config: &Config,
-    progress: &dyn ProgressCallback,
-    held: &MaintenanceHeld,
-    stop: &dyn Fn() -> Option<i32>,
-    scrub_one: &dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld) -> ScrubFsResult,
-) -> Vec<ScrubFsResult> {
-    let labels = config.scrub_target_labels();
-    let total = labels.len() as u64;
-    progress.on_stage("Scrubbing DAS filesystems", total);
-
-    let mut results = Vec::new();
-    // Sequential by construction: the DAS filesystems share one USB bus.
-    for (i, label) in labels.iter().enumerate() {
-        if let Some(signal) = stop() {
-            // Caught between targets: this one is listed as not begun, so the
-            // pass reads as interrupted, and nothing after it starts.
-            let mut result = ScrubFsResult::new(label);
-            result.interrupted_by = Some(signal);
-            result.errors.push(format!(
-                "not started: the pass was interrupted by {}",
-                signal_name(signal)
-            ));
-            progress.on_log(
-                LogLevel::Error,
-                &format!(
-                    "{label}: scrub not started — interrupted by {}",
-                    signal_name(signal)
-                ),
-            );
-            results.push(result);
-            break;
-        }
-        progress.on_progress((i + 1) as u64, total, &format!("Scrubbing {label}"));
-        let result = scrub_one(config, label, progress, held);
-        let interrupted = result.interrupted_by.is_some();
-        if result.ok() {
-            progress.on_log(
-                LogLevel::Info,
-                &format!(
-                    "{label}: scrub finished cleanly ({} in {}s)",
-                    format_bytes(result.bytes_scrubbed),
-                    result.duration_secs
-                ),
-            );
-        } else {
-            progress.on_log(
-                LogLevel::Error,
-                &format!("{label}: scrub FAILED — {}", describe_failure(&result)),
-            );
-        }
-        results.push(result);
-        if interrupted {
-            break;
-        }
-    }
-    results
 }
 
 /// Merge a pass into the persisted state and write it back.
@@ -2176,6 +2192,7 @@ fn scrub_one_target(
     label: &str,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
+    claimed: &dyn Fn() -> bool,
 ) -> ScrubFsResult {
     let mut result = ScrubFsResult::new(label);
 
@@ -2230,7 +2247,8 @@ fn scrub_one_target(
         },
         progress,
     );
-    match run_btrfs_scrub(&mount_point, &fsuuid, progress) {
+    let mut yielded = None;
+    match run_btrfs_scrub(&mount_point, &fsuuid, progress, claimed) {
         ScrubRunOutcome::SpawnFailed(e) => {
             result.errors.push(e);
         }
@@ -2247,6 +2265,55 @@ fn scrub_one_target(
             result
                 .errors
                 .push(format!("scrub interrupted by {}", signal_name(signal)));
+        }
+        ScrubRunOutcome::Yielded { launched } => {
+            if launched {
+                result.started_epoch = scrub_started;
+                result.scrub_launched = true;
+            }
+            yielded = Some(launched);
+        }
+    }
+
+    // --- the yield (bd DAS-Backup-Manager-su1b.2) -------------------------
+    // The child is reaped. Before the mount goes: did the kernel stop, and
+    // what did the segment leave? Nothing is read through the mount point
+    // unless it is verified to be this filesystem (`live_scrub_state`).
+    if let Some(launched) = yielded {
+        let (live, record) = if launched {
+            (
+                live_scrub_state(&mount_point, &fsuuid),
+                read_scrub_status(&fsuuid).ok(),
+            )
+        } else {
+            (LiveScrubState::NotRunning, None)
+        };
+        match yield_verdict(launched, live, record.as_ref(), scrub_started) {
+            YieldVerdict::Finished => {
+                // Finished as it was stopped: read as a result below, and
+                // the pass yields before the next filesystem instead.
+            }
+            YieldVerdict::Pause { note } => {
+                if let Some(note) = note {
+                    progress.on_log(LogLevel::Warning, &format!("{label}: {note}"));
+                }
+                if result.mounted_by_engine
+                    && let Err(e) = unmount(&mount_point, progress)
+                {
+                    // A-F10: the backup's leftover check takes it down, or
+                    // refuses; recorded either way.
+                    result
+                        .errors
+                        .push(format!("{e} (when pausing the scrub for a backup)"));
+                }
+                result.pending_yield = Some(PendingYield { resume: true });
+                return result;
+            }
+            YieldVerdict::KernelLive(why) => {
+                result.errors.push(why);
+                result.pending_yield = Some(PendingYield { resume: false });
+                return result;
+            }
         }
     }
 
@@ -2484,6 +2551,10 @@ enum ScrubRunOutcome {
     /// The pass caught a termination signal while the child ran (or before it
     /// started); the child was stopped and reaped first.
     Interrupted(i32),
+    /// A backup claimed the maintenance lock (bd DAS-Backup-Manager-su1b.2):
+    /// the child, if `launched`, was stopped by [`stop_child`] and reaped, so
+    /// its record stays resumable; not `launched`, none was started.
+    Yielded { launched: bool },
 }
 
 /// True when a `resume` attempt exited nonzero *specifically* because the
@@ -2562,11 +2633,12 @@ fn run_btrfs_scrub(
     mount_point: &str,
     fsuuid: &str,
     progress: &dyn ProgressCallback,
+    claimed: &dyn Fn() -> bool,
 ) -> ScrubRunOutcome {
     run_btrfs_scrub_with(
         decide_scrub_start_mode(fsuuid, mount_point),
         mount_point,
-        &|args| run_scrub_argv(args, progress),
+        &|args| run_scrub_argv(args, progress, claimed),
         progress,
     )
 }
@@ -2608,7 +2680,11 @@ fn run_btrfs_scrub_with(
 /// full argument vector including the mountpoint; the fsuuid for progress
 /// reporting is recovered from the record itself, so this helper needs only the
 /// argv and the progress sink.
-fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunOutcome {
+fn run_scrub_argv(
+    args: &[String],
+    progress: &dyn ProgressCallback,
+    claimed: &dyn Fn() -> bool,
+) -> ScrubRunOutcome {
     // The mountpoint is the final argument; progress is keyed by the FS UUID of
     // whatever is mounted there.
     let mount_point = args.last().map(String::as_str).unwrap_or("");
@@ -2619,6 +2695,7 @@ fn run_scrub_argv(args: &[String], progress: &dyn ProgressCallback) -> ScrubRunO
         &fsuuid,
         SCRUB_POLL_INTERVAL,
         &pending_signal,
+        claimed,
         progress,
     )
 }
@@ -2640,21 +2717,33 @@ fn stop_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// [`run_scrub_argv`] with the program, the poll interval and the source of
-/// "a termination signal arrived" supplied by the caller, so a test drives a
-/// signal at a stand-in child instead of a real scrub.
+/// [`run_scrub_argv`] with the program, the poll interval, the source of
+/// "a termination signal arrived" and the source of "a backup claims the
+/// maintenance lock" supplied by the caller, so a test drives a signal or a
+/// claim at a stand-in child instead of a real scrub.
+///
+/// A claim is a second stop source beside `pending`, looked at before the
+/// spawn and at every poll (bd DAS-Backup-Manager-su1b.2): the child is
+/// stopped by [`stop_child`] (SIGTERM, which leaves a resumable record on
+/// btrfs-progs 7.3, step A1) and reaped before this returns
+/// [`ScrubRunOutcome::Yielded`]. A signal outranks a claim.
 fn run_scrub_child(
     program: &str,
     args: &[String],
     fsuuid: &str,
     poll: Duration,
     pending: &dyn Fn() -> Option<i32>,
+    claimed: &dyn Fn() -> bool,
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
     let mount_point = args.last().map(String::as_str).unwrap_or("");
-    // Never start a scrub for a pass that has already been told to stop.
+    // Never start a scrub for a pass that has already been told to stop, or
+    // that a backup has asked for the lock.
     if let Some(signal) = pending() {
         return ScrubRunOutcome::Interrupted(signal);
+    }
+    if claimed() {
+        return ScrubRunOutcome::Yielded { launched: false };
     }
     let mut child = match Command::new(program)
         .args(args)
@@ -2693,6 +2782,12 @@ fn run_scrub_child(
                 if let Some(signal) = pending() {
                     stop_child(&mut child);
                     return ScrubRunOutcome::Interrupted(signal);
+                }
+                if claimed() {
+                    // SIGTERM, then reaped: the record stays resumable
+                    // (step A1). Never returns while the child lives.
+                    stop_child(&mut child);
+                    return ScrubRunOutcome::Yielded { launched: true };
                 }
             }
             Err(e) => {
@@ -2752,6 +2847,712 @@ fn run_scrub_child(
             }
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// The yield: a backup asks the pass to give the maintenance lock up
+// (bd DAS-Backup-Manager-su1b.2, step A5)
+// ---------------------------------------------------------------------------
+
+/// What the pass knows of the claim lock ([`crate::maintenance::CLAIM_LOCK_PATH`]),
+/// a backup's request that the pass let it go first.
+///
+/// A probe that cannot look (the file cannot be opened or locked) is read
+/// as a claim once, while the pass holds the maintenance lock — the cautious
+/// reading for the backup that may be waiting (`fail-silent.md`) — and then
+/// as no claim until a probe works again, so a broken probe costs one pause,
+/// never a pass that stops every few seconds or waits outside for ever.
+/// Safety never rests on the claim: only the maintenance lock decides who
+/// mounts.
+pub(crate) struct ClaimWatch {
+    path: PathBuf,
+    broken: std::cell::Cell<bool>,
+}
+
+impl ClaimWatch {
+    pub(crate) fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            broken: std::cell::Cell::new(false),
+        }
+    }
+
+    /// One probe: `Some(held)` when it could look (and the probe works
+    /// again), `None` when it could not — said once, when it starts failing.
+    fn probe(&self, progress: &dyn ProgressCallback) -> Option<bool> {
+        match crate::maintenance::claim_is_held(&self.path) {
+            Ok(held) => {
+                self.broken.set(false);
+                Some(held)
+            }
+            Err(e) => {
+                if !self.broken.get() {
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!(
+                            "cannot look at the claim lock {} ({e}) — a pass holding the \
+                             maintenance lock gives it up once, as if a backup had asked; until \
+                             the claim can be looked at again, it neither waits for one nor \
+                             gives the lock up for one",
+                            self.path.display()
+                        ),
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// While the pass holds the maintenance lock: whether a backup wants it.
+    pub(crate) fn wants_lock(&self, progress: &dyn ProgressCallback) -> bool {
+        let was_broken = self.broken.get();
+        let seen = self.probe(progress);
+        let now_broken = seen.is_none();
+        self.broken.set(now_broken);
+        // A probe that has just started failing is read as a claim, once.
+        seen.unwrap_or(!was_broken)
+    }
+
+    /// While the pass waits outside: whether a backup still waits to go
+    /// first. A probe that cannot look does not keep the pass waiting.
+    pub(crate) fn still_waiting(&self, progress: &dyn ProgressCallback) -> bool {
+        let seen = self.probe(progress);
+        self.broken.set(seen.is_none());
+        seen.unwrap_or(false)
+    }
+
+    /// The claimant, as it recorded itself (`backup-run.sh pid 1234`).
+    pub(crate) fn holder(&self) -> String {
+        crate::maintenance::holder_of(&self.path)
+    }
+}
+
+/// What the stopped segment's state allows, once its child is reaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum YieldVerdict {
+    /// Unmount, give the lock up, resume this filesystem afterwards. `note`
+    /// says why the resume may start from zero (a canceled record, or none
+    /// written by this segment yet); `None` when the record is resumable.
+    Pause { note: Option<String> },
+    /// The filesystem finished as it was stopped: a result like any other.
+    Finished,
+    /// The kernel was not seen to stop the scrub: the mount is left as it
+    /// is, the lock given up, and this filesystem not scrubbed again in this
+    /// pass (design A-F8).
+    KernelLive(String),
+}
+
+/// Decide [`YieldVerdict`] from whether a child ran, what the kernel says
+/// now, and the record as read by UUID. A record whose last start or resume
+/// predates this segment's start is not this segment's (the 2026-07-27
+/// stale-record trap): it is never read as a finished result.
+fn yield_verdict(
+    launched: bool,
+    live: LiveScrubState,
+    record: Option<&ScrubStatusRecord>,
+    segment_started: i64,
+) -> YieldVerdict {
+    if !launched {
+        return YieldVerdict::Pause { note: None };
+    }
+    if live != LiveScrubState::NotRunning {
+        // `Unknown` is as good as `Running` here: an unmount under a live
+        // scrub is refused anyway, and nothing may act on a guess.
+        return YieldVerdict::KernelLive(format!(
+            "the kernel was not seen to stop this filesystem's scrub after its btrfs child \
+             was stopped and reaped (scrub status: {live:?}) — left mounted for the next job's \
+             leftover check, and not resumed in this pass"
+        ));
+    }
+    match record {
+        Some(r)
+            if r.last_activity_start() != 0
+                && r.last_activity_start() >= segment_started - RECORD_FRESHNESS_SLACK_SECS =>
+        {
+            match r.outcome() {
+                ScrubOutcome::Finished => YieldVerdict::Finished,
+                ScrubOutcome::Aborted => YieldVerdict::Pause { note: None },
+                ScrubOutcome::Canceled => YieldVerdict::Pause {
+                    note: Some(
+                        "the stopped scrub left a canceled record (canceled:1): the resume \
+                         will start this filesystem from zero — no region is skipped, only \
+                         work repeated"
+                            .to_string(),
+                    ),
+                },
+            }
+        }
+        _ => YieldVerdict::Pause {
+            note: Some(
+                "the stopped scrub had not yet written a record of its own: the resume \
+                 decides from the earlier record, and may start this filesystem afresh"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+/// The pass's hold on the maintenance lock, which it gives up for a waiting
+/// backup and takes back: the only owner of the pass's [`MaintenanceHeld`].
+/// Every mount still needs a `&MaintenanceHeld`, which only a held slot
+/// gives.
+#[derive(Debug)]
+pub struct MaintenanceSlot {
+    path: PathBuf,
+    poll: Duration,
+    held: Option<MaintenanceHeld>,
+}
+
+impl MaintenanceSlot {
+    /// The hold, while the pass has it.
+    pub fn held(&self) -> Option<&MaintenanceHeld> {
+        self.held.as_ref()
+    }
+
+    /// The lock file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// How a wait for the maintenance lock, behind any claim, ended.
+#[derive(Debug)]
+enum Retake {
+    Held(MaintenanceHeld),
+    Interrupted(i32),
+}
+
+/// Take the maintenance lock at `path` for the pass, behind any backup that
+/// claims it (design checkpoints 1 and 2): while `still_waiting()`, wait;
+/// once it is not, try the lock; taken, but `wants_lock()` now says a backup
+/// claimed it meanwhile, let it go unused and wait again. Every `poll`,
+/// `stop()` is looked at, so a signal ends the wait at once — a blocking
+/// `flock` would retry through it. Logs the wait after
+/// [`LOCK_WAIT_ANNOUNCE_SECS`], again every [`LOCK_WAIT_REANNOUNCE_SECS`].
+fn take_maintenance_behind_claims(
+    path: &Path,
+    poll: Duration,
+    still_waiting: &dyn Fn() -> bool,
+    wants_lock: &dyn Fn() -> bool,
+    stop: &dyn Fn() -> Option<i32>,
+    progress: &dyn ProgressCallback,
+) -> Result<Retake, ScrubError> {
+    let started = Instant::now();
+    let mut next_notice = LOCK_WAIT_ANNOUNCE_SECS;
+    let mut announced = false;
+    loop {
+        if let Some(signal) = stop() {
+            return Ok(Retake::Interrupted(signal));
+        }
+        let claimed = still_waiting();
+        if !claimed && let Some(held) = MaintenanceHeld::try_acquire_at(path, SCRUB_JOB)? {
+            if !wants_lock() {
+                if announced {
+                    progress.on_log(
+                        LogLevel::Info,
+                        &format!(
+                            "DAS maintenance lock acquired after waiting {}s",
+                            started.elapsed().as_secs()
+                        ),
+                    );
+                }
+                return Ok(Retake::Held(held));
+            }
+            // A backup claimed it as it was taken: let it go unused.
+            drop(held);
+        }
+        let waited = started.elapsed().as_secs();
+        if waited >= next_notice {
+            let line = if claimed {
+                format!(
+                    "Waiting: a backup claims the DAS maintenance lock {} — this pass lets it go \
+                     first",
+                    path.display()
+                )
+            } else {
+                crate::maintenance::blocked_line(path)
+            };
+            if announced {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!("{line} — still waiting after {}m", waited / 60),
+                );
+            } else {
+                progress.on_log(LogLevel::Info, &line);
+            }
+            announced = true;
+            next_notice = if next_notice < LOCK_WAIT_REANNOUNCE_SECS {
+                LOCK_WAIT_REANNOUNCE_SECS
+            } else {
+                next_notice + LOCK_WAIT_REANNOUNCE_SECS
+            };
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// What the pass writes when it gives the lock up: a `yielded` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct YieldMark {
+    pub(crate) label: String,
+    pub(crate) fsuuid: String,
+    pub(crate) mountpoint: String,
+    pub(crate) started_epoch: i64,
+    pub(crate) at_epoch: i64,
+    pub(crate) holder: String,
+    pub(crate) yields: u32,
+    pub(crate) paused_secs: u64,
+}
+
+/// Scrub one target under the hold: [`scrub_one_target`] in production.
+type ScrubOne<'a> = dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld, &dyn Fn() -> bool) -> ScrubFsResult
+    + 'a;
+
+/// What the pass loop calls out to, so a test drives each.
+pub(crate) struct PassHooks<'a> {
+    /// The signal the pass caught, if any.
+    pub(crate) stop: &'a dyn Fn() -> Option<i32>,
+    /// Read `config.toml` again, after a pause.
+    pub(crate) reload: &'a dyn Fn() -> Result<Config, String>,
+    pub(crate) scrub_one: &'a ScrubOne<'a>,
+    /// File a filesystem's result the moment it is done.
+    pub(crate) file_result: &'a dyn Fn(&ScrubFsResult),
+    /// File a `yielded` record as the pass gives the lock up.
+    pub(crate) file_yield: &'a dyn Fn(&YieldMark),
+}
+
+/// One filesystem's scrub across the segments its pauses cut it into.
+#[derive(Debug, Default)]
+struct Segments {
+    label: String,
+    fsuuid: String,
+    mountpoint: String,
+    started_epoch: i64,
+    launched: bool,
+    yields: Vec<ScrubYield>,
+    errors: Vec<String>,
+}
+
+impl Segments {
+    fn for_label(label: &str, config: &Config) -> Self {
+        Self {
+            label: label.to_string(),
+            fsuuid: resolve_target_fsuuid(config, label).unwrap_or_default(),
+            mountpoint: config
+                .targets
+                .iter()
+                .find(|t| t.label == label)
+                .map(|t| t.mount.clone())
+                .unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    /// Fold a segment that stopped for a claim into this filesystem's scrub.
+    fn add(&mut self, segment: &ScrubFsResult) {
+        if !segment.fsuuid.is_empty() {
+            self.fsuuid = segment.fsuuid.clone();
+        }
+        if !segment.mountpoint.is_empty() {
+            self.mountpoint = segment.mountpoint.clone();
+        }
+        if self.started_epoch == 0 {
+            self.started_epoch = segment.started_epoch;
+        }
+        self.launched |= segment.scrub_launched;
+        self.errors.extend(segment.errors.iter().cloned());
+    }
+
+    fn paused_secs(&self) -> u64 {
+        self.yields.iter().filter_map(|y| y.paused_secs).sum()
+    }
+
+    /// The `yielded` record of a pause about to begin (already in `yields`).
+    fn mark(&self) -> YieldMark {
+        let current = self.yields.last();
+        YieldMark {
+            label: self.label.clone(),
+            fsuuid: self.fsuuid.clone(),
+            mountpoint: self.mountpoint.clone(),
+            started_epoch: self.started_epoch,
+            at_epoch: current.map_or_else(now_epoch, |y| y.at_epoch),
+            holder: current.map(|y| y.holder.clone()).unwrap_or_default(),
+            yields: self.yields.len() as u32,
+            paused_secs: self.paused_secs(),
+        }
+    }
+
+    /// This filesystem's result: `last` (the last segment's, or a fresh one
+    /// for a filesystem the pass could not go back to) with what the earlier
+    /// segments did.
+    fn finish(self, mut last: ScrubFsResult) -> ScrubFsResult {
+        last.pending_yield = None;
+        if last.fsuuid.is_empty() {
+            last.fsuuid = self.fsuuid;
+        }
+        if last.mountpoint.is_empty() {
+            last.mountpoint = self.mountpoint;
+        }
+        if last.started_epoch == 0 {
+            last.started_epoch = self.started_epoch;
+        }
+        last.scrub_launched |= self.launched;
+        let mut errors = self.errors;
+        errors.append(&mut last.errors);
+        last.errors = errors;
+        let mut yields = self.yields;
+        yields.append(&mut last.yields);
+        last.yields = yields;
+        last
+    }
+}
+
+/// How a pause ended.
+enum PauseEnd {
+    /// The lock is the pass's again after this many seconds.
+    Resumed(u64),
+    Interrupted(i32),
+    LockFailed(String),
+}
+
+/// Give the lock up for the claimant (its record cleared, then unlocked),
+/// wait behind it and any other claim, and take the lock back.
+fn pause_for_claim(
+    slot: &mut MaintenanceSlot,
+    claim: &ClaimWatch,
+    stop: &dyn Fn() -> Option<i32>,
+    progress: &dyn ProgressCallback,
+) -> PauseEnd {
+    slot.held = None;
+    let started = Instant::now();
+    match take_maintenance_behind_claims(
+        &slot.path,
+        slot.poll,
+        &|| claim.still_waiting(progress),
+        &|| claim.wants_lock(progress),
+        stop,
+        progress,
+    ) {
+        Ok(Retake::Held(held)) => {
+            slot.held = Some(held);
+            PauseEnd::Resumed(started.elapsed().as_secs())
+        }
+        Ok(Retake::Interrupted(signal)) => PauseEnd::Interrupted(signal),
+        Err(e) => PauseEnd::LockFailed(e.to_string()),
+    }
+}
+
+/// Scrub every `[scrub].targets` entry in turn, giving the maintenance lock
+/// up whenever a backup claims it, and resuming the same filesystem once it
+/// is back (design §3.2):
+///
+/// - checkpoint 3, before each filesystem's mount: a claim pauses the pass
+///   with nothing mounted, and a `yielded` record names the filesystem next
+///   in line, so a pass that dies there is not silent;
+/// - checkpoint 4, inside the scrub ([`run_scrub_child`]): the child is
+///   stopped and reaped and the filesystem unmounted by `scrub_one`
+///   ([`scrub_one_target`]); only then is the lock given up here;
+/// - checkpoints 1 and 2 are [`take_maintenance_behind_claims`], at every
+///   return to the lock (and at the pass's start, [`acquire_locks_at`]).
+///
+/// After each pause `config.toml` is read again before anything is mounted:
+/// the backup that ran may have changed it (its subvolume sync does). A
+/// configuration that cannot be read ends the pass, the paused filesystem
+/// failing with the reason; a filesystem the new configuration no longer
+/// scrubs is not resumed, and says so.
+fn scrub_targets_yielding(
+    config: &Config,
+    progress: &dyn ProgressCallback,
+    slot: &mut MaintenanceSlot,
+    claim: &ClaimWatch,
+    hooks: &PassHooks,
+) -> Vec<ScrubFsResult> {
+    let mut config = config.clone();
+    let mut queue: std::collections::VecDeque<String> =
+        config.scrub_target_labels().into_iter().collect();
+    progress.on_stage("Scrubbing DAS filesystems", queue.len() as u64);
+
+    let mut results: Vec<ScrubFsResult> = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+    // The filesystem whose scrub a pause cut, while it waits to resume.
+    let mut cut: Option<Segments> = None;
+    // A filesystem filed already whose pause (A-F8) is yet to end.
+    let mut filed_pause: Option<usize> = None;
+    let mut step = 0u64;
+
+    let fail = |results: &mut Vec<ScrubFsResult>, result: ScrubFsResult| {
+        (hooks.file_result)(&result);
+        results.push(result);
+    };
+
+    'targets: while let Some(label) = queue.front().cloned() {
+        let resuming = cut.as_ref().is_some_and(|c| c.label == label);
+        if !resuming {
+            if let Some(signal) = (hooks.stop)() {
+                // Caught between targets: this one is listed as not begun, so the
+                // pass reads as interrupted, and nothing after it starts.
+                let mut result = ScrubFsResult::new(&label);
+                result.interrupted_by = Some(signal);
+                result.errors.push(format!(
+                    "not started: the pass was interrupted by {}",
+                    signal_name(signal)
+                ));
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!(
+                        "{label}: scrub not started — interrupted by {}",
+                        signal_name(signal)
+                    ),
+                );
+                results.push(result);
+                break;
+            }
+            step += 1;
+            progress.on_progress(
+                step,
+                (done.len() + queue.len()) as u64,
+                &format!("Scrubbing {label}"),
+            );
+        }
+
+        // Checkpoint 3: a claim before the mount pauses with nothing mounted.
+        let pause_now = claim.wants_lock(progress);
+        let result = if pause_now {
+            None
+        } else {
+            let Some(held) = slot.held.as_ref() else {
+                // Unreachable while the loop takes the lock back before going
+                // on; a pass without it mounts nothing.
+                let mut result = ScrubFsResult::new(&label);
+                result
+                    .errors
+                    .push("the pass does not hold the maintenance lock — not scrubbed".into());
+                fail(&mut results, result);
+                break;
+            };
+            Some((hooks.scrub_one)(&config, &label, progress, held, &|| {
+                claim.wants_lock(progress)
+            }))
+        };
+
+        let pending = result.as_ref().and_then(|r| r.pending_yield);
+        if let (Some(r), None) = (result.as_ref(), pending) {
+            // The filesystem is done.
+            let r = match cut.take() {
+                Some(segments) if segments.label == label => segments.finish(r.clone()),
+                other => {
+                    cut = other;
+                    r.clone()
+                }
+            };
+            let interrupted = r.interrupted_by.is_some();
+            if r.ok() {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "{label}: scrub finished cleanly ({} in {}s)",
+                        format_bytes(r.bytes_scrubbed),
+                        r.duration_secs
+                    ),
+                );
+            } else {
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!("{label}: scrub FAILED — {}", describe_failure(&r)),
+                );
+            }
+            (hooks.file_result)(&r);
+            results.push(r);
+            done.push(label.clone());
+            queue.pop_front();
+            if interrupted {
+                break;
+            }
+            continue;
+        }
+
+        // A pause: before the mount (`result` is None) or a stopped segment.
+        let holder = claim.holder();
+        let at_epoch = now_epoch();
+        let this_yield = ScrubYield {
+            at_epoch,
+            holder: holder.clone(),
+            paused_secs: None,
+        };
+        match (result, pending) {
+            (Some(segment), Some(PendingYield { resume: false })) => {
+                // A-F8: filed now, with its error; not resumed in this pass.
+                let segments = match cut.take() {
+                    Some(s) if s.label == label => s,
+                    other => {
+                        cut = other;
+                        Segments::for_label(&label, &config)
+                    }
+                };
+                let mut r = segments.finish(segment);
+                r.yields.push(this_yield);
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!("{label}: scrub FAILED — {}", describe_failure(&r)),
+                );
+                (hooks.file_result)(&r);
+                results.push(r);
+                filed_pause = Some(results.len() - 1);
+                done.push(label.clone());
+                queue.pop_front();
+            }
+            (segment, _) => {
+                let mut segments = match cut.take() {
+                    Some(s) if s.label == label => s,
+                    _ => Segments::for_label(&label, &config),
+                };
+                if let Some(segment) = segment.as_ref() {
+                    segments.add(segment);
+                }
+                segments.yields.push(this_yield);
+                (hooks.file_yield)(&segments.mark());
+                cut = Some(segments);
+            }
+        }
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "{label}: giving the DAS maintenance lock up to {holder}, which claims it; \
+                 this pass resumes once it is done"
+            ),
+        );
+
+        // The pause itself.
+        let end = pause_for_claim(slot, claim, hooks.stop, progress);
+        let paused = match end {
+            PauseEnd::Resumed(secs) => secs,
+            PauseEnd::Interrupted(signal) => {
+                let mut r = match cut.take() {
+                    Some(s) => {
+                        let label = s.label.clone();
+                        s.finish(ScrubFsResult::new(&label))
+                    }
+                    None => match queue.front() {
+                        Some(next) => ScrubFsResult::new(next),
+                        None => {
+                            // Nothing left to begin: the last filesystem,
+                            // filed already (A-F8), carries the signal.
+                            if let Some(last) = results.last_mut() {
+                                last.interrupted_by = Some(signal);
+                                (hooks.file_result)(last);
+                            }
+                            break 'targets;
+                        }
+                    },
+                };
+                r.interrupted_by = Some(signal);
+                r.errors.push(format!(
+                    "interrupted by {} while paused for a backup",
+                    signal_name(signal)
+                ));
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!(
+                        "{}: interrupted by {} while paused for a backup",
+                        r.target_label,
+                        signal_name(signal)
+                    ),
+                );
+                fail(&mut results, r);
+                break;
+            }
+            PauseEnd::LockFailed(why) => {
+                let label = cut
+                    .as_ref()
+                    .map(|s| s.label.clone())
+                    .or_else(|| queue.front().cloned());
+                let Some(label) = label else { break };
+                let mut r = match cut.take() {
+                    Some(s) => s.finish(ScrubFsResult::new(&label)),
+                    None => ScrubFsResult::new(&label),
+                };
+                r.errors.push(format!(
+                    "the DAS maintenance lock could not be taken back after the pause: {why} \
+                     — not resumed; this pass stops here"
+                ));
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!("{label}: {}", r.errors.last().unwrap()),
+                );
+                fail(&mut results, r);
+                break;
+            }
+        };
+        if let Some(segments) = cut.as_mut()
+            && let Some(last) = segments.yields.last_mut()
+        {
+            last.paused_secs = Some(paused);
+        }
+        if let Some(i) = filed_pause.take()
+            && let Some(last) = results[i].yields.last_mut()
+        {
+            last.paused_secs = Some(paused);
+        }
+        progress.on_log(
+            LogLevel::Info,
+            &format!("{label}: the DAS maintenance lock is back after a pause of {paused}s"),
+        );
+
+        // Read the configuration again before anything is mounted.
+        match (hooks.reload)() {
+            Ok(fresh) => config = fresh,
+            Err(why) => {
+                let Some(label) = cut
+                    .as_ref()
+                    .map(|s| s.label.clone())
+                    .or_else(|| queue.front().cloned())
+                else {
+                    break;
+                };
+                let mut r = match cut.take() {
+                    Some(s) => s.finish(ScrubFsResult::new(&label)),
+                    None => ScrubFsResult::new(&label),
+                };
+                r.errors.push(format!(
+                    "config.toml could not be read again after the pause for a backup ({why}) \
+                     — {label} was not resumed; this pass stops here"
+                ));
+                progress.on_log(
+                    LogLevel::Error,
+                    &format!("{label}: {}", r.errors.last().unwrap()),
+                );
+                fail(&mut results, r);
+                break;
+            }
+        }
+        queue = config
+            .scrub_target_labels()
+            .into_iter()
+            .filter(|l| !done.contains(l))
+            .collect();
+        if let Some(segments) = cut.take_if(|s| !queue.contains(&s.label)) {
+            let label = segments.label.clone();
+            let mut r = segments.finish(ScrubFsResult::new(&label));
+            r.errors.push(format!(
+                "{label} is no longer a [scrub] target in config.toml as read again after the \
+                 pause for a backup — not resumed"
+            ));
+            progress.on_log(
+                LogLevel::Error,
+                &format!("{label}: {}", r.errors.last().unwrap()),
+            );
+            fail(&mut results, r);
+            done.push(label);
+        }
+        // The cut filesystem goes first, wherever the new list puts it.
+        if let Some(segments) = cut.as_ref()
+            && let Some(at) = queue.iter().position(|l| *l == segments.label)
+            && let Some(l) = queue.remove(at)
+        {
+            queue.push_front(l);
+        }
+    }
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -2900,6 +3701,61 @@ fn record_running_logged(path: &Path, marker: &RunningMarker, progress: &dyn Pro
             &format!(
                 "Could not record the running scrub of {} in {}: {e} — a pass killed before it                  ends will leave no trace there",
                 marker.label,
+                path.display()
+            ),
+        );
+    }
+}
+
+/// Write a `yielded` attempt for the filesystem the pass is about to give the
+/// maintenance lock up for (bd DAS-Backup-Manager-su1b.2): while this
+/// process lives in this boot it reads as in progress; once it does not, as
+/// `interrupted` — a pass that paused and then died is never silent. The last
+/// success stays, so ageing is unchanged. A filesystem with no UUID resolved
+/// has no key to file under.
+fn record_yielded(
+    path: &Path,
+    mark: &YieldMark,
+    progress: &dyn ProgressCallback,
+) -> Result<(), ScrubError> {
+    if mark.fsuuid.is_empty() {
+        return Ok(());
+    }
+    let mut state = load_state_for_write(path, progress)?;
+    let last_success_epoch = state
+        .filesystems
+        .get(&mark.fsuuid)
+        .and_then(|f| f.last_success_epoch);
+    state.filesystems.insert(
+        mark.fsuuid.clone(),
+        FsState {
+            target_label: mark.label.clone(),
+            mountpoint: mark.mountpoint.clone(),
+            last_success_epoch,
+            last_attempt: AttemptState {
+                outcome: "yielded".to_string(),
+                started_epoch: mark.started_epoch,
+                pid: Some(std::process::id()),
+                boot_id: current_boot_id(),
+                yielded_to: Some(mark.holder.clone()),
+                yielded_epoch: Some(mark.at_epoch),
+                yields: Some(mark.yields),
+                paused_secs: Some(mark.paused_secs),
+                ..Default::default()
+            },
+        },
+    );
+    save_state_to(&state, path)
+}
+
+/// [`record_yielded`], with a failure logged: the pause goes on.
+fn record_yielded_logged(path: &Path, mark: &YieldMark, progress: &dyn ProgressCallback) {
+    if let Err(e) = record_yielded(path, mark, progress) {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Could not record the pause of {}'s scrub in {}: {e}",
+                mark.label,
                 path.display()
             ),
         );
@@ -3973,7 +4829,7 @@ Total to scrub:   401.28MiB\n";
         let (s, m) = locks.paths();
         assert_eq!(s, singleton.as_path());
         assert_eq!(m, maintenance.as_path());
-        assert_eq!(locks.maintenance().path(), maintenance.as_path());
+        assert_eq!(locks.maintenance().unwrap().path(), maintenance.as_path());
         assert_eq!(
             fs::read_to_string(&maintenance).unwrap(),
             format!("btrdasd scrub run pid {}\n", std::process::id()),
@@ -4006,6 +4862,7 @@ Total to scrub:   401.28MiB\n";
         acquire_locks_at(
             singleton,
             maintenance,
+            &maintenance.with_file_name("claim.lock"),
             progress,
             Duration::ZERO,
             Duration::from_millis(10),
@@ -4045,6 +4902,7 @@ Total to scrub:   401.28MiB\n";
         let attempt = acquire_locks_at(
             &singleton,
             &maintenance,
+            &maintenance.with_file_name("claim.lock"),
             &NullProgress,
             Duration::from_secs(30),
             Duration::from_millis(10),
@@ -4110,6 +4968,7 @@ Total to scrub:   401.28MiB\n";
             acquire_locks_at(
                 &singleton,
                 &maintenance,
+                &maintenance.with_file_name("claim.lock"),
                 &progress,
                 Duration::from_secs(30),
                 Duration::from_millis(20),
@@ -4144,6 +5003,7 @@ Total to scrub:   401.28MiB\n";
         let attempt = acquire_locks_at(
             &singleton,
             &maintenance,
+            &maintenance.with_file_name("claim.lock"),
             &NullProgress,
             Duration::from_millis(200),
             Duration::from_millis(20),
@@ -4207,6 +5067,47 @@ Total to scrub:   401.28MiB\n";
         fn on_complete(&self, _: bool, _: &str) {}
     }
 
+    /// The pass loop with nothing ever claimed, for the tests of its order,
+    /// steps and stops: a scratch maintenance lock, a claim nobody takes, a
+    /// reload that is never asked for, nothing filed.
+    pub(super) fn drive_pass(
+        config: &Config,
+        progress: &dyn ProgressCallback,
+        stop: &dyn Fn() -> Option<i32>,
+        scrub_one: &dyn Fn(&Config, &str, &dyn ProgressCallback, &MaintenanceHeld) -> ScrubFsResult,
+    ) -> Vec<ScrubFsResult> {
+        let dir = tempfile::tempdir().unwrap();
+        let maintenance = dir.path().join("maintenance.lock");
+        let mut slot = MaintenanceSlot {
+            path: maintenance.clone(),
+            poll: Duration::from_millis(10),
+            held: Some(
+                MaintenanceHeld::try_acquire_at(&maintenance, SCRUB_JOB)
+                    .unwrap()
+                    .unwrap(),
+            ),
+        };
+        let claim = ClaimWatch::new(&dir.path().join("claim.lock"));
+        let adapted = |c: &Config,
+                       l: &str,
+                       p: &dyn ProgressCallback,
+                       h: &MaintenanceHeld,
+                       _: &dyn Fn() -> bool| scrub_one(c, l, p, h);
+        scrub_targets_yielding(
+            config,
+            progress,
+            &mut slot,
+            &claim,
+            &PassHooks {
+                stop,
+                reload: &|| panic!("nothing paused, so nothing is read again"),
+                scrub_one: &adapted,
+                file_result: &|_| {},
+                file_yield: &|_| panic!("nothing claimed"),
+            },
+        )
+    }
+
     /// bd DAS-Backup-Manager-dis3: with no `[scrub].targets` the pass scrubs
     /// every configured `[[target]]`, in config order — never a built-in list
     /// that matches nothing on another install.
@@ -4232,13 +5133,7 @@ Total to scrub:   401.28MiB\n";
             scrubbed.lock().unwrap().push(label.to_string());
             fs_result(label, "uuid", true, 1)
         };
-        let results = scrub_targets_with(
-            &config,
-            &NullProgress,
-            &MaintenanceHeld::assumed(),
-            &|| None,
-            &scrub_one,
-        );
+        let results = drive_pass(&config, &NullProgress, &|| None, &scrub_one);
         assert_eq!(*scrubbed.lock().unwrap(), ["first", "second"]);
         assert_eq!(results.len(), 2);
     }
@@ -4254,13 +5149,7 @@ Total to scrub:   401.28MiB\n";
             fs_result(label, "uuid", label == "primary-22tb", 1_000_400)
         };
 
-        let results = scrub_targets_with(
-            &config,
-            &progress,
-            &MaintenanceHeld::assumed(),
-            &|| None,
-            &scrub_one,
-        );
+        let results = drive_pass(&config, &progress, &|| None, &scrub_one);
 
         assert_eq!(*scrubbed.lock().unwrap(), ["primary-22tb", "recovery-a"]);
         let labels: Vec<&str> = results.iter().map(|r| r.target_label.as_str()).collect();
@@ -4595,7 +5484,7 @@ Total to scrub:   401.28MiB\n";
         let mut config = Config::default();
         config.scrub.targets.clear();
         assert!(config.targets.is_empty());
-        let err = run_scrub_pass(&config, &NullProgress).unwrap_err();
+        let err = run_scrub_pass(&config, &|| Ok(config.clone()), &NullProgress).unwrap_err();
         assert!(matches!(err, ScrubError::NoTargets));
     }
 
@@ -4712,6 +5601,7 @@ Total to scrub:   401.28MiB\n";
 /// finished pass as the current one.
 #[cfg(test)]
 mod interrupted_pass_tests {
+    use super::tests::drive_pass;
     use super::*;
     use crate::progress::{NullProgress, TestProgress};
 
@@ -4758,6 +5648,7 @@ mod interrupted_pass_tests {
                 (calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1)
                     .then_some(libc::SIGTERM)
             },
+            &|| false,
             &NullProgress,
         );
         assert!(
@@ -4780,6 +5671,7 @@ mod interrupted_pass_tests {
             "",
             Duration::from_millis(20),
             &|| None,
+            &|| false,
             &NullProgress,
         );
         assert!(matches!(outcome, ScrubRunOutcome::Launched(Ok(()))));
@@ -5073,13 +5965,7 @@ mod interrupted_pass_tests {
             r.interrupted_by = Some(libc::SIGTERM);
             r
         };
-        let results = scrub_targets_with(
-            &two_target_config(),
-            &NullProgress,
-            &MaintenanceHeld::assumed(),
-            &|| None,
-            &scrub_one,
-        );
+        let results = drive_pass(&two_target_config(), &NullProgress, &|| None, &scrub_one);
         assert_eq!(*ran.lock().unwrap(), ["first"]);
         assert_eq!(results.len(), 1);
     }
@@ -5100,18 +5986,927 @@ mod interrupted_pass_tests {
             r.outcome = Some(ScrubOutcome::Finished);
             r
         };
-        let results = scrub_targets_with(
-            &two_target_config(),
-            &NullProgress,
-            &MaintenanceHeld::assumed(),
-            &stop,
-            &scrub_one,
-        );
+        let results = drive_pass(&two_target_config(), &NullProgress, &stop, &scrub_one);
         assert_eq!(*ran.lock().unwrap(), ["first"]);
         assert_eq!(results.len(), 2);
         assert_eq!(results[1].target_label, "second");
         assert_eq!(results[1].interrupted_by, Some(libc::SIGHUP));
         assert!(!results[1].scrub_launched);
         assert!(!results[1].ok());
+    }
+}
+
+/// The yield (bd DAS-Backup-Manager-su1b.2, step A5): a backup's claim makes
+/// the pass stop its scrub, unmount, give the maintenance lock up, wait, and
+/// resume the same filesystem. Real `flock`s on scratch files throughout; the
+/// claimant is a thread holding a real [`crate::maintenance::Claim`].
+#[cfg(test)]
+mod yield_tests {
+    use super::*;
+    use crate::maintenance::{Claim, claim_is_held};
+    use crate::progress::{NullProgress, TestProgress};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    const POLL: Duration = Duration::from_millis(10);
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    /// A record of filesystem `u` as btrfs-progs writes it.
+    fn record(t_start: i64, t_resumed: i64, canceled: u8, finished: u8) -> ScrubStatusRecord {
+        parse_scrub_status(
+            &format!(
+                "scrub status:1\nu:1|data_extents_scrubbed:1|tree_extents_scrubbed:1|\
+                 data_bytes_scrubbed:4096|tree_bytes_scrubbed:4096|read_errors:0|csum_errors:0|\
+                 verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|malloc_errors:0|\
+                 uncorrectable_errors:0|corrected_errors:0|last_physical:8192|t_start:{t_start}|\
+                 t_resumed:{t_resumed}|duration:10|canceled:{canceled}|finished:{finished}\n"
+            ),
+            "u",
+        )
+        .unwrap()
+    }
+
+    /// Two scrub targets the loop can resolve by UUID without a drive.
+    fn config() -> Config {
+        let mut config = Config::default();
+        for label in ["first", "second"] {
+            config.targets.push(crate::config::Target {
+                label: label.into(),
+                serial: String::new(),
+                serials: Vec::new(),
+                mount_uuid: Some(format!("u-{label}")),
+                mount: format!("/mnt/{label}"),
+                role: crate::config::TargetRole::Primary,
+                retention: crate::config::Retention::default(),
+                display_name: String::new(),
+                esp_partuuid: None,
+            });
+        }
+        config.scrub.targets = vec!["first".into(), "second".into()];
+        config
+    }
+
+    fn clean(label: &str) -> ScrubFsResult {
+        let mut r = ScrubFsResult::new(label);
+        r.fsuuid = format!("u-{label}");
+        r.outcome = Some(ScrubOutcome::Finished);
+        r.scrub_launched = true;
+        r.started_epoch = 1_000;
+        r.finished_epoch = 2_000;
+        r
+    }
+
+    /// A segment that stopped for the claim, its unmount attempted.
+    fn paused(label: &str, resume: bool) -> ScrubFsResult {
+        let mut r = ScrubFsResult::new(label);
+        r.fsuuid = format!("u-{label}");
+        r.scrub_launched = true;
+        r.started_epoch = 1_000;
+        r.pending_yield = Some(PendingYield { resume });
+        r
+    }
+
+    struct Scratch {
+        _dir: tempfile::TempDir,
+        maintenance: PathBuf,
+        claim: PathBuf,
+    }
+
+    fn scratch() -> Scratch {
+        let dir = tempfile::tempdir().unwrap();
+        Scratch {
+            maintenance: dir.path().join("maintenance.lock"),
+            claim: dir.path().join("claim.lock"),
+            _dir: dir,
+        }
+    }
+
+    fn slot_held(path: &Path) -> MaintenanceSlot {
+        MaintenanceSlot {
+            path: path.to_path_buf(),
+            poll: POLL,
+            held: Some(
+                MaintenanceHeld::try_acquire_at(path, "btrdasd scrub run")
+                    .unwrap()
+                    .unwrap(),
+            ),
+        }
+    }
+
+    /// Whether this process could take the lock at `path` now (and lets go).
+    fn lock_is_free(path: &Path) -> bool {
+        FileLock::try_acquire(path).unwrap().is_some()
+    }
+
+    fn wait_until(limit: Duration, what: &str, f: impl Fn() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A backup in a thread, as `acquire_manual_locks_at` will be: on `go`,
+    /// claim; wait for the maintenance lock; once it has it, let the claim
+    /// go; hold the lock for `hold`, then let it go. `ran` is set while it
+    /// holds the lock.
+    fn backup(
+        s: &Scratch,
+        go: mpsc::Receiver<()>,
+        ran: Arc<AtomicBool>,
+        hold: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let (maintenance, claim) = (s.maintenance.clone(), s.claim.clone());
+        std::thread::spawn(move || {
+            if go.recv().is_err() {
+                return;
+            }
+            let claimed = Claim::take_at(&claim, "test backup").unwrap();
+            let held = loop {
+                if let Some(h) =
+                    MaintenanceHeld::try_acquire_at(&maintenance, "test backup").unwrap()
+                {
+                    break h;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            drop(claimed);
+            ran.store(true, Ordering::SeqCst);
+            std::thread::sleep(hold);
+            drop(held);
+        })
+    }
+
+    struct Filed {
+        results: Mutex<Vec<String>>,
+        yields: Mutex<Vec<YieldMark>>,
+    }
+
+    fn filed() -> Filed {
+        Filed {
+            results: Mutex::new(Vec::new()),
+            yields: Mutex::new(Vec::new()),
+        }
+    }
+
+    // --- the claim probe ---------------------------------------------------
+
+    #[test]
+    fn the_claim_is_seen_while_a_backup_holds_it_and_not_once_it_lets_go() {
+        let s = scratch();
+        let watch = ClaimWatch::new(&s.claim);
+        assert!(!watch.wants_lock(&NullProgress));
+        assert!(!watch.still_waiting(&NullProgress));
+        let claimed = Claim::take_at(&s.claim, "test backup").unwrap();
+        assert!(watch.wants_lock(&NullProgress));
+        assert!(watch.still_waiting(&NullProgress));
+        assert_eq!(
+            watch.holder(),
+            format!("test backup pid {}", std::process::id())
+        );
+        drop(claimed);
+        assert!(!watch.wants_lock(&NullProgress));
+    }
+
+    /// A probe that cannot look reads as a claim once (the pass yields), then
+    /// as none until it can look again: one pause, never a pass that stops
+    /// every poll or waits outside for ever. Said, as a warning.
+    #[test]
+    fn a_probe_that_cannot_look_costs_one_pause_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        let watch = ClaimWatch::new(&dir.path().join("file").join("claim.lock"));
+        let progress = TestProgress::default();
+        assert!(watch.wants_lock(&progress), "the first failure yields");
+        assert!(!watch.still_waiting(&progress), "outside, it does not wait");
+        assert!(!watch.wants_lock(&progress), "and it does not yield again");
+        let logs = progress.logs.lock().unwrap();
+        assert!(
+            logs.iter().any(
+                |(l, m)| *l == LogLevel::Warning && m.contains("cannot look at the claim lock")
+            ),
+            "{logs:?}"
+        );
+    }
+
+    // --- the stop ----------------------------------------------------------
+
+    #[test]
+    fn a_claim_before_the_spawn_starts_no_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let outcome = run_scrub_child(
+            "touch",
+            &args(&[marker.to_str().unwrap()]),
+            "",
+            POLL,
+            &|| None,
+            &|| true,
+            &NullProgress,
+        );
+        assert!(
+            matches!(outcome, ScrubRunOutcome::Yielded { launched: false }),
+            "{outcome:?}"
+        );
+        assert!(!marker.exists(), "no child may start for a claimed lock");
+    }
+
+    /// A claim while the child runs stops it (and reaps it) long before the
+    /// 5 s it would take, and says it yielded, not that it was interrupted.
+    #[test]
+    fn a_claim_while_the_child_runs_stops_and_reaps_it() {
+        let started = Instant::now();
+        let calls = AtomicUsize::new(0);
+        let outcome = run_scrub_child(
+            "sleep",
+            &args(&["5"]),
+            "",
+            Duration::from_millis(20),
+            &|| None,
+            &|| calls.fetch_add(1, Ordering::SeqCst) >= 1,
+            &NullProgress,
+        );
+        assert!(
+            matches!(outcome, ScrubRunOutcome::Yielded { launched: true }),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_signal_outranks_a_claim() {
+        let outcome = run_scrub_child(
+            "sleep",
+            &args(&["5"]),
+            "",
+            POLL,
+            &|| Some(libc::SIGTERM),
+            &|| true,
+            &NullProgress,
+        );
+        assert!(
+            matches!(outcome, ScrubRunOutcome::Interrupted(s) if s == libc::SIGTERM),
+            "{outcome:?}"
+        );
+    }
+
+    // --- what the stopped segment allows -----------------------------------
+
+    #[test]
+    fn a_segment_that_never_started_pauses_and_resumes() {
+        assert_eq!(
+            yield_verdict(false, LiveScrubState::Unknown, None, 1_000),
+            YieldVerdict::Pause { note: None }
+        );
+    }
+
+    #[test]
+    fn a_kernel_not_seen_to_stop_is_never_unmounted() {
+        for live in [LiveScrubState::Running, LiveScrubState::Unknown] {
+            let fresh = record(1_000, 0, 0, 0);
+            assert!(
+                matches!(
+                    yield_verdict(true, live, Some(&fresh), 1_000),
+                    YieldVerdict::KernelLive(_)
+                ),
+                "{live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_unfinished_record_pauses_and_resumes() {
+        let fresh = record(1_000, 0, 0, 0);
+        assert_eq!(
+            yield_verdict(true, LiveScrubState::NotRunning, Some(&fresh), 1_000),
+            YieldVerdict::Pause { note: None }
+        );
+        // A resumed segment's record is fresh by its resume time.
+        let resumed = record(10, 1_000, 0, 0);
+        assert_eq!(
+            yield_verdict(true, LiveScrubState::NotRunning, Some(&resumed), 1_000),
+            YieldVerdict::Pause { note: None }
+        );
+    }
+
+    #[test]
+    fn a_filesystem_that_finished_as_it_was_stopped_is_a_result() {
+        let fresh = record(1_000, 0, 0, 1);
+        assert_eq!(
+            yield_verdict(true, LiveScrubState::NotRunning, Some(&fresh), 1_000),
+            YieldVerdict::Finished
+        );
+    }
+
+    /// Last month's finished record, seen before this segment wrote its own,
+    /// is never this segment's result: the pass pauses, and the resume starts
+    /// the filesystem afresh.
+    #[test]
+    fn a_stale_finished_record_is_not_a_result() {
+        let stale = record(10, 0, 0, 1);
+        assert!(matches!(
+            yield_verdict(true, LiveScrubState::NotRunning, Some(&stale), 1_000_000),
+            YieldVerdict::Pause { note: Some(_) }
+        ));
+        assert!(matches!(
+            yield_verdict(true, LiveScrubState::NotRunning, None, 1_000_000),
+            YieldVerdict::Pause { note: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn a_canceled_record_pauses_and_says_the_resume_starts_from_zero() {
+        let canceled = record(1_000, 0, 1, 1);
+        let YieldVerdict::Pause { note: Some(note) } =
+            yield_verdict(true, LiveScrubState::NotRunning, Some(&canceled), 1_000)
+        else {
+            panic!("a canceled record pauses with a note");
+        };
+        assert!(note.contains("from zero"), "{note}");
+    }
+
+    // --- waiting for the lock behind a claim -------------------------------
+
+    /// Checkpoint 1: while a backup claims, the pass does not take the lock,
+    /// even though it is free; once the claim goes, it does.
+    #[test]
+    fn the_pass_waits_while_claimed_without_taking_the_free_lock() {
+        let s = scratch();
+        let claimed = Claim::take_at(&s.claim, "test backup").unwrap();
+        let (maintenance, claim) = (s.maintenance.clone(), s.claim.clone());
+        let waiter = std::thread::spawn(move || {
+            let watch = ClaimWatch::new(&claim);
+            take_maintenance_behind_claims(
+                &maintenance,
+                POLL,
+                &|| watch.still_waiting(&NullProgress),
+                &|| watch.wants_lock(&NullProgress),
+                &|| None,
+                &NullProgress,
+            )
+            .map(|r| matches!(r, Retake::Held(_)))
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "the pass went ahead of a claim");
+        assert!(
+            lock_is_free(&s.maintenance),
+            "the pass took the lock while claimed"
+        );
+        drop(claimed);
+        assert!(waiter.join().unwrap().unwrap(), "taken once the claim went");
+    }
+
+    /// Checkpoint 2: a claim made while the pass took the lock: it is let go
+    /// unused, and taken again only once nobody claims.
+    #[test]
+    fn a_lock_claimed_as_it_was_taken_is_let_go_unused() {
+        let s = scratch();
+        let wants = AtomicUsize::new(0);
+        let outcome = take_maintenance_behind_claims(
+            &s.maintenance,
+            POLL,
+            &|| false,
+            &|| wants.fetch_add(1, Ordering::SeqCst) == 0,
+            &|| None,
+            &NullProgress,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Retake::Held(_)));
+        assert_eq!(
+            wants.load(Ordering::SeqCst),
+            2,
+            "taken twice, kept the second time"
+        );
+    }
+
+    /// A signal ends the wait at once, holding nothing — a blocking flock
+    /// would retry through it.
+    #[test]
+    fn a_signal_ends_the_wait_holding_nothing() {
+        let s = scratch();
+        let other = FileLock::try_acquire(&s.maintenance).unwrap().unwrap();
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        let outcome = take_maintenance_behind_claims(
+            &s.maintenance,
+            POLL,
+            &|| false,
+            &|| false,
+            &|| (calls.fetch_add(1, Ordering::SeqCst) >= 3).then_some(libc::SIGTERM),
+            &NullProgress,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Retake::Interrupted(s) if s == libc::SIGTERM));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(other);
+        assert!(lock_is_free(&s.maintenance));
+    }
+
+    // --- the pass loop -----------------------------------------------------
+
+    /// Checkpoint 4 and the yield: a claim during a target. The hold is the
+    /// pass's while the segment stops and unmounts (the backup cannot get it);
+    /// only then is it given up; the backup runs; the SAME target is resumed,
+    /// then the next. One `yielded` record, no result filed for the segment,
+    /// and the finished target lists its pause.
+    #[test]
+    fn a_claim_during_a_target_yields_then_resumes_the_same_target() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(30));
+        let calls = Mutex::new(Vec::new());
+        let maintenance = s.maintenance.clone();
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         claimed: &dyn Fn() -> bool| {
+            assert!(!lock_is_free(&maintenance), "scrubbing without the lock");
+            let first = calls.lock().unwrap().is_empty();
+            calls
+                .lock()
+                .unwrap()
+                .push((label.to_string(), ran.load(Ordering::SeqCst)));
+            if first {
+                go.send(()).unwrap();
+                wait_until(Duration::from_secs(5), "the claim", claimed);
+                // Stopping and unmounting: the backup cannot have the lock.
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(
+                    !ran.load(Ordering::SeqCst),
+                    "the lock went before the unmount"
+                );
+                return paused(label, true);
+            }
+            clean(label)
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| Ok(config()),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                ("first".to_string(), false),
+                ("first".to_string(), true),
+                ("second".to_string(), true)
+            ]
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[0].ok(), "{:?}", results[0]);
+        assert!(results[0].pending_yield.is_none());
+        assert_eq!(results[0].yields.len(), 1);
+        assert_eq!(
+            results[0].yields[0].holder,
+            format!("test backup pid {}", std::process::id())
+        );
+        assert!(results[0].yields[0].paused_secs.is_some());
+        assert!(results[1].yields.is_empty());
+        assert_eq!(*f.results.lock().unwrap(), ["first", "second"]);
+        let yields = f.yields.lock().unwrap();
+        assert_eq!(yields.len(), 1);
+        assert_eq!(yields[0].label, "first");
+        assert_eq!(yields[0].fsuuid, "u-first");
+        assert_eq!(yields[0].mountpoint, "/mnt/first");
+        assert_eq!(yields[0].yields, 1);
+        assert_eq!(yields[0].started_epoch, 1_000);
+        assert!(
+            slot.held().is_some(),
+            "the pass holds the lock again at its end"
+        );
+    }
+
+    /// Checkpoint 3: a claim between targets yields with nothing mounted —
+    /// the next target is not begun until the backup is done — and its
+    /// `yielded` record names it, so a pass that dies there is not silent.
+    #[test]
+    fn a_claim_between_targets_yields_before_the_next_mount() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(30));
+        let calls = Mutex::new(Vec::new());
+        let claim = s.claim.clone();
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         _: &dyn Fn() -> bool| {
+            calls
+                .lock()
+                .unwrap()
+                .push((label.to_string(), ran.load(Ordering::SeqCst)));
+            if label == "first" {
+                go.send(()).unwrap();
+                wait_until(Duration::from_secs(5), "the claim", || {
+                    claim_is_held(&claim).unwrap()
+                });
+            }
+            clean(label)
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| Ok(config()),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("first".to_string(), false), ("second".to_string(), true)]
+        );
+        assert!(results.iter().all(ScrubFsResult::ok));
+        assert_eq!(results[1].yields.len(), 1);
+        let yields = f.yields.lock().unwrap();
+        assert_eq!(yields.len(), 1);
+        assert_eq!(yields[0].label, "second");
+        assert_eq!(yields[0].fsuuid, "u-second");
+    }
+
+    /// A signal while the pass waits for a backup: the target is filed
+    /// `interrupted` with its pause, nothing more is scrubbed, and the pass
+    /// holds no maintenance lock.
+    #[test]
+    fn a_signal_while_yielded_files_interrupted_and_holds_nothing() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let claimant = Arc::new(Mutex::new(None));
+        let calls = AtomicUsize::new(0);
+        let claim = s.claim.clone();
+        let held_claim = claimant.clone();
+        let scrub_one = move |_: &Config,
+                              label: &str,
+                              _: &dyn ProgressCallback,
+                              _: &MaintenanceHeld,
+                              _: &dyn Fn() -> bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            // A claimant that never takes the lock: the pass waits outside.
+            *held_claim.lock().unwrap() = Some(Claim::take_at(&claim, "test backup").unwrap());
+            paused(label, true)
+        };
+        let f = filed();
+        let stop = || (!f.yields.lock().unwrap().is_empty()).then_some(libc::SIGTERM);
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &stop,
+                reload: &|| Ok(config()),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].interrupted_by, Some(libc::SIGTERM));
+        assert_eq!(results[0].yields.len(), 1);
+        assert!(!results[0].ok());
+        assert!(results[0].scrub_launched);
+        assert_eq!(*f.results.lock().unwrap(), ["first"]);
+        assert!(
+            slot.held().is_none(),
+            "a pass stopped while yielded holds no lock"
+        );
+        assert!(lock_is_free(&s.maintenance));
+        drop(claimant);
+    }
+
+    /// After a pause the configuration is read again before anything is
+    /// mounted: the resumed target is scrubbed by the reloaded config.
+    #[test]
+    fn a_resumed_target_runs_on_the_configuration_read_after_the_pause() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(10));
+        let seen = Mutex::new(Vec::new());
+        let scrub_one = |cfg: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         claimed: &dyn Fn() -> bool| {
+            seen.lock().unwrap().push(cfg.das.mount_opts.clone());
+            if seen.lock().unwrap().len() == 1 {
+                go.send(()).unwrap();
+                wait_until(Duration::from_secs(5), "the claim", claimed);
+                return paused(label, true);
+            }
+            clean(label)
+        };
+        let reloads = AtomicUsize::new(0);
+        let reload = || {
+            reloads.fetch_add(1, Ordering::SeqCst);
+            let mut c = config();
+            c.das.mount_opts = "reloaded".into();
+            Ok(c)
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &reload,
+                scrub_one: &scrub_one,
+                file_result: &|_| {},
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(results.len(), 2);
+        let first_opts = Config::default().das.mount_opts;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [first_opts.as_str(), "reloaded", "reloaded"]
+        );
+        assert_eq!(
+            reloads.load(Ordering::SeqCst),
+            1,
+            "read again after the pause only"
+        );
+    }
+
+    /// A configuration that cannot be read after the pause: nothing more is
+    /// mounted, and the paused target fails visibly, naming why.
+    #[test]
+    fn an_unreadable_configuration_after_the_pause_ends_the_pass_visibly() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(10));
+        let calls = AtomicUsize::new(0);
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         claimed: &dyn Fn() -> bool| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            go.send(()).unwrap();
+            wait_until(Duration::from_secs(5), "the claim", claimed);
+            paused(label, true)
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| Err("boom: config.toml unreadable".to_string()),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|_| {},
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok());
+        assert!(
+            results[0].errors.iter().any(|e| e.contains("boom")),
+            "{:?}",
+            results[0].errors
+        );
+        assert_eq!(*f.results.lock().unwrap(), ["first"]);
+    }
+
+    /// A target the reloaded configuration no longer scrubs is not resumed,
+    /// and says so; the rest of the reloaded list goes on.
+    #[test]
+    fn a_target_gone_from_the_reloaded_configuration_is_not_resumed() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(10));
+        let calls = Mutex::new(Vec::new());
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         claimed: &dyn Fn() -> bool| {
+            calls.lock().unwrap().push(label.to_string());
+            if label == "first" {
+                go.send(()).unwrap();
+                wait_until(Duration::from_secs(5), "the claim", claimed);
+                return paused(label, true);
+            }
+            clean(label)
+        };
+        let reload = || {
+            let mut c = config();
+            c.scrub.targets = vec!["second".into()];
+            Ok(c)
+        };
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &reload,
+                scrub_one: &scrub_one,
+                file_result: &|_| {},
+                file_yield: &|_| {},
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["first", "second"]);
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].ok());
+        assert!(
+            results[0].errors.iter().any(|e| e.contains("no longer")),
+            "{:?}",
+            results[0].errors
+        );
+        assert!(results[1].ok());
+    }
+
+    /// A segment whose kernel scrub was not seen to stop (A-F8) gives the
+    /// lock up all the same, is filed with its error, and is not resumed:
+    /// the pass goes on to the next target.
+    #[test]
+    fn a_target_whose_kernel_scrub_did_not_stop_is_filed_and_not_resumed() {
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let (go, rx) = mpsc::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let backup = backup(&s, rx, ran.clone(), Duration::from_millis(10));
+        let calls = Mutex::new(Vec::new());
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         claimed: &dyn Fn() -> bool| {
+            calls
+                .lock()
+                .unwrap()
+                .push((label.to_string(), ran.load(Ordering::SeqCst)));
+            if label == "first" {
+                go.send(()).unwrap();
+                wait_until(Duration::from_secs(5), "the claim", claimed);
+                let mut r = paused(label, false);
+                r.errors.push("the kernel still reports a scrub".into());
+                return r;
+            }
+            clean(label)
+        };
+        let f = filed();
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| Ok(config()),
+                scrub_one: &scrub_one,
+                file_result: &|r| f.results.lock().unwrap().push(r.target_label.clone()),
+                file_yield: &|m| f.yields.lock().unwrap().push(m.clone()),
+            },
+        );
+        backup.join().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("first".to_string(), false), ("second".to_string(), true)]
+        );
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].ok());
+        assert_eq!(results[0].yields.len(), 1);
+        assert!(results[1].ok());
+        assert_eq!(*f.results.lock().unwrap(), ["first", "second"]);
+    }
+
+    /// The `yielded` record: this process, this boot, the claimant, the
+    /// count and the pause so far, the earlier success kept; a filesystem
+    /// with no UUID is not filed.
+    #[test]
+    fn a_yielded_record_names_the_claimant_and_keeps_the_last_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub-state.json");
+        let marker = RunningMarker {
+            label: "first",
+            fsuuid: "u-first",
+            mountpoint: "/mnt/first",
+            started_epoch: 1_000,
+        };
+        record_running(&path, &marker, &NullProgress).unwrap();
+        let mut state = load_state_from(&path).unwrap();
+        state
+            .filesystems
+            .get_mut("u-first")
+            .unwrap()
+            .last_success_epoch = Some(500);
+        save_state_to(&state, &path).unwrap();
+        let mark = YieldMark {
+            label: "first".into(),
+            fsuuid: "u-first".into(),
+            mountpoint: "/mnt/first".into(),
+            started_epoch: 1_000,
+            at_epoch: 1_200,
+            holder: "backup-run.sh pid 42".into(),
+            yields: 2,
+            paused_secs: 30,
+        };
+        record_yielded(&path, &mark, &NullProgress).unwrap();
+        let fs = load_state_from(&path).unwrap().filesystems["u-first"].clone();
+        assert_eq!(fs.last_success_epoch, Some(500));
+        let a = &fs.last_attempt;
+        assert_eq!(a.outcome, "yielded");
+        assert!(!a.ok);
+        assert_eq!(a.started_epoch, 1_000);
+        assert_eq!(a.pid, Some(std::process::id()));
+        assert_eq!(a.boot_id, current_boot_id());
+        assert_eq!(a.yielded_to.as_deref(), Some("backup-run.sh pid 42"));
+        assert_eq!(
+            (a.yielded_epoch, a.yields, a.paused_secs),
+            (Some(1_200), Some(2), Some(30))
+        );
+        assert!(a.is_live(), "a pause of this live pass is in progress");
+
+        let unresolved = YieldMark {
+            fsuuid: String::new(),
+            ..mark
+        };
+        let before = std::fs::read_to_string(&path).unwrap();
+        record_yielded(&path, &unresolved, &NullProgress).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// Checkpoint 1 at the pass's start: the scrub singleton is taken, but
+    /// the maintenance lock is not while a backup claims it.
+    #[test]
+    fn a_pass_starting_while_a_backup_claims_lets_the_backup_go_first() {
+        let s = scratch();
+        let singleton = s.maintenance.with_file_name("scrub.lock");
+        let claimed = Claim::take_at(&s.claim, "test backup").unwrap();
+        let (singleton2, maintenance, claim) =
+            (singleton.clone(), s.maintenance.clone(), s.claim.clone());
+        let pass = std::thread::spawn(move || {
+            matches!(
+                acquire_locks_at(
+                    &singleton2,
+                    &maintenance,
+                    &claim,
+                    &NullProgress,
+                    Duration::ZERO,
+                    POLL
+                )
+                .unwrap(),
+                ScrubLockAttempt::Taken(_)
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!pass.is_finished(), "the pass went ahead of the claim");
+        assert!(
+            lock_is_free(&s.maintenance),
+            "the pass took the claimed lock"
+        );
+        drop(claimed);
+        assert!(pass.join().unwrap());
     }
 }

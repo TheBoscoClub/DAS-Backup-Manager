@@ -3455,7 +3455,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let progress = CliProgress;
-                let pass = scrub::run_scrub_pass(&cfg, &progress)?;
+                let pass = scrub::run_scrub_pass(
+                    &cfg,
+                    &|| Config::load(&config).map_err(|e| e.to_string()),
+                    &progress,
+                )?;
                 let exit_code = exit_code_for_pass(&pass);
                 let interrupted = pass.interrupted_by();
                 let status_word = match (pass.status, interrupted) {
@@ -4482,6 +4486,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             scrub_launched,
             interrupted_by: None,
             yields: Vec::new(),
+            pending_yield: None,
         }
     }
 
