@@ -1763,6 +1763,12 @@ impl ScrubPass {
             .count()
     }
 
+    /// How many filesystems scrubbed cleanly: a paused one is neither clean
+    /// nor failed (bd DAS-Backup-Manager-su1b.15).
+    pub fn clean_count(&self) -> usize {
+        self.results.iter().filter(|r| r.ok()).count()
+    }
+
     /// Whether every scrubbed filesystem passed and the pass hit no
     /// pass-level errors. A skipped pass counts as a success (nothing broke).
     pub fn success(&self) -> bool {
@@ -2156,12 +2162,12 @@ pub fn run_scrub_pass(
         Some(signal) => format!(
             "Interrupted by {} — {} of {} filesystems scrubbed cleanly before it",
             signal_name(signal),
-            pass.results.len() - pass.failed_count(),
+            pass.clean_count(),
             pass.results.len()
         ),
         None => format!(
             "{} of {} filesystems scrubbed cleanly",
-            pass.results.len() - pass.failed_count(),
+            pass.clean_count(),
             pass.results.len()
         ),
     };
@@ -8047,6 +8053,7 @@ mod yield_tests {
             errors: Vec::new(),
         };
         assert_eq!(pass.failed_count(), 0, "a pause is not a failure");
+        assert_eq!(pass.clean_count(), 0, "nor is it a clean scrub");
         assert!(pass.success());
         let report = format_scrub_report(&pass, &config());
         assert!(report.contains("Status: PAUSED"), "{report}");

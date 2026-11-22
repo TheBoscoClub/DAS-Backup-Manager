@@ -450,6 +450,7 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
     let rig = Rig::new("pass");
     let config = rig_config(&rig);
     let state_file = rig.dir.join("scrub-state.json");
+    let rig_pause = rig.dir.join("das-scrub-pause");
 
     println!("== rig: uuid={} loop={} ==", rig.uuid, rig.loop_dev);
     assert!(
@@ -459,9 +460,18 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
 
     // ---- pass 1: the ordinary path -------------------------------------
     println!("== pass 1: ordinary scrub ==");
-    let pass = with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
-        scrub::run_scrub_pass(&config, &|| Ok(config.clone()), &Echo).expect("pass must run")
-    });
+    // The rig's own pause request (bd DAS-Backup-Manager-su1b.15): never the
+    // host's /run/das-scrub-pause, which a pass reads and may remove.
+    let pass = with_env(
+        "DAS_SCRUB_PAUSE_REQUEST",
+        rig_pause.to_str().unwrap(),
+        || {
+            with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
+                scrub::run_scrub_pass(&config, &|| Ok(config.clone()), &Echo)
+                    .expect("pass must run")
+            })
+        },
+    );
 
     assert_eq!(pass.status, PassStatus::Completed);
     assert_eq!(pass.results.len(), 1);
@@ -522,9 +532,18 @@ fn loopback_full_pass_then_forced_recovery_from_aborted_record() {
         }
     });
 
-    let pass2 = with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
-        scrub::run_scrub_pass(&config, &|| Ok(config.clone()), &Echo).expect("pass must run")
-    });
+    // The rig's own pause request (bd DAS-Backup-Manager-su1b.15): never the
+    // host's /run/das-scrub-pause, which a pass reads and may remove.
+    let pass2 = with_env(
+        "DAS_SCRUB_PAUSE_REQUEST",
+        rig_pause.to_str().unwrap(),
+        || {
+            with_env("DAS_SCRUB_STATE", state_file.to_str().unwrap(), || {
+                scrub::run_scrub_pass(&config, &|| Ok(config.clone()), &Echo)
+                    .expect("pass must run")
+            })
+        },
+    );
     let result2 = &pass2.results[0];
     // The invariant an aborted record must satisfy: it must NOT wedge scrubs.
     // Whether the forged position is accepted by `btrfs scrub resume` or falls
@@ -1217,6 +1236,7 @@ impl PassSite {
             .env("DAS_MAINTENANCE_LOCK", self.maintenance())
             .env("DAS_CLAIM_LOCK", self.claim())
             .env("DAS_SCRUB_STATE", &self.state)
+            .env("DAS_SCRUB_PAUSE_REQUEST", self.lock("das-scrub-pause"))
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()

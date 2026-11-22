@@ -3740,7 +3740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!(
                         "Scrub pass {status_word}: {} of {} filesystems clean",
-                        pass.results.len() - pass.failed_count(),
+                        pass.clean_count(),
                         pass.results.len()
                     );
                     if !pass.success() && exit_code == 0 {
