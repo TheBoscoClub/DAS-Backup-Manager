@@ -93,12 +93,16 @@ concurrency lock.
 
 **`setup` is guarded (bd `6wt`, rounds 3–4).** Every mode that writes or removes
 installed files — the wizard, `--modify`, `--force`, `--upgrade`, `--uninstall`,
-`--uninstall-all` — takes `/run/das-backup.lock`, then `/run/das-maintenance.lock`, both
-non-blocking and in the project's order, before its first write (for `--upgrade`, before it
-rewrites `config.toml`; for `--force`, before it even reads it), holds both through every write
-and the helper restart, and lets them go on every path. Either held: nothing written or removed,
-the lock named on **stderr** (the maintenance one with its holder's record; the singleton carries
-no record — `backup-run.sh` opens it with `>`), exit 75. With the writes atomic, the locks still
+`--uninstall-all` — takes `/run/das-backup.lock`, then `/run/das-scrub.lock`, then
+`/run/das-maintenance.lock`, all non-blocking and in the project's order, before its first write
+(for `--upgrade`, before it rewrites `config.toml`; for `--force`, before it even reads it), holds
+all three through every write and the helper restart, and lets them go on every path. Any held:
+nothing written or removed, the lock named on **stderr** (the maintenance one with its holder's
+record; neither singleton carries one setup can name — `backup-run.sh` opens it with `>`, the scrub
+writes none), exit 75. The scrub singleton is there since bd `su1b.2` step A4: a scrub pass holds
+it for its whole life but the maintenance lock only while it scrubs, so a pass waiting for that
+lock — or, once step A5 lands, yielded to a backup — would otherwise go on with files setup
+replaced or removed under it. With the writes atomic, the locks still
 matter: a run must see one version of the files from start to end — the scripts it calls later,
 the `btrbk.conf` btrbk reads, the config sync reads again — an uninstall removes them, and the
 helper restart must not kill a job that is mounting. The singleton is the one that matters for
@@ -110,14 +114,18 @@ once it holds the locks: changed — the GUI, a subvol sync — and it writes no
 the other writer's change is not lost under the wizard's answers. The host bindings take the proof
 (`SetupLocks`): a mode that skips the locks does not compile. `setup::dispatch` reaches the host
 only through `SetupHost`, so the tests drive every mode on a scratch tree: each writing mode
-refuses with 75 and changes nothing while either lock is held, and `--check` takes neither and
-runs while both are. The hold cannot deadlock: nothing setup reaches takes either lock
+refuses with 75 and changes nothing while any of the three is held, and `--check` takes none and
+runs while all are. The hold cannot deadlock: nothing setup reaches takes any of them
 (`take_setup_locks` is the only lock call in `src/setup/`, and the library code it uses —
 `config`, `btrbk_conf`, `fsutil` — calls none); the helper claims its bus name, which the restart
 waits for, before it can take a lock; and `systemctl enable --now` waits for the timer's own
 start-up, not for a service the timer then triggers (systemctl(1) `--no-block`, systemd.timer(5)
 `Persistent=` — read in the docs, not tested). A catch-up run triggered that way during the hold
-finds the singleton held and skips (a backup), or waits for setup to let go (a scrub).
+finds its singleton held and skips: a backup, and since bd `su1b.2` step A4 a scrub too (it used to
+wait on the maintenance lock instead). That scrub logs "Another scrub holds /run/das-scrub.lock —
+skipping this invocation", exits 0 and writes no state; nothing retries it before the next
+calendar date, and the scrub's age in `btrdasd health` is what shows it (read from the code, not
+observed on the host).
 
 **`cmake --install` takes no lock**: the check below stays, for it — every residual above is a
 run that overlaps the install.
@@ -129,10 +137,18 @@ an older binary's write transaction (a backup's `walk` indexing) and then fails 
 Check before deploying, every time:
 
 ```bash
-busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
+busy=; for u in das-backup.service das-backup-full.service das-scrub.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
 ```
 
-Both units are `Type=oneshot`, so **while one runs its state is `activating`, never `active`**.
+`das-scrub.service` joined the loop with bd `su1b.2` step A4: a scrub pass runs the installed
+`btrdasd`, and from step A5 it holds no maintenance lock while yielded to a backup, so the backup
+units alone cannot show it. Its unit only: a `btrdasd scrub run` started by hand is not seen
+(the check does not probe `/run/das-scrub.lock`, which would make a scrub starting in that
+instant skip its pass). Checked 2026-11-22 with a stub `systemctl` and a scratch lock: the scrub
+unit `active`, `activating` or `deactivating` → `WAIT`; `inactive` or `failed` → silent; the
+check without it → silent in every state.
+
+All three units are `Type=oneshot`, so **while one runs its state is `activating`, never `active`**.
 The check this replaces — `systemctl is-active -q das-backup.service das-backup-full.service || …`
 — could therefore never fire on its first half: `is-active` is true only for `active`, `reloading`
 and `refreshing`. Measured 2026-10-03 against a throwaway `systemd-run --user` oneshot (the user

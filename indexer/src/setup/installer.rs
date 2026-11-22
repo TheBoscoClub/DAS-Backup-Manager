@@ -1071,7 +1071,7 @@ fn migrate_config(config: &mut Config) -> Vec<String> {
 /// `--upgrade` on the host: reload the existing config, apply migrations,
 /// remove the backup units older versions installed under `/usr`, regenerate
 /// every file and restart the D-Bus helper onto the binary just installed —
-/// all of it under setup's two locks at `site` ([`SetupLocks`]) — the helper's
+/// all of it under setup's three locks at `site` ([`SetupLocks`]) — the helper's
 /// unit reached through the real `systemctl`. A refusal is said on `warn`;
 /// everything else on `say`.
 pub fn upgrade(
@@ -1152,7 +1152,7 @@ pub fn exit_with(code: i32) -> ! {
 /// unknown counts — so it is not success.
 pub const UPGRADE_RESTART_DEFERRED_EXIT: i32 = 3;
 
-/// `btrdasd setup`'s exit status when a backup, or a job holding the DAS
+/// `btrdasd setup`'s exit status when a backup, a scrub pass, or a job holding the DAS
 /// maintenance lock, was running — or, for `--modify`, when `config.toml`
 /// changed while the wizard was open: nothing was written or removed — try
 /// again later. `EX_TEMPFAIL`, as `walk` and `restore --no-wait` exit when
@@ -1271,11 +1271,14 @@ fn upgrade_with(
     })
 }
 
-/// Where the two locks setup takes are: the host's in production, scratch
+/// Where the three locks setup takes are: the host's in production, scratch
 /// files in tests.
 pub struct SetupLockSite {
     /// The backup singleton — `/run/das-backup.lock`.
     pub backup: PathBuf,
+    /// The scrub singleton — `/run/das-scrub.lock`, held by a scrub pass for
+    /// the whole of its life.
+    pub scrub: PathBuf,
     /// The DAS maintenance lock — `/run/das-maintenance.lock`.
     pub maintenance: PathBuf,
 }
@@ -1286,18 +1289,19 @@ impl SetupLockSite {
     pub fn production() -> Self {
         Self {
             backup: PathBuf::from(buttered_dasd::backup::BACKUP_LOCK_PATH),
+            scrub: PathBuf::from(buttered_dasd::scrub::SCRUB_LOCK_PATH),
             maintenance: PathBuf::from(buttered_dasd::scrub::MAINTENANCE_LOCK_PATH),
         }
     }
 }
 
-/// Proof that this process holds the backup singleton and the DAS
-/// maintenance lock, for as long as the value lives. [`take_setup_locks`] is
+/// Proof that this process holds the backup singleton, the scrub singleton and
+/// the DAS maintenance lock, for as long as the value lives. [`take_setup_locks`] is
 /// the only way to get one, and everything setup does to the installed files
 /// needs one — `install`, `uninstall`, `uninstall_all` and the helper restart
 /// take it as an argument — so a mode that skips the locks does not compile.
 ///
-/// Why both (`.claude/rules/backup.md` §Never Run `setup --upgrade` …): setup's
+/// Why these (`.claude/rules/backup.md` §Never Run `setup --upgrade` …): setup's
 /// writes are atomic — a new file renamed into place, so a backup already
 /// reading `backup-run.sh` keeps reading the old one whole — but a run must
 /// still see one version of the files from its start to its end: the scripts
@@ -1305,27 +1309,34 @@ impl SetupLockSite {
 /// And an uninstall removes them. A backup holds the singleton from its start,
 /// also while it still waits for the maintenance lock. The maintenance lock is
 /// held by every job that mounts a backup target, and none of them may be
-/// mounting while the helper restart kills the helper's jobs.
+/// mounting while the helper restart kills the helper's jobs. The scrub
+/// singleton, because a scrub pass holds it for its whole life but the
+/// maintenance lock only while it scrubs: a pass waiting for that lock (or,
+/// bd DAS-Backup-Manager-su1b.2, yielded to a backup) would otherwise go on
+/// with files setup replaced or removed under it.
 pub struct SetupLocks {
     // Dropped in declaration order: the maintenance lock — its record emptied
-    // first — then the singleton, the reverse of taking them.
+    // first — then the scrub singleton, then the backup singleton, the
+    // reverse of taking them.
     _maintenance: MaintenanceHeld,
+    _scrub: buttered_dasd::scrub::FileLock,
     _backup: buttered_dasd::backup::SingletonHeld,
 }
 
-/// How setup found its two locks.
+/// How setup found its three locks.
 enum SetupLockAttempt {
-    /// Both taken, and held until the value is dropped.
+    /// All taken, and held until the value is dropped.
     Taken(SetupLocks),
     /// Another holds one of them: what setup says, naming it. Nothing is held.
     Busy(String),
 }
 
-/// Take setup's two locks without waiting, in the project's order — the
-/// backup singleton, then the maintenance lock, recording `job` as its holder
-/// — or say which one is held, and by whom, holding neither. Not waiting is
-/// the point: setup is run by hand, and a backup can run for hours. A lock
-/// file that cannot be opened is an error, never a free lock.
+/// Take setup's three locks without waiting, in the project's order — the
+/// backup singleton, the scrub singleton, then the maintenance lock,
+/// recording `job` as its holder — or say which one is held, and by whom,
+/// holding none. Not waiting is the point: setup is run by hand, and a backup
+/// or a scrub pass can run for hours. A lock file that cannot be opened is an
+/// error, never a free lock.
 fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt, String> {
     // `job` (`btrdasd setup --upgrade`) is recorded in the singleton too:
     // `backup-run.sh` reads it and waits for setup instead of skipping its run
@@ -1335,10 +1346,16 @@ fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt,
     else {
         return Ok(SetupLockAttempt::Busy(backup_held_line(&site.backup)));
     };
+    // On every early return below, what was taken is let go as this returns,
+    // the backup singleton's record emptied first.
+    let Some(scrub) =
+        buttered_dasd::scrub::FileLock::try_acquire(&site.scrub).map_err(|e| e.to_string())?
+    else {
+        return Ok(SetupLockAttempt::Busy(scrub_pass_held_line(&site.scrub)));
+    };
     let Some(maintenance) =
         MaintenanceHeld::try_acquire_at(&site.maintenance, job).map_err(|e| e.to_string())?
     else {
-        // The singleton is let go as this returns.
         return Ok(SetupLockAttempt::Busy(maintenance_held_line(
             &site.maintenance,
             &buttered_dasd::maintenance::holder_of(&site.maintenance),
@@ -1346,6 +1363,7 @@ fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt,
     };
     Ok(SetupLockAttempt::Taken(SetupLocks {
         _maintenance: maintenance,
+        _scrub: scrub,
         _backup: backup,
     }))
 }
@@ -1363,6 +1381,20 @@ fn backup_held_line(path: &Path) -> String {
          {SETUP_REFUSED_EXIT}).",
         path.display(),
         buttered_dasd::maintenance::holder_of(path)
+    )
+}
+
+/// What setup says, and stops at, when the scrub singleton at `path` is held:
+/// a scrub pass is alive — scrubbing, or waiting for the DAS maintenance lock
+/// without holding it (bd DAS-Backup-Manager-su1b.2). The singleton carries no
+/// record, so no holder is named.
+fn scrub_pass_held_line(path: &Path) -> String {
+    format!(
+        "Refused, nothing written or removed: the scrub singleton {} is held, so a scrub pass \
+         is running, scrubbing or waiting for the DAS maintenance lock. A running pass uses \
+         the files setup rewrites. Run setup again once it has finished (btrdasd scrub \
+         status; exit {SETUP_REFUSED_EXIT}).",
+        path.display()
     )
 }
 
@@ -4600,6 +4632,7 @@ auth = "starttls""#,
             let dir = tempfile::tempdir().unwrap();
             let site = SetupLockSite {
                 backup: dir.path().join("das-backup.lock"),
+                scrub: dir.path().join("das-scrub.lock"),
                 maintenance: dir.path().join("das-maintenance.lock"),
             };
             Self { _dir: dir, site }
@@ -4610,6 +4643,23 @@ auth = "starttls""#,
             FileLock::try_acquire(&self.site.backup)
                 .unwrap()
                 .expect("the scratch singleton is free")
+        }
+
+        /// The scrub singleton alone, as a scrub pass holds it while it waits
+        /// for the maintenance lock: no record.
+        fn hold_scrub_pass(&self) -> FileLock {
+            FileLock::try_acquire(&self.site.scrub)
+                .unwrap()
+                .expect("the scratch scrub singleton is free")
+        }
+
+        /// Whether a scrub pass asking for its singleton now would find it
+        /// `held` or `free`.
+        fn scrub_state(&self) -> &'static str {
+            match FileLock::try_acquire(&self.site.scrub).unwrap() {
+                Some(_) => "free",
+                None => "held",
+            }
         }
 
         /// The maintenance lock, held as a scrub holds it, record and all.
@@ -4695,6 +4745,9 @@ auth = "starttls""#,
         Backup,
         /// A scrub: the maintenance lock, with its record.
         Maintenance,
+        /// A scrub pass that holds only its singleton: waiting for the
+        /// maintenance lock (or, from su1b.2 A5, yielded to a backup).
+        ScrubPass,
     }
 
     /// How [`upgrade_installed_tree`] sets the host up.
@@ -5175,10 +5228,12 @@ auth = "starttls""#,
         for site in [
             SetupLockSite {
                 backup: unopenable(),
+                scrub: scratch.path().join("das-scrub.lock"),
                 maintenance: scratch.path().join("das-maintenance.lock"),
             },
             SetupLockSite {
                 backup: scratch.path().join("das-backup.lock"),
+                scrub: scratch.path().join("das-scrub.lock"),
                 maintenance: unopenable(),
             },
         ] {
@@ -5347,6 +5402,96 @@ auth = "starttls""#,
     }
 
     #[test]
+    fn setup_refuses_while_a_scrub_pass_holds_only_its_singleton() {
+        let locks = ScratchLocks::new();
+        let pass = locks.hold_scrub_pass();
+
+        match take_setup_locks(&locks.site, "btrdasd setup").unwrap() {
+            SetupLockAttempt::Busy(why) => {
+                assert_eq!(why, scrub_pass_held_line(&locks.site.scrub));
+            }
+            SetupLockAttempt::Taken(_) => panic!("a scrub pass is alive"),
+        }
+        assert!(
+            !locks.site.maintenance.exists(),
+            "the maintenance lock must not be opened while the pass is alive"
+        );
+        assert_eq!(locks.state(), BOTH_FREE, "the backup singleton is let go");
+        assert_eq!(
+            std::fs::read_to_string(&locks.site.backup).unwrap(),
+            "",
+            "its record emptied, or backup-run.sh would wait for a setup that left"
+        );
+        assert_eq!(locks.scrub_state(), "held");
+        drop(pass);
+        assert_eq!(locks.scrub_state(), "free");
+    }
+
+    #[test]
+    fn setup_holds_the_scrub_singleton_through_its_change_and_lets_it_go() {
+        let locks = ScratchLocks::new();
+        let mut during = None;
+        let ran = under_setup_locks(&locks.site, "btrdasd setup", |_| {
+            during = Some((locks.scrub_state(), locks.state()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(ran, Locked::Ran(()));
+        assert_eq!(
+            during,
+            Some(("held", BOTH_HELD.to_string())),
+            "a scrub pass that fires mid-change must not start"
+        );
+        assert_eq!(
+            locks.scrub_state(),
+            "free",
+            "let go when the change returns"
+        );
+        assert_eq!(locks.state(), BOTH_FREE);
+    }
+
+    /// A scrub pass that died (SIGKILL: no unwinding, no unlock) leaves its
+    /// singleton free with the process, so it does not block setup.
+    #[test]
+    fn a_scrub_pass_killed_by_sigkill_no_longer_blocks_setup() {
+        let locks = ScratchLocks::new();
+        // A pass stand-in: one process holding the singleton by flock(2), as
+        // `btrdasd scrub run` does. The shell locks its own descriptor, then
+        // becomes `sleep` (exec, no fork), so it is the only holder.
+        let mut pass = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"exec 9<>"$1" && flock -x 9 && exec sleep 600"#)
+            .arg("sh")
+            .arg(&locks.site.scrub)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("flock(1) runs");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(locks.site.scrub.exists() && locks.scrub_state() == "held") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never held"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let alive = under_setup_locks(&locks.site, "btrdasd setup", |_| Ok(()));
+        // SIGKILL and reap the stand-in before any assertion can unwind past it.
+        let _ = pass.kill();
+        let _ = pass.wait();
+        let dead = under_setup_locks(&locks.site, "btrdasd setup", |_| Ok(()));
+
+        assert!(
+            matches!(alive, Ok(Locked::Refused(_))),
+            "refused while the pass lived: {alive:?}"
+        );
+        assert_eq!(dead.unwrap(), Locked::Ran(()), "ran once it was dead");
+    }
+
+    #[test]
     fn a_lock_setup_cannot_open_is_an_error_never_free() {
         let scratch = tempfile::tempdir().unwrap();
         let free_backup = scratch.path().join("das-backup.lock");
@@ -5354,6 +5499,7 @@ auth = "starttls""#,
             (
                 SetupLockSite {
                     backup: PathBuf::from("/dev/null/das-backup.lock"),
+                    scrub: scratch.path().join("das-scrub.lock"),
                     maintenance: scratch.path().join("das-maintenance.lock"),
                 },
                 "/dev/null/das-backup.lock",
@@ -5361,9 +5507,18 @@ auth = "starttls""#,
             (
                 SetupLockSite {
                     backup: free_backup.clone(),
+                    scrub: scratch.path().join("das-scrub.lock"),
                     maintenance: PathBuf::from("/dev/null/das-maintenance.lock"),
                 },
                 "/dev/null/das-maintenance.lock",
+            ),
+            (
+                SetupLockSite {
+                    backup: free_backup.clone(),
+                    scrub: PathBuf::from("/dev/null/das-scrub.lock"),
+                    maintenance: scratch.path().join("das-maintenance.lock"),
+                },
+                "/dev/null/das-scrub.lock",
             ),
         ] {
             match take_setup_locks(&site, "btrdasd setup") {
@@ -5381,6 +5536,7 @@ auth = "starttls""#,
     fn setup_takes_the_very_lock_files_a_backup_takes() {
         let site = SetupLockSite::production();
         assert_eq!(site.backup, Path::new("/run/das-backup.lock"));
+        assert_eq!(site.scrub, Path::new("/run/das-scrub.lock"));
         assert_eq!(site.maintenance, Path::new("/run/das-maintenance.lock"));
         // backup-run.sh, as this binary installs it.
         let script = include_str!("../../../scripts/backup-run.sh");
@@ -6296,6 +6452,10 @@ auth = "starttls""#,
         changed_after_wizard: Vec<PathBuf>,
         locks_after: String,
         record_after: String,
+        /// The scrub singleton once it returned, and the backup singleton's
+        /// record.
+        scrub_after: &'static str,
+        backup_record_after: String,
         config_path: PathBuf,
         /// `config.toml` once it returned, if there was one.
         config_after: Option<Config>,
@@ -6328,6 +6488,9 @@ auth = "starttls""#,
         let _scrub = holding
             .contains(&Holding::Maintenance)
             .then(|| locks.hold_maintenance());
+        let _pass = holding
+            .contains(&Holding::ScrubPass)
+            .then(|| locks.hold_scrub_pass());
 
         let steps = std::cell::RefCell::new(Vec::new());
         let step = |name: &str| {
@@ -6411,6 +6574,7 @@ auth = "starttls""#,
         let host = SetupHost {
             site: SetupLockSite {
                 backup: locks.site.backup.clone(),
+                scrub: locks.site.scrub.clone(),
                 maintenance: locks.site.maintenance.clone(),
             },
             check: &check,
@@ -6446,6 +6610,8 @@ auth = "starttls""#,
             changed_after_wizard: changed(&after_wizard, &now),
             locks_after: locks.state(),
             record_after: locks.record(),
+            scrub_after: locks.scrub_state(),
+            backup_record_after: std::fs::read_to_string(&locks.site.backup).unwrap_or_default(),
             config_after: Config::load(&config_path).ok(),
             config_path,
         }
@@ -6524,6 +6690,48 @@ auth = "starttls""#,
         }
     }
 
+    /// su1b.2 A4: a scrub pass holding only its singleton — waiting for the
+    /// maintenance lock, or yielded to a backup — holds no maintenance lock,
+    /// yet runs the installed files: every writing mode refuses, 75, and
+    /// leaves the backup singleton free with its record emptied.
+    #[test]
+    fn every_writing_mode_refuses_with_75_and_writes_nothing_while_a_scrub_pass_is_alive() {
+        for flags in WRITING_MODES {
+            let case = format!("{flags:?} while a scrub pass holds its singleton");
+            let run = dispatch_on_installed_tree(flags, &[Holding::ScrubPass], false);
+
+            assert_eq!(run.outcome, Ok(SetupOutcome::Refused), "{case}");
+            assert_eq!(exit_status(SetupOutcome::Refused), 75);
+            assert_eq!(run.changed, Vec::<PathBuf>::new(), "{case}");
+            let asked: Vec<String> = questions(flags)
+                .iter()
+                .map(|q| format!("{q} ({BOTH_FREE})"))
+                .collect();
+            assert_eq!(run.steps, asked, "{case}: nothing ran after the questions");
+            assert_eq!(run.warned.len(), 1, "{case}: {:?}", run.warned);
+            assert!(
+                run.warned[0]
+                    .starts_with("Refused, nothing written or removed: the scrub singleton "),
+                "{case}: {:?}",
+                run.warned
+            );
+            assert!(
+                !run.said.iter().any(|l| l.contains("Refused")),
+                "{case}: a refusal goes to stderr: {:?}",
+                run.said
+            );
+            assert_eq!(run.locks_after, BOTH_FREE, "{case}: setup holds nothing");
+            assert_eq!(
+                run.scrub_after, "held",
+                "{case}: the pass keeps its singleton"
+            );
+            assert_eq!(
+                run.backup_record_after, "",
+                "{case}: the singleton setup let go carries no stale setup record"
+            );
+        }
+    }
+
     #[test]
     fn every_writing_mode_asks_first_then_writes_under_both_locks_and_lets_them_go() {
         for flags in WRITING_MODES {
@@ -6569,8 +6777,11 @@ auth = "starttls""#,
             assert_eq!(run.steps, vec![format!("check ({BOTH_FREE})")], "{flags:?}");
 
             // Both held by others: it still runs, and changes nothing.
-            let run =
-                dispatch_on_installed_tree(flags, &[Holding::Backup, Holding::Maintenance], false);
+            let run = dispatch_on_installed_tree(
+                flags,
+                &[Holding::Backup, Holding::Maintenance, Holding::ScrubPass],
+                false,
+            );
             assert_eq!(run.outcome, Ok(SetupOutcome::Done), "{flags:?}");
             assert_eq!(exit_status(SetupOutcome::Done), 0);
             assert_eq!(run.steps, vec![format!("check ({BOTH_HELD})")], "{flags:?}");

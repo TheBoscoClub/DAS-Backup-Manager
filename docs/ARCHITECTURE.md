@@ -234,7 +234,7 @@ while the pass still exited 0, so they are re-checked at each btrfs-progs upgrad
 --check` reads `das-scrub.service`'s effective `Nice` / `IOSchedulingClass` / `IOSchedulingPriority`
 back from systemd and reports any difference from what setup writes — a unit not yet upgraded, or a
 drop-in that lowers it. A scrub already running keeps the priority it started with; the unit is
-refreshed between runs (`setup --upgrade` refuses while a pass holds the locks), and a later start or
+refreshed between runs (`setup --upgrade` refuses while a pass is alive: it holds `/run/das-scrub.lock` for its whole life), and a later start or
 resume picks it up.
 
 **Resume-or-start** (bd `DAS-Backup-Manager-292`): each target does not blindly `btrfs scrub start`.
@@ -491,7 +491,8 @@ under a free name), given its mode (scripts 0755, any other file the mode it had
 root, the old file's owner and group, flushed, renamed over the old one, the directory flushed — so
 a backup already reading a script keeps the old file, and two writers never meet. Every mode that writes or removes these files (install,
 `--modify`, `--force`, `--upgrade`, `--uninstall`, `--uninstall-all`) does it holding
-`/run/das-backup.lock` and then `/run/das-maintenance.lock`, taken without waiting before the first
+`/run/das-backup.lock`, `/run/das-scrub.lock` (a scrub pass holds it for its whole life, also while
+it waits for maintenance) and then `/run/das-maintenance.lock`, taken without waiting before the first
 write, or refuses with exit 75 on stderr, changing nothing; `--modify` also refuses when
 `config.toml` changed while its wizard was open. `install`, `uninstall` and `uninstall_all` take the
 proof of that hold (`installer::SetupLocks`) as an argument, and `setup::dispatch` reaches the host

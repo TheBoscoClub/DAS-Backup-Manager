@@ -667,6 +667,7 @@ mod tests {
         SetupHost {
             site: installer::SetupLockSite {
                 backup: dir.join("das-backup.lock"),
+                scrub: dir.join("das-scrub.lock"),
                 maintenance: dir.join("das-maintenance.lock"),
             },
             check: &never_check,

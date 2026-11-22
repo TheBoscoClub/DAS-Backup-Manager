@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`btrdasd setup` refuses while a scrub pass is alive** (bd `DAS-Backup-Manager-su1b.2`, step A4): every mode that writes or removes installed files now takes `/run/das-scrub.lock` between the backup singleton and the maintenance lock, without waiting, and holds it to the end; held — a pass scrubbing, or waiting for the maintenance lock — it writes nothing and exits `75`, naming the lock on stderr
+  - A pass that died (SIGKILL included) leaves the lock free and no longer blocks setup; an unopenable lock file is an error, never free; `--check` still takes no lock
+  - A scrub the timer starts while setup holds the lock skips that pass (exit 0, no state written) instead of waiting for it: run setup outside the scrub's calendar slot
+  - The pre-`cmake --install` busy check (`docs/INSTALL.md`) also waits for `das-scrub.service`; a `btrdasd scrub run` started by hand is still not seen by it
+  - `btrdasd(1)` now says a backup started during setup waits up to 15 minutes before it skips, as it has since bd `DAS-Backup-Manager-al9`
 - **The Disaster Recovery Guide's unattended step list matches the session's steps** (bd `DAS-Backup-Manager-3gzs.7`, `DAS-Backup-Manager-ua01`): it gains **slot** (after snapshot) and **desktop** (after kernel), the half-upgraded note names the snapshot step by its number again, and the script's header puts slot where it runs
   - Troubleshooting says not to suspend a session's script: a stop across an in-guest reboot ends in exit status 6, and one over about 30 seconds ends reset watching for the rest of the session
 - **The Flatpak builds on the current KDE runtime, 6.11** (bd `DAS-Backup-Manager-jeaq`): the manifest named KDE 6.7, which Flathub marks end-of-life, so a bundle got no runtime security fixes

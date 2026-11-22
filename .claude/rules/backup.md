@@ -11,12 +11,12 @@ Installation specifics: `.claude/rules/local-installation.md` (gitignored, this 
 
 ## Never Run `setup --upgrade` or `cmake --install` While a Backup Is Running
 
-**`setup` refuses by itself**: every mode that writes or removes installed files takes `/run/das-backup.lock`
-then `/run/das-maintenance.lock`, non-blocking, before its first write, holds both to the end, and exits 75 (on stderr), changing nothing, if either is held.
+**`setup` refuses by itself**: every mode that writes or removes installed files takes `/run/das-backup.lock`,
+`/run/das-scrub.lock` (a scrub pass holds it for its whole life, also while it waits for maintenance; bd `su1b.2`), then `/run/das-maintenance.lock`, non-blocking, before its first write, holds all three to the end, and exits 75 (on stderr), changing nothing, if any is held.
 **`cmake --install` takes no lock** — check first, every time:
 
 ```bash
-busy=; for u in das-backup.service das-backup-full.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; sudo flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
+busy=; for u in das-backup.service das-backup-full.service das-scrub.service; do case "$(systemctl show -P ActiveState "$u")" in inactive | failed) ;; *) busy=1 ;; esac; done; sudo flock -n /run/das-backup.lock true || busy=1; [ -z "$busy" ] || echo "WAIT — do not install"
 ```
 
 Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before btrbk starts, and re-reads `config.toml`.

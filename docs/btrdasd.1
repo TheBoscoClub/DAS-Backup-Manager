@@ -401,7 +401,7 @@ Regenerate all managed files from the existing configuration
 (useful after a binary update), then restart
 .B btrdasd\-helper.service
 when it is running, so the GUI is served by the new binary. All of it is done
-holding setup's two locks (below); the restart may hold them for at most 300
+holding setup's three locks (below); the restart may hold them for at most 300
 seconds, so no job can start mounting under it. A unit that refuses a manual
 stop (RefuseManualStop=yes, from a host drop\-in) refuses the try\-restart; the
 upgrade then runs
@@ -503,14 +503,17 @@ Every mode that writes or removes installed files \(em the wizard,
 and
 .B \-\-uninstall\-all
 \(em first takes
-.I /run/das\-backup.lock
+.IR /run/das\-backup.lock ,
+then
+.I /run/das\-scrub.lock
 and then
 .IR /run/das\-maintenance.lock ,
-without waiting, holds both until it is done, and lets them go however it ends.
-A backup holds the first from its start, also while it waits for the second;
-every job that mounts a backup target holds the second. If either is held,
-setup writes and removes nothing, says on standard error which lock is held
-and, for the second, by whom, and exits 75; run it again once that job has
+without waiting, holds all three until it is done, and lets them go however it
+ends. A backup holds the first from its start, also while it waits for the
+third; a scrub pass holds the second for its whole life, also while it waits
+for the third; every job that mounts a backup target holds the third. If any is
+held, setup writes and removes nothing, says on standard error which lock is
+held and, for the third, by whom, and exits 75; run it again once that job has
 finished. The questions of the wizard and of an uninstall come first: the locks
 are taken once they are answered; a wizard refused then asks whether to wait
 and try again, keeping its answers.
@@ -521,7 +524,10 @@ compares the file with what it read before the wizard opened, and if anything
 else wrote it meanwhile it writes nothing and exits 75. While setup holds the
 locks, a backup started meanwhile \(em by the timer, too \(em finds
 .I /run/das\-backup.lock
-held and skips its run.
+held, reads in it that setup holds it, and waits for it up to 15 minutes
+before it skips its run; a scrub started meanwhile finds
+.I /run/das\-scrub.lock
+held and skips its pass.
 .PP
 Every file setup writes is replaced whole: a new file, given its mode (scripts
 0755, any other file the mode it had) and, written by root, owner and group
