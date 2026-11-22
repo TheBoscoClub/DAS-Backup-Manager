@@ -39,6 +39,8 @@
 #include <QTableView>
 #include <QTableWidget>
 #include <QComboBox>
+#include <QLineEdit>
+#include <QPlainTextEdit>
 #include <QDateTimeEdit>
 
 #include <algorithm>
@@ -55,6 +57,7 @@
 #include "../src/backuppanel.h"
 #include "../src/configdialog.h"
 #include "../src/coveragedialog.h"
+#include "../src/raidacceptdialog.h"
 #include "../src/backupsteps.h"
 #include "../src/statustext.h"
 #include "../src/panelconfig.h"
@@ -791,6 +794,47 @@ private Q_SLOTS:
     }
 
     // --- subvolume coverage: list and accept (bd sp78.4) ---------------------
+
+    // bd DAS-Backup-Manager-su1b.11: the RAID-1 accept is offered only after
+    // a preview that succeeded and the label typed exactly; with no helper the
+    // preview fails and nothing is offered.
+    void raidAcceptDialogOffersAcceptOnlyForTheExactLabelAfterAPreview()
+    {
+        DBusClient client; // no helper reachable in this suite
+        RaidAcceptDialog dlg(&client, QStringLiteral("primary"));
+        auto *accept = dlg.findChild<QPushButton *>(QStringLiteral("raidAcceptButton"));
+        auto *typed = dlg.findChild<QLineEdit *>(QStringLiteral("raidAcceptLabelEdit"));
+        auto *text = dlg.findChild<QPlainTextEdit *>(QStringLiteral("raidAcceptExplanation"));
+        QVERIFY(accept && typed && text);
+        for (QPushButton *b : dlg.findChildren<QPushButton *>())
+            QVERIFY2(!b->toolTip().isEmpty(), qPrintable(b->text()));
+        QVERIFY(!typed->toolTip().isEmpty());
+        // The unavailable helper: no preview, and the label alone offers nothing.
+        typed->setText(QStringLiteral("primary"));
+        QVERIFY(!dlg.acceptOffered());
+        QVERIFY(!accept->isEnabled());
+        // A preview: only the exact label offers Accept.
+        QVERIFY(dlg.applyPreview(true, QStringLiteral("Target 'primary' ... is refused for split brain.")));
+        QVERIFY(text->toPlainText().contains(QStringLiteral("split brain")));
+        QVERIFY(accept->isEnabled());
+        for (const char *wrong : {"primar", "primary ", "PRIMARY", ""}) {
+            typed->setText(QString::fromLatin1(wrong));
+            QVERIFY2(!accept->isEnabled(), wrong);
+        }
+        typed->setText(QStringLiteral("primary"));
+        QVERIFY(accept->isEnabled());
+        // A failed preview takes the offer back.
+        QVERIFY(!dlg.applyPreview(false, QStringLiteral("nothing to accept")));
+        QVERIFY(!accept->isEnabled());
+        QVERIFY(text->toPlainText().isEmpty());
+
+        // The target view offers it, with a tooltip, once a row is selected.
+        HealthDashboard health(&client);
+        auto *open = health.findChild<QPushButton *>(QStringLiteral("healthRaidAcceptButton"));
+        QVERIFY(open);
+        QVERIFY(!open->toolTip().isEmpty());
+        QVERIFY2(!open->isEnabled(), "offered with no target selected");
+    }
 
     void coverageDialogShowsTheDroppedPairsAndAcceptsOnlyASelectedOne()
     {

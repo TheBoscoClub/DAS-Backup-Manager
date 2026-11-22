@@ -215,7 +215,25 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 (backup run, doctor, walk, restore, the GUI helper), the scrub engine, and
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
-refused, 2 could not run). Single-device targets are mounted as before.
+refused, 2 could not run). Single-device targets are mounted as before. Every
+caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
+`ReadOnly` only for a job that persists nothing derived from the target's
+contents (restore file, restore snapshot, browse, the doctor's report);
+`Write` for everything else — backups, boot archiving, forget/purge, the
+scrub, and walk, index walk, reindex, reconcile and the recovery-OS reading,
+which write the index or a state file from what they read.
+
+At the end of every job that mounted a RAID-1 target read-write and not
+degraded, before the
+unmount (`MountGuard`, the scrub engine, `backup-run.sh` through hidden
+`btrdasd backup raid-check`), the kernel's view is read again: a member missing,
+or a view that cannot be read, is recorded as a degraded period on the members
+present, so the next mount with both owes a scrub. A mount that turns a
+degraded record into scrub-owed reports `REJOINED`, and the job that made it
+starts `das-scrub.service` (`systemctl start --no-block`) once its maintenance
+lock is released (`MaintenanceHeld`'s drop; the script's `start_owed_scrub`
+after closing fds 7, 8 and 9); the pass scrubs every `[scrub].targets`
+filesystem, and a backup preempts it by the claim.
 
 ```text
 blkid -c /dev/null -t UUID=<fsid> -o device   → the members, never found by serial alone
@@ -230,13 +248,39 @@ all num_devices present?
          still absent, a configured serial absent:
            mount ro,degraded,rescue=nologreplay → read the witness → unmount
            split-brain verdict (primary + witness):
-             present ⊄ last period's members, or a copy unreadable → REFUSE
+             a copy unreadable → REFUSE (every job)
+             present ⊄ last period's members (split brain):
+               Intent::Write    → REFUSE
+               Intent::ReadOnly → mount <mount_opts>,ro,degraded,rescue=nologreplay,
+                                  nothing written → STALE-READ-ONLY (WARN, data date)
            write primary record → mount <mount_opts>,degraded → write witness → DEGRADED (WARN)
          still absent with every configured serial attached → REFUSE
 ```
 
-The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`,
-`member=<devid> <dev_uuid> <generation>`, `since`, `last`, `rejoined`) lives in
+A dead drive behind a split brain: `btrdasd raid accept <label>` (root; the
+GUI's Health dashboard (Drives tab) through the helper's `RaidAccept`, polkit
+`org.dasbackup.raid.accept`, `auth_admin`), under the backup singleton and the
+maintenance lock:
+
+```text
+split_brain_now (one look, no wait)   → refused for split brain now? else nothing to accept
+explanation (present member, period given up, runs in it from backup_runs)
+typed label == target label?          → else nothing written
+accepted_record: degraded period on the present members from now,
+                 every member of the old period in rejected=
+write primary → mount <mount_opts>,degraded rw → write witness → unmount
+logger -t btrdasd; raid_accepted row (schema 9)
+```
+
+A rejected member is refused for every job, alone or beside the others: each
+superblock is read before its device is scanned, a rejected one is never
+scanned (primary copy); a rejection only the witness carries takes the normal
+mount straight down. The scrub that pays the debt after a replacement keeps
+the rejection (`state=settled`).
+
+The record (`format=das-backup-raid-record 1`, `key=value`: `fsid`, `state`
+(`degraded`, `scrub-owed`, `settled`), `member=<devid> <dev_uuid>
+<generation>`, `rejected=` the same, `since`, `last`, `rejoined`) lives in
 `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`) and in
 `.das-backup-raid.record` at the target's top level. A completed scrub begun
 after `rejoined`, nothing uncorrectable, removes both (witness first);
@@ -496,7 +540,9 @@ btrdasd-gui
          │         ├──▶ ConfigCheck()          → ConfigDialog (unknown-key warnings before a save)
          │         ├──▶ ConfigGet()            → ConfigDialog (the file's text, as it is)
          │         ├──▶ CoverageList()         → CoverageDialog (pairs no longer backed up; org.dasbackup.index.read)
-         │         └──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
+         │         ├──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
+         │         ├──▶ RaidAcceptPreview(l)   → RaidAcceptDialog (what `raid accept` would show; org.dasbackup.raid.accept)
+         │         └──▶ RaidAccept(l, typed)   → RaidAcceptDialog (the typed label compared again; org.dasbackup.raid.accept, auth_admin)
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
          ├──▶ SnapshotWatcher             QFileSystemWatcher → auto-detect new snapshots

@@ -374,7 +374,8 @@ pub struct Das {
     /// How long, in seconds, a RAID-1 target's mount waits for a member that
     /// is configured but not yet present (late USB enumeration after the
     /// enclosure powers on) before it decides the member is absent and mounts
-    /// degraded. 60 by default; 0 decides at once; at most
+    /// degraded. 900 (15 minutes) by default (operator 2026-11-22, bd
+    /// DAS-Backup-Manager-su1b.11); 0 decides at once; at most
     /// [`MEMBER_WAIT_SECS_MAX`].
     #[serde(default = "default_member_wait_secs")]
     pub member_wait_secs: u32,
@@ -406,12 +407,12 @@ fn default_nr_requests() -> u32 {
 }
 
 fn default_member_wait_secs() -> u32 {
-    60
+    900
 }
 
-/// The longest `[das].member_wait_secs` accepted: a backup or scrub waits this
-/// long per RAID-1 target at most.
-pub const MEMBER_WAIT_SECS_MAX: u32 = 900;
+/// The longest `[das].member_wait_secs` accepted, an hour: a backup or scrub
+/// waits this long per RAID-1 target at most.
+pub const MEMBER_WAIT_SECS_MAX: u32 = 3600;
 
 /// The kernel's floor for `queue/nr_requests` (`BLKDEV_MIN_RQ`): a smaller
 /// write is silently raised to it, so config refuses one.
@@ -4997,15 +4998,14 @@ mod tests {
     /// bd su1b.4: the scheduler is written into a udev rule and a sysfs file,
     /// so only the kernel's known names pass; empty is "leave the drives alone".
     #[test]
-    fn member_wait_secs_defaults_to_60_and_is_bounded() {
-        assert_eq!(Config::default().das.member_wait_secs, 60);
+    fn member_wait_secs_defaults_to_900_and_is_bounded_at_an_hour() {
+        // Operator 2026-11-22 (bd DAS-Backup-Manager-su1b.11): 15 minutes by
+        // default, adjustable up to an hour.
+        assert_eq!(Config::default().das.member_wait_secs, 900);
         let parsed: Das = toml::from_str("mount_opts = \"noatime\"").unwrap();
-        assert_eq!(parsed.member_wait_secs, 60, "an absent key is the default");
-        for (secs, ok) in [
-            (0, true),
-            (MEMBER_WAIT_SECS_MAX, true),
-            (MEMBER_WAIT_SECS_MAX + 1, false),
-        ] {
+        assert_eq!(parsed.member_wait_secs, 900, "an absent key is the default");
+        assert_eq!(MEMBER_WAIT_SECS_MAX, 3600);
+        for (secs, ok) in [(0, true), (3600, true), (3601, false)] {
             let mut cfg = Config::default();
             cfg.das.member_wait_secs = secs;
             assert_eq!(

@@ -122,7 +122,12 @@ where
     };
 
     let progress = CliProgress;
-    let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Job::Forget.intent(),
+        &progress,
+        locks.maintenance(),
+    )?;
     let database = Database::open(db)?;
 
     let outcome =
@@ -393,6 +398,11 @@ enum Commands {
         #[command(subcommand)]
         action: ScrubAction,
     },
+    /// RAID-1 targets: what the guard decided (bd DAS-Backup-Manager-su1b.11)
+    Raid {
+        #[command(subcommand)]
+        action: RaidAction,
+    },
     /// Subvolume drift detector — find source subvolumes that exist on disk
     /// but aren't backed up (or config entries for subvolumes that no longer
     /// exist)
@@ -532,9 +542,19 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, DEGRADED), 1 not mounted, 3 refused, 2 could not run.
+    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, REJOINED — this mount was the rejoin, the caller starts the owed scrub once it has let its locks go — DEGRADED), 1 not mounted, 3 refused, 2 could not run.
     #[command(hide = true)]
     MountTarget {
+        /// The target's label
+        #[arg(long)]
+        label: String,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// At the end of backup-run.sh's run, before it unmounts a RAID-1 target it mounted through the guard (bd DAS-Backup-Manager-su1b.14): a member the kernel shows missing, or a view that cannot be read, is recorded as a degraded period on the members present. Under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID CHECK: <STATUS>  (<detail>)`, STATUS OK, RECORDED or WARN. EXIT CODE: 0 checked, 2 could not run.
+    #[command(hide = true)]
+    RaidCheck {
         /// The target's label
         #[arg(long)]
         label: String,
@@ -894,6 +914,31 @@ enum RecoveryOsAction {
         /// The whole disk, e.g. /dev/disk/by-id/ata-<model>_<serial>
         #[arg(long, value_name = "PATH")]
         device: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RaidAction {
+    /// Make the drive present the history of a RAID-1 target the guard refuses
+    /// for split brain (its other drive is dead), giving up what only the
+    /// absent drive holds. Root only. Shows what the present drive holds and
+    /// what is given up, then asks for the target's label, typed exactly, at
+    /// a terminal; there is no --yes. The absent drive is refused from then
+    /// on, alone or beside the other, until it is wiped or removed from the
+    /// filesystem.
+    ///
+    /// EXIT CODE: 0 accepted, 1 refused or not accepted (nothing changed,
+    /// unless it says the record was half written), 75 a backup, scrub or
+    /// configuration edit holds the locks.
+    Accept {
+        /// The target's label
+        label: String,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Path to the SQLite database (backup history; the accept log)
+        #[arg(long, default_value = DEFAULT_DB)]
+        db: PathBuf,
     },
 }
 
@@ -2241,10 +2286,173 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     if health::is_mountpoint(mount_path) {
         return cannot_run(format!("{} is already a mount point", target.mount));
     }
-    let result = mount::mount_guarded_target(&cfg, target, &CliProgress, &held);
+    let result = mount::mount_guarded_target(
+        &cfg,
+        target,
+        buttered_dasd::raid_guard::Job::MountTarget.intent(),
+        &CliProgress,
+        &held,
+    );
     let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
     println!("{line}");
     code
+}
+
+/// `btrdasd backup raid-check`: the end-of-job check of one RAID-1 target
+/// `backup-run.sh` mounted, before it unmounts it (bd
+/// DAS-Backup-Manager-su1b.14). Only under a handed-down maintenance lock,
+/// with the target mounted at its path.
+fn cmd_raid_check(label: &str, config: &Path) -> i32 {
+    let cant = |why: String| {
+        println!("RAID CHECK: CANNOT-RUN  ({why})");
+        2
+    };
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => return cant(format!("cannot read {}: {e}", config.display())),
+    };
+    let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
+        return cant(format!("no [[target]] labelled '{label}'"));
+    };
+    if !buttered_dasd::raid_guard::is_guarded(target) {
+        return cant(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let lock = CliLock::production();
+    let Some(raw) = &lock.delegated else {
+        return cant(format!(
+            "only under a maintenance lock handed down by {}",
+            maintenance::DELEGATED_FD_ENV
+        ));
+    };
+    if let Err(e) = raw
+        .to_str()
+        .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{}={raw:?} is not a descriptor number",
+                maintenance::DELEGATED_FD_ENV
+            )
+        })
+        .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
+    {
+        return cant(e);
+    }
+    if !health::is_mountpoint(Path::new(&target.mount)) {
+        return cant(format!("{} is not mounted", target.mount));
+    }
+    let check = mount::raid_end_check(&cfg, target);
+    println!("{}", buttered_dasd::raid_guard::end_check_line(&check));
+    0
+}
+
+/// `btrdasd raid accept <label>` (bd DAS-Backup-Manager-su1b.11): root only,
+/// under the backup singleton and the maintenance lock, both taken without
+/// waiting (held: exit 75). The label is read from a terminal; anything else
+/// accepts nothing.
+fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
+    use std::io::{BufRead, IsTerminal, Write};
+    // SAFETY: geteuid(2) takes nothing and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("Error: btrdasd raid accept must be run as root");
+        return 1;
+    }
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: cannot read {}: {e}", config.display());
+            return 1;
+        }
+    };
+    let job = "btrdasd raid accept";
+    let singleton_path = buttered_dasd::backup::config_edit_lock_path();
+    let singleton = match buttered_dasd::backup::SingletonHeld::try_acquire_at(&singleton_path, job)
+    {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            eprintln!(
+                "Not accepted, nothing changed: {} holds {}. Try again when it finishes.",
+                maintenance::holder_of(&singleton_path),
+                singleton_path.display()
+            );
+            return 75;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let maintenance_path = Path::new(scrub::MAINTENANCE_LOCK_PATH);
+    let held = match maintenance::MaintenanceHeld::try_acquire_at(maintenance_path, job) {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            eprintln!(
+                "Not accepted, nothing changed: {} holds {}. Try again when it finishes.",
+                maintenance::holder_of(maintenance_path),
+                maintenance_path.display()
+            );
+            return 75;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let mut confirm = |explanation: &str| -> Result<String, String> {
+        println!("{explanation}");
+        if !std::io::stdin().is_terminal() {
+            return Err(
+                "standard input is not a terminal: run it at a terminal and type the label (there is no --yes)"
+                    .into(),
+            );
+        }
+        print!("To accept, type the target label exactly ({label}): ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("cannot read the answer: {e}"))?;
+        Ok(line)
+    };
+    match mount::raid_accept(
+        &cfg,
+        label,
+        db,
+        &mut confirm,
+        &CliProgress,
+        &singleton,
+        &held,
+    ) {
+        Ok(done) => {
+            for w in &done.warnings {
+                eprintln!("WARNING: {w}");
+            }
+            println!(
+                "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed from the filesystem.",
+                done.accepted
+                    .after
+                    .members
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                done.accepted
+                    .after
+                    .rejected
+                    .iter()
+                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            0
+        }
+        Err(why) => {
+            eprintln!("Error: {why}");
+            1
+        }
+    }
 }
 
 /// `btrdasd walk`.
@@ -2259,7 +2467,12 @@ fn cmd_walk(
     let Some(held) = hold_for_cli("btrdasd walk", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Job::Walk.intent(),
+        progress,
+        &held,
+    )?;
     let database = Database::open(db)?;
     // A mount point is not an identity: the root must be the configured
     // filesystem's top level before anything is read from or pruned under it.
@@ -2376,7 +2589,12 @@ fn cmd_restore_file(
     let Some(held) = hold_for_cli("btrdasd restore file", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Job::RestoreFiles.intent(),
+        progress,
+        &held,
+    )?;
     let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let result = restore::restore_files(
         snapshot,
@@ -2409,7 +2627,12 @@ fn cmd_restore_snapshot(
     let Some(held) = hold_for_cli("btrdasd restore snapshot", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Job::RestoreSnapshot.intent(),
+        progress,
+        &held,
+    )?;
     let result = restore::restore_snapshot(
         snapshot,
         dest,
@@ -2440,7 +2663,12 @@ fn cmd_restore_browse(
     let Some(held) = hold_for_cli("btrdasd restore browse", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(&cfg, progress, &held)?;
+    let mut guard = mount::ensure_targets_mounted(
+        &cfg,
+        buttered_dasd::raid_guard::Job::Browse.intent(),
+        progress,
+        &held,
+    )?;
     let entries = restore::browse_snapshot(snapshot, prefix);
     let still_mounted = guard.unmount(progress);
     print!("{}", browse_listing(json, &entries?));
@@ -2577,7 +2805,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+            let mut guard = mount::ensure_targets_mounted(
+                &cfg,
+                buttered_dasd::raid_guard::Job::Reindex.intent(),
+                &progress,
+                locks.maintenance(),
+            )?;
             let database = Database::open(&db)?;
             let verified = checked_roots(&cfg);
 
@@ -2680,7 +2913,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let progress = CliProgress;
-            let mut guard = mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance())?;
+            let mut guard = mount::ensure_targets_mounted(
+                &cfg,
+                buttered_dasd::raid_guard::Job::Reconcile.intent(),
+                &progress,
+                locks.maintenance(),
+            )?;
             let database = Database::open(&db)?;
 
             // Failures that must fail the command, but only after the targets
@@ -3075,14 +3313,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The locks are held, so the command has begun: targets that
                 // will not mount are a target's state, 3 as `backup run`
                 // classifies it, not 1 ("could not start").
-                let mut guard =
-                    match mount::ensure_targets_mounted(&cfg, &progress, locks.maintenance()) {
-                        Ok(guard) => guard,
-                        Err(why) => {
-                            eprintln!("Error: {why}");
-                            std::process::exit(backup::BootStep::mount_failure_exit_code());
-                        }
-                    };
+                let mut guard = match mount::ensure_targets_mounted(
+                    &cfg,
+                    buttered_dasd::raid_guard::Job::BootArchive.intent(),
+                    &progress,
+                    locks.maintenance(),
+                ) {
+                    Ok(guard) => guard,
+                    Err(why) => {
+                        eprintln!("Error: {why}");
+                        std::process::exit(backup::BootStep::mount_failure_exit_code());
+                    }
+                };
                 let step = buttered_dasd::backup::archive_boot(&cfg, &progress);
                 let still_mounted = guard.unmount(&progress);
                 println!("Boot subvolumes: {}", step.row());
@@ -3107,6 +3349,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BackupAction::MountTarget { label, config } => {
                 std::process::exit(cmd_mount_target(&label, &config));
+            }
+            BackupAction::RaidCheck { label, config } => {
+                std::process::exit(cmd_raid_check(&label, &config));
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {
@@ -3704,6 +3949,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // ----- Scrub commands -----
+        Commands::Raid { action } => match action {
+            RaidAction::Accept { label, config, db } => {
+                std::process::exit(cmd_raid_accept(&label, &config, &db));
+            }
+        },
         Commands::Scrub { action } => match action {
             ScrubAction::Run { config } => {
                 let cfg = Config::load(&config)?;
@@ -4004,6 +4254,28 @@ mod tests {
     /// `backup run --sources/--targets` and what the run is handed (bd
     /// DAS-Backup-Manager-7tx): no flag is "all"; a flag is exactly what it
     /// names; a flag naming nothing real is a label nobody has, never "all".
+    /// bd DAS-Backup-Manager-su1b.11: `raid accept` takes the label and
+    /// nothing that answers for the operator — there is no `--yes`.
+    #[test]
+    fn raid_accept_takes_a_label_and_has_no_yes() {
+        match Cli::try_parse_from(["btrdasd", "raid", "accept", "primary"])
+            .unwrap()
+            .command
+        {
+            Commands::Raid {
+                action: RaidAction::Accept { label, .. },
+            } => assert_eq!(label, "primary"),
+            _ => panic!("not raid accept"),
+        }
+        for extra in ["--yes", "-y", "--force"] {
+            assert!(
+                Cli::try_parse_from(["btrdasd", "raid", "accept", "primary", extra]).is_err(),
+                "{extra} accepted"
+            );
+        }
+        assert!(Cli::try_parse_from(["btrdasd", "raid", "accept"]).is_err());
+    }
+
     #[test]
     fn backup_run_flags_become_a_selection_and_never_widen_to_all() {
         let selection = |extra: &[&str]| {

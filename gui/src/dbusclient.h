@@ -62,6 +62,21 @@ public:
                                           const QString &subvolume,
                                           const QString &target);
 
+    // `btrdasd raid accept` (bd DAS-Backup-Manager-su1b.11). `ok` with the
+    // helper's text, or `ok == false` with why (polkit, nothing to accept, a
+    // lock held, the helper unavailable): shown in the dialog, so neither
+    // emits errorOccurred.
+    struct RaidReply {
+        bool ok = false;
+        QString text;
+    };
+    RaidReply raidAcceptPreview(const QString &label);
+    // `typed` is what the operator typed; the helper compares it with the
+    // label itself. Uses the long timeout: polkit asks, then the target is
+    // probe-mounted, the record written and a degraded mount made and taken
+    // down.
+    RaidReply raidAccept(const QString &label, const QString &typed);
+
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();
     // Turns a HealthQuery reply into healthQueryResult, and a failed one into

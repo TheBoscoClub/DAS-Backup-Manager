@@ -57,6 +57,7 @@ target_sources(btrdasd-gui PRIVATE
     src/recoverypanel.cpp
     src/configdialog.cpp
     src/coveragedialog.cpp
+    src/raidacceptdialog.cpp
     src/snapshotbrowser.cpp
 )
 
@@ -115,6 +116,7 @@ if(BUILD_TESTING)
         src/backuppanel.cpp
         src/configdialog.cpp
         src/coveragedialog.cpp
+        src/raidacceptdialog.cpp
         src/panelconfig.cpp
         src/progresspanel.cpp
         src/indexrunner.cpp

@@ -22,7 +22,9 @@ use std::time::Duration;
 /// 8 — `coverage_baseline.volume_uuid`: the pair's source volume by its
 ///     filesystem UUID, so a moved mount path is followed (bd
 ///     DAS-Backup-Manager-sp78.6). NULL on a row an earlier binary wrote.
-pub const SCHEMA_VERSION: i64 = 8;
+/// 9 — `raid_accepted`: the `btrdasd raid accept` log (bd
+///     DAS-Backup-Manager-su1b.11), made by `CREATE TABLE IF NOT EXISTS`.
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Series key for a snapshot: its `name` and `source` joined by US (0x1f).
 ///
@@ -237,10 +239,27 @@ CREATE TABLE IF NOT EXISTS coverage_accepted (
 );
 "#;
 
-/// Every table this schema has: schema 4's, then the coverage tables.
+/// The `btrdasd raid accept` log (schema 9, bd DAS-Backup-Manager-su1b.11):
+/// one row per accept, never changed after.
+const RAID_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS raid_accepted (
+    id            INTEGER PRIMARY KEY,
+    accepted_at   INTEGER NOT NULL,        -- Unix seconds
+    target        TEXT NOT NULL,           -- target label
+    fsid          TEXT NOT NULL,
+    accepted      TEXT NOT NULL,           -- '<devid> <dev_uuid>', comma-separated
+    rejected      TEXT NOT NULL,           -- the members given up, the same way
+    period_since  INTEGER NOT NULL,        -- the period given up
+    period_last   INTEGER NOT NULL
+);
+"#;
+
+/// Every table this schema has: schema 4's, the coverage tables, the RAID
+/// accept log.
 fn create_tables(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(SCHEMA_SQL)?;
-    conn.execute_batch(COVERAGE_SQL)
+    conn.execute_batch(COVERAGE_SQL)?;
+    conn.execute_batch(RAID_SQL)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,6 +370,7 @@ impl Database {
         Self::add_coverage_column(conn, "subvol_uuid")?;
         // v7 -> v8: coverage_baseline.volume_uuid, the same way.
         Self::add_coverage_column(conn, "volume_uuid")?;
+        // v8 -> v9: raid_accepted, made by RAID_SQL's IF NOT EXISTS.
         // v4 -> v5: coverage_* tables, made by COVERAGE_SQL's IF NOT EXISTS;
         // the stamp advances below. An older database re-runs the steps above,
         // each idempotent by the table's shape. An older binary on a newer
@@ -1645,6 +1665,42 @@ pub fn newest_successful_run_read_only(path: &Path) -> Result<Option<i64>, Strin
     }
 }
 
+/// How many backup runs the history at `path` records with a timestamp in
+/// `[from, to]` (Unix seconds), read as [`open_read_only`] reads: `None` when
+/// no database is there; `Err` when it cannot be read — never 0 for a
+/// database that could not be asked (bd DAS-Backup-Manager-su1b.11).
+pub fn count_backup_runs_between_read_only(
+    path: &Path,
+    from: i64,
+    to: i64,
+) -> Result<Option<u64>, String> {
+    match open_read_only(path)? {
+        None => Ok(None),
+        Some(conn) => conn
+            .query_row(
+                "SELECT COUNT(*) FROM backup_runs WHERE timestamp >= ?1 AND timestamp <= ?2",
+                [from, to],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| Some(n.max(0) as u64))
+            .map_err(|e| format!("{}: {e}", path.display())),
+    }
+}
+
+/// One `btrdasd raid accept`, for the history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaidAcceptance {
+    pub accepted_at: i64,
+    pub target: String,
+    pub fsid: String,
+    /// `<devid> <dev_uuid>` of each member accepted, comma-separated.
+    pub accepted: String,
+    /// `<devid> <dev_uuid>` of each member given up, comma-separated.
+    pub rejected: String,
+    pub period_since: i64,
+    pub period_last: i64,
+}
+
 /// The coverage baseline at `path`, read without creating or migrating
 /// anything: `None` when the file is absent, older than schema 5, or holds
 /// no recorded check; `Err` when it cannot be opened or read.
@@ -1664,6 +1720,46 @@ pub fn read_accepted_read_only(path: &Path) -> Result<Vec<AcceptedCoverage>, Str
 }
 
 impl Database {
+    /// Record one `btrdasd raid accept` (bd DAS-Backup-Manager-su1b.11).
+    pub fn record_raid_accept(&self, a: &RaidAcceptance) -> SqlResult<i64> {
+        self.conn.execute(
+            "INSERT INTO raid_accepted
+                 (accepted_at, target, fsid, accepted, rejected, period_since, period_last)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                a.accepted_at,
+                a.target,
+                a.fsid,
+                a.accepted,
+                a.rejected,
+                a.period_since,
+                a.period_last
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every recorded `raid accept`, oldest first.
+    pub fn raid_acceptances(&self) -> SqlResult<Vec<RaidAcceptance>> {
+        self.conn
+            .prepare(
+                "SELECT accepted_at, target, fsid, accepted, rejected, period_since, period_last
+                 FROM raid_accepted ORDER BY id",
+            )?
+            .query_map([], |r| {
+                Ok(RaidAcceptance {
+                    accepted_at: r.get(0)?,
+                    target: r.get(1)?,
+                    fsid: r.get(2)?,
+                    accepted: r.get(3)?,
+                    rejected: r.get(4)?,
+                    period_since: r.get(5)?,
+                    period_last: r.get(6)?,
+                })
+            })?
+            .collect()
+    }
+
     /// The coverage baseline, as [`read_coverage_read_only`] defines it.
     pub fn coverage_baseline(&self) -> SqlResult<Option<Baseline>> {
         read_baseline(&self.conn)
@@ -1835,6 +1931,50 @@ fn owner_only(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// bd DAS-Backup-Manager-su1b.11: the accept log, and the run count an
+    /// accept shows, which is unknown rather than 0 when it cannot be read.
+    #[test]
+    fn raid_accepts_are_logged_and_runs_in_a_period_are_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("i.db");
+        assert_eq!(
+            count_backup_runs_between_read_only(&path, 0, 10),
+            Ok(None),
+            "no database"
+        );
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        for ts in [100, 200, 300, 400] {
+            db.conn
+                .execute(
+                    "INSERT INTO backup_runs (timestamp, success, mode) VALUES (?1, 1, 'incremental')",
+                    [ts],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            count_backup_runs_between_read_only(&path, 200, 300),
+            Ok(Some(2))
+        );
+        assert_eq!(
+            count_backup_runs_between_read_only(&path, 500, 600),
+            Ok(Some(0))
+        );
+        let a = RaidAcceptance {
+            accepted_at: 999,
+            target: "primary".into(),
+            fsid: "5eed0016-0000-4000-8000-000000000016".into(),
+            accepted: "2 5eed00a2-0000-4000-8000-0000000000a2".into(),
+            rejected: "1 5eed00a1-0000-4000-8000-0000000000a1".into(),
+            period_since: 200,
+            period_last: 300,
+        };
+        let id = db.record_raid_accept(&a).unwrap();
+        assert!(id > 0);
+        assert_eq!(db.raid_acceptances().unwrap(), [a]);
+        std::fs::write(dir.path().join("bad.db"), "not sqlite").unwrap();
+        assert!(count_backup_runs_between_read_only(&dir.path().join("bad.db"), 0, 1).is_err());
+    }
     use super::*;
 
     /// bd DAS-Backup-Manager-sp78.19: what `owner_only` leaves alone, and
@@ -4127,7 +4267,7 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_current_schema_with_the_coverage_tables() {
         let db = Database::open(":memory:").unwrap();
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
         assert_eq!(user_version(&db.conn), SCHEMA_VERSION);
         assert_eq!(tables(&db.conn), COVERAGE_TABLES);
         assert_eq!(

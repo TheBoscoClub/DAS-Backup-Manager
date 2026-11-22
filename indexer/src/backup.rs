@@ -4470,9 +4470,14 @@ impl BackupJobHost for SystemBackupHost {
         progress: &dyn ProgressCallback,
         held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String> {
-        mount::ensure_targets_mounted(config, progress, held)
-            .map(|guard| Box::new(guard) as Box<dyn Release>)
-            .map_err(|e| e.to_string())
+        mount::ensure_targets_mounted(
+            config,
+            crate::raid_guard::Job::Backup.intent(),
+            progress,
+            held,
+        )
+        .map(|guard| Box::new(guard) as Box<dyn Release>)
+        .map_err(|e| e.to_string())
     }
 
     fn run(
@@ -4849,9 +4854,14 @@ impl RecordHost for SystemRecordHost {
         progress: &dyn ProgressCallback,
         held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String> {
-        mount::ensure_targets_mounted(&mounted_read_only(drives), progress, held)
-            .map(|guard| Box::new(guard) as Box<dyn Release>)
-            .map_err(|e| e.to_string())
+        mount::ensure_targets_mounted(
+            &mounted_read_only(drives),
+            crate::raid_guard::Job::RecoveryOsRecord.intent(),
+            progress,
+            held,
+        )
+        .map(|guard| Box::new(guard) as Box<dyn Release>)
+        .map_err(|e| e.to_string())
     }
 
     fn is_mounted(&self, mount: &Path) -> bool {

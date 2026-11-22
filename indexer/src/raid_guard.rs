@@ -32,6 +32,13 @@
 //!    closed). Only "no such file" is "no record".
 //! 7. After a normal mount the kernel's own view (`/sys/fs/btrfs/<fsid>/
 //!    devinfo/<devid>/missing`) must show no member missing.
+//! 8. What the job will do to the target is the caller's to say, never
+//!    inferred ([`Intent`], bd DAS-Backup-Manager-su1b.11, operator
+//!    2026-11-22): a job that only reads it (walk, restore, browsing, the
+//!    doctor) is given the split-brain member read-only —
+//!    [`STALE_READ_OPTS`], nothing replayed, no record changed — with a
+//!    warning naming the date its data stops; a job that writes stays
+//!    refused.
 //!
 //! Single-device targets never come here.
 
@@ -58,6 +65,106 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// The read-only probe mount that reads the witness before a degraded mount
 /// is decided: nothing is written to the member, log replay included.
 pub const PROBE_OPTS: &str = "ro,degraded,rescue=nologreplay";
+/// What a read-only job's mount of a split-brain member adds to the
+/// configured options (`degraded` and any `rw` taken out first).
+pub const STALE_READ_OPTS: &str = "ro,degraded,rescue=nologreplay";
+
+/// What the job that asks for a mount will do to the target. Every caller
+/// says it, through [`Job::intent`]; nothing infers it from the mount
+/// options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// The job writes the target, or writes state derived from its contents
+    /// (the index, a record): given a split-brain member it is refused.
+    Write,
+    /// The job persists nothing derived from what it reads: it may read a
+    /// split-brain member, read-only.
+    ReadOnly,
+}
+
+/// Every job that mounts a target, and the [`Intent`] it mounts with. Only a
+/// job that persists nothing derived from the target's contents (browsing,
+/// restoring a file or snapshot to the host, the doctor's report) is
+/// [`Intent::ReadOnly`]. A walk, an index job, reindex and reconcile
+/// (`--rebuild`, `--repair` included) write the index from what the mount
+/// shows, and the recovery-OS reading writes its state file: on a
+/// split-brain member they would delete real index entries and record old
+/// contents as current, so they are [`Intent::Write`] and refused (bd
+/// DAS-Backup-Manager-su1b.11, security review 2026-11-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// `btrdasd backup run|snapshot|send|static`, the helper's `BackupRun`.
+    Backup,
+    /// `btrdasd backup boot-archive`.
+    BootArchive,
+    /// `btrdasd forget`, `btrdasd purge`.
+    Forget,
+    /// The scrub engine.
+    Scrub,
+    /// `btrdasd backup mount-target`, for `backup-run.sh`.
+    MountTarget,
+    /// `btrdasd walk`.
+    Walk,
+    /// The helper's `IndexWalk`.
+    IndexWalk,
+    /// `btrdasd reindex`.
+    Reindex,
+    /// `btrdasd reconcile`.
+    Reconcile,
+    /// `btrdasd recovery-os record` and the backup's recovery-OS reading.
+    RecoveryOsRecord,
+    /// `btrdasd restore file`, the helper's `RestoreFiles`.
+    RestoreFiles,
+    /// `btrdasd restore snapshot`, the helper's `RestoreSnapshot`.
+    RestoreSnapshot,
+    /// `btrdasd restore browse`.
+    Browse,
+    /// `btrdasd doctor`'s delivery check (a report; it records nothing).
+    Doctor,
+    /// `btrdasd raid accept`: it rewrites the record and the witness.
+    RaidAccept,
+}
+
+impl Job {
+    /// Every job, for the tests that hold the table to its rule.
+    pub const ALL: [Job; 15] = [
+        Job::Backup,
+        Job::BootArchive,
+        Job::Forget,
+        Job::Scrub,
+        Job::MountTarget,
+        Job::Walk,
+        Job::IndexWalk,
+        Job::Reindex,
+        Job::Reconcile,
+        Job::RecoveryOsRecord,
+        Job::RestoreFiles,
+        Job::RestoreSnapshot,
+        Job::Browse,
+        Job::Doctor,
+        Job::RaidAccept,
+    ];
+
+    /// The intent this job mounts with.
+    pub const fn intent(self) -> Intent {
+        match self {
+            Job::RestoreFiles | Job::RestoreSnapshot | Job::Browse | Job::Doctor => {
+                Intent::ReadOnly
+            }
+            Job::Backup
+            | Job::BootArchive
+            | Job::Forget
+            | Job::Scrub
+            | Job::MountTarget
+            | Job::Walk
+            | Job::IndexWalk
+            | Job::Reindex
+            | Job::Reconcile
+            | Job::RecoveryOsRecord
+            | Job::RaidAccept => Intent::Write,
+        }
+    }
+}
 /// The first line of every record copy.
 const FORMAT_LINE: &str = "format=das-backup-raid-record 1";
 
@@ -111,6 +218,25 @@ pub fn with_degraded(opts: &str) -> String {
     } else {
         format!("{base},degraded")
     }
+}
+
+/// `opts` for a read-only job's mount of a split-brain member: the configured
+/// options without `degraded`, `rw` or `ro`, then [`STALE_READ_OPTS`].
+pub fn stale_read_opts(opts: &str) -> String {
+    let base: Vec<&str> = tokens(opts)
+        .filter(|o| !matches!(*o, "degraded" | "rw" | "ro"))
+        .collect();
+    if base.is_empty() {
+        STALE_READ_OPTS.into()
+    } else {
+        format!("{},{STALE_READ_OPTS}", base.join(","))
+    }
+}
+
+/// `epoch` as the host's local date and time, or the bare number when the C
+/// library cannot convert it.
+pub fn when(epoch: i64) -> String {
+    crate::caldate::local_datetime(epoch).unwrap_or_else(|| format!("epoch {epoch}"))
 }
 
 /// Whether `opts` asks for a read-only mount.
@@ -213,6 +339,10 @@ pub enum State {
     /// Every member is present again; a scrub is owed before the pair is
     /// trusted.
     ScrubOwed,
+    /// No degraded period is open and no scrub is owed, but members retired
+    /// by `btrdasd raid accept` ([`Record::rejected`]) are still refused. Only
+    /// with at least one rejected member.
+    Settled,
 }
 
 impl State {
@@ -220,6 +350,17 @@ impl State {
         match self {
             Self::Degraded => "degraded",
             Self::ScrubOwed => "scrub-owed",
+            Self::Settled => "settled",
+        }
+    }
+
+    /// How cautious the state is, for merging two copies: the more cautious
+    /// wins.
+    fn caution(self) -> u8 {
+        match self {
+            Self::Degraded => 2,
+            Self::ScrubOwed => 1,
+            Self::Settled => 0,
         }
     }
 }
@@ -247,12 +388,23 @@ pub struct Record {
     pub last: i64,
     /// When every member was first seen present again (scrub-owed only).
     pub rejoined: Option<i64>,
+    /// Members `btrdasd raid accept` gave up (bd DAS-Backup-Manager-su1b.11):
+    /// refused, alone or beside the others, while their superblock is found.
+    /// Each is `<devid> <dev_uuid> <generation>`, its generation when the
+    /// period it ran on was recorded. Kept across the scrub (state
+    /// [`State::Settled`]).
+    pub rejected: Vec<PeriodMember>,
 }
 
 impl Record {
     /// The per-device UUIDs the period ran on.
     pub fn dev_uuids(&self) -> BTreeSet<&str> {
         self.members.iter().map(|m| m.dev_uuid.as_str()).collect()
+    }
+
+    /// The per-device UUIDs `btrdasd raid accept` gave up.
+    pub fn rejected_uuids(&self) -> BTreeSet<&str> {
+        self.rejected.iter().map(|m| m.dev_uuid.as_str()).collect()
     }
 
     /// The text of one copy.
@@ -268,6 +420,12 @@ impl Record {
                 m.devid, m.dev_uuid, m.generation
             ));
         }
+        for m in &self.rejected {
+            out.push_str(&format!(
+                "rejected={} {} {}\n",
+                m.devid, m.dev_uuid, m.generation
+            ));
+        }
         out.push_str(&format!("since={}\nlast={}\n", self.since, self.last));
         if let Some(r) = self.rejoined {
             out.push_str(&format!("rejoined={r}\n"));
@@ -276,8 +434,9 @@ impl Record {
     }
 
     /// Parse one copy, strictly: the format line first, every key known,
-    /// each once (`member` one or more times), `rejoined` exactly when the
-    /// state is `scrub-owed`, and `fsid` equal to `fsid`.
+    /// each once (`member` one or more times, `rejected` any number),
+    /// `rejoined` exactly when the state is `scrub-owed`, `settled` only with
+    /// a `rejected` line, and `fsid` equal to `fsid`.
     pub fn parse(text: &str, fsid: &str) -> Result<Self, String> {
         let mut lines = text.lines();
         if lines.next() != Some(FORMAT_LINE) {
@@ -286,6 +445,7 @@ impl Record {
         let (mut rec_fsid, mut state, mut since, mut last, mut rejoined) =
             (None, None, None, None, None);
         let mut members = Vec::new();
+        let mut rejected = Vec::new();
         for line in lines {
             let Some((key, value)) = line.split_once('=') else {
                 return Err(format!("'{line}' is not key=value"));
@@ -304,26 +464,16 @@ impl Record {
                 "since" => once(&mut since)?,
                 "last" => once(&mut last)?,
                 "rejoined" => once(&mut rejoined)?,
-                "member" => {
-                    let parts: Vec<&str> = value.split(' ').collect();
-                    let [devid, dev_uuid, generation] = parts[..] else {
-                        return Err(format!(
-                            "member '{value}' is not '<devid> <dev_uuid> <generation>'"
-                        ));
-                    };
-                    let (Ok(devid), Ok(generation)) = (devid.parse(), generation.parse()) else {
-                        return Err(format!(
-                            "member '{value}' has a devid or generation that is not a number"
-                        ));
-                    };
-                    if !is_uuid(dev_uuid) {
-                        return Err(format!("member '{value}' has no device UUID"));
+                "member" => members.push(parse_member(key, value)?),
+                "rejected" => {
+                    let m = parse_member(key, value)?;
+                    if rejected
+                        .iter()
+                        .any(|r: &PeriodMember| r.dev_uuid == m.dev_uuid)
+                    {
+                        return Err(format!("rejected '{value}' appears twice"));
                     }
-                    members.push(PeriodMember {
-                        devid,
-                        dev_uuid: dev_uuid.to_ascii_lowercase(),
-                        generation,
-                    });
+                    rejected.push(m);
                 }
                 _ => return Err(format!("unknown key '{key}'")),
             }
@@ -336,9 +486,10 @@ impl Record {
         let state = match need(state, "state")?.as_str() {
             "degraded" => State::Degraded,
             "scrub-owed" => State::ScrubOwed,
+            "settled" => State::Settled,
             other => {
                 return Err(format!(
-                    "state '{other}' is neither degraded nor scrub-owed"
+                    "state '{other}' is not degraded, scrub-owed or settled"
                 ));
             }
         };
@@ -352,10 +503,23 @@ impl Record {
         match (state, rejoined) {
             (State::ScrubOwed, None) => return Err("scrub-owed without 'rejoined'".into()),
             (State::Degraded, Some(_)) => return Err("degraded with 'rejoined'".into()),
+            (State::Settled, Some(_)) => return Err("settled with 'rejoined'".into()),
             _ => {}
         }
         if members.is_empty() {
             return Err("no 'member' line".into());
+        }
+        if state == State::Settled && rejected.is_empty() {
+            return Err("settled without a 'rejected' line".into());
+        }
+        if let Some(m) = members
+            .iter()
+            .find(|m| rejected.iter().any(|r| r.dev_uuid == m.dev_uuid))
+        {
+            return Err(format!(
+                "device {} is both a member and rejected",
+                m.dev_uuid
+            ));
         }
         Ok(Self {
             fsid: rec_fsid.to_ascii_lowercase(),
@@ -364,8 +528,32 @@ impl Record {
             since,
             last,
             rejoined,
+            rejected,
         })
     }
+}
+
+/// One `member=` or `rejected=` value: `<devid> <dev_uuid> <generation>`.
+fn parse_member(key: &str, value: &str) -> Result<PeriodMember, String> {
+    let parts: Vec<&str> = value.split(' ').collect();
+    let [devid, dev_uuid, generation] = parts[..] else {
+        return Err(format!(
+            "{key} '{value}' is not '<devid> <dev_uuid> <generation>'"
+        ));
+    };
+    let (Ok(devid), Ok(generation)) = (devid.parse(), generation.parse()) else {
+        return Err(format!(
+            "{key} '{value}' has a devid or generation that is not a number"
+        ));
+    };
+    if !is_uuid(dev_uuid) {
+        return Err(format!("{key} '{value}' has no device UUID"));
+    }
+    Ok(PeriodMember {
+        devid,
+        dev_uuid: dev_uuid.to_ascii_lowercase(),
+        generation,
+    })
 }
 
 /// What reading one copy found.
@@ -474,22 +662,30 @@ pub fn merged(primary: &Copy, witness: &Copy) -> Result<Option<Record>, String> 
                     names(&b.dev_uuids())
                 ));
             }
-            let degraded = a.state == State::Degraded || b.state == State::Degraded;
+            let state = if a.state.caution() >= b.state.caution() {
+                a.state
+            } else {
+                b.state
+            };
+            // Every member either copy rejected stays rejected.
+            let mut rejected = a.rejected.clone();
+            for r in &b.rejected {
+                if !rejected.iter().any(|o| o.dev_uuid == r.dev_uuid) {
+                    rejected.push(r.clone());
+                }
+            }
             Ok(Some(Record {
                 fsid: a.fsid.clone(),
-                state: if degraded {
-                    State::Degraded
-                } else {
-                    State::ScrubOwed
-                },
+                state,
                 members: a.members.clone(),
                 since: a.since.min(b.since),
                 last: a.last.max(b.last),
-                rejoined: if degraded {
-                    None
-                } else {
+                rejoined: if state == State::ScrubOwed {
                     a.rejoined.max(b.rejoined)
+                } else {
+                    None
                 },
+                rejected,
             }))
         }
     }
@@ -504,6 +700,11 @@ fn names(set: &BTreeSet<&str>) -> String {
 pub enum Verdict {
     /// Yes; this is the record to write before it is used.
     Allow(Record),
+    /// No: the present members lack the writes of the last degraded period,
+    /// which ran on others (`record`). Refused for writing, whatever the
+    /// state; a read-only job may read them ([`Intent::ReadOnly`]).
+    SplitBrain { record: Record, why: String },
+    /// No, for any job: a copy unreadable, or the copies disagree.
     Refuse(String),
 }
 
@@ -542,8 +743,30 @@ pub fn degraded_verdict(
             since: now,
             last: now,
             rejoined: None,
+            rejected: Vec::new(),
         });
     };
+    if let Some(why) = rejected_present(&record, present) {
+        return Verdict::Refuse(why);
+    }
+    if record.state == State::Settled {
+        // No period open: a new one on `present`, the rejection kept.
+        return Verdict::Allow(Record {
+            state: State::Degraded,
+            members: present
+                .iter()
+                .map(|m| PeriodMember {
+                    devid: m.devid,
+                    dev_uuid: m.dev_uuid.clone(),
+                    generation: m.generation,
+                })
+                .collect(),
+            since: now,
+            last: now,
+            rejoined: None,
+            ..record
+        });
+    }
     let period = record.dev_uuids();
     let strangers: Vec<String> = present
         .iter()
@@ -551,7 +774,7 @@ pub fn degraded_verdict(
         .map(|m| format!("devid {} ({})", m.devid, m.dev_uuid))
         .collect();
     if !strangers.is_empty() {
-        return Verdict::Refuse(format!(
+        let why = format!(
             "split brain: the last degraded period (since {}) ran on {}, and {} — which \
              lacks that period's writes — is the only member present{}; mounting it degraded \
              would give the filesystem two diverging histories",
@@ -563,7 +786,8 @@ pub fn degraded_verdict(
             } else {
                 ""
             }
-        ));
+        );
+        return Verdict::SplitBrain { record, why };
     }
     let members = record
         .members
@@ -580,6 +804,31 @@ pub fn degraded_verdict(
     })
 }
 
+/// The refusal of a present member `btrdasd raid accept` gave up, if one is
+/// among `present`.
+pub fn rejected_present(record: &Record, present: &[Member]) -> Option<String> {
+    let rejected = record.rejected_uuids();
+    let found: Vec<&Member> = present
+        .iter()
+        .filter(|m| rejected.contains(m.dev_uuid.as_str()))
+        .collect();
+    (!found.is_empty()).then(|| rejected_why(&found))
+}
+
+fn rejected_why(found: &[&Member]) -> String {
+    format!(
+        "{} was given up by 'btrdasd raid accept' and lacks the writes made since: \
+         refused, alone or beside the other members, until it is wiped (wipefs) or \
+         removed from the filesystem (btrfs device remove, btrfs replace) — take it out \
+         of the enclosure",
+        found
+            .iter()
+            .map(|m| format!("devid {} ({}) at {}", m.devid, m.dev_uuid, m.path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// What a normal mount (every member present) does with the record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejoin {
@@ -590,6 +839,8 @@ pub enum Rejoin {
         record: Record,
         write_primary: bool,
         write_witness: bool,
+        /// The record was degraded: this mount is the rejoin.
+        rejoined_now: bool,
     },
     /// A copy could not be read: nothing is changed.
     Unreadable(String),
@@ -602,6 +853,7 @@ pub fn rejoin(primary: &Copy, witness: &Copy, now: i64) -> Rejoin {
         Ok(Some(r)) => r,
         Err(e) => return Rejoin::Unreadable(e),
     };
+    let rejoined_now = record.state == State::Degraded;
     let record = match record.state {
         State::Degraded => Record {
             state: State::ScrubOwed,
@@ -609,8 +861,10 @@ pub fn rejoin(primary: &Copy, witness: &Copy, now: i64) -> Rejoin {
             ..record
         },
         State::ScrubOwed => record,
+        State::Settled => return Rejoin::Clean,
     };
     Rejoin::Owed {
+        rejoined_now,
         write_primary: *primary != Copy::Read(record.clone()),
         write_witness: *witness != Copy::Read(record.clone()),
         record,
@@ -655,8 +909,20 @@ pub fn clear_after_scrub(
         Ok(m) => return Err(format!("the kernel shows devid(s) {m:?} missing")),
         Err(e) => return Err(format!("whether a member is missing cannot be read ({e})")),
     }
-    remove_copy(&witness_path)?;
-    remove_copy(&primary_path)?;
+    if record.rejected.is_empty() {
+        remove_copy(&witness_path)?;
+        remove_copy(&primary_path)?;
+    } else {
+        // The debt is paid, the rejection is not lifted: `settled`, witness
+        // first (a primary left `scrub-owed` merges as the more cautious).
+        let settled = Record {
+            state: State::Settled,
+            rejoined: None,
+            ..record.clone()
+        };
+        write_copy(&witness_path, &settled, false)?;
+        write_copy(&primary_path, &settled, true)?;
+    }
     Ok(Some(record))
 }
 
@@ -696,6 +962,36 @@ pub fn missing_devids_under(root: &Path, fsid: &str) -> Result<Vec<u64>, String>
     Ok(missing)
 }
 
+/// Every devid the kernel lists for a mounted filesystem, and whether it is
+/// missing: `<root>/<fsid>/devinfo/<devid>/missing`. An unreadable directory
+/// or flag is an error.
+pub fn devinfo_under(root: &Path, fsid: &str) -> Result<Vec<(u64, bool)>, String> {
+    let dir = root.join(fsid.to_ascii_lowercase()).join("devinfo");
+    let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = entry.file_name();
+        let Some(devid) = name.to_str().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let flag = entry.path().join("missing");
+        let text = fs::read_to_string(&flag).map_err(|e| format!("{}: {e}", flag.display()))?;
+        match text.trim() {
+            "0" => out.push((devid, false)),
+            "1" => out.push((devid, true)),
+            other => {
+                return Err(format!("{}: '{other}', neither 0 nor 1", flag.display()));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("{}: lists no device", dir.display()));
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// [`missing_devids_under`] `/sys/fs/btrfs`.
 pub fn missing_devids(fsid: &str) -> Result<Vec<u64>, String> {
     missing_devids_under(Path::new("/sys/fs/btrfs"), fsid)
@@ -714,6 +1010,17 @@ pub trait MemberHost {
     fn members(&self, fsid: &str) -> Result<Vec<String>, String>;
     /// `btrfs device scan <path>`: register this one device.
     fn scan(&self, path: &str) -> Result<(), String>;
+    /// `btrfs device scan --forget <path>`: unregister this one device, by
+    /// its exact path (never unscoped).
+    fn forget(&self, path: &str) -> Result<(), String>;
+    /// `mount -t btrfs -o <opts> <device> <at>`: one member by its own path.
+    fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String>;
+    /// A new private, empty directory to probe-mount one member at.
+    fn temp_mountpoint(&self) -> Result<String, String>;
+    /// Remove the directory [`MemberHost::temp_mountpoint`] made.
+    fn remove_mountpoint(&self, at: &str) -> Result<(), String>;
+    /// Whether filesystem `fsid` is mounted anywhere now.
+    fn fsid_mounted(&self, fsid: &str) -> Result<bool, String>;
     /// `btrfs inspect-internal dump-super <path>`.
     fn read_super(&self, path: &str) -> Result<String, String>;
     /// Whether a drive with this serial is attached.
@@ -723,6 +1030,9 @@ pub trait MemberHost {
     fn umount(&self, mount: &str) -> Result<(), String>;
     /// The kernel's missing devids for the mounted filesystem.
     fn missing_devids(&self, fsid: &str) -> Result<Vec<u64>, String>;
+    /// Every devid the kernel lists for the mounted filesystem, and whether
+    /// it is missing ([`devinfo_under`]).
+    fn devinfo(&self, fsid: &str) -> Result<Vec<(u64, bool)>, String>;
     /// The witness copy on the filesystem now mounted at `mount`.
     fn read_witness(&self, mount: &str, fsid: &str) -> Copy;
     fn write_witness(&self, mount: &str, record: &Record) -> Result<(), String>;
@@ -740,6 +1050,8 @@ pub struct Plan<'a> {
     pub mount_opts: &'a str,
     pub wait: Duration,
     pub record_dir: &'a Path,
+    /// What the job will do to the target; never inferred.
+    pub intent: Intent,
 }
 
 /// How a guarded mount came up.
@@ -755,7 +1067,25 @@ pub enum Outcome {
         /// A record copy that could not be read or written (WARN; nothing
         /// changed).
         record_problem: Option<String>,
+        /// This mount turned a degraded record into scrub-owed (the rejoin):
+        /// the job that made it starts the owed scrub once it has let its
+        /// locks go (bd DAS-Backup-Manager-su1b.14).
+        rejoined_now: bool,
     },
+    /// Split brain, for a read-only job: mounted read-only
+    /// ([`STALE_READ_OPTS`]) on `members`, which lack the writes of the
+    /// degraded period in `record` (unchanged). Nothing is written to it.
+    StaleReadOnly {
+        members: Vec<Member>,
+        absent_serials: Vec<String>,
+        expected: u64,
+        record: Record,
+    },
+    /// No readable record can vouch for the members (the primary copy is
+    /// unreadable, or absent while their superblock generations differ), for
+    /// a read-only job: mounted read-only ([`STALE_READ_OPTS`]), nothing
+    /// written. A job that writes is refused.
+    ReadOnly { members: Vec<Member>, why: String },
     /// A member is absent: mounted degraded on `members`.
     Degraded {
         members: Vec<Member>,
@@ -768,8 +1098,8 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The one-line status this mount reports: `OK`, `SCRUB-OWED` or
-    /// `DEGRADED`, and the detail.
+    /// The one-line status this mount reports: `OK`, `SCRUB-OWED`,
+    /// `DEGRADED` or `STALE-READ-ONLY`, and the detail.
     pub fn status_line(&self) -> (&'static str, String) {
         match self {
             Self::Normal {
@@ -777,6 +1107,7 @@ impl Outcome {
                 waited,
                 owed,
                 record_problem,
+                rejoined_now,
             } => {
                 let base = format!(
                     "all {} members present ({}){}",
@@ -792,20 +1123,76 @@ impl Outcome {
                     ("WARN", format!("{base}; RAID record problem: {problem}"))
                 } else if let Some(r) = owed {
                     (
-                        "SCRUB-OWED",
+                        if *rejoined_now {
+                            "REJOINED"
+                        } else {
+                            "SCRUB-OWED"
+                        },
                         format!(
                             "{base}; a scrub is owed before the pair is trusted: degraded on {} \
-                             from {} to {}, rejoined {}",
+                             from {} to {}, rejoined {}{}",
                             names(&r.dev_uuids()),
                             r.since,
                             r.last,
-                            r.rejoined.unwrap_or(r.last)
+                            r.rejoined.unwrap_or(r.last),
+                            if *rejoined_now {
+                                "; the scrub starts once this job has ended"
+                            } else {
+                                ""
+                            }
                         ),
                     )
                 } else {
                     ("OK", base)
                 }
             }
+            Self::ReadOnly { members, why } => (
+                "READ-ONLY",
+                format!(
+                    "mounted READ-ONLY ({STALE_READ_OPTS}) for a job that only reads, nothing \
+                     written: {why}; members {}",
+                    member_list(members)
+                ),
+            ),
+            Self::StaleReadOnly {
+                members,
+                absent_serials,
+                expected,
+                record,
+            } => (
+                "STALE-READ-ONLY",
+                format!(
+                    "split brain, mounted READ-ONLY ({STALE_READ_OPTS}) for a job that only \
+                     reads: {} of {expected} members present ({}), which lack the writes of the \
+                     last degraded period — it ran on {} from {} to {}{} — so the data here \
+                     stops no later than {}; absent drive(s) {}; nothing is written to it and \
+                     the record is unchanged; every job that writes the target stays refused \
+                     until that drive returns (or 'btrdasd raid accept')",
+                    members.len(),
+                    members
+                        .iter()
+                        .map(|m| format!(
+                            "devid {} {} {}, superblock generation {}",
+                            m.devid, m.dev_uuid, m.path, m.generation
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    names(&record.dev_uuids()),
+                    when(record.since),
+                    when(record.last),
+                    if record.state == State::ScrubOwed {
+                        ", rejoined and not yet scrubbed"
+                    } else {
+                        ""
+                    },
+                    when(record.since),
+                    if absent_serials.is_empty() {
+                        "unknown (no serial configured)".to_string()
+                    } else {
+                        absent_serials.join(", ")
+                    },
+                ),
+            ),
             Self::Degraded {
                 members,
                 absent_serials,
@@ -869,7 +1256,9 @@ impl Failure {
 
 /// The one line `btrdasd backup mount-target` prints for `backup-run.sh`, and
 /// its exit status: `RAID GUARD: <STATUS>  (<detail>)`, two spaces, with
-/// STATUS one of `OK`, `WARN`, `SCRUB-OWED`, `DEGRADED` (exit 0: mounted),
+/// STATUS one of `OK`, `WARN`, `SCRUB-OWED`, `REJOINED` (a scrub is owed and
+/// this mount is the rejoin: the caller starts it once it has let its locks
+/// go), `DEGRADED`, `STALE-READ-ONLY` (exit 0: mounted),
 /// `NOT-MOUNTED` (exit 1) or `REFUSED` (exit 3; `left_mounted` adds
 /// `still mounted` to the detail).
 pub fn cli_line(result: &Result<Outcome, Failure>) -> (String, i32) {
@@ -908,6 +1297,8 @@ fn refused(why: String) -> Failure {
 struct Survey {
     members: Vec<Member>,
     expected: u64,
+    /// Members the record's rejection names: never scanned, never counted.
+    rejected: Vec<Member>,
 }
 
 impl Survey {
@@ -916,7 +1307,15 @@ impl Survey {
     }
 }
 
-fn survey(host: &dyn MemberHost, plan: &Plan<'_>, progress: &dyn ProgressCallback) -> Survey {
+/// One look at the members. Each superblock is read before its device is
+/// registered with btrfs: a member in `rejected` (dev_uuids) is never
+/// scanned, so the kernel never learns of it.
+fn survey(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    rejected: &BTreeSet<String>,
+    progress: &dyn ProgressCallback,
+) -> Survey {
     let warn =
         |m: String| progress.on_log(LogLevel::Warning, &format!("Target '{}': {m}", plan.label));
     let paths = host.members(plan.fsid).unwrap_or_else(|e| {
@@ -924,23 +1323,42 @@ fn survey(host: &dyn MemberHost, plan: &Plan<'_>, progress: &dyn ProgressCallbac
         Vec::new()
     });
     let mut members: Vec<Member> = Vec::new();
+    let mut refused: Vec<Member> = Vec::new();
     for path in paths {
-        if let Err(e) = host.scan(&path) {
-            warn(format!("btrfs device scan {path} failed: {e}"));
-        }
         let member = host
             .read_super(&path)
             .and_then(|text| parse_super(&path, &text, plan.fsid));
-        match member {
-            Ok(m) if members.iter().any(|o| o.devid == m.devid) => {
-                warn(format!("{path} is devid {} again — counted once", m.devid))
+        let m = match member {
+            Ok(m) if rejected.contains(&m.dev_uuid) => {
+                refused.push(m);
+                continue;
             }
-            Ok(m) => members.push(m),
-            Err(e) => warn(format!("not counted as a member: {e}")),
+            Ok(m) => m,
+            Err(e) => {
+                // Registered all the same, as before: a superblock this
+                // parser cannot read is not a reason to hide a member.
+                if let Err(e) = host.scan(&path) {
+                    warn(format!("btrfs device scan {path} failed: {e}"));
+                }
+                warn(format!("not counted as a member: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = host.scan(&path) {
+            warn(format!("btrfs device scan {path} failed: {e}"));
+        }
+        if members.iter().any(|o| o.devid == m.devid) {
+            warn(format!("{path} is devid {} again — counted once", m.devid));
+        } else {
+            members.push(m);
         }
     }
     let expected = members.iter().map(|m| m.num_devices).max().unwrap_or(0);
-    Survey { members, expected }
+    Survey {
+        members,
+        expected,
+        rejected: refused,
+    }
 }
 
 /// Mount `plan`'s filesystem by the rules in this module's documentation.
@@ -953,8 +1371,60 @@ pub fn mount_guarded(
     let plain = without_degraded(plan.mount_opts);
     let mut waited = Duration::ZERO;
     let mut last_mount_error: Option<String> = None;
+    // The rejection is read from the primary copy before anything is
+    // scanned or mounted; the witness, on the filesystem, is checked once it
+    // can be read (after the mount). An unreadable primary cannot say who is
+    // rejected: every job that writes is refused before anything is scanned
+    // (review F1); a read-only job gets a read-only mount.
+    let primary = read_copy(&primary_path(plan.record_dir, plan.fsid), plan.fsid);
+    let rejected: BTreeSet<String> = match &primary {
+        Copy::Read(r) => r.rejected.iter().map(|m| m.dev_uuid.clone()).collect(),
+        Copy::Absent | Copy::Bad(_) => BTreeSet::new(),
+    };
+    if let Copy::Bad(e) = &primary {
+        let why = format!(
+            "the RAID record is unreadable ({e}): it cannot say which members are rejected or \
+             which hold the last degraded period's writes — every job that writes the target is \
+             refused until it is restored from a backup or repaired"
+        );
+        return match plan.intent {
+            Intent::Write => Err(refused(why)),
+            Intent::ReadOnly => {
+                let s = survey(host, plan, &rejected, progress);
+                mount_read_only_unvouched(host, plan, s, why, progress)
+            }
+        };
+    }
     let found = loop {
-        let s = survey(host, plan, progress);
+        let s = survey(host, plan, &rejected, progress);
+        if !s.rejected.is_empty() {
+            return Err(refused(rejected_why(
+                &s.rejected.iter().collect::<Vec<_>>(),
+            )));
+        }
+        // Members whose superblock generations differ, whatever the primary
+        // says (it may be a stale copy from before an accept; review round
+        // 3): each member's own witness is read alone before anything is
+        // mounted read-write, and a member any copy rejects is refused.
+        if s.all_present()
+            && generations_differ(&s.members)
+            && let Some(refusal) = member_witness_check(host, plan, &s, &rejected, progress)
+        {
+            return refusal;
+        }
+        // Members whose superblock generations differ with no record to say
+        // why (the primary lost to a rollback, or never written): one of them
+        // may be a drive `raid accept` gave up, whose tree the kernel would
+        // take. Never read-write (review F1).
+        if s.all_present()
+            && primary == Copy::Absent
+            && let Some(why) = diverged_without_record(plan, &s.members)
+        {
+            return match plan.intent {
+                Intent::Write => Err(refused(why)),
+                Intent::ReadOnly => mount_read_only_unvouched(host, plan, s, why, progress),
+            };
+        }
         if s.all_present() {
             match host.mount(&plain, plan.fsid, plan.mount) {
                 Ok(()) => break Ok(s),
@@ -1034,6 +1504,245 @@ pub fn mount_guarded(
     mount_degraded(host, plan, s, absent_serials, progress)
 }
 
+/// Whether the members' superblock generations are not all one.
+fn generations_differ(members: &[Member]) -> bool {
+    members
+        .first()
+        .is_some_and(|f| members.iter().any(|m| m.generation != f.generation))
+}
+
+/// Devices forgotten for a one-member probe, registered again when it goes
+/// out of scope, on every path. A registration that fails here leaves the
+/// member unknown to the kernel: the plain mount then fails and the guard
+/// waits or refuses, the cautious direction.
+struct Reregister<'a> {
+    host: &'a dyn MemberHost,
+    paths: Vec<String>,
+}
+
+impl Drop for Reregister<'_> {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            let _ = self.host.scan(&path);
+        }
+    }
+}
+
+/// Each present member's own witness, read with that member alone: every
+/// other present member forgotten by its exact path, the member mounted
+/// [`PROBE_OPTS`] at a private directory, the witness read, unmounted, the
+/// others registered again. Refused when the filesystem is mounted anywhere
+/// (nothing is forgotten or mounted then), when a probe fails, or when a
+/// member's own copy cannot be read.
+fn member_witnesses(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    members: &[Member],
+) -> Result<Vec<Copy>, String> {
+    match host.fsid_mounted(plan.fsid) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(format!(
+                "filesystem {} is mounted elsewhere: its members, whose generations differ, \
+                 cannot each be read alone — not mounting it",
+                plan.fsid
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "whether filesystem {} is mounted elsewhere cannot be read ({e})",
+                plan.fsid
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for m in members {
+        let mut again = Reregister {
+            host,
+            paths: Vec::new(),
+        };
+        for other in members.iter().filter(|o| o.path != m.path) {
+            again.paths.push(other.path.clone());
+            host.forget(&other.path).map_err(|e| {
+                format!(
+                    "{} cannot be set aside to read {} alone ({e})",
+                    other.path, m.path
+                )
+            })?;
+        }
+        let at = host.temp_mountpoint()?;
+        if let Err(e) = host.mount_device(PROBE_OPTS, &m.path, &at) {
+            let _ = host.remove_mountpoint(&at);
+            return Err(format!(
+                "{}: the read-only probe of this member alone failed ({e})",
+                m.path
+            ));
+        }
+        let copy = host.read_witness(&at, plan.fsid);
+        host.umount(&at)
+            .map_err(|e| format!("{}: the probe mount at {at} will not unmount ({e})", m.path))?;
+        let _ = host.remove_mountpoint(&at);
+        if let Copy::Bad(e) = &copy {
+            return Err(format!(
+                "{}: its own RAID record is unreadable ({e})",
+                m.path
+            ));
+        }
+        out.push(copy);
+        drop(again);
+    }
+    Ok(out)
+}
+
+/// The per-member check of members whose generations differ: `None` to go
+/// on, `Some` the job's outcome (a refusal, or a read-only job's mount of a
+/// member no copy rejects).
+fn member_witness_check(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: &Survey,
+    primary_rejected: &BTreeSet<String>,
+    progress: &dyn ProgressCallback,
+) -> Option<Result<Outcome, Failure>> {
+    let witnesses = match member_witnesses(host, plan, &s.members) {
+        Ok(w) => w,
+        Err(why) => {
+            let why = format!(
+                "{why} — the members' generations differ and each member's own record must be \
+                 read before a read-write mount; restore the NEWEST copy of the RAID record, or \
+                 pull the drive that is not wanted"
+            );
+            return Some(match plan.intent {
+                Intent::Write => Err(refused(why)),
+                // Mounted elsewhere: never a second mount of it.
+                Intent::ReadOnly if why.contains("mounted elsewhere") => Err(refused(why)),
+                Intent::ReadOnly => mount_read_only_unvouched(
+                    host,
+                    plan,
+                    Survey {
+                        members: s.members.clone(),
+                        expected: s.expected,
+                        rejected: Vec::new(),
+                    },
+                    why,
+                    progress,
+                ),
+            });
+        }
+    };
+    let mut rejected = primary_rejected.clone();
+    for copy in &witnesses {
+        if let Copy::Read(r) = copy {
+            rejected.extend(r.rejected.iter().map(|m| m.dev_uuid.clone()));
+        }
+    }
+    let found: Vec<&Member> = s
+        .members
+        .iter()
+        .filter(|m| rejected.contains(&m.dev_uuid))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    let why = format!(
+        "{} (found by reading each member's own record; the primary copy may be older than the \
+         accept — restore the NEWEST copy of the record)",
+        rejected_why(&found)
+    );
+    Some(match plan.intent {
+        Intent::Write => Err(refused(why)),
+        Intent::ReadOnly => {
+            // Only a member no copy rejects, alone: the rejected ones set
+            // aside (left unregistered: they are refused anyway).
+            let Some(keep) = s.members.iter().find(|m| !rejected.contains(&m.dev_uuid)) else {
+                return Some(Err(refused(why)));
+            };
+            for r in &found {
+                if let Err(e) = host.forget(&r.path) {
+                    return Some(Err(refused(format!(
+                        "{why}; and {} cannot be set aside ({e})",
+                        r.path
+                    ))));
+                }
+            }
+            match host.mount_device(&stale_read_opts(plan.mount_opts), &keep.path, plan.mount) {
+                Ok(()) => {
+                    let outcome = Outcome::ReadOnly {
+                        members: vec![keep.clone()],
+                        why,
+                    };
+                    let (status, detail) = outcome.status_line();
+                    progress.on_log(
+                        LogLevel::Warning,
+                        &format!("Target '{}': {status}: {detail}", plan.label),
+                    );
+                    Ok(outcome)
+                }
+                Err(e) => Err(Failure::MountFailed(format!(
+                    "the read-only mount of {} failed: {e}; {why}",
+                    keep.path
+                ))),
+            }
+        }
+    })
+}
+
+/// Why members whose superblock generations differ cannot be mounted
+/// read-write when no record is readable, or `None` when they agree (a
+/// healthy pair has one generation).
+fn diverged_without_record(plan: &Plan<'_>, members: &[Member]) -> Option<String> {
+    let first = members.first()?.generation;
+    if members.iter().all(|m| m.generation == first) {
+        return None;
+    }
+    Some(format!(
+        "the members' superblock generations differ ({}) and no RAID record explains it \
+         ({} is absent): one of them may lack writes the other holds, or be a drive 'btrdasd \
+         raid accept' gave up — not mounting it read-write (each member's own record named no \
+         rejection). Restore the NEWEST copy of the record from a backup, or, if one drive is \
+         dead, pull it and run 'btrdasd raid accept {}'",
+        members
+            .iter()
+            .map(|m| format!(
+                "devid {} {} at {}: generation {}",
+                m.devid, m.dev_uuid, m.path, m.generation
+            ))
+            .collect::<Vec<_>>()
+            .join("; "),
+        primary_path(plan.record_dir, plan.fsid).display(),
+        plan.label
+    ))
+}
+
+/// A read-only job's mount when no readable record can vouch for the members:
+/// [`stale_read_opts`], nothing written.
+fn mount_read_only_unvouched(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: Survey,
+    why: String,
+    progress: &dyn ProgressCallback,
+) -> Result<Outcome, Failure> {
+    if s.members.is_empty() {
+        return Err(Failure::NoMember(format!(
+            "no member of filesystem {} was found (blkid); {why}",
+            plan.fsid
+        )));
+    }
+    host.mount(&stale_read_opts(plan.mount_opts), plan.fsid, plan.mount)
+        .map_err(|e| Failure::MountFailed(format!("the read-only mount failed: {e}; {why}")))?;
+    let outcome = Outcome::ReadOnly {
+        members: s.members,
+        why,
+    };
+    let (status, detail) = outcome.status_line();
+    progress.on_log(
+        LogLevel::Warning,
+        &format!("Target '{}': {status}: {detail}", plan.label),
+    );
+    Ok(outcome)
+}
+
 fn after_normal_mount(
     host: &dyn MemberHost,
     plan: &Plan<'_>,
@@ -1067,16 +1776,26 @@ fn after_normal_mount(
     let primary_path = primary_path(plan.record_dir, plan.fsid);
     let primary = read_copy(&primary_path, plan.fsid);
     let witness = host.read_witness(plan.mount, plan.fsid);
-    let (owed, record_problem) = match rejoin(&primary, &witness, host.now()) {
-        Rejoin::Clean => (None, None),
-        Rejoin::Unreadable(e) => (None, Some(format!("{e}; nothing changed"))),
+    // A rejection only the witness carries (the primary lost): seen only now.
+    for copy in [&primary, &witness] {
+        if let Copy::Read(r) = copy
+            && let Some(why) = rejected_present(r, &s.members)
+        {
+            return Err(take_down(why));
+        }
+    }
+    let (owed, record_problem, rejoined_now) = match rejoin(&primary, &witness, host.now()) {
+        Rejoin::Clean => (None, None, false),
+        Rejoin::Unreadable(e) => (None, Some(format!("{e}; nothing changed")), false),
         Rejoin::Owed {
             record,
             write_primary,
             write_witness,
+            rejoined_now,
         } => {
             let mut problems = Vec::new();
-            if !is_read_only(plan.mount_opts) {
+            let read_only = is_read_only(plan.mount_opts);
+            if !read_only {
                 if write_primary && let Err(e) = write_copy(&primary_path, &record, true) {
                     problems.push(e);
                 }
@@ -1084,9 +1803,13 @@ fn after_normal_mount(
                     problems.push(e);
                 }
             }
+            // The rejoin counts only once it is recorded: a scrub begun
+            // after it then pays the debt.
+            let recorded = !read_only && problems.is_empty();
             (
                 Some(record),
                 (!problems.is_empty()).then(|| problems.join("; ")),
+                rejoined_now && recorded,
             )
         }
     };
@@ -1095,6 +1818,7 @@ fn after_normal_mount(
         waited,
         owed,
         record_problem,
+        rejoined_now,
     };
     let (status, detail) = outcome.status_line();
     progress.on_log(
@@ -1133,6 +1857,14 @@ fn mount_degraded(
     let primary = read_copy(&primary_path, plan.fsid);
     let record = match degraded_verdict(plan.fsid, &primary, &witness, &s.members, host.now()) {
         Verdict::Allow(r) => r,
+        Verdict::SplitBrain { record, why } => {
+            return match plan.intent {
+                Intent::Write => Err(refused(why)),
+                Intent::ReadOnly => {
+                    mount_stale_read_only(host, plan, s, absent_serials, record, progress)
+                }
+            };
+        }
         Verdict::Refuse(why) => return Err(refused(why)),
     };
     let read_only = is_read_only(plan.mount_opts);
@@ -1164,6 +1896,636 @@ fn mount_degraded(
         expected: s.expected,
         record,
         recorded: !read_only,
+    };
+    let (status, detail) = outcome.status_line();
+    progress.on_log(
+        LogLevel::Warning,
+        &format!("Target '{}': {status}: {detail}", plan.label),
+    );
+    Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// The end of a job (bd DAS-Backup-Manager-su1b.14)
+// ---------------------------------------------------------------------------
+
+/// What [`check_before_unmount`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndCheck {
+    /// No member missing: nothing to record.
+    Whole,
+    /// A member is missing, or may be: a degraded period is recorded for the
+    /// present members (`why` says which, and why).
+    Recorded { record: Record, why: String },
+    /// A member is missing, or may be, and nothing could be recorded.
+    Problem(String),
+}
+
+/// At the end of a job that mounted `plan`'s target read-write, before it is
+/// unmounted: the kernel's view (`missing_devids`). A member missing — it
+/// dropped while the job ran, and every write since went to the others alone
+/// — or a view that cannot be read (possibly dropped: the cautious reading) is
+/// recorded as a degraded period on the members still present, both copies,
+/// as the guard records a degraded mount, so the next mount with every member
+/// owes a scrub. The members present are found by filesystem UUID and read by
+/// their superblocks; nothing is scanned or mounted. A record naming other
+/// members (their period not yet scrubbed) is replaced by a period on the
+/// present ones — the writes just made exist only there — and said. A copy
+/// that cannot be read is a [`EndCheck::Problem`], never overwritten.
+pub fn check_before_unmount(host: &dyn MemberHost, plan: &Plan<'_>) -> EndCheck {
+    let (missing, why) = match host.missing_devids(plan.fsid) {
+        Ok(m) if m.is_empty() => return EndCheck::Whole,
+        Ok(m) => (
+            Some(m.clone()),
+            format!("the kernel shows devid(s) {m:?} missing at the end of the job"),
+        ),
+        Err(e) => (
+            None,
+            format!(
+                "whether a member dropped during the job cannot be read ({e}); taken as \
+                 possibly dropped"
+            ),
+        ),
+    };
+    let paths = match host.members(plan.fsid) {
+        Ok(p) => p,
+        Err(e) => {
+            return EndCheck::Problem(format!(
+                "{why}, and the members cannot be listed ({e}): nothing recorded"
+            ));
+        }
+    };
+    let present: Vec<Member> = paths
+        .iter()
+        .filter_map(|path| {
+            host.read_super(path)
+                .and_then(|t| parse_super(path, &t, plan.fsid))
+                .ok()
+        })
+        .filter(|m| missing.as_ref().is_none_or(|ms| !ms.contains(&m.devid)))
+        .fold(Vec::new(), |mut acc: Vec<Member>, m| {
+            if !acc.iter().any(|o| o.devid == m.devid) {
+                acc.push(m);
+            }
+            acc
+        });
+    if present.is_empty() {
+        return EndCheck::Problem(format!(
+            "{why}, and no present member can be identified: nothing recorded"
+        ));
+    }
+    let primary_path = primary_path(plan.record_dir, plan.fsid);
+    let primary = read_copy(&primary_path, plan.fsid);
+    let witness = host.read_witness(plan.mount, plan.fsid);
+    let now = host.now();
+    let (record, why) = match degraded_verdict(plan.fsid, &primary, &witness, &present, now) {
+        Verdict::Allow(r) => (r, why),
+        Verdict::SplitBrain { record, .. } => (
+            Record {
+                fsid: plan.fsid.to_ascii_lowercase(),
+                state: State::Degraded,
+                members: present
+                    .iter()
+                    .map(|m| PeriodMember {
+                        devid: m.devid,
+                        dev_uuid: m.dev_uuid.clone(),
+                        generation: m.generation,
+                    })
+                    .collect(),
+                since: now,
+                last: now,
+                rejoined: None,
+                rejected: record.rejected.clone(),
+            },
+            format!(
+                "{why}; the earlier degraded period on {} was not yet scrubbed, so both \
+                 drives now hold writes the other lacks",
+                names(&record.dev_uuids())
+            ),
+        ),
+        Verdict::Refuse(e) => {
+            return EndCheck::Problem(format!("{why}, and {e}: nothing recorded"));
+        }
+    };
+    if let Err(e) = write_copy(&primary_path, &record, true) {
+        return EndCheck::Problem(format!("{why}, and the record cannot be written ({e})"));
+    }
+    if let Err(e) = host.write_witness(plan.mount, &record) {
+        return EndCheck::Problem(format!(
+            "{why}; the record is written, the witness is not ({e})"
+        ));
+    }
+    EndCheck::Recorded { record, why }
+}
+
+/// The one line `btrdasd backup raid-check` prints for `backup-run.sh`:
+/// `RAID CHECK: <STATUS>  (<detail>)`, STATUS `OK`, `RECORDED` or `WARN`.
+pub fn end_check_line(check: &EndCheck) -> String {
+    let (status, detail) = match check {
+        EndCheck::Whole => ("OK", "no member missing at the end of the job".to_string()),
+        EndCheck::Recorded { record, why } => (
+            "RECORDED",
+            format!(
+                "{why}: a degraded period is recorded on {} — a scrub is owed once every \
+                 member is back",
+                names(&record.dev_uuids())
+            ),
+        ),
+        EndCheck::Problem(why) => ("WARN", why.clone()),
+    };
+    format!("RAID CHECK: {status}  ({})", detail.replace('\n', " "))
+}
+
+// ---------------------------------------------------------------------------
+// The owed scrub, started after the job (bd DAS-Backup-Manager-su1b.14)
+// ---------------------------------------------------------------------------
+
+/// The unit an owed scrub is started with. It scrubs every `[scrub].targets`
+/// filesystem in order (`btrdasd scrub run` takes no target): the owed one is
+/// among them.
+pub const SCRUB_UNIT: &str = "das-scrub.service";
+
+/// Targets whose mount in this process was the rejoin ([`Outcome::Normal`]
+/// `rejoined_now`), waiting for the job's maintenance lock to be released.
+static OWED_SCRUB: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Note that `label`'s mount was the rejoin: the scrub owed starts once this
+/// process lets the maintenance lock go ([`after_maintenance_released`]).
+pub fn note_owed_scrub(label: &str) {
+    let mut owed = OWED_SCRUB.lock().unwrap_or_else(|e| e.into_inner());
+    if !owed.iter().any(|l| l == label) {
+        owed.push(label.to_string());
+    }
+}
+
+/// The targets noted and not yet started for, taken.
+pub fn take_owed_scrub() -> Vec<String> {
+    std::mem::take(&mut *OWED_SCRUB.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `systemctl start --no-block das-scrub.service`: queued, never waited for,
+/// so nothing here can wait on the locks the scrub needs. A backup still
+/// preempts it through the claim. Refused in a test build: a test never
+/// starts a real unit.
+pub fn start_owed_scrub() -> Result<(), String> {
+    if cfg!(test) || cfg!(feature = "test-overrides") {
+        return Err(format!(
+            "refused in a test build: a test never starts {SCRUB_UNIT}"
+        ));
+    }
+    let out = std::process::Command::new("systemctl")
+        .args(["start", "--no-block", SCRUB_UNIT])
+        .output()
+        .map_err(|e| format!("systemctl could not be run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl start --no-block {SCRUB_UNIT} exited with code {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Called by [`crate::maintenance::MaintenanceHeld`] right after it releases
+/// a lock this process took: starts the owed scrub for anything noted, and
+/// says so on stderr (the journal of a unit or the helper). A start that
+/// fails is a warning, never an error. Returns what it said, for tests.
+pub fn after_maintenance_released() -> Option<String> {
+    let owed = take_owed_scrub();
+    if owed.is_empty() {
+        return None;
+    }
+    let line = match start_owed_scrub() {
+        Ok(()) => format!(
+            "info: RAID-1 target(s) {} rejoined: {SCRUB_UNIT} started (not waited for) to pay \
+             the scrub owed",
+            owed.join(", ")
+        ),
+        Err(e) => format!(
+            "warning: RAID-1 target(s) {} rejoined, and the owed scrub was not started ({e}); \
+             run 'btrdasd scrub run' or wait for the scheduled one",
+            owed.join(", ")
+        ),
+    };
+    eprintln!("{line}");
+    Some(line)
+}
+
+// ---------------------------------------------------------------------------
+// `btrdasd raid accept` (bd DAS-Backup-Manager-su1b.11)
+// ---------------------------------------------------------------------------
+
+/// What `raid accept` found: the guard refuses this target for split brain
+/// right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitBrainNow {
+    /// The members present, each by its own superblock.
+    pub present: Vec<Member>,
+    /// The last degraded period, which ran on members that are absent.
+    pub period: Record,
+    pub absent_serials: Vec<String>,
+    pub expected: u64,
+    /// An earlier accept wrote one copy and not the other: this one
+    /// finishes it.
+    pub resumed: bool,
+}
+
+/// What an accept did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accepted {
+    /// The period given up.
+    pub before: Record,
+    /// The record written to both copies.
+    pub after: Record,
+    /// What was shown before the label was typed.
+    pub explanation: String,
+}
+
+/// Look at the target as the guard would, once, without waiting and without
+/// mounting anything writable: `Ok` only when the guard would refuse it for
+/// split brain now — fewer members present than the filesystem has, a
+/// configured drive absent, and the last degraded period run on members
+/// that are not present. The witness is read through the read-only probe
+/// mount ([`PROBE_OPTS`]), taken down before deciding. A member the record
+/// already rejects is refused, so two drives can never be accepted back and
+/// forth.
+pub fn split_brain_now(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    progress: &dyn ProgressCallback,
+) -> Result<SplitBrainNow, String> {
+    let primary_path = primary_path(plan.record_dir, plan.fsid);
+    let primary = read_copy(&primary_path, plan.fsid);
+    let rejected: BTreeSet<String> = match &primary {
+        Copy::Read(r) => r.rejected.iter().map(|m| m.dev_uuid.clone()).collect(),
+        Copy::Absent | Copy::Bad(_) => BTreeSet::new(),
+    };
+    let s = survey(host, plan, &rejected, progress);
+    if !s.rejected.is_empty() {
+        return Err(rejected_why(&s.rejected.iter().collect::<Vec<_>>()));
+    }
+    if s.members.is_empty() {
+        return Err(format!(
+            "no member of filesystem {} is present: nothing to accept",
+            plan.fsid
+        ));
+    }
+    if s.all_present() {
+        return Err(format!(
+            "every member of {} is present ({}): the guard mounts it normally; nothing to \
+             accept",
+            plan.fsid,
+            member_list(&s.members)
+        ));
+    }
+    let absent_serials: Vec<String> = plan
+        .serials
+        .iter()
+        .filter(|serial| !host.serial_attached(serial))
+        .cloned()
+        .collect();
+    if !plan.serials.is_empty() && absent_serials.is_empty() {
+        return Err(format!(
+            "every configured drive ({}) is attached although a member is not found: the \
+             guard refuses this for another reason than split brain; nothing to accept",
+            plan.serials.join(", ")
+        ));
+    }
+    host.mount(PROBE_OPTS, plan.fsid, plan.mount)
+        .map_err(|e| format!("the read-only probe mount failed: {e}"))?;
+    let witness = host.read_witness(plan.mount, plan.fsid);
+    host.umount(plan.mount)
+        .map_err(|e| format!("the read-only probe mount will not unmount: {e}"))?;
+    let found = |period: Record, resumed: bool| SplitBrainNow {
+        present: s.members.clone(),
+        period,
+        absent_serials: absent_serials.clone(),
+        expected: s.expected,
+        resumed,
+    };
+    match degraded_verdict(plan.fsid, &primary, &witness, &s.members, host.now()) {
+        Verdict::SplitBrain { record, .. } => Ok(found(record, false)),
+        Verdict::Allow(_) => Err(format!(
+            "not refused: the guard mounts it degraded on the members present ({}); nothing \
+             to accept",
+            member_list(&s.members)
+        )),
+        Verdict::Refuse(why) => match half_accepted(&primary, &witness, &s.members) {
+            Some(period) => Ok(found(period, true)),
+            None => Err(format!(
+                "the guard refuses this target for another reason than split brain: {why}"
+            )),
+        },
+    }
+}
+
+/// An accept that wrote one copy and not the other: one copy names exactly
+/// the present members and rejects every member the other copy's period ran
+/// on. Returns that other copy (the period given up).
+fn half_accepted(primary: &Copy, witness: &Copy, present: &[Member]) -> Option<Record> {
+    let (Copy::Read(a), Copy::Read(b)) = (primary, witness) else {
+        return None;
+    };
+    let present: BTreeSet<&str> = present.iter().map(|m| m.dev_uuid.as_str()).collect();
+    let finishes = |done: &Record, old: &Record| {
+        done.dev_uuids() == present && old.dev_uuids().is_subset(&done.rejected_uuids())
+    };
+    if finishes(a, b) {
+        Some(b.clone())
+    } else if finishes(b, a) {
+        Some(a.clone())
+    } else {
+        None
+    }
+}
+
+/// The record an accept writes: a degraded period on the present members,
+/// from `now`, every member of the period given up (and any already
+/// rejected) rejected.
+pub fn accepted_record(found: &SplitBrainNow, now: i64) -> Record {
+    let mut rejected = found.period.rejected.clone();
+    for m in &found.period.members {
+        if !found.present.iter().any(|p| p.dev_uuid == m.dev_uuid)
+            && !rejected.iter().any(|r| r.dev_uuid == m.dev_uuid)
+        {
+            rejected.push(m.clone());
+        }
+    }
+    Record {
+        fsid: found.period.fsid.clone(),
+        state: State::Degraded,
+        members: found
+            .present
+            .iter()
+            .map(|m| PeriodMember {
+                devid: m.devid,
+                dev_uuid: m.dev_uuid.clone(),
+                generation: m.generation,
+            })
+            .collect(),
+        since: now,
+        last: now,
+        rejoined: None,
+        rejected,
+    }
+}
+
+/// What the operator is shown before typing the label. `runs` is how many
+/// backup runs the history records inside the period given up: `None` or an
+/// error is said as unknown, never as 0.
+pub fn accept_explanation(
+    label: &str,
+    fsid: &str,
+    found: &SplitBrainNow,
+    runs: &Result<Option<u64>, String>,
+) -> String {
+    let p = &found.period;
+    let runs = match runs {
+        Ok(Some(n)) => format!("{n} backup run(s) recorded in the history"),
+        Ok(None) => "unknown (no backup history)".to_string(),
+        Err(e) => format!("unknown ({e})"),
+    };
+    let mut text = format!(
+        "Target '{label}' (filesystem {fsid}) is refused for split brain.\n\
+         \n\
+         Present ({} of {} members):\n",
+        found.present.len(),
+        found.expected
+    );
+    for m in &found.present {
+        text.push_str(&format!(
+            "  devid {} {} at {}, superblock generation {}\n",
+            m.devid, m.dev_uuid, m.path, m.generation
+        ));
+    }
+    text.push_str("\nThe last degraded period ran on:\n");
+    for m in &p.members {
+        text.push_str(&format!(
+            "  devid {} {}, superblock generation {} when the period was recorded\n",
+            m.devid, m.dev_uuid, m.generation
+        ));
+    }
+    text.push_str(&format!(
+        "  from {} to {}{}; absent drive(s): {}\n\
+         \n\
+         Writes of that period exist only on the absent drive: {runs} between those times.\n\
+         The present drive's data stops no later than {}.\n\
+         {}\
+         \n\
+         Accepting makes the present drive the filesystem's history from now on. What \
+         only the absent drive holds is given up, and the absent drive is REFUSED from then \
+         on, alone or beside this one, until it is wiped (wipefs) or removed from the \
+         filesystem (btrfs device remove, btrfs replace). The present drive is mounted \
+         degraded to write the record, and every later job runs on it degraded, one copy of \
+         every write, until a second drive is added (btrfs replace) and scrubbed.\n",
+        when(p.since),
+        when(p.last),
+        match (p.state, p.rejoined) {
+            (State::ScrubOwed, Some(r)) => format!(
+                ", every member present again from {} (the scrub owed did not complete)",
+                when(r)
+            ),
+            _ => String::new(),
+        },
+        if found.absent_serials.is_empty() {
+            "unknown (no serial configured)".to_string()
+        } else {
+            found.absent_serials.join(", ")
+        },
+        when(p.since),
+        if found.resumed {
+            "(An earlier accept wrote only one copy of its record; this one finishes it.)\n"
+        } else {
+            ""
+        },
+    ));
+    text
+}
+
+/// The whole accept, under the caller's locks: [`split_brain_now`], the
+/// explanation handed to `confirm`, which returns what the operator typed
+/// (an `Err` when it cannot ask: never a yes), the label compared exactly,
+/// then the members looked at again (any other present: refused), the
+/// present member mounted degraded and read-write, the kernel's view checked
+/// (another member present: unmounted, refused), the primary copy and the
+/// witness written, and unmounted. Nothing is written unless
+/// the typed text is the label. `runs_between(since, last)` counts the
+/// backup runs the history records in the period given up.
+pub fn accept(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    runs_between: &dyn Fn(i64, i64) -> Result<Option<u64>, String>,
+    confirm: &mut dyn FnMut(&str) -> Result<String, String>,
+    progress: &dyn ProgressCallback,
+) -> Result<Accepted, String> {
+    let found = split_brain_now(host, plan, progress)?;
+    let explanation = accept_explanation(
+        plan.label,
+        plan.fsid,
+        &found,
+        &runs_between(found.period.since, found.period.last),
+    );
+    let typed = confirm(&explanation).map_err(|e| format!("not accepted: {e}"))?;
+    let typed = typed.strip_suffix('\n').unwrap_or(&typed);
+    let typed = typed.strip_suffix('\r').unwrap_or(typed);
+    if typed != plan.label {
+        return Err(format!(
+            "not accepted: '{typed}' is not the target label '{}' — nothing changed",
+            plan.label
+        ));
+    }
+    // Look again (review F2): a drive plugged in while the label was typed
+    // is registered by udev on its own, and the mount below would assemble
+    // it. Only the members the explanation named may be present.
+    let accepted_uuids: BTreeSet<&str> =
+        found.present.iter().map(|m| m.dev_uuid.as_str()).collect();
+    // Every listed path must be read: one whose superblock cannot be read is
+    // a refusal, never left out (review round 3).
+    let now_present: Vec<Member> = host
+        .members(plan.fsid)
+        .map_err(|e| format!("not accepted, nothing changed: cannot list the members ({e})"))?
+        .iter()
+        .map(|path| {
+            host.read_super(path)
+                .and_then(|t| parse_super(path, &t, plan.fsid))
+                .map_err(|e| {
+                    format!(
+                        "not accepted, nothing changed: {path} is listed with this filesystem \
+                         and its superblock cannot be read ({e}) — unplug that drive first"
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let foreign: Vec<String> = now_present
+        .iter()
+        .filter(|m| !accepted_uuids.contains(m.dev_uuid.as_str()))
+        .map(|m| format!("devid {} ({}) at {}", m.devid, m.dev_uuid, m.path))
+        .collect();
+    if !foreign.is_empty() {
+        return Err(format!(
+            "not accepted, nothing changed: {} is attached as well — unplug it first, then run \
+             'btrdasd raid accept {}' again",
+            foreign.join(", "),
+            plan.label
+        ));
+    }
+    // The absent drive attached again, whatever blkid lists.
+    let back: Vec<&String> = found
+        .absent_serials
+        .iter()
+        .filter(|serial| host.serial_attached(serial))
+        .collect();
+    if !back.is_empty() {
+        return Err(format!(
+            "not accepted, nothing changed: drive {} is attached again — unplug it first, then \
+             run 'btrdasd raid accept {}' again",
+            back.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            plan.label
+        ));
+    }
+    if !accepted_uuids
+        .iter()
+        .all(|u| now_present.iter().any(|m| m.dev_uuid == *u))
+    {
+        return Err(
+            "not accepted, nothing changed: the drive to accept is no longer present".into(),
+        );
+    }
+    let after = accepted_record(&found, host.now());
+    let primary_path = primary_path(plan.record_dir, plan.fsid);
+    host.mount(
+        &with_degraded(&without_degraded(plan.mount_opts)),
+        plan.fsid,
+        plan.mount,
+    )
+    .map_err(|e| format!("not accepted, nothing changed: the degraded mount failed ({e})"))?;
+    let take_down = |why: String| match host.umount(plan.mount) {
+        Ok(()) => why,
+        Err(u) => format!("{why}; and {} will not unmount: {u}", plan.mount),
+    };
+    // The kernel's own view of what it assembled: only the accepted members
+    // present (review F2), or the mount comes straight down, nothing written.
+    let accepted_devids: BTreeSet<u64> = found.present.iter().map(|m| m.devid).collect();
+    match host.devinfo(plan.fsid) {
+        Ok(devs) => {
+            let extra: Vec<u64> = devs
+                .iter()
+                .filter(|(id, missing)| !missing && !accepted_devids.contains(id))
+                .map(|(id, _)| *id)
+                .collect();
+            if !extra.is_empty() {
+                return Err(take_down(format!(
+                    "not accepted, nothing changed: the mounted filesystem has devid {} present \
+                     besides the drive to accept — unmounted; unplug it first",
+                    extra
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", devid ")
+                )));
+            }
+        }
+        Err(e) => {
+            return Err(take_down(format!(
+                "not accepted, nothing changed: what the kernel assembled cannot be read ({e}) \
+                 — unmounted"
+            )));
+        }
+    }
+    if let Err(e) = write_copy(&primary_path, &after, true) {
+        return Err(take_down(format!(
+            "not accepted, nothing changed: the record cannot be written ({e})"
+        )));
+    }
+    let witness = host.write_witness(plan.mount, &after);
+    let unmounted = host.umount(plan.mount);
+    match (witness, unmounted) {
+        (Ok(()), Ok(())) => {}
+        (Err(e), u) => {
+            return Err(format!(
+                "the record is written, but the witness is not ({e}){}; run 'btrdasd raid \
+                 accept' again to finish",
+                u.err()
+                    .map(|u| format!("; and {} will not unmount: {u}", plan.mount))
+                    .unwrap_or_default()
+            ));
+        }
+        (Ok(()), Err(u)) => {
+            return Err(format!(
+                "accepted (both copies written), but {} will not unmount: {u}",
+                plan.mount
+            ));
+        }
+    }
+    Ok(Accepted {
+        before: found.period,
+        after,
+        explanation,
+    })
+}
+
+/// A read-only job's mount of a split-brain member: [`stale_read_opts`],
+/// nothing written, the record left as it is.
+fn mount_stale_read_only(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: Survey,
+    absent_serials: Vec<String>,
+    record: Record,
+    progress: &dyn ProgressCallback,
+) -> Result<Outcome, Failure> {
+    host.mount(&stale_read_opts(plan.mount_opts), plan.fsid, plan.mount)
+        .map_err(|e| Failure::MountFailed(format!("the read-only mount failed: {e}")))?;
+    let outcome = Outcome::StaleReadOnly {
+        members: s.members,
+        absent_serials,
+        expected: s.expected,
+        record,
     };
     let (status, detail) = outcome.status_line();
     progress.on_log(
@@ -1221,6 +2583,17 @@ mod tests {
         /// A witness per view (sorted dev_uuids present).
         witness: RefCell<BTreeMap<String, Copy>>,
         missing: RefCell<Result<Vec<u64>, String>>,
+        /// The kernel's devinfo, when a case says it (else the present
+        /// drives, each missing as `missing` says).
+        devinfo: RefCell<Option<DevInfo>>,
+        /// The member a device mount mounted alone: its own view.
+        alone: RefCell<Option<String>>,
+        /// Device paths whose ro mount fails, and whose superblock cannot be
+        /// read.
+        fail_device_mount: RefCell<BTreeSet<String>>,
+        bad_super: RefCell<BTreeSet<String>>,
+        /// The filesystem is mounted elsewhere.
+        mounted_elsewhere: Cell<bool>,
         fail_mount_plain: Cell<bool>,
         hide_members: Cell<bool>,
         /// The kernel as the incident left it (a `--forget`): a member is
@@ -1233,6 +2606,9 @@ mod tests {
         now: Cell<i64>,
     }
 
+    /// What the kernel lists for a mounted filesystem: devid, missing.
+    type DevInfo = Result<Vec<(u64, bool)>, String>;
+
     impl FakeHost {
         fn new(drives: Vec<(&'static str, &'static str, u64, &'static str, u64, u32)>) -> Self {
             Self {
@@ -1242,6 +2618,11 @@ mod tests {
                 mounted: RefCell::new(None),
                 witness: RefCell::new(BTreeMap::new()),
                 missing: RefCell::new(Ok(Vec::new())),
+                devinfo: RefCell::new(None),
+                alone: RefCell::new(None),
+                fail_device_mount: RefCell::new(BTreeSet::new()),
+                bad_super: RefCell::new(BTreeSet::new()),
+                mounted_elsewhere: Cell::new(false),
                 fail_mount_plain: Cell::new(false),
                 hide_members: Cell::new(false),
                 model_kernel: Cell::new(false),
@@ -1291,7 +2672,35 @@ mod tests {
             self.registered.borrow_mut().insert(path.to_string());
             Ok(())
         }
+        fn forget(&self, path: &str) -> Result<(), String> {
+            self.log(format!("forget {path}"));
+            self.registered.borrow_mut().remove(path);
+            Ok(())
+        }
+        fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String> {
+            self.log(format!("mount-dev {opts} {device} {at}"));
+            if self.fail_device_mount.borrow().contains(device) {
+                return Err("wrong fs type (fake)".into());
+            }
+            let uuid = self.drives.iter().find(|d| d.1 == device).unwrap().3;
+            *self.alone.borrow_mut() = Some(uuid.to_string());
+            *self.mounted.borrow_mut() = Some(opts.to_string());
+            Ok(())
+        }
+        fn temp_mountpoint(&self) -> Result<String, String> {
+            Ok("/run/fake-probe".into())
+        }
+        fn remove_mountpoint(&self, at: &str) -> Result<(), String> {
+            self.log(format!("rmdir {at}"));
+            Ok(())
+        }
+        fn fsid_mounted(&self, _fsid: &str) -> Result<bool, String> {
+            Ok(self.mounted_elsewhere.get())
+        }
         fn read_super(&self, path: &str) -> Result<String, String> {
+            if self.bad_super.borrow().contains(path) {
+                return Err(format!("{path}: bad superblock (fake)"));
+            }
             let d = self.drives.iter().find(|d| d.1 == path).unwrap();
             Ok(sup(d.2, d.3, d.4))
         }
@@ -1314,19 +2723,32 @@ mod tests {
         fn umount(&self, mount: &str) -> Result<(), String> {
             self.log(format!("umount {mount}"));
             *self.mounted.borrow_mut() = None;
+            *self.alone.borrow_mut() = None;
             Ok(())
         }
         fn missing_devids(&self, _fsid: &str) -> Result<Vec<u64>, String> {
             self.missing.borrow().clone()
+        }
+        fn devinfo(&self, _fsid: &str) -> Result<Vec<(u64, bool)>, String> {
+            if let Some(d) = self.devinfo.borrow().clone() {
+                return d;
+            }
+            let missing = self.missing.borrow().clone()?;
+            Ok(self
+                .present()
+                .iter()
+                .map(|d| (d.2, missing.contains(&d.2)))
+                .collect())
         }
         fn read_witness(&self, _mount: &str, _fsid: &str) -> Copy {
             assert!(
                 self.mounted.borrow().is_some(),
                 "witness read while unmounted"
             );
+            let view = self.alone.borrow().clone().unwrap_or_else(|| self.view());
             self.witness
                 .borrow()
-                .get(&self.view())
+                .get(&view)
                 .cloned()
                 .unwrap_or(Copy::Absent)
         }
@@ -1369,6 +2791,13 @@ mod tests {
             }
         }
         fn run(&self, host: &FakeHost) -> (Result<Outcome, Failure>, TestProgress) {
+            self.run_as(host, Intent::Write)
+        }
+        fn run_as(
+            &self,
+            host: &FakeHost,
+            intent: Intent,
+        ) -> (Result<Outcome, Failure>, TestProgress) {
             let progress = TestProgress::default();
             let plan = Plan {
                 label: "primary",
@@ -1378,6 +2807,7 @@ mod tests {
                 mount_opts: "noatime,degraded,compress=zstd",
                 wait: Duration::from_secs(60),
                 record_dir: self.dir.path(),
+                intent,
             };
             (mount_guarded(host, &plan, &progress), progress)
         }
@@ -1546,6 +2976,1015 @@ mod tests {
         );
     }
 
+    /// Operator 2026-11-22 (bd DAS-Backup-Manager-su1b.11): a job that never
+    /// writes the target may read the member that lacks the last degraded
+    /// period's writes — read-only, nothing replayed, nothing recorded — and
+    /// says the date its data stops.
+    #[test]
+    fn a_read_only_job_mounts_the_stale_member_read_only_and_records_nothing() {
+        let case = Case::new();
+        let period = match case.run(&only_x()).0 {
+            Ok(Outcome::Degraded { record, .. }) => record,
+            other => panic!("{other:?}"),
+        };
+        let before = case.primary();
+        let host = only_y();
+        let (r, progress) = case.run_as(&host, Intent::ReadOnly);
+        match r {
+            Ok(Outcome::StaleReadOnly {
+                record, members, ..
+            }) => {
+                assert_eq!(record, period, "the record as it was");
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].dev_uuid, DY);
+            }
+            other => panic!("{other:?}"),
+        }
+        let calls = host.calls();
+        assert_eq!(
+            calls.last().unwrap(),
+            &format!("mount noatime,compress=zstd,ro,degraded,rescue=nologreplay {FS} /mnt/p"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c == "write witness"), "{calls:?}");
+        assert_eq!(case.primary(), before, "no record change");
+        let when = crate::caldate::local_datetime(period.since).unwrap();
+        assert!(
+            warnings(&progress)
+                .iter()
+                .any(|w| w.contains("STALE-READ-ONLY") && w.contains(&when) && w.contains(DX)),
+            "{:?}",
+            warnings(&progress)
+        );
+        // A writing job is still refused the same member.
+        let why = refusal(case.run_as(&only_y(), Intent::Write).0);
+        assert!(why.contains("split brain"), "{why}");
+    }
+
+    #[test]
+    fn a_read_only_job_gets_only_a_read_only_mount_when_the_record_cannot_be_read() {
+        // Review F1 (binding): an unreadable record refuses every job that
+        // writes; a read-only job gets the read-only mount, nothing written.
+        let case = Case::new();
+        fs::write(primary_path(case.dir.path(), FS), "garbage\n").unwrap();
+        let host = only_y();
+        match case.run_as(&host, Intent::ReadOnly).0 {
+            Ok(Outcome::ReadOnly { why, .. }) => assert!(why.contains("unreadable"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            host.calls()
+                .iter()
+                .filter(|c| c.starts_with("mount"))
+                .all(|c| c.contains(STALE_READ_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+        assert!(!host.calls().iter().any(|c| c == "write witness"));
+    }
+
+    /// Only jobs that persist nothing derived from the target's contents may
+    /// read a split-brain member: every job that writes the index, a record
+    /// or a state file from what it reads is refused it.
+    #[test]
+    fn only_jobs_that_persist_nothing_from_the_target_read_a_split_brain_member() {
+        let read_only: Vec<Job> = Job::ALL
+            .into_iter()
+            .filter(|j| j.intent() == Intent::ReadOnly)
+            .collect();
+        assert_eq!(
+            read_only,
+            [
+                Job::RestoreFiles,
+                Job::RestoreSnapshot,
+                Job::Browse,
+                Job::Doctor
+            ]
+        );
+        for job in [
+            Job::Walk,
+            Job::IndexWalk,
+            Job::Reindex,
+            Job::Reconcile,
+            Job::RecoveryOsRecord,
+        ] {
+            let case = Case::new();
+            assert!(case.run(&only_x()).0.is_ok());
+            let why = refusal(case.run_as(&only_y(), job.intent()).0);
+            assert!(why.contains("split brain"), "{job:?}: {why}");
+        }
+    }
+
+    /// Every caller names its job: each `ensure_targets_mounted(` and
+    /// `mount_guarded_target(` call in the sources passes
+    /// `Job::<job>.intent()`, never a bare `Intent`, so the table above is the
+    /// whole classification.
+    #[test]
+    fn every_target_mount_names_its_job() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = vec![src];
+        let mut calls = 0;
+        while let Some(p) = paths.pop() {
+            if p.is_dir() {
+                paths.extend(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&p).unwrap();
+            for name in ["ensure_targets_mounted(", "mount_guarded_target("] {
+                for (at, _) in text.match_indices(name) {
+                    let before = &text[..at];
+                    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+                    let line_head = text[line_start..at].trim_start();
+                    if before.ends_with("fn ")
+                        || before.ends_with('"')
+                        || line_head.starts_with("//")
+                    {
+                        continue;
+                    }
+                    let end = text[at..].find(';').map_or(text.len(), |e| at + e);
+                    let args = &text[at..end];
+                    assert!(
+                        args.contains("Job::") && args.contains(".intent()"),
+                        "{}: a target mount that does not name its job: {args}",
+                        p.display()
+                    );
+                    calls += 1;
+                }
+            }
+        }
+        assert!(calls >= 15, "the scan found only {calls} calls");
+    }
+
+    /// The record `btrdasd raid accept` leaves: Y is the history from now,
+    /// X is given up.
+    fn accepted() -> Record {
+        Record {
+            fsid: FS.into(),
+            state: State::Degraded,
+            members: vec![PeriodMember {
+                devid: 2,
+                dev_uuid: DY.into(),
+                generation: 52,
+            }],
+            since: 2000,
+            last: 2000,
+            rejoined: None,
+            rejected: vec![PeriodMember {
+                devid: 1,
+                dev_uuid: DX.into(),
+                generation: 60,
+            }],
+        }
+    }
+
+    fn put_primary(case: &Case, r: &Record) {
+        write_copy(&primary_path(case.dir.path(), FS), r, true).unwrap();
+    }
+
+    /// bd DAS-Backup-Manager-su1b.11: a member `raid accept` gave up is
+    /// refused alone, for every job, before it is registered with btrfs or
+    /// anything is mounted.
+    #[test]
+    fn a_rejected_member_alone_is_refused_before_it_is_scanned_or_mounted() {
+        for intent in [Intent::Write, Intent::ReadOnly] {
+            let case = Case::new();
+            put_primary(&case, &accepted());
+            let host = only_x();
+            let why = refusal(case.run_as(&host, intent).0);
+            assert!(why.contains("raid accept") && why.contains(DX), "{why}");
+            let calls = host.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("scan") || c.starts_with("mount")),
+                "{intent:?}: {calls:?}"
+            );
+            assert_eq!(case.primary(), Copy::Read(accepted()), "unchanged");
+        }
+    }
+
+    /// Beside the accepted member: the plain mount would join two histories.
+    /// Refused before X is scanned and before anything is mounted.
+    #[test]
+    fn a_rejected_member_beside_the_accepted_one_is_refused_before_any_mount() {
+        let case = Case::new();
+        put_primary(&case, &accepted());
+        let host = both();
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("raid accept") && why.contains(DX), "{why}");
+        let calls = host.calls();
+        assert!(!calls.iter().any(|c| c == "scan /dev/sdb1"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("mount")), "{calls:?}");
+    }
+
+    /// The primary lost (a rollback of /): only the witness on the filesystem
+    /// still names X. Both present mount normally before it can be read, so
+    /// the mount is taken straight back down and refused.
+    #[test]
+    fn a_witness_naming_a_rejected_member_takes_the_normal_mount_back_down() {
+        let case = Case::new();
+        let host = both();
+        host.witness
+            .borrow_mut()
+            .insert(format!("{DX}+{DY}"), Copy::Read(accepted()));
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("raid accept") && why.contains(DX), "{why}");
+        assert_eq!(host.calls().last().unwrap(), "umount /mnt/p");
+        assert!(!host.calls().iter().any(|c| c == "write witness"));
+    }
+
+    /// Y alone again after the accept continues Y's period, and the rejected
+    /// member stays rejected.
+    #[test]
+    fn the_accepted_member_alone_continues_and_keeps_the_rejection() {
+        let case = Case::new();
+        put_primary(&case, &accepted());
+        let host = only_y();
+        host.now.set(3000);
+        host.witness
+            .borrow_mut()
+            .insert(DY.into(), Copy::Read(accepted()));
+        match case.run(&host).0 {
+            Ok(Outcome::Degraded { record, .. }) => {
+                assert_eq!(record.since, 2000, "the same period");
+                assert!(record.last > 3000, "{}", record.last);
+                assert_eq!(record.rejected, accepted().rejected);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A replacement joined (devid 1 again, a new device UUID): the scrub
+    /// after it pays the debt, and the rejection is kept as `settled`, so the
+    /// old drive, if it is ever attached unwiped, is still refused.
+    #[test]
+    fn the_rejection_outlives_the_scrub_as_settled() {
+        const DZ: &str = "5eed00a3-0000-4000-8000-0000000000a3";
+        let records = tempfile::TempDir::new().unwrap();
+        let fs_root = tempfile::TempDir::new().unwrap();
+        let mount = fs_root.path().to_str().unwrap();
+        let owed = Record {
+            state: State::ScrubOwed,
+            rejoined: Some(4000),
+            ..accepted()
+        };
+        write_copy(&primary_path(records.path(), FS), &owed, true).unwrap();
+        write_copy(&witness_path(mount), &owed, false).unwrap();
+        let cleared = clear_after_scrub(records.path(), mount, FS, 4001, Ok(vec![])).unwrap();
+        assert_eq!(cleared, Some(owed.clone()));
+        let settled = Record {
+            state: State::Settled,
+            rejoined: None,
+            ..owed
+        };
+        assert_eq!(
+            read_copy(&primary_path(records.path(), FS), FS),
+            Copy::Read(settled.clone())
+        );
+        assert_eq!(
+            read_copy(&witness_path(mount), FS),
+            Copy::Read(settled.clone())
+        );
+        // Settled, every current member present: a normal mount, nothing owed.
+        let case = Case::new();
+        put_primary(&case, &settled);
+        let host = FakeHost::new(vec![
+            ("SERIAL13", "/dev/sdd1", 1, DZ, 70, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        assert!(matches!(
+            case.run(&host).0,
+            Ok(Outcome::Normal {
+                owed: None,
+                record_problem: None,
+                ..
+            })
+        ));
+        // The old drive X beside the pair: refused.
+        let host = FakeHost::new(vec![
+            ("SERIAL13", "/dev/sdd1", 1, DZ, 70, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+        ]);
+        assert!(refusal(case.run(&host).0).contains(DX));
+    }
+
+    #[test]
+    fn a_rejection_round_trips_and_malformed_ones_are_bad() {
+        let rec = accepted();
+        let text = rec.render();
+        let line = format!("rejected=1 {DX} 60\n");
+        assert!(text.contains(&line), "{text}");
+        assert_eq!(Record::parse(&text, FS), Ok(rec.clone()));
+        let settled = Record {
+            state: State::Settled,
+            ..rec.clone()
+        };
+        assert_eq!(Record::parse(&settled.render(), FS), Ok(settled.clone()));
+        for broken in [
+            settled.render().replace(&line, ""),
+            format!("{text}{line}"),
+            text.replace(&line, &format!("rejected=2 {DY} 60\n")),
+            text.replace(&line, "rejected=1 nope 60\n"),
+        ] {
+            assert!(Record::parse(&broken, FS).is_err(), "{broken}");
+        }
+        // A copy that lacks the rejection does not drop it.
+        let plain = Record {
+            rejected: Vec::new(),
+            ..rec.clone()
+        };
+        let m = merged(&Copy::Read(plain), &Copy::Read(rec.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.rejected, rec.rejected);
+    }
+
+    fn plan_for<'a>(case: &'a Case) -> Plan<'a> {
+        Plan {
+            label: "primary",
+            fsid: FS,
+            mount: "/mnt/p",
+            serials: &case.serials,
+            mount_opts: "noatime,degraded,compress=zstd",
+            wait: Duration::from_secs(60),
+            record_dir: case.dir.path(),
+            intent: Intent::Write,
+        }
+    }
+
+    /// X recorded degraded (since 1060, last 1060), then Y alone: the split
+    /// brain `raid accept` exists for.
+    fn split_brain_case() -> (Case, Record) {
+        let case = Case::new();
+        let period = match case.run(&only_x()).0 {
+            Ok(Outcome::Degraded { record, .. }) => record,
+            other => panic!("{other:?}"),
+        };
+        (case, period)
+    }
+
+    fn accept_with(
+        case: &Case,
+        host: &FakeHost,
+        typed: Result<&str, &str>,
+    ) -> (Result<Accepted, String>, Vec<String>) {
+        let mut shown = Vec::new();
+        let mut confirm = |text: &str| {
+            shown.push(text.to_string());
+            typed.map(str::to_string).map_err(str::to_string)
+        };
+        let runs = |from: i64, to: i64| {
+            assert!(from <= to);
+            Ok(Some(3))
+        };
+        let r = accept(
+            host,
+            &plan_for(case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        );
+        (r, shown)
+    }
+
+    #[test]
+    fn accept_is_refused_unless_the_guard_refuses_the_target_for_split_brain() {
+        // No record: a degraded mount would be allowed.
+        let case = Case::new();
+        let (r, shown) = accept_with(&case, &only_x(), Ok("primary"));
+        assert!(r.unwrap_err().contains("not refused"));
+        assert!(shown.is_empty(), "nothing asked");
+        // Both present.
+        let (case, _) = split_brain_case();
+        let (r, _) = accept_with(&case, &both(), Ok("primary"));
+        assert!(r.unwrap_err().contains("every member"));
+        // The record unreadable: refused for another reason.
+        let case = Case::new();
+        fs::write(primary_path(case.dir.path(), FS), "junk\n").unwrap();
+        let (r, _) = accept_with(&case, &only_y(), Ok("primary"));
+        assert!(r.unwrap_err().contains("unreadable"));
+        assert_eq!(
+            read_copy(&primary_path(case.dir.path(), FS), FS),
+            Copy::Bad(format!(
+                "{}: the first line is not '{FORMAT_LINE}'",
+                primary_path(case.dir.path(), FS).display()
+            ))
+        );
+    }
+
+    #[test]
+    fn accept_needs_the_label_typed_exactly_and_writes_nothing_otherwise() {
+        for typed in [
+            Ok("primar"),
+            Ok("primary "),
+            Ok("PRIMARY"),
+            Ok(""),
+            Err("not a terminal"),
+        ] {
+            let (case, period) = split_brain_case();
+            let host = only_y();
+            let (r, shown) = accept_with(&case, &host, typed);
+            assert!(r.is_err(), "{typed:?}");
+            assert_eq!(shown.len(), 1, "explained once");
+            assert_eq!(case.primary(), Copy::Read(period.clone()), "{typed:?}");
+            let calls = host.calls();
+            assert!(!calls.iter().any(|c| c == "write witness"), "{calls:?}");
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("mount") && !c.contains(PROBE_OPTS)),
+                "mounted writable: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_makes_the_present_member_the_history_and_rejects_the_absent_one() {
+        let (case, period) = split_brain_case();
+        let host = only_y();
+        host.now.set(7000);
+        let (r, shown) = accept_with(&case, &host, Ok("primary"));
+        let done = r.unwrap();
+        // What was shown: Y by its superblock, the period on X, the runs only X holds.
+        let text = &shown[0];
+        for needle in [
+            DY,
+            "superblock generation 52",
+            DX,
+            "3 backup run",
+            "SERIAL11",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(text.contains(&when(period.since)), "{text}");
+        assert_eq!(done.before, period);
+        let after = done.after.clone();
+        assert_eq!(after.state, State::Degraded);
+        assert_eq!(after.dev_uuids(), BTreeSet::from([DY]));
+        assert_eq!(after.members[0].generation, 52);
+        assert_eq!(after.rejected_uuids(), BTreeSet::from([DX]));
+        assert_eq!(after.since, 7000);
+        assert_eq!(case.primary(), Copy::Read(after.clone()));
+        assert_eq!(
+            host.witness.borrow().get(DY),
+            Some(&Copy::Read(after.clone()))
+        );
+        let calls = host.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("mount"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                format!("mount {PROBE_OPTS} {FS} /mnt/p"),
+                format!("mount noatime,compress=zstd,degraded {FS} /mnt/p"),
+            ]
+        );
+        assert_eq!(calls.last().unwrap(), "umount /mnt/p", "left unmounted");
+        // From now on: Y alone is the period, X is refused alone and beside Y.
+        assert!(matches!(
+            case.run(&only_y()).0,
+            Ok(Outcome::Degraded { .. })
+        ));
+        assert!(refusal(case.run(&only_x()).0).contains("raid accept"));
+        assert!(refusal(case.run(&both()).0).contains("raid accept"));
+        // And a second accept, X alone, is refused: X is rejected.
+        let (r, _) = accept_with(&case, &only_x(), Ok("primary"));
+        assert!(r.unwrap_err().contains("raid accept"));
+    }
+
+    #[test]
+    fn accept_says_unknown_when_the_runs_cannot_be_counted() {
+        let (case, _) = split_brain_case();
+        let host = only_y();
+        let found = split_brain_now(&host, &plan_for(&case), &TestProgress::default()).unwrap();
+        let text = accept_explanation("primary", FS, &found, &Err("no database".into()));
+        assert!(text.contains("unknown (no database)"), "{text}");
+        assert!(!text.contains(" 0 backup run"), "{text}");
+    }
+
+    /// The primary copy was rewritten and the witness was not (the mount for
+    /// it failed): a second accept finishes the first.
+    #[test]
+    fn a_half_finished_accept_is_finished_by_the_next() {
+        let (case, period) = split_brain_case();
+        let half = Record {
+            members: vec![PeriodMember {
+                devid: 2,
+                dev_uuid: DY.into(),
+                generation: 52,
+            }],
+            rejected: period.members.clone(),
+            since: 6000,
+            last: 6000,
+            ..period.clone()
+        };
+        put_primary(&case, &half);
+        let host = only_y();
+        host.witness
+            .borrow_mut()
+            .insert(DY.into(), Copy::Read(period.clone()));
+        let found = split_brain_now(&host, &plan_for(&case), &TestProgress::default()).unwrap();
+        assert!(found.resumed);
+        let (r, _) = accept_with(&case, &host, Ok("primary"));
+        let after = r.unwrap().after;
+        assert_eq!(
+            host.witness.borrow().get(DY),
+            Some(&Copy::Read(after.clone()))
+        );
+        assert_eq!(case.primary(), Copy::Read(after));
+    }
+
+    /// bd DAS-Backup-Manager-su1b.14: only the mount that turns a degraded
+    /// record into scrub-owed is the rejoin; the next one owes the same scrub
+    /// and is not.
+    #[test]
+    fn only_the_mount_that_rejoins_says_so() {
+        let case = Case::new();
+        assert!(case.run(&only_x()).0.is_ok());
+        let first = case.run(&both()).0;
+        assert!(
+            matches!(
+                first,
+                Ok(Outcome::Normal {
+                    rejoined_now: true,
+                    owed: Some(_),
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        let (line, code) = cli_line(&first);
+        assert!(line.starts_with("RAID GUARD: REJOINED  ("), "{line}");
+        assert_eq!(code, 0);
+        let again = case.run(&both()).0;
+        assert!(
+            matches!(
+                again,
+                Ok(Outcome::Normal {
+                    rejoined_now: false,
+                    owed: Some(_),
+                    ..
+                })
+            ),
+            "{again:?}"
+        );
+        assert!(cli_line(&again).0.starts_with("RAID GUARD: SCRUB-OWED  ("));
+    }
+
+    /// A member that drops while a job has the target mounted (bd
+    /// DAS-Backup-Manager-su1b.14): the end-of-job check records a degraded
+    /// period on the members still present, so the next mount with both owes
+    /// a scrub.
+    #[test]
+    fn a_member_that_drops_during_a_job_is_recorded_before_the_unmount() {
+        let case = Case::new();
+        let host = both();
+        assert!(matches!(
+            case.run(&host).0,
+            Ok(Outcome::Normal { owed: None, .. })
+        ));
+        assert_eq!(
+            check_before_unmount(&host, &plan_for(&case)),
+            EndCheck::Whole
+        );
+        assert_eq!(case.primary(), Copy::Absent, "nothing to record");
+        *host.missing.borrow_mut() = Ok(vec![2]);
+        host.now.set(5000);
+        let record = match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Recorded { record, why } => {
+                assert!(why.contains("devid(s) [2]"), "{why}");
+                record
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(record.state, State::Degraded);
+        assert_eq!(record.dev_uuids(), BTreeSet::from([DX]));
+        assert_eq!((record.since, record.last), (5000, 5000));
+        assert_eq!(case.primary(), Copy::Read(record.clone()));
+        assert_eq!(
+            host.witness.borrow().get(&format!("{DX}+{DY}")),
+            Some(&Copy::Read(record.clone()))
+        );
+        // The next mount with both present is the rejoin.
+        assert!(matches!(
+            case.run(&both()).0,
+            Ok(Outcome::Normal {
+                rejoined_now: true,
+                ..
+            })
+        ));
+    }
+
+    /// The kernel's view unreadable at the end: possibly dropped, so a period
+    /// is recorded on every member found — the cautious answer, a scrub owed
+    /// at the next mount.
+    #[test]
+    fn an_unreadable_view_at_the_end_records_a_period_on_every_member_found() {
+        let case = Case::new();
+        let host = both();
+        assert!(case.run(&host).0.is_ok());
+        *host.missing.borrow_mut() = Err("no such directory".into());
+        match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Recorded { record, why } => {
+                assert!(why.contains("cannot be read"), "{why}");
+                assert_eq!(record.dev_uuids(), BTreeSet::from([DX, DY]));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(case.primary(), Copy::Read(_)));
+    }
+
+    /// An unreadable record at the end: a member missing and nothing can be
+    /// written over it — said, never a silent "recorded".
+    #[test]
+    fn a_drop_with_an_unreadable_record_is_a_problem_not_a_record() {
+        let case = Case::new();
+        let host = both();
+        assert!(case.run(&host).0.is_ok());
+        fs::write(primary_path(case.dir.path(), FS), "junk\n").unwrap();
+        *host.missing.borrow_mut() = Ok(vec![1]);
+        match check_before_unmount(&host, &plan_for(&case)) {
+            EndCheck::Problem(why) => assert!(why.contains("unreadable"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// bd DAS-Backup-Manager-su1b.14: a rejoin noted in this process starts
+    /// the owed scrub once the lock is let go — and a test build never starts
+    /// the real unit.
+    #[test]
+    fn the_owed_scrub_is_started_after_release_and_never_by_a_test_build() {
+        let label = "owed-scrub-test-target";
+        note_owed_scrub(label);
+        note_owed_scrub(label);
+        let said = after_maintenance_released();
+        // Another test's release may have taken it first; either way it is
+        // gone and nothing real was started.
+        if let Some(line) = said {
+            assert!(line.contains("refused in a test build"), "{line}");
+            assert!(line.starts_with("warning: "), "{line}");
+        }
+        assert!(!take_owed_scrub().iter().any(|l| l == label));
+        assert!(
+            start_owed_scrub()
+                .unwrap_err()
+                .contains("refused in a test build")
+        );
+    }
+
+    /// Review F1 (bd DAS-Backup-Manager-su1b.11): the primary lost (a
+    /// rollback of /), the rejected X attached beside the accepted Y. Their
+    /// superblock generations differ and no readable record explains it:
+    /// never a read-write mount (the kernel would take X's tree and the
+    /// rejoin's scrub would "repair" Y from it). A read-only job gets a
+    /// read-only mount.
+    #[test]
+    fn diverged_generations_with_no_record_are_refused_before_any_rw_mount() {
+        let pair = || {
+            let host = FakeHost::new(vec![
+                ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+                ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ]);
+            host.witness
+                .borrow_mut()
+                .insert(format!("{DX}+{DY}"), Copy::Read(accepted()));
+            host
+        };
+        let case = Case::new();
+        let host = pair();
+        let why = refusal(case.run(&host).0);
+        assert!(
+            why.contains("generation") && why.contains("raid accept"),
+            "{why}"
+        );
+        assert!(
+            !host.calls().iter().any(|c| c.starts_with("mount ")),
+            "{:?}",
+            host.calls()
+        );
+        let host = pair();
+        match case.run_as(&host, Intent::ReadOnly).0 {
+            Ok(Outcome::ReadOnly { why, .. }) => assert!(why.contains("generation"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let mounts: Vec<String> = host
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("mount "))
+            .collect();
+        assert_eq!(
+            mounts,
+            [format!(
+                "mount noatime,compress=zstd,{STALE_READ_OPTS} {FS} /mnt/p"
+            )]
+        );
+        assert!(!host.calls().iter().any(|c| c == "write witness"));
+        assert_eq!(case.primary(), Copy::Absent);
+    }
+
+    /// A healthy pair after a rollback of / (no primary, equal generations)
+    /// mounts normally.
+    #[test]
+    fn equal_generations_with_no_record_mount_normally() {
+        let case = Case::new();
+        assert!(matches!(
+            case.run(&both()).0,
+            Ok(Outcome::Normal { owed: None, .. })
+        ));
+    }
+
+    /// Review F1: an unreadable primary refuses every job that writes, before
+    /// anything is scanned or mounted; a read-only job gets a read-only mount.
+    #[test]
+    fn an_unreadable_primary_refuses_every_write_mount() {
+        let case = Case::new();
+        fs::write(primary_path(case.dir.path(), FS), "junk\n").unwrap();
+        let host = both();
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("unreadable"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount") || c.starts_with("scan")),
+            "{:?}",
+            host.calls()
+        );
+        let host = both();
+        assert!(matches!(
+            case.run_as(&host, Intent::ReadOnly).0,
+            Ok(Outcome::ReadOnly { .. })
+        ));
+        assert!(
+            host.calls()
+                .iter()
+                .filter(|c| c.starts_with("mount"))
+                .all(|c| c.contains(STALE_READ_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+    }
+
+    /// Review F2: the rejected X plugged in while the label is typed (udev
+    /// registers it by itself): refused before anything is written or
+    /// mounted read-write.
+    #[test]
+    fn accept_refuses_a_member_that_appears_during_the_prompt() {
+        let (case, period) = split_brain_case();
+        let host = FakeHost::new(vec![
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 1),
+        ]);
+        let mut confirm = |_: &str| {
+            host.polls.set(1);
+            Ok("primary".to_string())
+        };
+        let runs = |_: i64, _: i64| Ok(Some(0));
+        let why = accept(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        )
+        .unwrap_err();
+        assert!(why.contains("unplug") && why.contains(DX), "{why}");
+        assert_eq!(case.primary(), Copy::Read(period), "nothing written");
+        let calls = host.calls();
+        assert!(!calls.iter().any(|c| c == "write witness"), "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("mount") && !c.contains(PROBE_OPTS)),
+            "{calls:?}"
+        );
+    }
+
+    /// Review F2: the degraded mount came up with a member besides the
+    /// accepted one: taken straight down, nothing written.
+    #[test]
+    fn accept_takes_down_a_mount_with_a_foreign_member_and_writes_nothing() {
+        let (case, period) = split_brain_case();
+        let host = only_y();
+        *host.devinfo.borrow_mut() = Some(Ok(vec![(1, false), (2, false)]));
+        let (r, _) = accept_with(&case, &host, Ok("primary"));
+        let why = r.unwrap_err();
+        assert!(why.contains("devid 1"), "{why}");
+        assert_eq!(host.calls().last().unwrap(), "umount /mnt/p");
+        assert!(!host.calls().iter().any(|c| c == "write witness"));
+        assert_eq!(case.primary(), Copy::Read(period), "nothing written");
+    }
+
+    /// Review round 3 (F1-stale): a primary that reads but predates the
+    /// accept (an old backup, a recovery OS's copy) — rejected nothing, the
+    /// period on X — with X and Y attached and their generations apart. Each
+    /// member's own witness is read alone: Y's rejects X. Refused before any
+    /// read-write mount; every member forgotten for a probe is registered
+    /// again.
+    #[test]
+    fn diverged_members_are_read_one_by_one_and_a_rejection_on_either_refuses() {
+        let case = Case::new();
+        let stale = Record {
+            members: vec![PeriodMember {
+                devid: 1,
+                dev_uuid: DX.into(),
+                generation: 60,
+            }],
+            rejected: Vec::new(),
+            since: 500,
+            last: 500,
+            ..accepted()
+        };
+        put_primary(&case, &stale);
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        host.witness
+            .borrow_mut()
+            .insert(DX.into(), Copy::Read(stale.clone()));
+        host.witness
+            .borrow_mut()
+            .insert(DY.into(), Copy::Read(accepted()));
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("raid accept") && why.contains(DX), "{why}");
+        let calls = host.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("mount ")),
+            "a filesystem mount: {calls:?}"
+        );
+        for (forgotten, probed) in [("/dev/sdc1", "/dev/sdb1"), ("/dev/sdb1", "/dev/sdc1")] {
+            let f = calls
+                .iter()
+                .position(|c| *c == format!("forget {forgotten}"))
+                .unwrap_or_else(|| panic!("{forgotten} not forgotten: {calls:?}"));
+            let m = calls
+                .iter()
+                .position(|c| *c == format!("mount-dev {PROBE_OPTS} {probed} /run/fake-probe"))
+                .unwrap_or_else(|| panic!("{probed} not probed alone: {calls:?}"));
+            let r = calls
+                .iter()
+                .rposition(|c| *c == format!("scan {forgotten}"))
+                .unwrap_or_else(|| panic!("{forgotten} not registered again: {calls:?}"));
+            assert!(f < m && m < r, "{calls:?}");
+        }
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "forget" || c.ends_with("--forget"))
+        );
+        assert_eq!(case.primary(), Copy::Read(stale), "nothing written");
+    }
+
+    /// A member whose own probe mount fails: refused for writing, and the
+    /// member forgotten for it is registered again all the same.
+    #[test]
+    fn a_failed_member_probe_refuses_and_still_registers_the_others_again() {
+        let case = Case::new();
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        put_primary(
+            &case,
+            &Record {
+                members: vec![PeriodMember {
+                    devid: 1,
+                    dev_uuid: DX.into(),
+                    generation: 60,
+                }],
+                rejected: Vec::new(),
+                ..accepted()
+            },
+        );
+        host.fail_device_mount
+            .borrow_mut()
+            .insert("/dev/sdb1".into());
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("/dev/sdb1"), "{why}");
+        let calls = host.calls();
+        let f = calls
+            .iter()
+            .position(|c| c == "forget /dev/sdc1")
+            .expect("forgot");
+        let r = calls.iter().rposition(|c| c == "scan /dev/sdc1").unwrap();
+        assert!(f < r, "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("mount ")), "{calls:?}");
+    }
+
+    /// The filesystem mounted somewhere else: nothing is forgotten or probed.
+    #[test]
+    fn diverged_members_of_a_filesystem_mounted_elsewhere_are_refused_untouched() {
+        let case = Case::new();
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 70, 0),
+        ]);
+        host.mounted_elsewhere.set(true);
+        let why = refusal(case.run(&host).0);
+        assert!(why.contains("mounted"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("forget") || c.starts_with("mount")),
+            "{:?}",
+            host.calls()
+        );
+    }
+
+    /// A healthy pair (one generation): no forget, no probe.
+    #[test]
+    fn a_healthy_pair_is_never_forgotten_or_probed() {
+        let case = Case::new();
+        let host = both();
+        assert!(matches!(case.run(&host).0, Ok(Outcome::Normal { .. })));
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("forget") || c.starts_with("mount-dev")),
+            "{:?}",
+            host.calls()
+        );
+    }
+
+    /// Review round 3 (F2-gap): during the prompt a drive appears whose
+    /// superblock cannot be read: refused, never filtered out.
+    #[test]
+    fn accept_refuses_a_listed_member_whose_superblock_cannot_be_read() {
+        let (case, period) = split_brain_case();
+        let host = FakeHost::new(vec![
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 1),
+        ]);
+        host.bad_super.borrow_mut().insert("/dev/sdb1".into());
+        let mut confirm = |_: &str| {
+            host.polls.set(1);
+            Ok("primary".to_string())
+        };
+        let runs = |_: i64, _: i64| Ok(Some(0));
+        let why = accept(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        )
+        .unwrap_err();
+        assert!(why.contains("/dev/sdb1"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount ") && !c.contains(PROBE_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+        assert_eq!(case.primary(), Copy::Read(period));
+    }
+
+    /// Review round 3 (F2-gap): the absent drive's serial is attached again
+    /// during the prompt although blkid does not list it: refused.
+    #[test]
+    fn accept_refuses_when_the_absent_drive_s_serial_is_attached_again() {
+        let (case, period) = split_brain_case();
+        let host = FakeHost::new(vec![
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 1),
+        ]);
+        let mut confirm = |_: &str| {
+            host.polls.set(1);
+            host.hide_members.set(true);
+            Ok("primary".to_string())
+        };
+        let runs = |_: i64, _: i64| Ok(Some(0));
+        let why = accept(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            &TestProgress::default(),
+        )
+        .unwrap_err();
+        assert!(why.contains("SERIAL11"), "{why}");
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("mount ") && !c.contains(PROBE_OPTS)),
+            "{:?}",
+            host.calls()
+        );
+        assert_eq!(case.primary(), Copy::Read(period));
+    }
+
     #[test]
     fn x_alone_again_continues_the_same_period() {
         let case = Case::new();
@@ -1590,7 +4029,11 @@ mod tests {
             host.witness.borrow().get(&format!("{DX}+{DY}")),
             Some(&Copy::Read(owed.clone()))
         );
-        assert!(warnings(&progress).iter().any(|w| w.contains("SCRUB-OWED")));
+        assert!(
+            warnings(&progress)
+                .iter()
+                .any(|w| w.contains("REJOINED") && w.contains("a scrub is owed"))
+        );
         assert!(!scrub_clears(&owed, 8999) && !scrub_clears(&owed, 9000));
         assert!(scrub_clears(&owed, 9001));
     }
@@ -1771,6 +4214,7 @@ mod tests {
             mount_opts: "noatime,ro",
             wait: Duration::ZERO,
             record_dir: case.dir.path(),
+            intent: Intent::ReadOnly,
         };
         match mount_guarded(&host, &plan, &progress) {
             Ok(Outcome::Degraded {
@@ -1829,6 +4273,7 @@ mod tests {
             since: 100,
             last: 200,
             rejoined: Some(300),
+            rejected: Vec::new(),
         };
         let primary = primary_path(records.path(), FS);
         let put = |r: &Record| {
@@ -1903,6 +4348,7 @@ mod tests {
             since: 1,
             last: 2,
             rejoined: Some(3),
+            rejected: Vec::new(),
         };
         assert_eq!(Record::parse(&rec.render(), FS), Ok(rec.clone()));
         assert!(
@@ -1946,6 +4392,7 @@ mod tests {
             since: 1,
             last: 1,
             rejoined: None,
+            rejected: Vec::new(),
         };
         let b = Record {
             members: vec![PeriodMember {

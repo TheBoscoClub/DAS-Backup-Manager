@@ -109,7 +109,7 @@ impl From<scrub::ScrubError> for DoctorError {
 ///
 /// **Kill-signal case (documented, not handled by a signal handler).** A
 /// `SIGKILL` — e.g. `systemd` escalating past `das-backup-doctor.service`'s
-/// `TimeoutStartSec=600` — gives [`mount::MountGuard`]'s `Drop` impl no chance
+/// `TimeoutStartSec` (600 s plus `[das].member_wait_secs` per RAID-1 target) — gives [`mount::MountGuard`]'s `Drop` impl no chance
 /// to run, so any source volumes newly mounted by this invocation are *not*
 /// unmounted. The two locks are unaffected: `flock(2)` is released by the
 /// kernel the instant the holding process's file descriptors close, which a
@@ -400,6 +400,8 @@ pub fn raid_findings(config: &Config, record_dir: &std::path::Path) -> Vec<RaidF
                             r.rejoined.unwrap_or(r.last)
                         ),
                     ),
+                    // Nothing owed; the members it refuses are the guard's.
+                    State::Settled => continue,
                 }
             }
         };
@@ -944,7 +946,12 @@ fn perform_delivery_check(
         "Checking that every target holds a recent snapshot of each pair",
         1,
     );
-    let mut guard = match mount::ensure_targets_mounted(config, progress, held) {
+    let mut guard = match mount::ensure_targets_mounted(
+        config,
+        crate::raid_guard::Job::Doctor.intent(),
+        progress,
+        held,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             (report.targets_failed, report.targets_absent) =
@@ -1278,6 +1285,7 @@ mod raid_record_tests {
             since: 1,
             last: 2,
             rejoined: Some(3),
+            rejected: Vec::new(),
         };
         let path = raid_guard::primary_path(dir.path(), FS);
         raid_guard::write_copy(&path, &owed, true).unwrap();

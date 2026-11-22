@@ -241,6 +241,66 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         }
     }
 
+    fn forget(&self, path: &str) -> Result<(), String> {
+        let out = self.run(Command::new("btrfs").args(["device", "scan", "--forget", path]))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed("btrfs device scan --forget", &out))
+        }
+    }
+
+    fn mount_device(&self, opts: &str, device: &str, at: &str) -> Result<(), String> {
+        let out = self.run(Command::new("mount").args(["-t", "btrfs", "-o", opts, device, at]))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let why = failed("mount", &out);
+        if (self.probes.is_mountpoint)(Path::new(at))
+            && let Err(u) = umount_retrying(self.runner, at, |_| {})
+        {
+            return Err(format!(
+                "{why}; it is mounted anyway and will not unmount: {u}"
+            ));
+        }
+        Err(why)
+    }
+
+    fn temp_mountpoint(&self) -> Result<String, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let at = format!(
+            "/run/btrdasd-raid-probe.{}.{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&at)
+            .map_err(|e| format!("cannot create {at}: {e}"))?;
+        Ok(at)
+    }
+
+    fn remove_mountpoint(&self, at: &str) -> Result<(), String> {
+        std::fs::remove_dir(at).map_err(|e| format!("cannot remove {at}: {e}"))
+    }
+
+    fn fsid_mounted(&self, fsid: &str) -> Result<bool, String> {
+        let out = self.run(Command::new("findmnt").args([
+            "-n",
+            "-o",
+            "TARGET",
+            "-S",
+            &format!("UUID={fsid}"),
+        ]))?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(failed("findmnt", &out)),
+        }
+    }
+
     fn read_super(&self, path: &str) -> Result<String, String> {
         let out = self.run(Command::new("btrfs").args(["inspect-internal", "dump-super", path]))?;
         if out.status.success() {
@@ -286,6 +346,10 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         (self.probes.missing_devids)(fsid)
     }
 
+    fn devinfo(&self, fsid: &str) -> Result<Vec<(u64, bool)>, String> {
+        raid_guard::devinfo_under(Path::new("/sys/fs/btrfs"), fsid)
+    }
+
     fn read_witness(&self, mount: &str, fsid: &str) -> raid_guard::Copy {
         raid_guard::read_copy(&raid_guard::witness_path(mount), fsid)
     }
@@ -314,12 +378,14 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
 pub fn mount_guarded_target(
     config: &Config,
     target: &Target,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     _held: &MaintenanceHeld,
 ) -> Result<raid_guard::Outcome, raid_guard::Failure> {
     mount_guarded_with(
         config,
         target,
+        intent,
         &raid_guard::record_dir(),
         progress,
         &HOST_PROBES,
@@ -330,6 +396,7 @@ pub fn mount_guarded_target(
 fn mount_guarded_with(
     config: &Config,
     target: &Target,
+    intent: raid_guard::Intent,
     record_dir: &Path,
     progress: &dyn ProgressCallback,
     probes: &MountProbes<'_>,
@@ -352,9 +419,231 @@ fn mount_guarded_with(
             mount_opts: &config.das.mount_opts,
             wait: Duration::from_secs(config.das.member_wait_secs.into()),
             record_dir,
+            intent,
         },
         progress,
     )
+}
+
+/// The end-of-job check of `target`, mounted at its path by this process's
+/// own code (the scrub engine, `btrdasd backup raid-check` for
+/// `backup-run.sh`), before it is unmounted (bd DAS-Backup-Manager-su1b.14).
+pub fn raid_end_check(config: &Config, target: &Target) -> raid_guard::EndCheck {
+    let serials = target.effective_serials();
+    let record_dir = raid_guard::record_dir();
+    let host = SystemMembers {
+        runner: &SystemRunner,
+        probes: &HOST_PROBES,
+    };
+    raid_guard::check_before_unmount(
+        &host,
+        &raid_guard::Plan {
+            label: &target.label,
+            fsid: target.mount_uuid.as_deref().unwrap_or_default(),
+            mount: &target.mount,
+            serials: &serials,
+            mount_opts: &config.das.mount_opts,
+            wait: Duration::ZERO,
+            record_dir: &record_dir,
+            intent: raid_guard::Job::Backup.intent(),
+        },
+    )
+}
+
+/// What `btrdasd raid accept` did, and what could not be logged.
+#[derive(Debug)]
+pub struct RaidAccepted {
+    pub accepted: raid_guard::Accepted,
+    /// The journal line or the history row that could not be written: the
+    /// record is rewritten all the same (that is the act).
+    pub warnings: Vec<String>,
+}
+
+/// The RAID-1 target labelled `label`, its mount point ready (created when
+/// missing, never already a mount point), for `raid accept`. Returns whether
+/// the directory was created here.
+fn accept_target<'a>(
+    config: &'a Config,
+    label: &str,
+    probes: &MountProbes<'_>,
+) -> Result<(&'a Target, bool), String> {
+    let target = config
+        .targets
+        .iter()
+        .find(|t| t.label == label)
+        .ok_or_else(|| format!("no [[target]] labelled '{label}'"))?;
+    if !raid_guard::is_guarded(target) {
+        return Err(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let mount = Path::new(&target.mount);
+    if (probes.is_mountpoint)(mount) {
+        return Err(format!(
+            "{} is mounted: nothing can be accepted while a job uses the target",
+            target.mount
+        ));
+    }
+    let created = !mount.exists();
+    if created {
+        std::fs::create_dir_all(mount)
+            .map_err(|e| format!("cannot create {}: {e}", target.mount))?;
+    }
+    Ok((target, created))
+}
+
+fn accept_plan<'a>(
+    config: &'a Config,
+    target: &'a Target,
+    serials: &'a [String],
+    record_dir: &'a Path,
+) -> raid_guard::Plan<'a> {
+    raid_guard::Plan {
+        label: &target.label,
+        fsid: target.mount_uuid.as_deref().unwrap_or_default(),
+        mount: &target.mount,
+        serials,
+        mount_opts: &config.das.mount_opts,
+        wait: Duration::ZERO,
+        record_dir,
+        intent: raid_guard::Job::RaidAccept.intent(),
+    }
+}
+
+/// What `btrdasd raid accept <label>` would show, without asking or writing:
+/// the explanation when the guard refuses the target for split brain now,
+/// else why there is nothing to accept. It probe-mounts the target
+/// read-only, so `held` proves the maintenance lock.
+pub fn raid_accept_preview(
+    config: &Config,
+    label: &str,
+    db: &Path,
+    progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
+) -> Result<String, String> {
+    let (target, created) = accept_target(config, label, &HOST_PROBES)?;
+    let serials = target.effective_serials();
+    let record_dir = raid_guard::record_dir();
+    let plan = accept_plan(config, target, &serials, &record_dir);
+    let host = SystemMembers {
+        runner: &SystemRunner,
+        probes: &HOST_PROBES,
+    };
+    let result = raid_guard::split_brain_now(&host, &plan, progress).map(|found| {
+        raid_guard::accept_explanation(
+            label,
+            plan.fsid,
+            &found,
+            &crate::db::count_backup_runs_between_read_only(
+                db,
+                found.period.since,
+                found.period.last,
+            ),
+        )
+    });
+    if created {
+        remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
+    }
+    result
+}
+
+/// `btrdasd raid accept <label>` on this host (bd DAS-Backup-Manager-su1b.11):
+/// [`raid_guard::accept`], then one line to the journal (`logger -t btrdasd
+/// -p user.warning`) and one row in the database's `raid_accepted`. The
+/// caller holds the backup singleton (`_singleton`) and the maintenance lock
+/// (`_held`), as a configuration edit and a mount do. `confirm` is shown the
+/// explanation and returns what was typed; an `Err` (no terminal, no typed
+/// text) accepts nothing.
+pub fn raid_accept(
+    config: &Config,
+    label: &str,
+    db: &Path,
+    confirm: &mut dyn FnMut(&str) -> Result<String, String>,
+    progress: &dyn ProgressCallback,
+    _singleton: &crate::backup::SingletonHeld,
+    _held: &MaintenanceHeld,
+) -> Result<RaidAccepted, String> {
+    let (target, created) = accept_target(config, label, &HOST_PROBES)?;
+    let serials = target.effective_serials();
+    let record_dir = raid_guard::record_dir();
+    let plan = accept_plan(config, target, &serials, &record_dir);
+    let host = SystemMembers {
+        runner: &SystemRunner,
+        probes: &HOST_PROBES,
+    };
+    let runs = |from, to| crate::db::count_backup_runs_between_read_only(db, from, to);
+    let result = raid_guard::accept(&host, &plan, &runs, confirm, progress);
+    if created {
+        remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
+    }
+    let accepted = result?;
+    let mut warnings = Vec::new();
+    let list = |ms: &[raid_guard::PeriodMember]| {
+        ms.iter()
+            .map(|m| format!("{} {}", m.devid, m.dev_uuid))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let given_up: Vec<raid_guard::PeriodMember> = accepted
+        .after
+        .rejected
+        .iter()
+        .filter(|r| {
+            !accepted
+                .before
+                .rejected
+                .iter()
+                .any(|o| o.dev_uuid == r.dev_uuid)
+        })
+        .cloned()
+        .collect();
+    let line = format!(
+        "raid accept: target '{label}' (filesystem {}): devid(s) {} accepted as the history \
+         from {}; devid(s) {} given up, with the degraded period {} to {} that only they hold",
+        plan.fsid,
+        list(&accepted.after.members),
+        raid_guard::when(accepted.after.since),
+        list(&given_up),
+        raid_guard::when(accepted.before.since),
+        raid_guard::when(accepted.before.last),
+    );
+    match SystemRunner.status(
+        Command::new("logger")
+            .args(["-t", "btrdasd", "-p", "user.warning", "--"])
+            .arg(&line),
+    ) {
+        Ok(s) if s.success() => {}
+        Ok(s) => warnings.push(format!(
+            "the journal line was not written ({})",
+            exit_why("logger", s)
+        )),
+        Err(e) => warnings.push(format!("the journal line was not written (logger: {e})")),
+    }
+    let row = crate::db::RaidAcceptance {
+        accepted_at: accepted.after.since,
+        target: label.to_string(),
+        fsid: plan.fsid.to_string(),
+        accepted: list(&accepted.after.members),
+        rejected: list(&given_up),
+        period_since: accepted.before.since,
+        period_last: accepted.before.last,
+    };
+    match db.to_str().map(crate::db::Database::open) {
+        Some(Ok(database)) => {
+            if let Err(e) = database.record_raid_accept(&row) {
+                warnings.push(format!("the history row was not written ({e})"));
+            }
+        }
+        Some(Err(e)) => warnings.push(format!(
+            "the history row was not written ({}: {e})",
+            db.display()
+        )),
+        None => warnings.push(format!(
+            "the history row was not written ({} is not UTF-8)",
+            db.display()
+        )),
+    }
+    Ok(RaidAccepted { accepted, warnings })
 }
 
 /// RAII guard that unmounts targets on drop.
@@ -364,6 +653,10 @@ fn mount_guarded_with(
 /// touched.
 pub struct MountGuard {
     newly_mounted: Vec<String>,
+    /// The RAID-1 targets this guard mounted read-write through the guard:
+    /// each is checked for a member that dropped during the job before it is
+    /// unmounted (bd DAS-Backup-Manager-su1b.14).
+    guarded: Vec<GuardedMount>,
     runner: Arc<dyn CommandRunner>,
     /// What this guard holds, for the progress stage it reports on release.
     held_kind: &'static str,
@@ -511,10 +804,33 @@ fn mounted_is_target(
     }
 }
 
+/// What the end-of-job check needs about one guarded mount.
+struct GuardedMount {
+    label: String,
+    fsid: String,
+    mount: String,
+    serials: Vec<String>,
+    mount_opts: String,
+    record_dir: std::path::PathBuf,
+    /// The kernel's view, read at the end (production: `/sys/fs/btrfs`).
+    missing: MissingProbe,
+}
+
+/// Where a guarded mount keeps its record, and how its end-of-job check
+/// reads the kernel's view.
+struct RaidSite<'a> {
+    record_dir: &'a Path,
+    missing: MissingProbe,
+}
+
+/// How the end-of-job check reads the kernel's missing devids.
+type MissingProbe = std::rc::Rc<dyn Fn(&str) -> Result<Vec<u64>, String>>;
+
 impl MountGuard {
     fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             newly_mounted: Vec::new(),
+            guarded: Vec::new(),
             runner,
             held_kind: "targets",
             esps: Vec::new(),
@@ -535,6 +851,44 @@ impl MountGuard {
             dir.to_string_lossy().into_owned(),
             format!("PARTUUID={}", pu.to_ascii_lowercase()),
         ));
+    }
+
+    /// The end-of-job check of the guarded mount at `mount_point`, if this
+    /// guard made one (bd DAS-Backup-Manager-su1b.14): taken out of the list,
+    /// run, and said — a recorded drop or a problem as a warning.
+    fn end_check(&mut self, mount_point: &str, say: &mut dyn FnMut(bool, String)) {
+        let Some(at) = self.guarded.iter().position(|g| g.mount == mount_point) else {
+            return;
+        };
+        let g = self.guarded.remove(at);
+        let probes = MountProbes {
+            missing_devids: &*g.missing,
+            ..HOST_PROBES
+        };
+        let host = SystemMembers {
+            runner: &*self.runner,
+            probes: &probes,
+        };
+        let plan = raid_guard::Plan {
+            label: &g.label,
+            fsid: &g.fsid,
+            mount: &g.mount,
+            serials: &g.serials,
+            mount_opts: &g.mount_opts,
+            wait: Duration::ZERO,
+            record_dir: &g.record_dir,
+            intent: raid_guard::Job::Backup.intent(),
+        };
+        let check = raid_guard::check_before_unmount(&host, &plan);
+        let warn = !matches!(check, raid_guard::EndCheck::Whole);
+        say(
+            warn,
+            format!(
+                "Target '{}': {}",
+                g.label,
+                raid_guard::end_check_line(&check)
+            ),
+        );
     }
 
     /// A guard over the source volumes rather than the targets.
@@ -601,6 +955,16 @@ impl MountGuard {
         progress.on_stage(&format!("Unmounting {}", self.held_kind), total);
         let held: Vec<String> = self.newly_mounted.drain(..).rev().collect();
         for (i, mount_point) in held.into_iter().enumerate() {
+            self.end_check(&mount_point, &mut |warn, line| {
+                progress.on_log(
+                    if warn {
+                        crate::progress::LogLevel::Warning
+                    } else {
+                        crate::progress::LogLevel::Info
+                    },
+                    &line,
+                )
+            });
             let released = self.release(&mount_point, |msg| {
                 progress.on_log(crate::progress::LogLevel::Warning, msg);
             });
@@ -690,6 +1054,11 @@ impl MountGuard {
         let held: Vec<String> = self.newly_mounted.drain(..).rev().collect();
         held.into_iter()
             .filter_map(|mount_point| {
+                self.end_check(&mount_point, &mut |warn, line| {
+                    if warn {
+                        eprintln!("MountGuard::drop: {line}");
+                    }
+                });
                 self.release(&mount_point, |msg| eprintln!("MountGuard::drop: {msg}"))
                     .err()
                     .map(|why| {
@@ -763,16 +1132,21 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// (bd DAS-Backup-Manager-frb). Release the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
     ensure_targets_mounted_with(
         config,
+        intent,
         progress,
         held,
         &HOST_PROBES,
         Arc::new(SystemRunner),
-        &raid_guard::record_dir(),
+        RaidSite {
+            record_dir: &raid_guard::record_dir(),
+            missing: std::rc::Rc::new(raid_guard::missing_devids),
+        },
     )
 }
 
@@ -826,12 +1200,17 @@ fn target_attached_with(target: &Target, probes: &MountProbes<'_>) -> bool {
 /// is mounted and where the drives are, `runner` executes `mount`.
 fn ensure_targets_mounted_with(
     config: &Config,
+    intent: raid_guard::Intent,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
     probes: &MountProbes<'_>,
     runner: Arc<dyn CommandRunner>,
-    raid_dir: &Path,
+    raid: RaidSite<'_>,
 ) -> Result<MountGuard, MountError> {
+    let RaidSite {
+        record_dir: raid_dir,
+        missing: end_missing,
+    } = raid;
     let mut guard = MountGuard::new(runner);
     let mut any_available = false;
     let total = config.targets.len() as u64;
@@ -1032,10 +1411,42 @@ fn ensure_targets_mounted_with(
         // A RAID-1 target: the guarded mount, never `degraded` as configured
         // and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
         if raid_guard::is_guarded(target) {
-            match mount_guarded_with(config, target, raid_dir, progress, probes, &*guard.runner) {
+            match mount_guarded_with(
+                config,
+                target,
+                intent,
+                raid_dir,
+                progress,
+                probes,
+                &*guard.runner,
+            ) {
                 Ok(outcome) => {
                     any_available = true;
                     guard.newly_mounted.push(target.mount.clone());
+                    // A normal read-write mount is checked for a dropped
+                    // member at its end (bd DAS-Backup-Manager-su1b.14). A
+                    // degraded one shows its absent member missing all its
+                    // life, its period recorded at the mount; a read-only one
+                    // writes nothing: neither has anything to record.
+                    if matches!(outcome, raid_guard::Outcome::Normal { .. })
+                        && !raid_guard::is_read_only(&config.das.mount_opts)
+                    {
+                        guard.guarded.push(GuardedMount {
+                            label: target.label.clone(),
+                            fsid: target.mount_uuid.clone().unwrap_or_default(),
+                            mount: target.mount.clone(),
+                            serials: target.effective_serials(),
+                            mount_opts: config.das.mount_opts.clone(),
+                            record_dir: raid_dir.to_path_buf(),
+                            missing: end_missing.clone(),
+                        });
+                    }
+                    if let raid_guard::Outcome::Normal {
+                        rejoined_now: true, ..
+                    } = outcome
+                    {
+                        raid_guard::note_owed_scrub(&target.label);
+                    }
                     let (status, _) = outcome.status_line();
                     progress.on_progress(
                         (i + 1) as u64,
@@ -2143,8 +2554,13 @@ mod tests {
         uuids: Vec<(String, String)>,
         /// filesystem UUID → the devids the kernel marks missing
         missing: Vec<(String, Vec<u64>)>,
+        /// What the kernel shows missing when the job ends, per filesystem
+        /// UUID (none listed: nothing).
+        missing_at_end: Vec<(String, Vec<u64>)>,
         /// Where a guarded mount keeps its record; never the host's.
         raid_dir: Option<PathBuf>,
+        /// The intent the targets are mounted with (none: a writing job).
+        intent: Option<raid_guard::Intent>,
     }
 
     impl Host {
@@ -2224,7 +2640,27 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/das-raid-test-record-dir"));
             self.with_probes(runner, |p| {
-                ensure_targets_mounted_with(config, progress, held, p, runner.clone(), &raid_dir)
+                ensure_targets_mounted_with(
+                    config,
+                    self.intent.unwrap_or(raid_guard::Intent::Write),
+                    progress,
+                    held,
+                    p,
+                    runner.clone(),
+                    RaidSite {
+                        record_dir: &raid_dir,
+                        missing: {
+                            let at_end = self.missing_at_end.clone();
+                            std::rc::Rc::new(move |uuid: &str| {
+                                Ok(at_end
+                                    .iter()
+                                    .find(|(u, _)| u == uuid)
+                                    .map(|(_, m)| m.clone())
+                                    .unwrap_or_default())
+                            })
+                        },
+                    },
+                )
             })
         }
 
@@ -3369,6 +3805,109 @@ mod tests {
         assert_eq!(guard.count(), 1);
     }
 
+    /// bd DAS-Backup-Manager-su1b.14: a member that drops while the job has
+    /// the target mounted is recorded when the job gives the target back,
+    /// before the unmount; a whole pair records nothing.
+    #[test]
+    fn a_raid1_member_that_drops_during_the_job_is_recorded_at_its_unmount() {
+        for dropped in [false, true] {
+            let scratch = Scratch::new();
+            let (mut config, mut host, part_b, mnt) = attached_primary(&scratch);
+            let part_c = scratch.touch("dev/sdc1");
+            config.targets[0].mount_uuid = Some("u-p".into());
+            config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+            config.das.mount_opts = "noatime,degraded".into();
+            host.devices.push(("SER-Q".into(), scratch.path("dev/sdc")));
+            host.raid_dir = Some(PathBuf::from(scratch.path("raid")));
+            if dropped {
+                host.missing_at_end = vec![("u-p".into(), vec![2])];
+            }
+            let dx = "5eed00a1-0000-4000-8000-0000000000a1";
+            let runner = ScriptedRunner::with_rules(&[
+                ("blkid", Reply::Out(0, format!("{part_b}\n{part_c}\n"))),
+                (&part_b, Reply::Out(0, super_of("u-p", 1, dx, 40))),
+                (
+                    &part_c,
+                    Reply::Out(
+                        0,
+                        super_of("u-p", 2, "5eed00a2-0000-4000-8000-0000000000a2", 40),
+                    ),
+                ),
+            ]);
+            let progress = Recorder::default();
+            let mut guard = host.mount_targets(&config, &progress, &runner).unwrap();
+            assert!(
+                !std::path::Path::new(&scratch.path("raid/u-p.record")).exists(),
+                "a whole mount records nothing"
+            );
+            let still = guard.unmount(&progress);
+            assert!(still.is_empty(), "{still:?}");
+            let logs = progress.logs.lock().unwrap().clone();
+            let record = std::fs::read_to_string(scratch.path("raid/u-p.record"));
+            if dropped {
+                let record = record.expect("recorded");
+                assert!(record.contains(&format!("member=1 {dx} 40")), "{record}");
+                assert!(!record.contains("member=2"), "{record}");
+                assert!(
+                    std::fs::read_to_string(raid_guard::witness_path(&mnt))
+                        .unwrap()
+                        .contains(dx),
+                    "the witness is written before the unmount"
+                );
+                assert!(
+                    logs.iter().any(|(l, m)| matches!(l, LogLevel::Warning)
+                        && m.contains("RAID CHECK: RECORDED")),
+                    "{logs:?}"
+                );
+            } else {
+                assert!(record.is_err(), "{record:?}");
+                assert!(
+                    logs.iter().any(|(_, m)| m.contains("RAID CHECK: OK")),
+                    "{logs:?}"
+                );
+            }
+        }
+    }
+
+    /// A mount the guard made degraded shows its absent member missing for
+    /// its whole life; the period is already open and recorded at the mount,
+    /// so the end-of-job check is not run on it (no WARN every degraded run).
+    #[test]
+    fn a_degraded_raid1_mount_is_not_rechecked_at_its_unmount() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part_b, _mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+        config.das.mount_opts = "noatime,degraded".into();
+        config.das.member_wait_secs = 0;
+        host.raid_dir = Some(PathBuf::from(scratch.path("raid")));
+        host.missing_at_end = vec![("u-p".into(), vec![2])];
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n"))),
+            (
+                &part_b,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 1, "5eed00a1-0000-4000-8000-0000000000a1", 40),
+                ),
+            ),
+        ]);
+        let progress = Recorder::default();
+        let mut guard = host.mount_targets(&config, &progress, &runner).unwrap();
+        let record = std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap();
+        assert!(guard.unmount(&progress).is_empty());
+        let logs = progress.logs.lock().unwrap().clone();
+        assert!(
+            !logs.iter().any(|(_, m)| m.contains("RAID CHECK")),
+            "{logs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap(),
+            record,
+            "the record as the mount left it"
+        );
+    }
+
     /// One leg absent after the wait: mounted degraded, the period recorded
     /// under the guard's record directory. The other leg alone on a later run
     /// is a split brain: the whole job is refused, never a skipped target.
@@ -3444,6 +3983,37 @@ mod tests {
             "the stale leg was mounted writable: {:?}",
             runner.calls()
         );
+
+        // A job that only reads (walk, restore) is given it read-only, and
+        // the record is left as it was (bd DAS-Backup-Manager-su1b.11).
+        let record_before = std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap();
+        host.intent = Some(raid_guard::Intent::ReadOnly);
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_c}\n"))),
+            (&part_c, Reply::Out(0, super_of("u-p", 2, dy, 38))),
+        ]);
+        let guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .expect("mounted read-only");
+        assert_eq!(guard.count(), 1);
+        assert!(
+            runner.calls().contains(&output_call(&[
+                "mount",
+                "-t",
+                "btrfs",
+                "-o",
+                "noatime,ro,degraded,rescue=nologreplay",
+                "UUID=u-p",
+                &mnt
+            ])),
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path("raid/u-p.record")).unwrap(),
+            record_before
+        );
+        assert!(!raid_guard::witness_path(&mnt).exists(), "nothing written");
     }
 
     /// Any configured serial counts, not only the first — a RAID-1 pair with
@@ -5403,7 +5973,12 @@ mod tests {
 
         let config = Config::default();
         let progress = NullProgress;
-        let result = ensure_targets_mounted(&config, &progress, &MaintenanceHeld::assumed());
+        let result = ensure_targets_mounted(
+            &config,
+            raid_guard::Job::Backup.intent(),
+            &progress,
+            &MaintenanceHeld::assumed(),
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().count(), 0);
     }
