@@ -2492,7 +2492,7 @@ refresh_serial_devs() { # refresh_serial_devs <label>
 # read: never "none missing".
 DAS_SYSFS_BTRFS="${DAS_SYSFS_BTRFS:-/sys/fs/btrfs}"
 raid_missing_devids() { # raid_missing_devids <uuid>
-    local dir="$DAS_SYSFS_BTRFS/$1/devinfo" d flag seen=0
+    local dir="$DAS_SYSFS_BTRFS/${1,,}/devinfo" d flag seen=0 # sysfs names the fsid in lower case
     [[ -d "$dir" ]] || return 1
     for d in "$dir"/*/; do
         d="${d%/}"
