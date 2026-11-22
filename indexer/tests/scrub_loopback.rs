@@ -947,17 +947,13 @@ fn stop_then_resume(method: StopMethod, tag: &str) -> StopObservation {
     // Stop on evidence: this pass's record shows a position and more data
     // scrubbed than one chunk, so a resume that continued and one that
     // restarted from zero differ by more than the re-scrubbed chunk.
-    let begun = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // The baseline's record is gone, so any unfinished record is this pass's.
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         let rec = rig.read_record();
         if record_u64(&rec, "data_bytes_scrubbed").unwrap_or(0) >= STOP_AFTER_BYTES
             && record_u64(&rec, "last_physical").unwrap_or(0) > 0
             && record_u64(&rec, "finished") == Some(0)
-            && record_u64(&rec, "t_start").is_some_and(|t| t >= begun)
         {
             break;
         }
