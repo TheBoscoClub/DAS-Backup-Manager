@@ -522,6 +522,91 @@ pub fn deferred_line(path: &Path, holder: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// The claim: a backup asks a scrub to let go of the maintenance lock
+// ---------------------------------------------------------------------------
+
+/// The claim lock (bd DAS-Backup-Manager-su1b.2, design step A2): a backup
+/// that waits for the maintenance lock holds this file shared for as long as
+/// it waits, and a scrub pass that holds the maintenance lock probes it to
+/// learn that a backup is waiting, so it can let the backup go first.
+///
+/// A `flock`, not a request file or a signal: it ends with its holder, so a
+/// claimant killed by SIGKILL leaves no request behind and no pid is ever
+/// trusted to steer the scrub. Root's alone (0600, like every lock here), so
+/// only root can make a scrub pause.
+///
+/// Order: a claimant takes it after its backup singleton and before the
+/// maintenance lock, and lets go once it holds maintenance; the scrub never
+/// waits on it (the probe is `LOCK_NB`), so it adds no wait to the
+/// singleton → maintenance order and no deadlock.
+///
+/// Nothing claims yet: the scrub's yield (step A5) and the backups' claim
+/// (step A6) are later steps.
+pub const CLAIM_LOCK_PATH: &str = "/run/das-maintenance-claim.lock";
+
+/// Proof that this process claims the maintenance lock: it holds the claim
+/// lock shared, with its record (`<job> pid <pid>`) in the file, until the
+/// value is dropped. Drop it as soon as the maintenance lock is held.
+///
+/// The descriptor is close-on-exec, so no command this process runs keeps
+/// the claim; a fork that has not yet exec'd shares it, and the drop's
+/// `LOCK_UN` lets go for it too (see [`FileLock`]).
+#[derive(Debug)]
+pub struct Claim {
+    lock: FileLock,
+}
+
+impl Claim {
+    /// Claim, waiting while a probe holds the file — an instant: the probe
+    /// lets go at once, and claims share. `job` is recorded with this
+    /// process's pid, so a scrub that pauses can say for whom. Only one
+    /// backup runs at a time (the backup singleton), so the record is one
+    /// claimant's; it is shown to people, never parsed for a decision.
+    pub fn take_at(path: &Path, job: &str) -> Result<Self, ScrubError> {
+        let lock = FileLock::acquire_shared(path)?;
+        // Display only, as for the maintenance lock's record: a record that
+        // cannot be written costs the name, never the claim.
+        if let Err(e) = lock.write_note(&format!("{job} pid {}\n", std::process::id())) {
+            eprintln!(
+                "warning: could not record {job} as the claimant in {}: {e}",
+                path.display()
+            );
+        }
+        Ok(Self { lock })
+    }
+
+    /// The claim lock file.
+    pub fn path(&self) -> &Path {
+        self.lock.path()
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // Empty the record while the claim is still held. Display only.
+        if let Err(e) = self.lock.clear_note() {
+            eprintln!(
+                "warning: could not empty the claimant record in {}: {e}",
+                self.lock.path().display()
+            );
+        }
+        // The `FileLock` is dropped after this, which lets go.
+    }
+}
+
+/// Whether some process claims the maintenance lock: `Ok(true)` when an
+/// exclusive, non-blocking probe of the claim file is refused because a
+/// claimant holds it; `Ok(false)` when the probe gets it, and lets go at
+/// once. A file that cannot be opened or locked is an `Err`, never "nobody
+/// claims": the caller reads an `Err` as claimed, the cautious reading
+/// (`.claude/rules/fail-silent.md`), so a waiting backup is never kept
+/// waiting by a probe that could not look.
+pub fn claim_is_held(path: &Path) -> Result<bool, ScrubError> {
+    // The probe's `FileLock` drops at the end of this statement: unlocked.
+    Ok(FileLock::try_acquire(path)?.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,5 +1598,363 @@ mod tests {
         std::fs::write(&site.path, "").unwrap();
         let err = MaintenanceHeld::delegated_at(&site.path, -1).unwrap_err();
         assert!(err.contains("not an open descriptor"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// Long enough to be sure a claimant is blocked, not merely slow to start.
+    const STILL_WAITING: Duration = Duration::from_millis(300);
+    /// Ample for a released lock to be seen free.
+    const NOTICES: Duration = Duration::from_secs(5);
+
+    const CHILD_PATH: &str = "BTRDASD_CLAIM_CHILD_PATH";
+    const CHILD_MODE: &str = "BTRDASD_CLAIM_CHILD_MODE";
+    const CHILD_READY: &str = "claim-child-holds";
+
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("das-maintenance-claim.lock");
+        (dir, path)
+    }
+
+    fn me(job: &str) -> String {
+        format!("{job} pid {}", std::process::id())
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A child this test started, SIGKILLed and reaped however the test ends.
+    struct Killed(Child);
+
+    impl Killed {
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// SIGKILL, then reap: the child is gone when this returns.
+        fn kill_now(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            self.kill_now();
+        }
+    }
+
+    /// The child's stdout lines up to and including the one containing
+    /// `ready`; panics if the child ends first.
+    fn await_line(child: &mut Child, ready: &str) -> Vec<String> {
+        let out = child.stdout.take().unwrap();
+        let mut seen = Vec::new();
+        for line in BufReader::new(out).lines() {
+            let line = line.unwrap();
+            let done = line.contains(ready);
+            seen.push(line);
+            if done {
+                return seen;
+            }
+        }
+        panic!("the child ended before it printed {ready}: {seen:?}");
+    }
+
+    /// This test binary again, running only [`claim_child`] in `mode` on
+    /// `path`: `claim` holds a [`Claim`]; `probe` holds the lock exclusive,
+    /// as a probe does for its instant. Returns once the child holds.
+    fn child_holding(path: &Path, mode: &str) -> Killed {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "maintenance::claim_tests::claim_child"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CHILD_PATH, path)
+            .env(CHILD_MODE, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        await_line(&mut child, CHILD_READY);
+        Killed(child)
+    }
+
+    /// Run only as the child of the tests below; does nothing otherwise.
+    #[test]
+    fn claim_child() {
+        let Some(path) = std::env::var_os(CHILD_PATH) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let mode = std::env::var(CHILD_MODE).unwrap();
+        let _held: Box<dyn std::fmt::Debug> = match mode.as_str() {
+            "claim" => Box::new(Claim::take_at(&path, "backup-run.sh").unwrap()),
+            "probe" => Box::new(FileLock::try_acquire(&path).unwrap().unwrap()),
+            other => panic!("unknown child mode {other}"),
+        };
+        println!("{CHILD_READY}");
+        // Killed by its test long before this ends; bounded if it is not.
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Polls until [`claim_is_held`] reads `want`, for at most [`NOTICES`].
+    fn reads_within(path: &Path, want: bool) -> bool {
+        let until = Instant::now() + NOTICES;
+        loop {
+            if claim_is_held(path).unwrap() == want {
+                return true;
+            }
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_held_claim_is_seen_and_a_dropped_one_is_not() {
+        let (_dir, path) = scratch();
+        assert!(!claim_is_held(&path).unwrap(), "nobody claims yet");
+        let claim = Claim::take_at(&path, "backup-run.sh").unwrap();
+        assert!(claim_is_held(&path).unwrap(), "a held claim is seen");
+        assert_eq!(
+            holder_of(&path),
+            me("backup-run.sh"),
+            "the claimant records itself"
+        );
+        drop(claim);
+        assert!(!claim_is_held(&path).unwrap(), "a dropped claim is gone");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "the record is emptied before the claim is let go"
+        );
+    }
+
+    /// The probe takes the lock for an instant and lets go: it never leaves
+    /// the claim file locked behind it, and never ends a claim.
+    #[test]
+    fn the_probe_lets_go_at_once() {
+        let (_dir, path) = scratch();
+        assert!(!claim_is_held(&path).unwrap());
+        assert!(
+            !claim_is_held(&path).unwrap(),
+            "a second probe finds it free"
+        );
+        assert!(
+            FileLock::try_acquire(&path).unwrap().is_some(),
+            "nothing holds the lock after a probe"
+        );
+        let claim = Claim::take_at(&path, "backup-run.sh").unwrap();
+        assert!(claim_is_held(&path).unwrap());
+        assert!(
+            claim_is_held(&path).unwrap(),
+            "a probe does not end a claim"
+        );
+        drop(claim);
+    }
+
+    /// Claims share: one claimant never waits behind another, only behind a
+    /// probe's instant.
+    #[test]
+    fn two_claims_coexist() {
+        let (_dir, path) = scratch();
+        let first = Claim::take_at(&path, "backup-run.sh").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Claim::take_at(&p, "btrdasd backup run").map(drop));
+        });
+        rx.recv_timeout(NOTICES)
+            .expect("a second claim waited behind the first")
+            .unwrap();
+        drop(first);
+    }
+
+    #[test]
+    fn the_claim_file_is_roots_alone() {
+        let (_dir, path) = scratch();
+        let claim = Claim::take_at(&path, "backup-run.sh").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "made by a claimant");
+        drop(claim);
+
+        let (_dir2, path) = scratch();
+        claim_is_held(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "made by a probe");
+
+        let (_dir3, path) = scratch();
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let claim = Claim::take_at(&path, "backup-run.sh").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "an older 0644 file is narrowed");
+        drop(claim);
+    }
+
+    /// A probe that cannot look is an error, never "nobody claims": a scrub
+    /// that read it as free would keep a waiting backup waiting.
+    #[test]
+    fn a_probe_that_cannot_open_the_file_is_an_error() {
+        let (dir, _) = scratch();
+        assert!(
+            claim_is_held(dir.path()).is_err(),
+            "the path is a directory"
+        );
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "").unwrap();
+        let under = file.join("das-maintenance-claim.lock");
+        assert!(claim_is_held(&under).is_err(), "its parent is a file");
+        assert!(Claim::take_at(&under, "backup-run.sh").is_err());
+    }
+
+    /// A-F1 / A-F2: a claimant SIGKILLed while it claims leaves no claim
+    /// behind. Its record stays, naming a pid that no longer runs, and is
+    /// read as gone; the next claimant records itself over it.
+    #[test]
+    fn a_claimant_killed_by_sigkill_leaves_no_claim() {
+        let (_dir, path) = scratch();
+        let mut child = child_holding(&path, "claim");
+        let pid = child.pid();
+        assert!(claim_is_held(&path).unwrap(), "the child's claim is seen");
+        assert_eq!(holder_of(&path), format!("backup-run.sh pid {pid}"));
+        child.kill_now();
+        assert!(
+            reads_within(&path, false),
+            "a killed claimant's claim is gone"
+        );
+        let stale = holder_of(&path);
+        assert!(stale.contains("is no longer running"), "{stale}");
+        let claim = Claim::take_at(&path, "backup-run.sh").unwrap();
+        assert_eq!(holder_of(&path), me("backup-run.sh"));
+        drop(claim);
+    }
+
+    /// A scrub SIGKILLed in the instant its probe holds the lock: the lock
+    /// goes with it, and a claimant blocked behind the probe gets its claim.
+    #[test]
+    fn a_probe_killed_mid_probe_does_not_strand_a_claimant() {
+        let (_dir, path) = scratch();
+        let mut child = child_holding(&path, "probe");
+        let (tx, rx) = mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Claim::take_at(&p, "backup-run.sh"));
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(STILL_WAITING),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the claimant waits while the probe holds the lock"
+        );
+        child.kill_now();
+        let claim = rx
+            .recv_timeout(NOTICES)
+            .expect("the claimant was stranded")
+            .unwrap();
+        assert!(claim_is_held(&path).unwrap());
+        drop(claim);
+    }
+
+    /// The claim is never inherited: a child started while this process
+    /// claims has no descriptor on the claim file, and the claim ends when
+    /// it is dropped, while the child lives on.
+    #[test]
+    fn no_child_inherits_the_claim() {
+        let (_dir, path) = scratch();
+        let claim = Claim::take_at(&path, "btrdasd backup run").unwrap();
+        let sleeper = Killed(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let fds = std::fs::read_dir(format!("/proc/{}/fd", sleeper.pid())).unwrap();
+        for fd in fds {
+            let target = std::fs::read_link(fd.unwrap().path()).unwrap_or_default();
+            assert_ne!(target, canonical, "the child inherited the claim file");
+        }
+        drop(claim);
+        assert!(
+            !claim_is_held(&path).unwrap(),
+            "the claim ended while the child lives"
+        );
+        drop(sleeper);
+    }
+
+    /// `script` run by bash with the claim file as `$1`; it prints `ready`
+    /// once it claims, after `child <pid>` for a child it started.
+    fn shell_claimant(path: &Path, script: &str) -> (Killed, Option<i32>) {
+        let mut shell = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lines = await_line(&mut shell, "ready");
+        let child = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("child "))
+            .map(|pid| pid.parse().unwrap());
+        (Killed(shell), child)
+    }
+
+    /// The shell side (`backup-run.sh`, step A6) claims with `flock -s` on a
+    /// descriptor. SIGKILLed, its claim goes with it when the child it
+    /// started was given `7<&-`; A-F1: a child that kept the descriptor holds
+    /// the claim until it exits, and no longer.
+    #[test]
+    fn a_shell_claimant_killed_by_sigkill_holds_only_through_a_child_with_the_descriptor() {
+        let (_dir, path) = scratch();
+        let (mut shell, child) = shell_claimant(
+            &path,
+            "exec 7<>\"$1\" && flock -s 7 || exit 1\n\
+             sleep 30 7<&- &\n\
+             echo \"child $!\"; echo ready; wait",
+        );
+        let closed = child.expect("the script named its child");
+        assert!(claim_is_held(&path).unwrap(), "the script's claim is seen");
+        shell.kill_now();
+        assert!(
+            reads_within(&path, false),
+            "a child given 7<&- does not keep the claim"
+        );
+        // SAFETY: kill(2) on the one pid the script above started.
+        unsafe { libc::kill(closed, libc::SIGKILL) };
+
+        let (mut shell, child) = shell_claimant(
+            &path,
+            "exec 7<>\"$1\" && flock -s 7 || exit 1\n\
+             sleep 30 &\n\
+             echo \"child $!\"; echo ready; wait",
+        );
+        let kept = child.expect("the script named its child");
+        shell.kill_now();
+        assert!(
+            claim_is_held(&path).unwrap(),
+            "a child holding the descriptor keeps the claim"
+        );
+        // SAFETY: kill(2) on the one pid the script above started.
+        unsafe { libc::kill(kept, libc::SIGKILL) };
+        assert!(
+            reads_within(&path, false),
+            "the claim ends with the last descriptor"
+        );
     }
 }

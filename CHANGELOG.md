@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The claim lock a backup will use to ask a scrub to pause** (bd `DAS-Backup-Manager-su1b.2`, step A2): `maintenance::Claim` holds `/run/das-maintenance-claim.lock` shared, recorded as `<job> pid <pid>` and emptied before it lets go; `maintenance::claim_is_held` probes it exclusive and non-blocking and lets go at once
+  - A probe that cannot open or lock the file is an error, never "nobody claims"; the file is root's alone (0600), its descriptor close-on-exec
+  - A claimant killed by SIGKILL leaves no claim (its record is read as no longer running); a shell claimant's claim outlives it only through a child that kept the descriptor
+  - Inert — nothing claims or probes yet: the scrub's pause and the backups' claim are later steps, so no run changes
 - **The helper logs each recovery-OS schedule write itself** (bd `DAS-Backup-Manager-3gzs.3`): one journal line per `RecoveryOsScheduleSet` call names the caller, the drives, and what was set (time and mode), cleared, or refused and why; before, only polkit's audit line and systemd's reload showed it
 - **The weekly doctor checks that `btrfs scrub` still accepts `-c`/`-n`** (bd `DAS-Backup-Manager-su1b.3`): every scrub argv carries `-c 2 -n 0`, deprecated upstream, and a btrfs-progs release that drops them would fail every target's scrub while `btrdasd scrub run` exits 0
   - `btrdasd doctor` runs `btrfs scrub start --help` and `btrfs --version` (no scrub) and reports `SCRUB TOOL`, exit `1`, naming the version, when either option line is gone or the help cannot be read

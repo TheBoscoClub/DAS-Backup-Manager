@@ -861,6 +861,20 @@ impl FileLock {
         }
     }
 
+    /// Take the lock shared (`LOCK_SH`), waiting as long as necessary: for
+    /// the claim lock (`maintenance::Claim`), where the only exclusive taker
+    /// is a probe that lets go at once.
+    pub(crate) fn acquire_shared(path: &Path) -> Result<FileLock, ScrubError> {
+        let file = Self::open(path)?;
+        // A blocking request returns only once held, or on a real error;
+        // EINTR is retried inside `flock`.
+        Self::flock(&file, path, libc::LOCK_SH)?;
+        Ok(FileLock {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
     /// Take the lock, waiting as long as necessary.
     ///
     /// A short non-blocking probe runs first so that ordinary sub-second
