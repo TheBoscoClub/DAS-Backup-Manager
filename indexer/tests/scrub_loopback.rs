@@ -1164,3 +1164,479 @@ fn stop_by_scrub_cancel_then_resume() {
     assert_clean_stop(&obs);
     assert_cancel_shaped(&obs);
 }
+
+// ---------------------------------------------------------------------------
+// The yield on a real scrub (bd DAS-Backup-Manager-su1b.2, step A5)
+// ---------------------------------------------------------------------------
+//
+// A real `btrdasd scrub run` (the test build of the binary, which reads the
+// `test-overrides` variables) scrubs a delayed loop device, with its scrub,
+// maintenance and claim locks and its state file in the rig's own directory:
+// nothing here touches /run's locks. A stand-in backup in its own process
+// claims the maintenance lock as backup-run.sh does (claim shared on fd 7,
+// maintenance on fd 8, the claim let go once maintenance is held). Each case
+// kills a process by its own pid only.
+
+/// The scratch lock directory and state file a yielding pass is run with.
+struct PassSite {
+    run_dir: PathBuf,
+    state: PathBuf,
+    config: PathBuf,
+}
+
+impl PassSite {
+    fn new(rig: &Rig) -> Self {
+        let run_dir = rig.dir.join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let config = rig.dir.join("config.toml");
+        std::fs::write(&config, rig_config(rig).to_toml().expect("config to toml"))
+            .expect("write config");
+        Self {
+            state: rig.dir.join("scrub-state.json"),
+            config,
+            run_dir,
+        }
+    }
+    fn lock(&self, name: &str) -> PathBuf {
+        self.run_dir.join(name)
+    }
+    fn maintenance(&self) -> PathBuf {
+        self.lock("das-maintenance.lock")
+    }
+    fn claim(&self) -> PathBuf {
+        self.lock("das-maintenance-claim.lock")
+    }
+    /// `btrdasd scrub run` on the rig, in the background, its output in
+    /// `<rig dir>/<tag>.log`.
+    fn start_pass(&self, rig: &Rig, tag: &str) -> Killed {
+        let log = std::fs::File::create(rig.dir.join(format!("{tag}.log"))).expect("log");
+        let child = Command::new(env!("CARGO_BIN_EXE_btrdasd"))
+            .args(["scrub", "run", "--config", self.config.to_str().unwrap()])
+            .env("DAS_SCRUB_LOCK", self.lock("das-scrub.lock"))
+            .env("DAS_MAINTENANCE_LOCK", self.maintenance())
+            .env("DAS_CLAIM_LOCK", self.claim())
+            .env("DAS_SCRUB_STATE", &self.state)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("spawn btrdasd scrub run");
+        Killed(child)
+    }
+    fn attempt(&self, rig: &Rig) -> Option<scrub::AttemptState> {
+        scrub::load_state_from(&self.state)
+            .ok()?
+            .filesystems
+            .get(&rig.uuid)
+            .map(|f| f.last_attempt.clone())
+    }
+}
+
+/// A child killed (SIGKILL) and reaped on drop, so a failed assertion never
+/// leaves a pass or a stand-in backup running.
+struct Killed(std::process::Child);
+
+impl Killed {
+    fn pid(&self) -> i32 {
+        self.0.id() as i32
+    }
+    fn signal(&self, signal: i32) {
+        // SAFETY: signalling a child this test started and has not reaped.
+        assert_eq!(unsafe { libc::kill(self.pid(), signal) }, 0, "kill failed");
+    }
+    fn wait_within(&mut self, limit: std::time::Duration) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("try_wait") {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still running after {limit:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    fn running(&mut self) -> bool {
+        self.0.try_wait().expect("try_wait").is_none()
+    }
+}
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// How the stand-in backup behaves.
+#[derive(Clone, Copy, PartialEq)]
+enum Backup {
+    /// Claim, take the maintenance lock, let the claim go, note whether the
+    /// target was mounted, hold until `<rig dir>/release`.
+    Full,
+    /// Claim and hold the claim, never taking the lock.
+    ClaimOnly,
+}
+
+fn start_backup(rig: &Rig, site: &PassSite, how: Backup) -> Killed {
+    for f in ["claimed", "holds", "saw", "release"] {
+        let _ = std::fs::remove_file(rig.dir.join(f));
+    }
+    let script = r#"
+        exec 7<>"$1"; flock -s 7; printf 'test-backup pid %s\n' "$$" >"$1"; : >"$4/claimed"
+        if [[ $5 == claim-only ]]; then exec sleep 600; fi
+        exec 8<>"$2"
+        until flock -n 8 7<&-; do sleep 0.2 7<&-; done
+        printf 'test-backup pid %s\n' "$$" >"$2"
+        : >"$1"; flock -u 7; exec 7<&-
+        if mountpoint -q "$3"; then echo mounted >"$4/saw"; else echo unmounted >"$4/saw"; fi
+        : >"$4/holds"
+        until [[ -e "$4/release" ]]; do sleep 0.1; done
+        : >"$2"
+    "#;
+    let child = Command::new("bash")
+        .args([
+            "-c",
+            script,
+            "_",
+            site.claim().to_str().unwrap(),
+            site.maintenance().to_str().unwrap(),
+            rig.mount_point.to_str().unwrap(),
+            rig.dir.to_str().unwrap(),
+            if how == Backup::ClaimOnly {
+                "claim-only"
+            } else {
+                "full"
+            },
+        ])
+        .spawn()
+        .expect("spawn the stand-in backup");
+    Killed(child)
+}
+
+fn wait_for(limit: std::time::Duration, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + limit;
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {limit:?} waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A rig whose pass is under way: 2 GiB of incompressible data on a delayed
+/// device, the clean full-pass byte count, and a pass that has scrubbed some
+/// of it.
+struct Running {
+    rig: Rig,
+    site: PassSite,
+    pass: Killed,
+    baseline_bytes: u64,
+    t_start: u64,
+}
+
+const YIELD_READ_DELAY_MS: u32 = 100;
+
+fn start_running(tag: &str) -> Running {
+    let mut rig = Rig::new_sized(tag, 3);
+    rig.fill_incompressible_gib(2);
+    let mnt = rig.mount_point.to_string_lossy().to_string();
+    must("mount", &[&rig.loop_dev, &mnt]);
+    must("btrfs", &["scrub", "start", "-B", &mnt]);
+    let baseline_bytes = rig.bytes_scrubbed();
+    rig.umount_when_idle();
+    std::fs::remove_file(rig.status_record()).expect("remove the baseline record");
+    let slow = rig.attach_slow_device(YIELD_READ_DELAY_MS);
+    let site = PassSite::new(&rig);
+    let mut pass = site.start_pass(&rig, tag);
+    wait_for(
+        std::time::Duration::from_secs(180),
+        "the pass to scrub 256 MiB",
+        || {
+            assert!(
+                pass.running(),
+                "the pass ended early: {}",
+                log_of(&rig, tag)
+            );
+            let rec = rig.read_record();
+            record_u64(&rec, "data_bytes_scrubbed").unwrap_or(0) >= 256 * 1024 * 1024
+                && record_u64(&rec, "finished") == Some(0)
+        },
+    );
+    // The engine mounted the delayed mapping, not the raw loop device.
+    let (_, source) = run("findmnt", &["-n", "-o", "SOURCE", "--mountpoint", &mnt]);
+    assert!(
+        source.contains(slow.trim_start_matches("/dev/mapper/")),
+        "the pass mounted {source:?}, not the delayed {slow}"
+    );
+    let t_start = rig.record_t_start();
+    Running {
+        rig,
+        site,
+        pass,
+        baseline_bytes,
+        t_start,
+    }
+}
+
+fn log_of(rig: &Rig, tag: &str) -> String {
+    std::fs::read_to_string(rig.dir.join(format!("{tag}.log"))).unwrap_or_default()
+}
+
+/// The end every case must reach: the filesystem scrubbed to the end by a
+/// resume of the same pass (its original start kept), never less than a
+/// clean full pass.
+fn assert_resumed_to_the_end(r: &Running, tag: &str) {
+    let rec = r.rig.read_record();
+    println!(
+        "--- {tag}: pass log ---\n{}--- record ---\n{rec}",
+        log_of(&r.rig, tag)
+    );
+    assert_eq!(
+        record_u64(&rec, "finished"),
+        Some(1),
+        "{rec}\n{}",
+        log_of(&r.rig, tag)
+    );
+    assert_eq!(record_u64(&rec, "canceled"), Some(0), "{rec}");
+    assert_eq!(
+        r.rig.record_t_start(),
+        r.t_start,
+        "resumed, not restarted: {rec}"
+    );
+    assert!(record_u64(&rec, "t_resumed").unwrap_or(0) > 0, "{rec}");
+    let bytes = r.rig.bytes_scrubbed();
+    assert!(
+        bytes >= r.baseline_bytes,
+        "resumed pass scrubbed {bytes} bytes, a full pass {}",
+        r.baseline_bytes
+    );
+    let attempt = r.site.attempt(&r.rig).expect("an attempt is filed");
+    assert_eq!(attempt.outcome, "finished", "{attempt:?}");
+    assert!(attempt.ok, "{attempt:?}");
+    assert!(
+        !run("mountpoint", &["-q", r.rig.mount_point.to_str().unwrap()]).0,
+        "the pass unmounts what it mounted"
+    );
+}
+
+/// The acceptance shape on a loop rig: a backup claims while the pass
+/// scrubs; the pass stops, unmounts and lets go (the backup finds the target
+/// unmounted and holds the lock alone), files `yielded`, waits, and resumes
+/// the same filesystem to the end once the backup is done.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_real_pass_yields_to_a_backup_and_resumes_to_the_end() {
+    assert!(is_root(), "must run as root");
+    let tag = "yield";
+    let mut r = start_running(tag);
+    let mut backup = start_backup(&r.rig, &r.site, Backup::Full);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the backup to hold the lock",
+        || r.rig.dir.join("holds").exists(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.rig.dir.join("saw"))
+            .unwrap()
+            .trim(),
+        "unmounted",
+        "the backup found the target mounted under it"
+    );
+    assert!(r.pass.running(), "the pass waits, it does not end");
+    let attempt = r.site.attempt(&r.rig).expect("a yielded record");
+    assert_eq!(attempt.outcome, "yielded", "{attempt:?}");
+    assert!(attempt.is_live(), "{attempt:?}");
+    assert_eq!(
+        attempt.yielded_to.as_deref(),
+        Some(format!("test-backup pid {}", backup.pid()).as_str())
+    );
+    let rec = r.rig.read_record();
+    assert_eq!(
+        (record_u64(&rec, "canceled"), record_u64(&rec, "finished")),
+        (Some(0), Some(0)),
+        "the stop left a resumable record: {rec}"
+    );
+    // The resume need not crawl through the delay the stop needed.
+    r.rig.set_slow_delay(0);
+    std::fs::write(r.rig.dir.join("release"), "").unwrap();
+    backup.wait_within(std::time::Duration::from_secs(30));
+    let status = r.pass.wait_within(std::time::Duration::from_secs(600));
+    assert!(status.success(), "{status:?}\n{}", log_of(&r.rig, tag));
+    let log = log_of(&r.rig, tag);
+    assert!(
+        log.contains("giving the DAS maintenance lock up to test-backup pid"),
+        "{log}"
+    );
+    assert!(log.contains("Resuming interrupted scrub"), "{log}");
+    assert_resumed_to_the_end(&r, tag);
+}
+
+/// A-F1: a claimant SIGKILLed right after it claimed (before or after the
+/// pass saw it): the pass finishes to the end.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_claimant_killed_as_it_claims_costs_at_most_one_pause() {
+    assert!(is_root(), "must run as root");
+    let tag = "claimkill";
+    let mut r = start_running(tag);
+    let backup = start_backup(&r.rig, &r.site, Backup::ClaimOnly);
+    wait_for(std::time::Duration::from_secs(30), "the claim", || {
+        r.rig.dir.join("claimed").exists()
+    });
+    backup.signal(libc::SIGKILL);
+    drop(backup);
+    // No dm reload here: the pass may still be scrubbing, and `dmsetup
+    // suspend` freezes the filesystem, which cancels a running scrub (EINTR,
+    // canceled:1) — a rig artefact, seen 2026-11-22, not the yield.
+    let status = r.pass.wait_within(std::time::Duration::from_secs(1500));
+    assert!(status.success(), "{status:?}\n{}", log_of(&r.rig, tag));
+    assert_resumed_or_finished(&r, tag);
+}
+
+/// The end of a case where the pass may not have paused at all: finished to
+/// the end with its original start, whether or not it resumed.
+fn assert_resumed_or_finished(r: &Running, tag: &str) {
+    let rec = r.rig.read_record();
+    println!(
+        "--- {tag}: pass log ---\n{}--- record ---\n{rec}",
+        log_of(&r.rig, tag)
+    );
+    assert_eq!(
+        record_u64(&rec, "finished"),
+        Some(1),
+        "{rec}\n{}",
+        log_of(&r.rig, tag)
+    );
+    assert_eq!(r.rig.record_t_start(), r.t_start, "{rec}");
+    assert!(r.rig.bytes_scrubbed() >= r.baseline_bytes, "{rec}");
+    let attempt = r.site.attempt(&r.rig).expect("an attempt is filed");
+    assert_eq!(attempt.outcome, "finished", "{attempt:?}");
+    assert!(attempt.ok, "{attempt:?}");
+}
+
+/// A-F2: the claimant SIGKILLed after the pass yielded, before it took the
+/// lock: the claim goes with it, and the pass resumes and finishes.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_claimant_killed_after_the_yield_lets_the_pass_resume() {
+    assert!(is_root(), "must run as root");
+    let tag = "yieldkill";
+    let mut r = start_running(tag);
+    let backup = start_backup(&r.rig, &r.site, Backup::ClaimOnly);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the pass to yield",
+        || {
+            r.site
+                .attempt(&r.rig)
+                .is_some_and(|a| a.outcome == "yielded")
+        },
+    );
+    assert!(!run("mountpoint", &["-q", r.rig.mount_point.to_str().unwrap()]).0);
+    r.rig.set_slow_delay(0);
+    backup.signal(libc::SIGKILL);
+    drop(backup);
+    let status = r.pass.wait_within(std::time::Duration::from_secs(600));
+    assert!(status.success(), "{status:?}\n{}", log_of(&r.rig, tag));
+    assert_resumed_to_the_end(&r, tag);
+}
+
+/// A-F6: the pass SIGKILLed while yielded: nothing is mounted, its record
+/// reads `interrupted` (health FAIL, operator Q3), and the next pass resumes
+/// the same scrub to the end.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_pass_killed_while_yielded_reads_interrupted_and_the_next_resumes() {
+    assert!(is_root(), "must run as root");
+    let tag = "passkill";
+    let mut r = start_running(tag);
+    let mut backup = start_backup(&r.rig, &r.site, Backup::Full);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the backup to hold the lock",
+        || r.rig.dir.join("holds").exists(),
+    );
+    r.pass.signal(libc::SIGKILL);
+    r.pass.wait_within(std::time::Duration::from_secs(30));
+    let attempt = r.site.attempt(&r.rig).expect("a record");
+    assert_eq!(attempt.outcome, "yielded");
+    assert_eq!(attempt.effective_outcome(), "interrupted", "{attempt:?}");
+    assert!(!run("mountpoint", &["-q", r.rig.mount_point.to_str().unwrap()]).0);
+    std::fs::write(r.rig.dir.join("release"), "").unwrap();
+    backup.wait_within(std::time::Duration::from_secs(30));
+    r.rig.set_slow_delay(0);
+    let mut next = r.site.start_pass(&r.rig, "passkill-next");
+    let status = next.wait_within(std::time::Duration::from_secs(600));
+    assert!(
+        status.success(),
+        "{status:?}\n{}",
+        log_of(&r.rig, "passkill-next")
+    );
+    assert!(log_of(&r.rig, "passkill-next").contains("Resuming interrupted scrub"));
+    assert_resumed_to_the_end(&r, "passkill-next");
+}
+
+/// SIGTERM while yielded: the pass files `interrupted` with the signal,
+/// leaves nothing mounted, and dies of the signal (exit contract unchanged).
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_pass_stopped_while_yielded_files_interrupted_and_dies_of_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    assert!(is_root(), "must run as root");
+    let tag = "passterm";
+    let mut r = start_running(tag);
+    let mut backup = start_backup(&r.rig, &r.site, Backup::Full);
+    wait_for(
+        std::time::Duration::from_secs(120),
+        "the backup to hold the lock",
+        || r.rig.dir.join("holds").exists(),
+    );
+    r.pass.signal(libc::SIGTERM);
+    let status = r.pass.wait_within(std::time::Duration::from_secs(30));
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "{status:?}\n{}",
+        log_of(&r.rig, tag)
+    );
+    let attempt = r.site.attempt(&r.rig).expect("a record");
+    assert_eq!(attempt.outcome, "interrupted", "{attempt:?}");
+    assert_eq!(attempt.signal.as_deref(), Some("SIGTERM"));
+    assert!(!attempt.ok);
+    assert!(!run("mountpoint", &["-q", r.rig.mount_point.to_str().unwrap()]).0);
+    std::fs::write(r.rig.dir.join("release"), "").unwrap();
+    backup.wait_within(std::time::Duration::from_secs(30));
+}
+
+/// A-F4/A-F5 the way a unit stop kills a cgroup: the pass and its btrfs
+/// child SIGKILLed mid-scrub, the target left mounted, the lock freed. The
+/// next pass takes the leftover down, mounts afresh and resumes to the end.
+#[test]
+#[ignore = "requires root; creates loop and device-mapper devices and runs real scrubs"]
+fn a_pass_killed_with_its_child_leaves_a_mount_the_next_pass_takes_down() {
+    assert!(is_root(), "must run as root");
+    let tag = "cgroupkill";
+    let mut r = start_running(tag);
+    let (_, kids) = run("pgrep", &["-P", &r.pass.pid().to_string()]);
+    r.pass.signal(libc::SIGKILL);
+    for kid in kids.split_whitespace() {
+        let _ = run("kill", &["-KILL", kid]);
+    }
+    r.pass.wait_within(std::time::Duration::from_secs(30));
+    assert!(r.rig.wait_mount_idle(std::time::Duration::from_secs(60)));
+    assert!(
+        run("mountpoint", &["-q", r.rig.mount_point.to_str().unwrap()]).0,
+        "the killed pass left its mount"
+    );
+    let attempt = r.site.attempt(&r.rig).expect("a record");
+    assert_eq!(attempt.effective_outcome(), "interrupted", "{attempt:?}");
+    r.rig.set_slow_delay(0);
+    let mut next = r.site.start_pass(&r.rig, "cgroupkill-next");
+    let status = next.wait_within(std::time::Duration::from_secs(600));
+    let log = log_of(&r.rig, "cgroupkill-next");
+    assert!(status.success(), "{status:?}\n{log}");
+    assert!(log.contains("left mounted by an earlier job"), "{log}");
+    assert_resumed_to_the_end(&r, "cgroupkill-next");
+}
