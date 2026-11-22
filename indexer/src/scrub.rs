@@ -4989,6 +4989,153 @@ Total to scrub:   401.28MiB\n";
         );
     }
 
+    /// CI mutants on 12114f7d: the words a wait is said in, each time branch.
+    #[test]
+    fn a_wait_is_said_in_minutes_seconds_or_milliseconds() {
+        assert_eq!(wait_words(Duration::from_secs(SETUP_WAIT_SECS)), "15 min");
+        assert_eq!(wait_words(Duration::from_secs(60)), "1 min");
+        assert_eq!(wait_words(Duration::from_secs(90)), "90 s");
+        assert_eq!(wait_words(Duration::from_secs(59)), "59 s");
+        assert_eq!(wait_words(Duration::from_secs(1)), "1 s");
+        assert_eq!(wait_words(Duration::from_millis(200)), "200 ms");
+        assert_eq!(wait_words(Duration::ZERO), "0 ms");
+    }
+
+    /// The exact line a pass logs when setup holds its singleton.
+    #[test]
+    fn the_wait_for_setup_is_said_in_these_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let setup = crate::backup::SingletonHeld::try_acquire_at(&singleton, "btrdasd setup")
+            .unwrap()
+            .unwrap();
+        let progress = TestProgress::new();
+        let _ = acquire_locks_at(
+            &singleton,
+            &maintenance,
+            &maintenance.with_file_name("claim.lock"),
+            &progress,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        drop(setup);
+        let logs = progress.logs.lock().unwrap().clone();
+        assert_eq!(
+            logs.first(),
+            Some(&(
+                LogLevel::Info,
+                format!(
+                    "{} is held by btrdasd setup pid {}, which is writing the installed files — \
+                     waiting up to 50 ms for it",
+                    singleton.display(),
+                    std::process::id()
+                )
+            )),
+            "{logs:?}"
+        );
+    }
+
+    /// CI mutant on 12114f7d (`holder_is_setup(&next)` → `true`): while a pass
+    /// waits for setup, setup lets go and ANOTHER PASS takes the singleton
+    /// first. The waiting pass skips at once, naming that pass — it does not
+    /// sit out the rest of its wait as if setup still held it.
+    #[test]
+    fn a_pass_waiting_for_setup_skips_at_once_when_another_pass_takes_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let setup = crate::backup::SingletonHeld::try_acquire_at(&singleton, "btrdasd setup")
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = singleton.clone();
+        let other = std::thread::spawn(move || {
+            // Setup lets go, and another pass takes the lock before the
+            // waiter looks again (it looks every 200 ms).
+            std::thread::sleep(Duration::from_millis(50));
+            drop(setup);
+            let pass = crate::backup::SingletonHeld::try_acquire_at(&path, SCRUB_JOB)
+                .unwrap()
+                .expect("free once setup let go");
+            rx.recv().unwrap();
+            drop(pass);
+        });
+        let started = Instant::now();
+        let attempt = acquire_locks_at(
+            &singleton,
+            &maintenance,
+            &maintenance.with_file_name("claim.lock"),
+            &NullProgress,
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let waited = started.elapsed();
+        tx.send(()).unwrap();
+        other.join().unwrap();
+        match attempt {
+            ScrubLockAttempt::Held(holder) => {
+                assert_eq!(holder, format!("{SCRUB_JOB} pid {}", std::process::id()));
+            }
+            other => panic!("another pass holds it: skip at once, not {other:?}"),
+        }
+        assert!(
+            waited < Duration::from_secs(2),
+            "it sat out the wait: {waited:?}"
+        );
+        assert!(
+            !maintenance.exists(),
+            "nothing past the singleton was tried"
+        );
+    }
+
+    /// CI mutants on 12114f7d (look_at_singleton's `attempt == 1 || holder
+    /// != UNKNOWN_HOLDER`): a holder that has emptied its record is letting
+    /// go, so an empty record is looked at once more after the grace — and a
+    /// lock free by then is taken, never a skip of a pass that could run.
+    #[test]
+    fn an_empty_record_is_looked_at_again_and_a_lock_let_go_meanwhile_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        // Held with no record, let go 30 ms later: within the 100 ms grace.
+        let silent = FileLock::try_acquire(&singleton).unwrap().unwrap();
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(silent);
+        });
+        let look = look_at_singleton(&singleton, Duration::from_millis(100)).unwrap();
+        letting_go.join().unwrap();
+        assert!(
+            matches!(look, SingletonLook::Taken(_)),
+            "an empty record is looked at again, and the lock is free by then"
+        );
+    }
+
+    /// The other side of the same line: a holder that named itself is
+    /// reported at the first look, without the grace.
+    #[test]
+    fn a_named_holder_is_reported_at_the_first_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let _pass = crate::backup::SingletonHeld::try_acquire_at(&singleton, SCRUB_JOB)
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        let look = look_at_singleton(&singleton, Duration::from_secs(2)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no grace for a named holder"
+        );
+        match look {
+            SingletonLook::HeldBy(h) => {
+                assert_eq!(h, format!("{SCRUB_JOB} pid {}", std::process::id()));
+            }
+            SingletonLook::Taken(_) => panic!("held"),
+        }
+    }
+
     /// Setup still holding once the wait is over: the pass did not run, and
     /// says so at WARN, naming setup; it is still a skip (exit 0).
     #[test]
