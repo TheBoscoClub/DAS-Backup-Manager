@@ -214,7 +214,7 @@ the one that catches the defect this guard was written for
          ▼
 2. btrdasd scrub run (indexer/src/scrub.rs)
          │
-         ├──▶ /run/das-scrub.lock         non-blocking singleton — a second pass skips, never queues (setup holds it too)
+         ├──▶ /run/das-scrub.lock         non-blocking singleton, recorded — a second pass skips, never queues; held by setup → wait ≤ 15 min, then skip with a WARN
          ├──▶ /run/das-maintenance.lock   blocking, shared with backup-run.sh — deferral, not cancellation
          ├──▶ mount + resume-or-start     sequential, per configured [scrub].targets
          └──▶ /var/lib/das-backup/scrub-state.json   consumed by health checks

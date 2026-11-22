@@ -527,7 +527,8 @@ locks, a backup started meanwhile \(em by the timer, too \(em finds
 held, reads in it that setup holds it, and waits for it up to 15 minutes
 before it skips its run; a scrub started meanwhile finds
 .I /run/das\-scrub.lock
-held and skips its pass.
+held and waits for setup the same way, up to 15 minutes, before it skips its
+pass with a warning that it did not run.
 .PP
 Every file setup writes is replaced whole: a new file, given its mode (scripts
 0755, any other file the mode it had) and, written by root, owner and group
@@ -3137,7 +3138,11 @@ pass automatically. Locates the actively-scrubbing filesystem via the
 engine's lock and live kernel state, then issues
 .B "btrfs scrub cancel"
 against it. A no-op (clean exit, no error) when no scrub is running. Exits 1
-if the cancel fails.
+if the cancel fails, and when
+.I /run/das\-scrub.lock
+is held by
+.B btrdasd setup
+(its record names it), which is not a pass: nothing is cancelled.
 .PP
 .B btrdasd scrub cancel
 .RB [ \-\-config
@@ -3705,7 +3710,9 @@ and
 .BR forget / purge )
 or drift check at a time.
 .B btrdasd setup
-holds the backup and scrub ones while it writes, so a scrub started then skips.
+holds the backup and scrub ones while it writes, recorded in each; a backup or
+scrub started then waits up to 15 minutes for it.
+Each lock file holds its holder's record (job and pid), emptied before release.
 .TP
 .I /run/das\-maintenance.lock
 Shared maintenance lock held by every job that mounts the backup targets \(em

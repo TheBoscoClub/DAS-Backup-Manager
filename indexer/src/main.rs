@@ -1301,13 +1301,31 @@ fn find_actively_scrubbing_target(config: &Config) -> Option<(String, String, St
 /// live, `find_actively_scrubbing_target` locates it (UUID-verified, never
 /// by path alone — see its doc comment).
 fn cancel_running_scrub(config: &Config) -> Result<String, String> {
-    match scrub::FileLock::try_acquire(scrub::SCRUB_LOCK_PATH) {
+    cancel_running_scrub_at(Path::new(scrub::SCRUB_LOCK_PATH), config)
+}
+
+/// [`cancel_running_scrub`] with the scrub singleton at `lock`.
+fn cancel_running_scrub_at(lock: &Path, config: &Config) -> Result<String, String> {
+    match scrub::FileLock::try_acquire(lock) {
         Ok(Some(_lock)) => {
             // Acquired and immediately dropped at end of scope — proof that
             // nothing was scrubbing, not a lock we intend to hold.
             return Ok("No scrub pass is currently running — nothing to cancel.".to_string());
         }
-        Ok(None) => {} // held elsewhere: a pass IS running
+        // Held elsewhere: a pass is running — unless its record names
+        // `btrdasd setup`, which holds this lock while it writes the installed
+        // files (bd DAS-Backup-Manager-su1b.2).
+        Ok(None) => {
+            let holder = buttered_dasd::maintenance::holder_of(lock);
+            if scrub::holder_is_setup(&holder) {
+                return Err(format!(
+                    "{} is held by {holder}, not a scrub pass: setup holds it while it writes \
+                     the installed files, and there is nothing to cancel. Run `btrdasd scrub \
+                     cancel` again once setup has finished, if a pass is then running.",
+                    lock.display()
+                ));
+            }
+        }
         Err(e) => return Err(format!("could not check scrub lock: {e}")),
     }
 
@@ -1354,8 +1372,9 @@ fn cancel_running_scrub(config: &Config) -> Result<String, String> {
 /// "the pass could not even start" — that fails in seconds, exactly where
 /// Sentinel's limiter genuinely brakes a real crash loop.
 ///
-/// - A [`PassStatus::Skipped`] pass (another scrub already running) is
-///   always 0 — nothing went wrong, there was simply nothing to do here.
+/// - A [`PassStatus::Skipped`] pass (another scrub already running, or
+///   `btrdasd setup` still holding the scrub lock after the pass waited for
+///   it, said at WARN) is always 0 — no retry would help sooner.
 /// - Otherwise: 0 if at least one target's `scrub_launched` is `true` —
 ///   [`scrub::ScrubFsResult::scrub_launched`] is set only once
 ///   `resolve_target_fsuuid` and `ensure_mounted` have both succeeded *and*
@@ -4378,6 +4397,48 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
                 );
             }
         }
+    }
+
+    /// su1b.2 A4 fix round: `btrdasd setup` holds the scrub singleton while it
+    /// writes, recorded as such. `scrub cancel` must not read that as a live
+    /// pass: it refuses, naming setup, and cancels nothing. A real pass's hold
+    /// is still a pass.
+    #[test]
+    fn cancel_refuses_while_setup_holds_the_scrub_singleton() {
+        let config = test_config(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("das-scrub.lock");
+
+        let setup =
+            buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "btrdasd setup --upgrade")
+                .unwrap()
+                .unwrap();
+        let refused = cancel_running_scrub_at(&lock, &config);
+        drop(setup);
+        let error = refused.expect_err("setup's hold is not a pass to cancel");
+        assert!(
+            error.contains(&format!(
+                "btrdasd setup --upgrade pid {}",
+                std::process::id()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("not a scrub pass"), "{error}");
+
+        let pass = buttered_dasd::backup::SingletonHeld::try_acquire_at(&lock, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let met = cancel_running_scrub_at(&lock, &config);
+        drop(pass);
+        assert!(
+            met.as_ref().is_ok_and(|m| m.contains("lock held")),
+            "a real pass is still a pass: {met:?}"
+        );
+
+        assert_eq!(
+            cancel_running_scrub_at(&lock, &config).unwrap(),
+            "No scrub pass is currently running — nothing to cancel."
+        );
     }
 
     #[test]

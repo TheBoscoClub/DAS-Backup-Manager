@@ -203,6 +203,7 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
    - `backup-run.sh` hands its hold to the `subvol sync` and `subvol expire` it runs (`DAS_BACKUP_LOCK_FD=9`, those two calls only); the child proves it (`SingletonHeld::delegated_at`) or fails, never takes the lock, never touches the record (bd `5237.9`).
    - Open the singleton `<>`, never `>` (a run that does not get the lock must not empty the holder's record).
    - `backup-run.sh` finds it held by setup or a config edit → waits, `SINGLETON_WAIT_SECS` (900 s), saying whom; still held → skip, exit 0, a WARN that this backup did NOT run.
+   - `/run/das-scrub.lock` carries its holder's record too (`btrdasd scrub run pid N`, or `btrdasd setup … pid N` while setup writes; bd `su1b.2`). A scrub pass finding it held by setup → waits `SETUP_WAIT_SECS` (900 s), saying whom; still held → skip, exit 0, a WARN that this pass did NOT run. Held by anything else → skip, naming the holder. `scrub cancel` refuses setup's hold, cancelling nothing.
    - Held by a backup → skip, exit 0, naming it. No record, no pid, or the pid gone → skip, exit 0, with the same WARN; never a silent skip.
 2. **Maintenance lock**: `/run/das-maintenance.lock`, shared by all sides, held for the whole operation.
    Backup and scrub **wait** for it, never skipped; `reconcile` and `doctor` defer.

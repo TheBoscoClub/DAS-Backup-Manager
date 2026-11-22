@@ -98,8 +98,8 @@ installed files — the wizard, `--modify`, `--force`, `--upgrade`, `--uninstall
 (for `--upgrade`, before it rewrites `config.toml`; for `--force`, before it even reads it), holds
 all three through every write and the helper restart, and lets them go on every path. Any held:
 nothing written or removed, the lock named on **stderr** (the maintenance one with its holder's
-record; neither singleton carries one setup can name — `backup-run.sh` opens it with `>`, the scrub
-writes none), exit 75. The scrub singleton is there since bd `su1b.2` step A4: a scrub pass holds
+record, the scrub singleton with its pass's — `btrdasd scrub run pid N`, since the A4 fix round),
+exit 75. The scrub singleton is there since bd `su1b.2` step A4: a scrub pass holds
 it for its whole life but the maintenance lock only while it scrubs, so a pass waiting for that
 lock — or, once step A5 lands, yielded to a backup — would otherwise go on with files setup
 replaced or removed under it. With the writes atomic, the locks still
@@ -121,11 +121,14 @@ runs while all are. The hold cannot deadlock: nothing setup reaches takes any of
 waits for, before it can take a lock; and `systemctl enable --now` waits for the timer's own
 start-up, not for a service the timer then triggers (systemctl(1) `--no-block`, systemd.timer(5)
 `Persistent=` — read in the docs, not tested). A catch-up run triggered that way during the hold
-finds its singleton held and skips: a backup, and since bd `su1b.2` step A4 a scrub too (it used to
-wait on the maintenance lock instead). That scrub logs "Another scrub holds /run/das-scrub.lock —
-skipping this invocation", exits 0 and writes no state; nothing retries it before the next
-calendar date, and the scrub's age in `btrdasd health` is what shows it (read from the code, not
-observed on the host).
+finds its singleton held by setup and waits for it, up to 15 minutes, saying whom: a backup (bd
+`al9`), and since bd `su1b.2` step A4 a scrub too, whose singleton setup now holds and records
+(`btrdasd setup … pid N`). A scrub that still finds setup there after `SETUP_WAIT_SECS` skips with a
+WARN that this pass did NOT run (exit 0, no state written): nothing retries it before the next
+calendar date. The decision was the operator's (2026-11-22): a scrub must not lose its monthly pass
+because setup is running. Each holder record is emptied while still held, so a scrub that meets a
+singleton held with no record looks once more after a short grace before it calls the holder
+unknown: that instant is a holder letting go.
 
 **`cmake --install` takes no lock**: the check below stays, for it — every residual above is a
 run that overlaps the install.
@@ -990,7 +993,7 @@ unreadable serial is a refusal, never a pass (bd `7tx` 4).
 
 Backups (`scripts/backup-run.sh`) and the scheduled BTRFS scrub engine (`indexer/src/scrub.rs`) both mount and unmount the same DAS filesystems, so they must never run concurrently. Two-lock design, identical on both sides, acquired in the same order (singleton → maintenance) so the pair is deadlock-free by construction:
 
-1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n -E 75` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0; a lock that cannot be opened or taken ⇒ "could not start", exit 1, bd `ismb`). Scrub: `flock -n` on `/run/das-scrub.lock` (held ⇒ skip, no state written; `btrdasd setup` holds it too while it writes, bd `su1b.2` A4).
+1. **Singleton lock** — non-blocking, prevents two instances of the *same* kind of job. Backup: `flock -n -E 75` fd 9 on `/run/das-backup.lock` (held ⇒ skip, exit 0; a lock that cannot be opened or taken ⇒ "could not start", exit 1, bd `ismb`). Scrub: `flock -n` on `/run/das-scrub.lock`, recorded `btrdasd scrub run pid N` (held ⇒ skip naming the holder, no state written; held by `btrdasd setup` ⇒ wait up to 900 s, then skip with a WARN, bd `su1b.2` A4).
 2. **Maintenance lock** — `/run/das-maintenance.lock`, path shared verbatim between both sides. Blocking on both sides: whichever job arrives second **waits**, it is never skipped or canceled. Held for the entire operation, including that job's own mounts/unmounts.
 
 Deadlock-freedom depends only on both sides **acquiring** in the same order (singleton, then maintenance) — never the reverse. Release order does not need to match on both sides for that guarantee to hold. The two implementations release differently: the scrub engine's `ScrubLocks` (Rust) has an explicit field-drop order (`maintenance` before `singleton`) that deliberately releases maintenance first; `backup-run.sh` (bash) has no equivalent — both fd 9 (singleton) and fd 8 (maintenance) simply stay open until the process exits, and the kernel's fd-teardown order at exit is unspecified and irrelevant here, since nothing in this design depends on it.

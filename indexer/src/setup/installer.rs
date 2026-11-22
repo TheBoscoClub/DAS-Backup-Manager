@@ -1319,7 +1319,7 @@ pub struct SetupLocks {
     // first — then the scrub singleton, then the backup singleton, the
     // reverse of taking them.
     _maintenance: MaintenanceHeld,
-    _scrub: buttered_dasd::scrub::FileLock,
+    _scrub: buttered_dasd::backup::SingletonHeld,
     _backup: buttered_dasd::backup::SingletonHeld,
 }
 
@@ -1347,11 +1347,17 @@ fn take_setup_locks(site: &SetupLockSite, job: &str) -> Result<SetupLockAttempt,
         return Ok(SetupLockAttempt::Busy(backup_held_line(&site.backup)));
     };
     // On every early return below, what was taken is let go as this returns,
-    // the backup singleton's record emptied first.
-    let Some(scrub) =
-        buttered_dasd::scrub::FileLock::try_acquire(&site.scrub).map_err(|e| e.to_string())?
+    // each record emptied first. `job` is recorded in the scrub singleton
+    // too: a scrub pass reads it and waits for setup instead of skipping its
+    // month, and `scrub cancel` does not take it for a pass (bd
+    // DAS-Backup-Manager-su1b.2).
+    let Some(scrub) = buttered_dasd::backup::SingletonHeld::try_acquire_at(&site.scrub, job)
+        .map_err(|e| e.to_string())?
     else {
-        return Ok(SetupLockAttempt::Busy(scrub_pass_held_line(&site.scrub)));
+        return Ok(SetupLockAttempt::Busy(scrub_pass_held_line(
+            &site.scrub,
+            &buttered_dasd::maintenance::holder_of(&site.scrub),
+        )));
     };
     let Some(maintenance) =
         MaintenanceHeld::try_acquire_at(&site.maintenance, job).map_err(|e| e.to_string())?
@@ -1386,14 +1392,14 @@ fn backup_held_line(path: &Path) -> String {
 
 /// What setup says, and stops at, when the scrub singleton at `path` is held:
 /// a scrub pass is alive — scrubbing, or waiting for the DAS maintenance lock
-/// without holding it (bd DAS-Backup-Manager-su1b.2). The singleton carries no
-/// record, so no holder is named.
-fn scrub_pass_held_line(path: &Path) -> String {
+/// without holding it (bd DAS-Backup-Manager-su1b.2) — naming `holder` as its
+/// record does (`btrdasd scrub run pid N`; an older pass records nothing).
+fn scrub_pass_held_line(path: &Path, holder: &str) -> String {
     format!(
-        "Refused, nothing written or removed: the scrub singleton {} is held, so a scrub pass \
-         is running, scrubbing or waiting for the DAS maintenance lock. A running pass uses \
-         the files setup rewrites. Run setup again once it has finished (btrdasd scrub \
-         status; exit {SETUP_REFUSED_EXIT}).",
+        "Refused, nothing written or removed: the scrub singleton {} is held by {holder}, so a \
+         scrub pass is running, scrubbing or waiting for the DAS maintenance lock. A running \
+         pass uses the files setup rewrites. Run setup again once it has finished (btrdasd \
+         scrub status; exit {SETUP_REFUSED_EXIT}).",
         path.display()
     )
 }
@@ -5438,7 +5444,13 @@ auth = "starttls""#,
 
         match take_setup_locks(&locks.site, "btrdasd setup").unwrap() {
             SetupLockAttempt::Busy(why) => {
-                assert_eq!(why, scrub_pass_held_line(&locks.site.scrub));
+                assert_eq!(
+                    why,
+                    scrub_pass_held_line(
+                        &locks.site.scrub,
+                        buttered_dasd::maintenance::UNKNOWN_HOLDER
+                    )
+                );
             }
             SetupLockAttempt::Taken(_) => panic!("a scrub pass is alive"),
         }
@@ -5461,8 +5473,10 @@ auth = "starttls""#,
     fn setup_holds_the_scrub_singleton_through_its_change_and_lets_it_go() {
         let locks = ScratchLocks::new();
         let mut during = None;
-        let ran = under_setup_locks(&locks.site, "btrdasd setup", |_| {
+        let mut record = None;
+        let ran = under_setup_locks(&locks.site, "btrdasd setup --upgrade", |_| {
             during = Some((locks.scrub_state(), locks.state()));
+            record = std::fs::read_to_string(&locks.site.scrub).ok();
             Ok(())
         })
         .unwrap();
@@ -5472,6 +5486,21 @@ auth = "starttls""#,
             during,
             Some(("held", BOTH_HELD.to_string())),
             "a scrub pass that fires mid-change must not start"
+        );
+        // Recorded, so a pass that finds it held waits for setup instead of
+        // skipping its month (su1b.2 A4 fix round), and emptied before setup
+        // lets go.
+        assert_eq!(
+            record,
+            Some(format!(
+                "btrdasd setup --upgrade pid {}\n",
+                std::process::id()
+            ))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&locks.site.scrub).unwrap(),
+            "",
+            "the record is emptied before setup lets go"
         );
         assert_eq!(
             locks.scrub_state(),

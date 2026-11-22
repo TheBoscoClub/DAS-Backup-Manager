@@ -98,10 +98,13 @@
 //!
 //! # Locking (two locks, acquired singleton → maintenance)
 //!
-//! * `/run/das-scrub.lock` — non-blocking. Held means another scrub pass is
-//!   already running, or `btrdasd setup` is writing the installed files (it
-//!   holds this lock too, bd DAS-Backup-Manager-su1b.2), so this invocation **skips** (logs and returns
-//!   [`PassStatus::Skipped`]); it never queues.
+//! * `/run/das-scrub.lock` — non-blocking, holding its holder's record
+//!   (`btrdasd scrub run pid N`). Held by another pass, or by a holder that
+//!   recorded nothing, this invocation **skips** (logs the holder and returns
+//!   [`PassStatus::Skipped`]); it never queues. Held by `btrdasd setup`, which
+//!   takes it while it writes the installed files (bd DAS-Backup-Manager-su1b.2),
+//!   the pass waits up to [`SETUP_WAIT_SECS`] for it, saying so, and skips with
+//!   a WARN that it did NOT run if setup still holds it.
 //! * `/run/das-maintenance.lock` — blocking, shared with `backup-run.sh`. Held
 //!   for the entire pass, including this module's own mounts and unmounts, so a
 //!   backup can never unmount a filesystem out from under a running scrub.
@@ -211,7 +214,8 @@ use crate::mount::partition_device;
 use crate::progress::{LogLevel, ProgressCallback};
 
 /// Non-blocking singleton lock — a second scrub pass skips rather than queues.
-/// `btrdasd setup` holds it too while it writes, so a pass started then skips.
+/// `btrdasd setup` holds it too while it writes; a pass started then waits for
+/// it ([`SETUP_WAIT_SECS`]).
 pub const SCRUB_LOCK_PATH: &str = "/run/das-scrub.lock";
 /// Blocking maintenance lock, shared with `backup-run.sh`.
 pub const MAINTENANCE_LOCK_PATH: &str = "/run/das-maintenance.lock";
@@ -1008,10 +1012,15 @@ impl Drop for FileLock {
 /// `maintenance` is released before `singleton` — the exact reverse of the
 /// singleton → maintenance acquisition order used on both this side and
 /// `backup-run.sh`'s, which is what makes the pair deadlock-free.
+///
+/// The singleton carries its holder record (`btrdasd scrub run pid N`),
+/// emptied while still held as the value drops, as the backup singleton's
+/// does — so `btrdasd setup` and `scrub cancel` can tell a pass from setup's
+/// own hold (bd DAS-Backup-Manager-su1b.2).
 #[derive(Debug)]
 pub struct ScrubLocks {
     maintenance: MaintenanceHeld,
-    singleton: FileLock,
+    singleton: crate::backup::SingletonHeld,
 }
 
 impl ScrubLocks {
@@ -1027,32 +1036,180 @@ impl HoldsMaintenance for ScrubLocks {
     }
 }
 
+/// How long a scrub pass that finds its singleton held by `btrdasd setup`
+/// waits for setup to let go before it skips — `backup-run.sh`'s
+/// `SINGLETON_WAIT_SECS` for setup and configuration edits (bd
+/// DAS-Backup-Manager-al9, DAS-Backup-Manager-su1b.2).
+pub const SETUP_WAIT_SECS: u64 = 900;
+
+/// How often that wait looks at the singleton again.
+const SETUP_WAIT_POLL: Duration = Duration::from_secs(5);
+
+/// How a holder record of `btrdasd setup` begins (`btrdasd setup pid 4242`,
+/// `btrdasd setup --upgrade pid 4242`), as `backup-run.sh` matches it.
+pub const SETUP_HOLDER_PREFIX: &str = "btrdasd setup";
+
+/// The job a scrub pass records itself as, in both of its locks.
+const SCRUB_JOB: &str = "btrdasd scrub run";
+
+/// Whether `holder`, as [`crate::maintenance::holder_of`] names a lock's
+/// holder, is a live `btrdasd setup`: `holder_of` gives the record's line only
+/// while its pid runs, so a dead setup's record reads as unknown.
+pub fn holder_is_setup(holder: &str) -> bool {
+    holder.starts_with(SETUP_HOLDER_PREFIX)
+}
+
+/// How a scrub pass found its locks.
+#[derive(Debug)]
+pub enum ScrubLockAttempt {
+    /// Both taken, and held until the value is dropped.
+    Taken(ScrubLocks),
+    /// The singleton is held by `holder` (as its record names it), which is
+    /// not `btrdasd setup`: another pass, or a holder that recorded nothing.
+    Held(String),
+    /// `btrdasd setup` (`holder`) still held the singleton once
+    /// [`SETUP_WAIT_SECS`] had passed: this pass did not run.
+    SetupOutlasted(String),
+}
+
+/// What one look at the singleton found.
+enum SingletonLook {
+    Taken(crate::backup::SingletonHeld),
+    HeldBy(String),
+}
+
+/// Try the singleton at `path` once, recording this pass on success; held,
+/// name its holder. A holder whose record names nobody is looked at once more
+/// after `grace`: a holder letting go empties its record while it still holds
+/// the lock, and that instant must not read as "someone else".
+fn look_at_singleton(path: &Path, grace: Duration) -> Result<SingletonLook, ScrubError> {
+    for attempt in 0..2 {
+        if let Some(held) = crate::backup::SingletonHeld::try_acquire_at(path, SCRUB_JOB)? {
+            return Ok(SingletonLook::Taken(held));
+        }
+        let holder = crate::maintenance::holder_of(path);
+        if attempt == 1 || holder != crate::maintenance::UNKNOWN_HOLDER {
+            return Ok(SingletonLook::HeldBy(holder));
+        }
+        std::thread::sleep(grace);
+    }
+    unreachable!("the second look always returns")
+}
+
+/// A wait, as the journal says it.
+fn wait_words(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else if secs >= 1 {
+        format!("{secs} s")
+    } else {
+        format!("{} ms", wait.as_millis())
+    }
+}
+
 /// Acquire the singleton lock (non-blocking) then the maintenance lock
-/// (blocking), recorded as held by `btrdasd scrub run`. `Ok(None)` means
-/// another scrub pass is already running and this invocation must skip.
+/// (blocking), recorded as held by `btrdasd scrub run`. A singleton held by
+/// `btrdasd setup` is waited for, up to `setup_wait`, looked at every `poll`,
+/// saying whom it waits for (bd DAS-Backup-Manager-su1b.2, as `backup-run.sh`
+/// waits for setup, bd DAS-Backup-Manager-al9); held by anything else, or
+/// still by setup once the wait is over, the pass does not run.
 fn acquire_locks_at(
     singleton_path: &Path,
     maintenance_path: &Path,
     progress: &dyn ProgressCallback,
-) -> Result<Option<ScrubLocks>, ScrubError> {
-    let Some(singleton) = FileLock::try_acquire(singleton_path)? else {
-        return Ok(None);
+    setup_wait: Duration,
+    poll: Duration,
+) -> Result<ScrubLockAttempt, ScrubError> {
+    let grace = poll.min(Duration::from_millis(100));
+    let singleton = match look_at_singleton(singleton_path, grace)? {
+        SingletonLook::Taken(held) => held,
+        SingletonLook::HeldBy(holder) if !holder_is_setup(&holder) => {
+            return Ok(ScrubLockAttempt::Held(holder));
+        }
+        SingletonLook::HeldBy(mut holder) => {
+            progress.on_log(
+                LogLevel::Info,
+                &format!(
+                    "{} is held by {holder}, which is writing the installed files — waiting up \
+                     to {} for it",
+                    singleton_path.display(),
+                    wait_words(setup_wait)
+                ),
+            );
+            let deadline = Instant::now() + setup_wait;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(ScrubLockAttempt::SetupOutlasted(holder));
+                }
+                std::thread::sleep(poll.min(deadline - now));
+                match look_at_singleton(singleton_path, grace)? {
+                    SingletonLook::Taken(held) => {
+                        progress.on_log(
+                            LogLevel::Info,
+                            &format!("{holder} has let go of {}", singleton_path.display()),
+                        );
+                        break held;
+                    }
+                    SingletonLook::HeldBy(next) if holder_is_setup(&next) => holder = next,
+                    // Setup let go and something else took it first.
+                    SingletonLook::HeldBy(next) => return Ok(ScrubLockAttempt::Held(next)),
+                }
+            }
+        }
     };
-    let maintenance =
-        MaintenanceHeld::acquire_blocking_at(maintenance_path, "btrdasd scrub run", progress)?;
-    Ok(Some(ScrubLocks {
+    let maintenance = MaintenanceHeld::acquire_blocking_at(maintenance_path, SCRUB_JOB, progress)?;
+    Ok(ScrubLockAttempt::Taken(ScrubLocks {
         maintenance,
         singleton,
     }))
 }
 
-/// Acquire the production scrub locks. `Ok(None)` means skip this invocation.
-pub fn acquire_locks(progress: &dyn ProgressCallback) -> Result<Option<ScrubLocks>, ScrubError> {
+/// Acquire the production scrub locks.
+pub fn acquire_locks(progress: &dyn ProgressCallback) -> Result<ScrubLockAttempt, ScrubError> {
     acquire_locks_at(
         Path::new(SCRUB_LOCK_PATH),
         Path::new(MAINTENANCE_LOCK_PATH),
         progress,
+        Duration::from_secs(SETUP_WAIT_SECS),
+        SETUP_WAIT_POLL,
     )
+}
+
+/// What a pass that did not get its locks says: the journal line, at its
+/// level, and the completion summary.
+fn skipped_lines(attempt: &ScrubLockAttempt) -> (LogLevel, String, String) {
+    match attempt {
+        ScrubLockAttempt::SetupOutlasted(holder) => (
+            LogLevel::Warning,
+            format!(
+                "{SCRUB_LOCK_PATH} is still held by {holder} after the {} this pass waits for \
+                 setup — this scrub pass did NOT run; run `btrdasd scrub run` once setup has \
+                 finished",
+                wait_words(Duration::from_secs(SETUP_WAIT_SECS))
+            ),
+            format!("Skipped — {holder} held the scrub lock; this pass did NOT run"),
+        ),
+        ScrubLockAttempt::Held(holder) => {
+            let named = if holder == crate::maintenance::UNKNOWN_HOLDER {
+                format!("{holder} (its record is empty or unreadable)")
+            } else {
+                holder.clone()
+            };
+            (
+                LogLevel::Info,
+                format!("{SCRUB_LOCK_PATH} is held by {named} — skipping this invocation"),
+                format!("Skipped — {named} holds the scrub lock"),
+            )
+        }
+        // Not a skip; listed so a new variant must be decided here.
+        ScrubLockAttempt::Taken(_) => (
+            LogLevel::Info,
+            "the scrub locks were taken".to_string(),
+            "the scrub locks were taken".to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,8 +1515,9 @@ fn merge_result_into_state(
 pub enum PassStatus {
     /// The pass ran (individual filesystems may still have failed).
     Completed,
-    /// Another scrub held the singleton lock — nothing was scrubbed, and no
-    /// state was written.
+    /// Another scrub held the singleton lock, or `btrdasd setup` still held
+    /// it after the pass waited [`SETUP_WAIT_SECS`] — nothing was scrubbed,
+    /// and no state was written.
     Skipped,
 }
 
@@ -1785,14 +1943,13 @@ pub fn run_scrub_pass(
 
     let started_epoch = now_epoch();
 
-    let Some(locks) = acquire_locks(progress)? else {
-        progress.on_log(
-            LogLevel::Info,
-            &format!("Another scrub holds {SCRUB_LOCK_PATH} — skipping this invocation"),
-        );
+    let attempt = acquire_locks(progress)?;
+    let ScrubLockAttempt::Taken(locks) = attempt else {
+        let (level, line, summary) = skipped_lines(&attempt);
+        progress.on_log(level, &line);
         // Close the progress lifecycle on this path too, so a caller driving a
         // UI or a log does not see a stage opened and never completed.
-        progress.on_complete(true, "Skipped — another scrub pass is already running");
+        progress.on_complete(true, &summary);
         return Ok(ScrubPass {
             status: PassStatus::Skipped,
             started_epoch,
@@ -3798,17 +3955,20 @@ Total to scrub:   401.28MiB\n";
         let progress = NullProgress;
 
         let held = FileLock::try_acquire(&singleton).unwrap().unwrap();
-        let result = acquire_locks_at(&singleton, &maintenance, &progress).unwrap();
-        assert!(result.is_none(), "must skip when singleton is held");
+        let result = locks_now(&singleton, &maintenance, &progress);
+        assert!(
+            matches!(result, ScrubLockAttempt::Held(_)),
+            "must skip when singleton is held: {result:?}"
+        );
         assert!(
             !maintenance.exists(),
             "maintenance lock must not be opened when the singleton is unavailable"
         );
 
         drop(held);
-        let locks = acquire_locks_at(&singleton, &maintenance, &progress)
-            .unwrap()
-            .expect("locks available");
+        let ScrubLockAttempt::Taken(locks) = locks_now(&singleton, &maintenance, &progress) else {
+            panic!("locks available");
+        };
         assert!(maintenance.exists());
         let (s, m) = locks.paths();
         assert_eq!(s, singleton.as_path());
@@ -3821,19 +3981,190 @@ Total to scrub:   401.28MiB\n";
         );
 
         // Both locks are held: a second pass skips.
-        assert!(
-            acquire_locks_at(&singleton, &maintenance, &progress)
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            locks_now(&singleton, &maintenance, &progress),
+            ScrubLockAttempt::Held(_)
+        ));
 
         drop(locks);
         assert!(
-            acquire_locks_at(&singleton, &maintenance, &progress)
-                .unwrap()
-                .is_some(),
+            matches!(
+                locks_now(&singleton, &maintenance, &progress),
+                ScrubLockAttempt::Taken(_)
+            ),
             "both locks must be released on drop"
         );
+    }
+
+    /// [`acquire_locks_at`] with no wait for setup, for the tests that are
+    /// not about that wait.
+    fn locks_now(
+        singleton: &Path,
+        maintenance: &Path,
+        progress: &dyn ProgressCallback,
+    ) -> ScrubLockAttempt {
+        acquire_locks_at(
+            singleton,
+            maintenance,
+            progress,
+            Duration::ZERO,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+    }
+
+    /// su1b.2 A4 fix round: a pass records itself in its singleton, as every
+    /// holder of a lock here does, and empties the record before it lets go.
+    #[test]
+    fn a_pass_records_itself_in_its_singleton_and_empties_it_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let ScrubLockAttempt::Taken(locks) = locks_now(&singleton, &maintenance, &NullProgress)
+        else {
+            panic!("free locks are taken");
+        };
+        assert_eq!(
+            crate::maintenance::holder_of(&singleton),
+            format!("btrdasd scrub run pid {}", std::process::id())
+        );
+        drop(locks);
+        assert_eq!(fs::read_to_string(&singleton).unwrap(), "");
+    }
+
+    /// A second pass that meets a pass skips at once and names it.
+    #[test]
+    fn a_pass_meeting_another_pass_skips_at_once_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let other = crate::backup::SingletonHeld::try_acquire_at(&singleton, "btrdasd scrub run")
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        let attempt = acquire_locks_at(
+            &singleton,
+            &maintenance,
+            &NullProgress,
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no wait for another pass"
+        );
+        let holder = format!("btrdasd scrub run pid {}", std::process::id());
+        match &attempt {
+            ScrubLockAttempt::Held(h) => assert_eq!(h, &holder),
+            other => panic!("skips: {other:?}"),
+        }
+        let (level, line, _) = skipped_lines(&attempt);
+        assert_eq!(level, LogLevel::Info);
+        assert_eq!(
+            line,
+            format!("{SCRUB_LOCK_PATH} is held by {holder} — skipping this invocation")
+        );
+        drop(other);
+    }
+
+    /// A singleton held with no record (or one that cannot be read) is not
+    /// asserted to be a scrub: the line says the record names nobody.
+    #[test]
+    fn a_singleton_held_with_no_record_skips_saying_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let held = FileLock::try_acquire(&singleton).unwrap().unwrap();
+        let attempt = locks_now(&singleton, &maintenance, &NullProgress);
+        let (level, line, summary) = skipped_lines(&attempt);
+        assert_eq!(level, LogLevel::Info);
+        assert_eq!(
+            line,
+            format!(
+                "{SCRUB_LOCK_PATH} is held by an unknown holder (its record is empty or \
+                 unreadable) — skipping this invocation"
+            )
+        );
+        assert!(!summary.contains("another scrub"), "{summary}");
+        drop(held);
+    }
+
+    /// Held by `btrdasd setup`: the pass waits, saying for whom, and runs once
+    /// setup lets go.
+    #[test]
+    fn a_pass_waits_for_setup_and_runs_once_it_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let setup =
+            crate::backup::SingletonHeld::try_acquire_at(&singleton, "btrdasd setup --upgrade")
+                .unwrap()
+                .unwrap();
+        let progress = TestProgress::new();
+        let attempt = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(setup);
+            });
+            acquire_locks_at(
+                &singleton,
+                &maintenance,
+                &progress,
+                Duration::from_secs(30),
+                Duration::from_millis(20),
+            )
+            .unwrap()
+        });
+        assert!(
+            matches!(attempt, ScrubLockAttempt::Taken(_)),
+            "ran once setup let go: {attempt:?}"
+        );
+        let logs = progress.logs.lock().unwrap().clone();
+        let holder = format!("btrdasd setup --upgrade pid {}", std::process::id());
+        assert!(
+            logs.iter().any(|(level, line)| *level == LogLevel::Info
+                && line.contains(&holder)
+                && line.contains("waiting")),
+            "says whom it waits for: {logs:?}"
+        );
+    }
+
+    /// Setup still holding once the wait is over: the pass did not run, and
+    /// says so at WARN, naming setup; it is still a skip (exit 0).
+    #[test]
+    fn a_pass_that_outwaits_its_wait_for_setup_skips_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let singleton = dir.path().join("das-scrub.lock");
+        let maintenance = dir.path().join("das-maintenance.lock");
+        let setup = crate::backup::SingletonHeld::try_acquire_at(&singleton, "btrdasd setup")
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        let attempt = acquire_locks_at(
+            &singleton,
+            &maintenance,
+            &NullProgress,
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200), "it waited");
+        let holder = format!("btrdasd setup pid {}", std::process::id());
+        match &attempt {
+            ScrubLockAttempt::SetupOutlasted(h) => assert_eq!(h, &holder),
+            other => panic!("setup outlasted the wait: {other:?}"),
+        }
+        assert!(
+            !maintenance.exists(),
+            "nothing past the singleton was tried"
+        );
+        let (level, line, summary) = skipped_lines(&attempt);
+        assert_eq!(level, LogLevel::Warning);
+        assert!(line.contains(&holder), "{line}");
+        assert!(line.contains("did NOT run"), "{line}");
+        assert!(summary.contains("did NOT run"), "{summary}");
+        drop(setup);
     }
 
     #[test]
