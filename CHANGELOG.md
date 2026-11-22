@@ -80,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A scrub runs its I/O at the real-time class where the disks bound its starvation** (bd `DAS-Backup-Manager-su1b.5`, operator 2026-11-22): just before each `btrfs scrub start` / `resume` / `start -f` the pass reads `/sys/fs/btrfs/<fsuuid>/devices/` and passes `-c 1 -n 0` only when every member device's disk runs mq-deadline and exposes `queue/iosched/prio_aging_expire` (a lower class then waits at most that long, 10 s by default); otherwise `-c 2 -n 0` as before
+  - Any device on BFQ (real-time preempts everything there, with no bound), another scheduler, mq-deadline without `prio_aging_expire`, a zero or unreadable aging value, a dangling member link, a missing devices directory or a malformed UUID keeps best-effort — the cautious default
+  - A partition entry is judged by its disk's `queue/`; one log line per filesystem names the class and why (`Scrub priority on <mnt>: realtime I/O, level 0 (-c 1 -n 0): every device runs mq-deadline (sdX, sdY; starvation bounded at 10 s)`, or `... best-effort I/O, level 0 (-c 2 -n 0): sdY runs bfq`)
+  - `das-scrub.service` keeps `Nice=-20`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=0` (its comment now says the per-device workers ignore that class); no real-time CPU policy
+  - `SCRUB_IOPRIO_ARGS` became `ScrubIoClass`; the doctor's `SCRUB TOOL` text names both flag pairs
 - **`btrdasd scrub run` reads `config.toml` again once it holds its locks** (bd `DAS-Backup-Manager-su1b.2`, A4 review): a pass that waited for setup or for the maintenance lock no longer runs on the file it started with
 - **`btrdasd setup` refuses while a scrub pass is alive** (bd `DAS-Backup-Manager-su1b.2`, step A4): every mode that writes or removes installed files now takes `/run/das-scrub.lock` between the backup singleton and the maintenance lock, without waiting, and holds it to the end; held — a pass scrubbing, or waiting for the maintenance lock — it writes nothing and exits `75`, naming the lock on stderr
   - A pass that died (SIGKILL included) leaves the lock free and no longer blocks setup; an unopenable lock file is an error, never free; `--check` still takes no lock

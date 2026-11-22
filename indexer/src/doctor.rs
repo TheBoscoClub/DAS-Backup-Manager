@@ -645,7 +645,7 @@ pub fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
 }
 
 /// Whether `btrfs scrub start --help` lists the `-c` and `-n` option lines
-/// (`-c CLASS`, `-n CDATA`) that `scrub::SCRUB_IOPRIO_ARGS` puts on every scrub
+/// (`-c CLASS`, `-n CDATA`) that `scrub::ScrubIoClass::args` puts on every scrub
 /// argv; returns `(has_c, has_n)`. Matches option lines only (leading
 /// whitespace, then the option and a space), never a mention in prose.
 pub fn scrub_help_ioprio_options(help: &str) -> (bool, bool) {
@@ -709,7 +709,7 @@ pub fn scrub_tool_check(runner: &dyn crate::fsutil::CommandRunner) -> Option<Scr
     Some(ScrubToolFinding {
         version,
         detail: format!(
-            "'btrfs scrub start --help' no longer lists {}; every scrub argv carries -c 2 -n 0, so scrubs will fail at the next pass",
+            "'btrfs scrub start --help' no longer lists {}; every scrub argv carries -c and -n (-c 1 -n 0 or -c 2 -n 0), so scrubs will fail at the next pass",
             gone.join(" and ")
         ),
     })
@@ -1120,10 +1120,10 @@ pub fn format_report(report: &DriftReport) -> String {
         ));
         r.push_str(&format!("  {}: {}\n", f.version, f.detail));
         r.push_str(
-            "\n  The monthly scrub passes -c 2 -n 0 (scrub.rs, SCRUB_IOPRIO_ARGS) to every\n  \
-             'btrfs scrub start'. If btrfs rejects them each target's scrub fails while\n  \
-             'btrdasd scrub run' still exits 0. Before the next 1st-of-month scrub, find\n  \
-             the replacement in 'man btrfs-scrub' and update SCRUB_IOPRIO_ARGS, or hold\n  \
+            "\n  The monthly scrub passes -c 1 -n 0 or -c 2 -n 0 (scrub.rs, ScrubIoClass) to\n  \
+             every 'btrfs scrub start'. If btrfs rejects them each target's scrub fails\n  \
+             while 'btrdasd scrub run' still exits 0. Before the next 1st-of-month scrub,\n  \
+             find the replacement in 'man btrfs-scrub' and update ScrubIoClass, or hold\n  \
              btrfs-progs at the last version that lists them.\n",
         );
     }

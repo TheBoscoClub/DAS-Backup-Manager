@@ -58,8 +58,8 @@
 //! never on a guess, because these locks cannot stop an operator from starting
 //! a scrub by hand. If the kernel then has no resumable state after all
 //! (`btrfs scrub resume` prints "nothing to resume"), the runner falls back to
-//! `start -B -f` (every argv also carries the priority flags `-c 2 -n 0`, see
-//! `SCRUB_IOPRIO_ARGS`), which also clears the genuinely stale record that
+//! `start -B -f` (every argv also carries the priority flags `-c 1 -n 0` or
+//! `-c 2 -n 0`, see `ScrubIoClass`), which also clears the genuinely stale record that
 //! `btrfs-progs` would otherwise read as a live scrub and refuse to start over
 //! ("useful when scrub status file is damaged and reports a running scrub
 //! although it is not", `man btrfs-scrub` on `-f`). So one aborted pass can
@@ -1865,7 +1865,7 @@ pub enum ScrubStartMode {
     /// Plain `btrfs scrub start -B` — no interrupted pass to continue.
     Normal,
     /// `btrfs scrub resume -B` (every scrub argv also carries the priority flags
-    /// `SCRUB_IOPRIO_ARGS`), because a previous pass left an aborted record
+    /// of `ScrubIoClass`), because a previous pass left an aborted record
     /// behind (interrupted by a reboot or an unmount) and nothing is running
     /// now. Resuming continues from the saved position in
     /// `/var/lib/btrfs/scrub.status.<uuid>` rather than re-scrubbing from zero,
@@ -2570,27 +2570,175 @@ fn resume_found_nothing(outcome: &ScrubRunOutcome) -> bool {
     )
 }
 
-/// I/O scheduling class passed to every `btrfs scrub` as `-c`: best-effort
-/// (2), at level 0 (`-n 0`), the highest priority that still cannot block
-/// writes (operator, 2026-11-01, bd DAS-Backup-Manager-su1b.1).
+/// The I/O class every `btrfs scrub` runs at, passed as `-c`/`-n` and chosen
+/// per filesystem just before each `start` / `resume` / `start -f` by
+/// [`choose_scrub_io_class`] (operator, 2026-11-22, bd
+/// DAS-Backup-Manager-su1b.5; before it, always best-effort, bd
+/// DAS-Backup-Manager-su1b.1).
 ///
 /// Why on the argv and not only in the unit: btrfs-progs (v7.3,
 /// `cmds/scrub.c`) defaults the class to *idle* and each per-device worker
 /// thread calls `ioprio_set(IOPRIO_WHO_PROCESS, 0, ..)` unconditionally before
 /// `BTRFS_IOC_SCRUB`, so the workers never inherit the unit's `Nice=` or
 /// `IOSchedulingClass=`; only `-c`/`-n` change them. `scrub resume` accepts
-/// the same flags. The real-time class (1) is excluded on purpose: under BFQ
-/// it preempts everything, writes included.
+/// the same flags.
+///
+/// Real-time (class 1) only where its starvation is bounded: mq-deadline with
+/// I/O-priority aging (`queue/iosched/prio_aging_expire`, 10 000 ms by
+/// default) dispatches a lower class's request once it has waited that long,
+/// so real-time cannot hold writes back for longer. BFQ has no such bound:
+/// there real-time preempts everything, writes included, so a member device
+/// on any other scheduler, or anything unreadable, keeps best-effort level 0,
+/// the highest class that cannot block writes under any scheduler.
 ///
 /// DEPRECATED UPSTREAM, chosen anyway: `man btrfs-scrub` (v7.3) lists `-c`/`-n`
 /// under "Deprecated options" because ioprio only works with some I/O
-/// schedulers (not mq-deadline). The DAS disks run BFQ (read from
-/// `/sys/block/<dev>/queue/scheduler`, 2026-11-01), where it works, and the
-/// per-worker `ioprio_set` leaves no other way to lift the workers. If a later
-/// btrfs-progs drops the flags every `scrub start`/`resume` exits nonzero on an
-/// unrecognised option; the pass still exits 0, so re-check the flags at every
-/// btrfs-progs upgrade (bd `DAS-Backup-Manager-su1b.1` follow-up).
-const SCRUB_IOPRIO_ARGS: [&str; 4] = ["-c", "2", "-n", "0"];
+/// schedulers, naming mq-deadline as one it does not work with; that is
+/// outdated (mq-deadline honours I/O classes and exposes `prio_aging_expire`,
+/// kernel 7.3.5, 2026-11-22). The per-worker `ioprio_set` leaves no other way
+/// to lift the workers. If a later btrfs-progs drops the flags every
+/// `scrub start`/`resume` exits nonzero on an unrecognised option; the pass
+/// still exits 0, so the weekly doctor checks they are still listed (bd
+/// `DAS-Backup-Manager-su1b.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubIoClass {
+    /// `-c 1 -n 0`: real-time, level 0.
+    Realtime,
+    /// `-c 2 -n 0`: best-effort, level 0.
+    BestEffort,
+}
+
+impl ScrubIoClass {
+    /// The `-c`/`-n` flags for this class.
+    fn args(self) -> [&'static str; 4] {
+        match self {
+            ScrubIoClass::Realtime => ["-c", "1", "-n", "0"],
+            ScrubIoClass::BestEffort => ["-c", "2", "-n", "0"],
+        }
+    }
+}
+
+/// The class [`choose_scrub_io_class`] picked for one filesystem, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrubIoChoice {
+    class: ScrubIoClass,
+    why: String,
+}
+
+impl ScrubIoChoice {
+    fn best_effort(why: String) -> Self {
+        ScrubIoChoice {
+            class: ScrubIoClass::BestEffort,
+            why,
+        }
+    }
+
+    /// The one log line naming the class and the reason.
+    fn log_line(&self, mount_point: &str) -> String {
+        let class = match self.class {
+            ScrubIoClass::Realtime => "realtime I/O, level 0 (-c 1 -n 0)",
+            ScrubIoClass::BestEffort => "best-effort I/O, level 0 (-c 2 -n 0)",
+        };
+        format!("Scrub priority on {mount_point}: {class}: {}", self.why)
+    }
+}
+
+/// Where sysfs is mounted; tests hand [`choose_scrub_io_class`] a fake tree.
+const SYSFS_ROOT: &str = "/sys";
+
+/// Choose the scrub's I/O class for the filesystem `fsuuid` from the sysfs
+/// tree at `sysfs`: real-time only when every member device's disk runs
+/// mq-deadline and exposes `queue/iosched/prio_aging_expire`; best-effort for
+/// anything else, an unreadable or unexpected tree included (the cautious
+/// default, `fail-silent.md`).
+fn choose_scrub_io_class(sysfs: &Path, fsuuid: &str) -> ScrubIoChoice {
+    match realtime_bound(sysfs, fsuuid) {
+        Ok((disks, bound_ms)) => ScrubIoChoice {
+            class: ScrubIoClass::Realtime,
+            why: format!(
+                "every device runs mq-deadline ({}; starvation bounded at {})",
+                disks.join(", "),
+                if bound_ms % 1000 == 0 {
+                    format!("{} s", bound_ms / 1000)
+                } else {
+                    format!("{bound_ms} ms")
+                }
+            ),
+        },
+        Err(why) => ScrubIoChoice::best_effort(why),
+    }
+}
+
+/// The member disks of `fsuuid` (sorted, each once) and the longest
+/// `prio_aging_expire` among them in ms, when every one runs mq-deadline with
+/// aging; otherwise the first reason it cannot be real-time.
+fn realtime_bound(sysfs: &Path, fsuuid: &str) -> Result<(Vec<String>, u64), String> {
+    if fsuuid.is_empty() || !fsuuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(format!("not a filesystem UUID: {fsuuid:?}"));
+    }
+    let dir = sysfs.join("fs/btrfs").join(fsuuid).join("devices");
+    let entries = fs::read_dir(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    if names.is_empty() {
+        return Err(format!("no member device listed in {}", dir.display()));
+    }
+    let mut disks: Vec<String> = Vec::new();
+    let mut bound_ms = 0;
+    for name in &names {
+        let real =
+            fs::canonicalize(dir.join(name)).map_err(|e| format!("{name}: cannot resolve: {e}"))?;
+        let is_partition = real
+            .join("partition")
+            .try_exists()
+            .map_err(|e| format!("{name}: cannot read: {e}"))?;
+        let disk_dir = if is_partition {
+            real.parent()
+                .ok_or_else(|| format!("{name}: partition without a disk"))?
+        } else {
+            real.as_path()
+        };
+        let disk = disk_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("{name}: no disk name"))?;
+        let queue = disk_dir.join("queue");
+        let raw = fs::read_to_string(queue.join("scheduler"))
+            .map_err(|e| format!("{disk}: cannot read queue/scheduler: {e}"))?;
+        let active = raw
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')))
+            .ok_or_else(|| format!("{disk}: no active scheduler in {:?}", raw.trim()))?;
+        if active != "mq-deadline" {
+            return Err(format!("{disk} runs {active}"));
+        }
+        let aging = match fs::read_to_string(queue.join("iosched/prio_aging_expire")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "{disk} runs mq-deadline without prio_aging_expire (no bound on starvation)"
+                ));
+            }
+            Err(e) => return Err(format!("{disk}: cannot read prio_aging_expire: {e}")),
+        };
+        let ms = aging
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .ok_or_else(|| format!("{disk}: prio_aging_expire {:?} is no bound", aging.trim()))?;
+        bound_ms = bound_ms.max(ms);
+        if !disks.contains(&disk) {
+            disks.push(disk);
+        }
+    }
+    disks.sort();
+    Ok((disks, bound_ms))
+}
 
 /// Which `btrfs scrub` invocation to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2604,9 +2752,13 @@ enum ScrubInvocation {
 }
 
 /// The `btrfs` argument vector for `invocation` on `mount_point`, in the
-/// foreground (`-B`), carrying [`SCRUB_IOPRIO_ARGS`]. The mountpoint is last:
-/// [`run_scrub_argv`] recovers it from there.
-fn btrfs_scrub_args(invocation: ScrubInvocation, mount_point: &str) -> Vec<String> {
+/// foreground (`-B`), carrying the `-c`/`-n` flags of `class`. The mountpoint
+/// is last: [`run_scrub_argv`] recovers it from there.
+fn btrfs_scrub_args(
+    invocation: ScrubInvocation,
+    class: ScrubIoClass,
+    mount_point: &str,
+) -> Vec<String> {
     let verb = match invocation {
         ScrubInvocation::Start | ScrubInvocation::ForcedStart => "start",
         ScrubInvocation::Resume => "resume",
@@ -2615,7 +2767,7 @@ fn btrfs_scrub_args(invocation: ScrubInvocation, mount_point: &str) -> Vec<Strin
     if invocation == ScrubInvocation::ForcedStart {
         args.push("-f".to_string());
     }
-    args.extend(SCRUB_IOPRIO_ARGS.iter().map(|a| (*a).to_string()));
+    args.extend(class.args().iter().map(|a| (*a).to_string()));
     args.push(mount_point.to_string());
     args
 }
@@ -2635,30 +2787,45 @@ fn run_btrfs_scrub(
     progress: &dyn ProgressCallback,
     claimed: &dyn Fn() -> bool,
 ) -> ScrubRunOutcome {
+    let mode = decide_scrub_start_mode(fsuuid, mount_point);
     run_btrfs_scrub_with(
-        decide_scrub_start_mode(fsuuid, mount_point),
+        mode,
+        &choose_scrub_io_class(Path::new(SYSFS_ROOT), fsuuid),
         mount_point,
         &|args| run_scrub_argv(args, progress, claimed),
         progress,
     )
 }
 
-/// [`run_btrfs_scrub`] with the start mode decided and the `btrfs` spawn
-/// supplied by the caller, so a test sees which argv each path asks for.
+/// [`run_btrfs_scrub`] with the start mode and I/O class decided and the
+/// `btrfs` spawn supplied by the caller, so a test sees which argv each path
+/// asks for. Logs the class once, before the first invocation; the
+/// forced-start fallback follows the failed resume at once and keeps it.
 fn run_btrfs_scrub_with(
     mode: ScrubStartMode,
+    io: &ScrubIoChoice,
     mount_point: &str,
     run: &dyn Fn(&[String]) -> ScrubRunOutcome,
     progress: &dyn ProgressCallback,
 ) -> ScrubRunOutcome {
+    progress.on_log(LogLevel::Info, &io.log_line(mount_point));
+    let class = io.class;
     match mode {
-        ScrubStartMode::Normal => run(&btrfs_scrub_args(ScrubInvocation::Start, mount_point)),
+        ScrubStartMode::Normal => run(&btrfs_scrub_args(
+            ScrubInvocation::Start,
+            class,
+            mount_point,
+        )),
         ScrubStartMode::Resume { reason } => {
             progress.on_log(
                 LogLevel::Info,
                 &format!("Resuming interrupted scrub: {reason}"),
             );
-            let outcome = run(&btrfs_scrub_args(ScrubInvocation::Resume, mount_point));
+            let outcome = run(&btrfs_scrub_args(
+                ScrubInvocation::Resume,
+                class,
+                mount_point,
+            ));
             if resume_found_nothing(&outcome) {
                 progress.on_log(
                     LogLevel::Warning,
@@ -2667,7 +2834,11 @@ fn run_btrfs_scrub_with(
                          starting a fresh scrub with -f to clear the stale aborted record"
                     ),
                 );
-                run(&btrfs_scrub_args(ScrubInvocation::ForcedStart, mount_point))
+                run(&btrfs_scrub_args(
+                    ScrubInvocation::ForcedStart,
+                    class,
+                    mount_point,
+                ))
             } else {
                 outcome
             }
@@ -4358,39 +4529,273 @@ mod tests {
 
     // --- pure decision, all four combinations -----------------------------
 
-    /// bd DAS-Backup-Manager-su1b.1: every scrub argv carries the best-effort
-    /// level-0 priority (`-c 2 -n 0`) — btrfs's workers reset their own
-    /// priority, so the argv is the only place it can be set — and keeps the
-    /// order and flags it had, the mountpoint last.
+    /// bd DAS-Backup-Manager-su1b.1/.5: every scrub argv carries the chosen
+    /// class's level-0 priority — btrfs's workers reset their own priority, so
+    /// the argv is the only place it can be set — and keeps the order and
+    /// flags it had, the mountpoint last.
     #[test]
     fn scrub_argv_start_carries_priority_and_keeps_its_shape() {
         assert_eq!(
-            btrfs_scrub_args(ScrubInvocation::Start, "/mnt/x"),
+            btrfs_scrub_args(ScrubInvocation::Start, ScrubIoClass::BestEffort, "/mnt/x"),
             ["scrub", "start", "-B", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+        assert_eq!(
+            btrfs_scrub_args(ScrubInvocation::Start, ScrubIoClass::Realtime, "/mnt/x"),
+            ["scrub", "start", "-B", "-c", "1", "-n", "0", "/mnt/x"]
         );
     }
 
     #[test]
     fn scrub_argv_resume_carries_priority_and_keeps_its_shape() {
         assert_eq!(
-            btrfs_scrub_args(ScrubInvocation::Resume, "/mnt/x"),
+            btrfs_scrub_args(ScrubInvocation::Resume, ScrubIoClass::BestEffort, "/mnt/x"),
             ["scrub", "resume", "-B", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+        assert_eq!(
+            btrfs_scrub_args(ScrubInvocation::Resume, ScrubIoClass::Realtime, "/mnt/x"),
+            ["scrub", "resume", "-B", "-c", "1", "-n", "0", "/mnt/x"]
         );
     }
 
     #[test]
     fn scrub_argv_forced_start_carries_priority_and_keeps_its_shape() {
         assert_eq!(
-            btrfs_scrub_args(ScrubInvocation::ForcedStart, "/mnt/x"),
+            btrfs_scrub_args(
+                ScrubInvocation::ForcedStart,
+                ScrubIoClass::BestEffort,
+                "/mnt/x"
+            ),
             ["scrub", "start", "-B", "-f", "-c", "2", "-n", "0", "/mnt/x"]
+        );
+        assert_eq!(
+            btrfs_scrub_args(
+                ScrubInvocation::ForcedStart,
+                ScrubIoClass::Realtime,
+                "/mnt/x"
+            ),
+            ["scrub", "start", "-B", "-f", "-c", "1", "-n", "0", "/mnt/x"]
         );
     }
 
-    /// The ceiling is best-effort level 0: class 1 (real-time) would preempt
-    /// writes under BFQ.
+    // --- the I/O class rule (bd DAS-Backup-Manager-su1b.5) ------------------
+
+    const FS: &str = "5eed0016-0000-4000-8000-000000000016";
+
+    /// One member of a fake filesystem: the entry name under
+    /// `fs/btrfs/<uuid>/devices/`, the disk it lives on, the disk's
+    /// `queue/scheduler` text (None: no file) and its `prio_aging_expire`
+    /// (None: no file).
+    struct Member<'a> {
+        entry: &'a str,
+        disk: &'a str,
+        scheduler: Option<&'a str>,
+        aging: Option<&'a str>,
+    }
+
+    fn member<'a>(
+        entry: &'a str,
+        disk: &'a str,
+        scheduler: Option<&'a str>,
+        aging: Option<&'a str>,
+    ) -> Member<'a> {
+        Member {
+            entry,
+            disk,
+            scheduler,
+            aging,
+        }
+    }
+
+    const MQ: &str = "none [mq-deadline] kyber adios bfq\n";
+    const BFQ: &str = "none mq-deadline kyber adios [bfq]\n";
+
+    /// A sysfs tree shaped as the kernel's: each entry under
+    /// `fs/btrfs/<uuid>/devices/` is a symlink into
+    /// `devices/.../block/<disk>[/<partition>]`, a partition directory holds a
+    /// `partition` file, and the disk's `queue/` holds the scheduler files.
+    fn fake_sysfs(members: &[Member<'_>]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let devices = root.path().join("fs/btrfs").join(FS).join("devices");
+        fs::create_dir_all(&devices).unwrap();
+        for m in members {
+            let disk = root.path().join("devices/pci0/host0/block").join(m.disk);
+            fs::create_dir_all(disk.join("queue/iosched")).unwrap();
+            if let Some(s) = m.scheduler {
+                fs::write(disk.join("queue/scheduler"), s).unwrap();
+            }
+            if let Some(a) = m.aging {
+                fs::write(disk.join("queue/iosched/prio_aging_expire"), a).unwrap();
+            }
+            let target = if m.entry == m.disk {
+                disk
+            } else {
+                let part = disk.join(m.entry);
+                fs::create_dir_all(&part).unwrap();
+                fs::write(part.join("partition"), "1\n").unwrap();
+                part
+            };
+            std::os::unix::fs::symlink(&target, devices.join(m.entry)).unwrap();
+        }
+        root
+    }
+
     #[test]
-    fn scrub_priority_is_best_effort_level_zero_never_realtime() {
-        assert_eq!(SCRUB_IOPRIO_ARGS, ["-c", "2", "-n", "0"]);
+    fn every_member_on_mq_deadline_with_aging_runs_realtime() {
+        let root = fake_sysfs(&[
+            member("sdi1", "sdi", Some(MQ), Some("10000\n")),
+            member("sdj1", "sdj", Some(MQ), Some("10000\n")),
+        ]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::Realtime, "{choice:?}");
+        assert_eq!(
+            choice.why,
+            "every device runs mq-deadline (sdi, sdj; starvation bounded at 10 s)"
+        );
+        assert_eq!(
+            choice.log_line("/mnt/t"),
+            "Scrub priority on /mnt/t: realtime I/O, level 0 (-c 1 -n 0): every device \
+             runs mq-deadline (sdi, sdj; starvation bounded at 10 s)"
+        );
+    }
+
+    /// The bound named is the longest any member allows, in ms when it is not
+    /// whole seconds.
+    #[test]
+    fn realtime_names_the_longest_aging_bound() {
+        let root = fake_sysfs(&[
+            member("sda", "sda", Some(MQ), Some("2500")),
+            member("sdb", "sdb", Some(MQ), Some("1000")),
+        ]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::Realtime);
+        assert!(
+            choice.why.ends_with("bounded at 2500 ms)"),
+            "{}",
+            choice.why
+        );
+    }
+
+    /// A partition entry resolves to its disk: the scheduler is read from the
+    /// disk's queue, and the disk's name is the one reported.
+    #[test]
+    fn a_partition_entry_is_judged_by_its_disk() {
+        let root = fake_sysfs(&[member("sdi1", "sdi", Some(BFQ), None)]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert_eq!(choice.why, "sdi runs bfq");
+    }
+
+    #[test]
+    fn any_member_on_bfq_keeps_best_effort() {
+        let root = fake_sysfs(&[
+            member("sdi1", "sdi", Some(MQ), Some("10000")),
+            member("sdj1", "sdj", Some(BFQ), None),
+        ]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert_eq!(choice.why, "sdj runs bfq");
+        assert_eq!(
+            choice.log_line("/mnt/t"),
+            "Scrub priority on /mnt/t: best-effort I/O, level 0 (-c 2 -n 0): sdj runs bfq"
+        );
+    }
+
+    #[test]
+    fn mq_deadline_without_prio_aging_expire_keeps_best_effort() {
+        let root = fake_sysfs(&[
+            member("sdi1", "sdi", Some(MQ), Some("10000")),
+            member("sdj1", "sdj", Some(MQ), None),
+        ]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(
+            choice
+                .why
+                .starts_with("sdj runs mq-deadline without prio_aging_expire"),
+            "{}",
+            choice.why
+        );
+    }
+
+    /// An aging value that is not a positive number of ms is no bound.
+    #[test]
+    fn an_unparsable_or_zero_aging_value_keeps_best_effort() {
+        for bad in ["", "ten", "0", "-1"] {
+            let root = fake_sysfs(&[member("sdi1", "sdi", Some(MQ), Some(bad))]);
+            let choice = choose_scrub_io_class(root.path(), FS);
+            assert_eq!(choice.class, ScrubIoClass::BestEffort, "aging {bad:?}");
+            assert!(choice.why.starts_with("sdi: "), "{}", choice.why);
+        }
+    }
+
+    #[test]
+    fn unreadable_or_unbracketed_scheduler_keeps_best_effort() {
+        let root = fake_sysfs(&[member("sdi1", "sdi", None, Some("10000"))]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(
+            choice.why.starts_with("sdi: cannot read queue/scheduler"),
+            "{}",
+            choice.why
+        );
+
+        let root = fake_sysfs(&[member("sdi1", "sdi", Some("mq-deadline\n"), Some("10000"))]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(
+            choice.why.starts_with("sdi: no active scheduler"),
+            "{}",
+            choice.why
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_devices_dir_keeps_best_effort() {
+        let root = tempfile::tempdir().unwrap();
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(choice.why.starts_with("cannot read "), "{}", choice.why);
+
+        let root = fake_sysfs(&[]);
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(choice.why.starts_with("no member device"), "{}", choice.why);
+    }
+
+    /// A dangling member link (the device went away) is unreadable, not
+    /// skipped: the rest being mq-deadline must not make it realtime.
+    #[test]
+    fn a_dangling_member_link_keeps_best_effort() {
+        let root = fake_sysfs(&[member("sdi1", "sdi", Some(MQ), Some("10000"))]);
+        let devices = root.path().join("fs/btrfs").join(FS).join("devices");
+        std::os::unix::fs::symlink(root.path().join("devices/gone"), devices.join("sdz1")).unwrap();
+        let choice = choose_scrub_io_class(root.path(), FS);
+        assert_eq!(choice.class, ScrubIoClass::BestEffort);
+        assert!(
+            choice.why.starts_with("sdz1: cannot resolve"),
+            "{}",
+            choice.why
+        );
+    }
+
+    /// A filesystem UUID that is not one cannot walk out of `fs/btrfs`.
+    #[test]
+    fn a_malformed_fsuuid_keeps_best_effort() {
+        let root = fake_sysfs(&[member("sdi1", "sdi", Some(MQ), Some("10000"))]);
+        for bad in [
+            "",
+            "../..",
+            "a/b",
+            "5eed0016-0000-4000-8000-000000000016/..",
+        ] {
+            let choice = choose_scrub_io_class(root.path(), bad);
+            assert_eq!(choice.class, ScrubIoClass::BestEffort, "{bad:?}");
+            assert!(
+                choice.why.starts_with("not a filesystem UUID"),
+                "{}",
+                choice.why
+            );
+        }
     }
 
     /// `decide_from` is the pure seam behind `decide_scrub_start_mode`. These
@@ -4444,10 +4849,23 @@ mod tests {
         mode: ScrubStartMode,
         answers: Vec<ScrubRunOutcome>,
     ) -> (ScrubRunOutcome, Vec<Vec<String>>) {
+        let io = ScrubIoChoice::best_effort("test".into());
+        let (outcome, calls, _) = drive_scrub_at(&io, mode, answers);
+        (outcome, calls)
+    }
+
+    /// [`drive_scrub`] at the I/O class `io`, also returning the log lines.
+    fn drive_scrub_at(
+        io: &ScrubIoChoice,
+        mode: ScrubStartMode,
+        answers: Vec<ScrubRunOutcome>,
+    ) -> (ScrubRunOutcome, Vec<Vec<String>>, Vec<(LogLevel, String)>) {
         let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
         let answers = std::cell::RefCell::new(answers.into_iter());
+        let progress = Steps::default();
         let outcome = run_btrfs_scrub_with(
             mode,
+            io,
             "/mnt/x",
             &|args| {
                 calls.borrow_mut().push(args.to_vec());
@@ -4456,13 +4874,14 @@ mod tests {
                     .next()
                     .expect("more spawns than answers")
             },
-            &NullProgress,
+            &progress,
         );
-        (outcome, calls.into_inner())
+        let logs = progress.logs.into_inner().unwrap();
+        (outcome, calls.into_inner(), logs)
     }
 
     fn argv(invocation: ScrubInvocation) -> Vec<String> {
-        btrfs_scrub_args(invocation, "/mnt/x")
+        btrfs_scrub_args(invocation, ScrubIoClass::BestEffort, "/mnt/x")
     }
 
     #[test]
@@ -4526,20 +4945,39 @@ mod tests {
     fn every_path_runs_the_priority_argv() {
         let nothing =
             || ScrubRunOutcome::Launched(Err("resume exited 2: nothing to resume".into()));
-        let (_, calls) = drive_scrub(
-            ScrubStartMode::Resume { reason: "r".into() },
-            vec![nothing(), ScrubRunOutcome::Launched(Ok(()))],
-        );
-        let (_, normal) = drive_scrub(
-            ScrubStartMode::Normal,
-            vec![ScrubRunOutcome::Launched(Ok(()))],
-        );
-        for call in calls.iter().chain(normal.iter()) {
-            let at = call.iter().position(|a| a == "-c").expect("-c present");
-            assert_eq!(call[at..at + 4], ["-c", "2", "-n", "0"], "{call:?}");
-            assert_eq!(call.last().map(String::as_str), Some("/mnt/x"));
+        for (class, flags) in [
+            (ScrubIoClass::BestEffort, ["-c", "2", "-n", "0"]),
+            (ScrubIoClass::Realtime, ["-c", "1", "-n", "0"]),
+        ] {
+            let io = ScrubIoChoice {
+                class,
+                why: "w".into(),
+            };
+            let (_, calls, logs) = drive_scrub_at(
+                &io,
+                ScrubStartMode::Resume { reason: "r".into() },
+                vec![nothing(), ScrubRunOutcome::Launched(Ok(()))],
+            );
+            let (_, normal, _) = drive_scrub_at(
+                &io,
+                ScrubStartMode::Normal,
+                vec![ScrubRunOutcome::Launched(Ok(()))],
+            );
+            for call in calls.iter().chain(normal.iter()) {
+                let at = call.iter().position(|a| a == "-c").expect("-c present");
+                assert_eq!(call[at..at + 4], flags, "{call:?}");
+                assert_eq!(call.last().map(String::as_str), Some("/mnt/x"));
+            }
+            assert_eq!(calls.len() + normal.len(), 3);
+            // One priority line per filesystem, before the run, even when the
+            // resume falls back to a forced start.
+            let lines: Vec<_> = logs
+                .iter()
+                .filter(|(_, m)| m.starts_with("Scrub priority on /mnt/x: "))
+                .collect();
+            assert_eq!(lines.len(), 1, "{logs:?}");
+            assert_eq!(lines[0].1, io.log_line("/mnt/x"));
         }
-        assert_eq!(calls.len() + normal.len(), 3);
     }
 
     // --- resume fallback predicate ----------------------------------------

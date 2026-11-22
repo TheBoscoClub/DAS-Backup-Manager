@@ -220,17 +220,33 @@ the one that catches the defect this guard was written for
          └──▶ /var/lib/das-backup/scrub-state.json   consumed by health checks
 ```
 
-**Priority** (bd `DAS-Backup-Manager-su1b.1`): a scrub runs at the highest priority that cannot block
-writes — best-effort I/O class, level 0, and nice -20; never real-time, which under BFQ preempts
-writes. `das-scrub.service` sets `Nice=-20`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=0`
-for `btrdasd` and the `btrfs` main thread. btrfs-progs' per-device worker threads call `ioprio_set`
+**Priority** (bd `DAS-Backup-Manager-su1b.1`, `DAS-Backup-Manager-su1b.5`): a scrub runs at the highest
+I/O priority that cannot hold writes back without a bound, and nice -20. `das-scrub.service` sets
+`Nice=-20`, `IOSchedulingClass=best-effort`, `IOSchedulingPriority=0` for `btrdasd` and the `btrfs`
+main thread. btrfs-progs' per-device worker threads, which do the scrub's I/O, call `ioprio_set`
 themselves (default class idle) and ignore what they inherit, so every `btrfs scrub start`/`resume`
-argv also carries `-c 2 -n 0` (`btrfs_scrub_args` in `indexer/src/scrub.rs`). The backup and doctor
-units stay idle/nice 19. Those two flags are listed under "Deprecated options" in `man btrfs-scrub`
-(v7.3) because ioprio only works with some I/O schedulers, not mq-deadline; they are used anyway
-because the DAS disks run BFQ, where they work, and the per-worker `ioprio_set` leaves no other way to
-lift the workers. A btrfs-progs that dropped them would fail every scrub on an unrecognised option
-while the pass still exited 0, so they are re-checked at each btrfs-progs upgrade. `btrdasd setup
+argv also carries `-c`/`-n` (`btrfs_scrub_args` in `indexer/src/scrub.rs`), chosen per filesystem just
+before each start, resume or forced start by `choose_scrub_io_class`:
+
+- **real-time, level 0 (`-c 1 -n 0`)** only when every member device listed in
+  `/sys/fs/btrfs/<fsuuid>/devices/` (a partition is judged by its disk) runs mq-deadline (the bracketed
+  name in `queue/scheduler`) and exposes `queue/iosched/prio_aging_expire`: mq-deadline then dispatches
+  a lower class's request once it has waited that long (10 000 ms, 10 s, by default), so real-time can
+  delay writes by at most that bound;
+- **best-effort, level 0 (`-c 2 -n 0`)** otherwise: any device on BFQ (where real-time preempts
+  everything, writes included, with no bound), on another scheduler, on mq-deadline without
+  `prio_aging_expire`, or anything unreadable or unexpected (the cautious default).
+
+One log line per filesystem names the class and why, e.g. `Scrub priority on /mnt/x: realtime I/O,
+level 0 (-c 1 -n 0): every device runs mq-deadline (sdX, sdY; starvation bounded at 10 s)` or
+`... best-effort I/O, level 0 (-c 2 -n 0): sdY runs bfq`. The scrub's I/O touches only the target's own
+disks. The CPU side stays nice -20: the work runs in kernel btrfs workers, and a real-time CPU policy
+could freeze the desktop. The backup and doctor units stay idle/nice 19. The two flags are listed
+under "Deprecated options" in `man btrfs-scrub` (v7.3) because ioprio only works with some I/O
+schedulers, naming mq-deadline as one it does not; that is outdated (mq-deadline honours I/O classes,
+kernel 7.3.5), and the per-worker `ioprio_set` leaves no other way to lift the workers. A btrfs-progs
+that dropped them would fail every scrub on an unrecognised option while the pass still exited 0, so
+the weekly doctor checks they are still listed (bd `DAS-Backup-Manager-su1b.3`). `btrdasd setup
 --check` reads `das-scrub.service`'s effective `Nice` / `IOSchedulingClass` / `IOSchedulingPriority`
 back from systemd and reports any difference from what setup writes — a unit not yet upgraded, or a
 drop-in that lowers it. A scrub already running keeps the priority it started with; the unit is
