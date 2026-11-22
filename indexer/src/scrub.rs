@@ -3699,7 +3699,7 @@ fn record_running_logged(path: &Path, marker: &RunningMarker, progress: &dyn Pro
         progress.on_log(
             LogLevel::Warning,
             &format!(
-                "Could not record the running scrub of {} in {}: {e} — a pass killed before it                  ends will leave no trace there",
+                "Could not record the running scrub of {} in {}: {e} — a pass killed before it ends will leave no trace there",
                 marker.label,
                 path.display()
             ),
