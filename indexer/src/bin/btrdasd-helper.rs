@@ -5196,6 +5196,13 @@ mod tests {
 <arg name="subvolume" type="s" direction="in"/>
 <arg name="target" type="s" direction="in"/>
 <arg type="s" direction="out"/>
+<method name="RaidAcceptPreview">
+<arg name="label" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="RaidAccept">
+<arg name="label" type="s" direction="in"/>
+<arg name="typed" type="s" direction="in"/>
+<arg type="s" direction="out"/>
 <method name="HealthQuery">
 <arg type="s" direction="out"/>
 <method name="RecoveryOsStatus">
