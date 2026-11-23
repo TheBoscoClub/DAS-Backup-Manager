@@ -2249,7 +2249,8 @@ fn hold_for_cli(
 }
 
 /// `btrdasd backup mount-target`: the guarded mount of one RAID-1 target,
-/// for `backup-run.sh`. Only under a handed-down maintenance lock, at a mount
+/// for `backup-run.sh` (write intent) and `backup-verify.sh` (`--read-only`,
+/// bd DAS-Backup-Manager-su1b.23). Only under a handed-down maintenance lock, at a mount
 /// point that exists and is not mounted (the script's own leftover check ran
 /// first). The mount is left for the script, which unmounts it.
 fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
