@@ -3342,6 +3342,17 @@ is a scrub ended by
 .BR "btrdasd scrub pause" :
 the line says since when and by whom; it is resumable and not a failure.
 .PP
+An
+.B INTERRUPTED
+pass shows the error counters its btrfs status record held at the
+interruption. When that record could not be read, or is not this run's, the
+byte count and
+.B errors=
+read
+.BR unknown :
+never 0 and never
+.BR "no errors" .
+.PP
 .B btrdasd scrub status
 .RB [ \-\-config
 .IR PATH ]

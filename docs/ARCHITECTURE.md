@@ -449,6 +449,11 @@ of letting it wait:
   leaves those filesystems out (`labels_already_scrubbed`: a log line each, a `DONE` report row) and so
   begins at the paused one. Anything doubtful scrubs: no marker, a stale one, a clock gone back, an
   unreadable state file, a UUID that cannot be resolved.
+- *Unread figures* (bd `DAS-Backup-Manager-su1b.22`): an `interrupted` attempt files the counters and bytes its
+  btrfs status record held at the interruption (the record must be this run's, the same freshness anchor as a
+  finished pass). A record that is missing, unreadable or stale, and every `paused` attempt, files
+  `counters_unknown: true` (counters and `bytes_scrubbed` are then placeholders, absent in older files = measured):
+  `scrub status` and the report print `unknown`, health's `error_total` is `null`, never 0 or "no errors".
 - *Reading it*: `paused` is not in progress and never `interrupted`; `scrub status` shows `PAUSED`
   with since and by; health is a WARN naming since, how long and by whom (a FAIL only when the last
   success is older than `fail_age_days`); the report's status line reads `PAUSED`. The resumed pass
