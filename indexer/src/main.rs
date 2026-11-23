@@ -2303,25 +2303,25 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
 /// DAS-Backup-Manager-su1b.14). Only under a handed-down maintenance lock,
 /// with the target mounted at its path.
 fn cmd_raid_check(label: &str, config: &Path) -> i32 {
-    let cant = |why: String| {
+    let cannot_run = |why: String| {
         println!("RAID CHECK: CANNOT-RUN  ({why})");
         2
     };
     let cfg = match Config::load(config) {
         Ok(c) => c,
-        Err(e) => return cant(format!("cannot read {}: {e}", config.display())),
+        Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
     };
     let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
-        return cant(format!("no [[target]] labelled '{label}'"));
+        return cannot_run(format!("no [[target]] labelled '{label}'"));
     };
     if !buttered_dasd::raid_guard::is_guarded(target) {
-        return cant(format!(
+        return cannot_run(format!(
             "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
         ));
     }
     let lock = CliLock::production();
     let Some(raw) = &lock.delegated else {
-        return cant(format!(
+        return cannot_run(format!(
             "only under a maintenance lock handed down by {}",
             maintenance::DELEGATED_FD_ENV
         ));
@@ -2337,10 +2337,10 @@ fn cmd_raid_check(label: &str, config: &Path) -> i32 {
         })
         .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
     {
-        return cant(e);
+        return cannot_run(e);
     }
     if !health::is_mountpoint(Path::new(&target.mount)) {
-        return cant(format!("{} is not mounted", target.mount));
+        return cannot_run(format!("{} is not mounted", target.mount));
     }
     let check = mount::raid_end_check(&cfg, target);
     println!("{}", buttered_dasd::raid_guard::end_check_line(&check));
