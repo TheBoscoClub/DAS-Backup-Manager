@@ -50,19 +50,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 ## Static Subvolumes (bd `5237.8`)
 
-Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` (same heading).
-
-- A `[[source.static]]` table → read-only subvolumes somebody else made, sent to the source's primary targets as they are by `btrdasd backup static` (`backup-run.sh` after the expiry, under its handed-down singleton; `backup run`; a hand run takes the locks, mounts and sync as `backup send`, a dry run does not sync).
-- Source side → never a snapshot, a property change or a delete; a read-write candidate → WARN, never sent, never made read-only.
-- A subvolume's identity → its received UUID when set, else its UUID; a copy belongs to the candidate whose identity it carries; a copy's source is gone only when no subvolume anywhere on the source volume has that identity. One function (`Subvol::identity`).
-- The incremental parent → the newest read-only sibling (same parent UUID, highest id) on the whole source volume that the target holds a read-only received copy of, anywhere on the target; else a full send.
-- A copy is received at its final name in `target_subdir` → never renamed after (a received read-only subvolume cannot be moved: EROFS); a marker file in `<target_subdir>/.incoming/` is written before each receive and removed once the copy is checked. Never clear `ro` to move one.
-- A copy counts only when `btrfs subvolume show` reads back its received UUID equal to the identity and `readonly`; the same name taken by anything else → FAIL for that one, nothing overwritten; a destination found by `symlink_metadata` → refused.
-- The only two deletes, each `btrfs subvolume delete` on one exact path from a verified target mount, never recursive, never on the source: (a) at the start of a pass, a read-write subvolume with no received UUID directly in `target_subdir` whose marker is in `.incoming/`; (b) a read-only copy with a received UUID whose source is gone, once a current candidate of the same series has a checked copy in a fresh listing taken after the sends, with no candidate of that series unsettled, the target verified again just before, and the pattern ending in `*` after a literal.
-- Everything else in `target_subdir` (no received UUID, read-write, no marker) → kept and listed, never deleted.
-- An unreadable or empty listing, either side → refusal for that table, never "nothing there"; a target not mounted at its top level, or a symlink in the `target_subdir` path → refusal.
-- `target_subdir` → distinct from, and not nested with, every directory a source sends snapshots to and every other table's; `dir` → inside a `.snapshots`/`.btrbk-snapshots` tree (sync adopts all else); `pattern` → never `.archive` (`boot-archive-cleanup.sh`). `Config::static_errors` enforces all three.
-- A failed table → FAIL in `STATIC SUBVOLUMES` (run exit 3) and stops nothing after it.
+**[scoped]** `backup-static.md` — `[[source.static]]` tables: identity, incremental parent, the only two deletes, refusals; **read it before a hand `btrdasd backup static` or any delete under a `target_subdir`**.
 
 ## Subvolume Coverage
 
@@ -91,36 +79,13 @@ Reasons, probes and the identity rule: `.claude/docs/rules-reference/backup.md` 
 
 ## Mount Options for a RAID-1 Primary Target
 
+**[scoped]** `backup-raid.md` — the guard's member wait, degraded and split-brain rules, Intent per job, records, `raid accept`'s steps, the end check, REJOINED; **read it before a hand mount, `raid accept` or any record change on a RAID-1 target**.
+
 - A RAID-1 target (`mount_uuid` and more than one serial, `raid_guard::is_guarded`) → mounted only by `raid_guard::mount_guarded`: the Rust jobs through `mount.rs`, the script through `btrdasd backup mount-target` (fd 8 handed down); never `mount -o` with `[das].mount_opts`' `degraded` (bd `su1b.10`).
 - Members → found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each `btrfs device scan <its path>`; never an unscoped scan, never `--forget`, in code, tests or proofs.
-- The mount → without `degraded` first; a member not present, or a plain mount that fails → poll every 5 s for `[das].member_wait_secs` (900, at most 3600; operator 2026-11-22, bd `su1b.11`), rescanning.
-- Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
-- A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
-- Split brain → refused (exit 3, ABORTED): present members not all among the record's; either copy unreadable or corrupt → refused (only ENOENT is "no record").
-- Every caller of `ensure_targets_mounted` / `mount_guarded_target` passes `raid_guard::Job::<job>.intent()`; never a bare `Intent`, never inferred from the mount options (`every_target_mount_names_its_job` scans for it).
-- `Intent::ReadOnly` → only a job that persists nothing derived from the target's contents: restore file, restore snapshot, browse, the doctor's report.
-- `Intent::Write` → everything else, including walk, the helper's index walk, reindex, reconcile and the recovery-OS reading: they write the index or a state file from what they read (security review 2026-11-22).
-- Split brain with `Intent::ReadOnly` → mounted `<mount_opts>,ro,degraded,rescue=nologreplay`, a `STALE-READ-ONLY` WARN naming the date its data stops, no record change (operator 2026-11-22, bd `su1b.11`); an unreadable record stays refused for every job.
 - `btrdasd raid accept <label>` (root; the GUI through the helper's `RaidAccept`, polkit `org.dasbackup.raid.accept`, `auth_admin`) → only while the guard refuses the target for split brain now (bd `su1b.11`).
 - `raid accept` → backup singleton then maintenance lock, both without waiting (exit 75); no member wait; nothing written unless the target label is typed exactly at a terminal; no `--yes`, ever.
-- `raid accept` shows → the present member (devid, dev_uuid, superblock generation), the period given up (since/last), the backup runs the history records inside it (`unknown`, never 0, when they cannot be counted).
-- `raid accept` writes → the primary record, then the witness through a degraded read-write mount: a new degraded period on the present members, every member of the old period in `rejected=`; then one journal line (`logger -t btrdasd`) and one `raid_accepted` row (schema 9); a half-written accept is finished by running it again.
-- A rejected member → refused for every job, alone or beside the others, before it is scanned or mounted (from the primary copy); found only in the witness → the normal mount taken straight down and refused.
-- An unreadable primary record → every `Intent::Write` mount refused before anything is scanned; `Intent::ReadOnly` → only the read-only mount (`READ-ONLY`), nothing written (review F1).
-- Every member present, no primary record, superblock generations differing → never a read-write mount: `Write` refused, `ReadOnly` the read-only mount; equal generations mount normally (review F1).
-- Every member present, superblock generations differing, whatever the primary says → each member's own witness read alone first (the others `btrfs device scan --forget <exact path>`, the member mounted `ro,degraded,rescue=nologreplay` at a private directory, unmounted, the others scanned again on every path); a member any copy rejects → `Write` refused, `ReadOnly` only the non-rejected member read-only (review round 3).
-- That per-member read → refused, nothing forgotten or mounted, while the filesystem is mounted anywhere; a probe that fails or an unreadable own copy → `Write` refused; equal generations → never forgotten or probed.
-- `raid accept`'s second look → a listed member whose superblock cannot be read, or an absent drive's serial attached again → refused before any mount (the post-mount devinfo check is the backstop only).
-- `raid accept` → looks at the members again after the label is typed (any other member present: refused, nothing written), then mounts, then reads devinfo: a member besides the accepted one present → unmounted at once, nothing written (review F2).
 - A rejection → lifted only by wiping the drive (wipefs) or removing it from the filesystem (`btrfs device remove`, `btrfs replace`); kept through the scrub as `state=settled`; never accepted back.
-- Every member back → normal mount, the record becomes scrub-owed (a WARN row, a doctor finding) until a completed scrub begun after the rejoin clears it.
-- Before a job unmounts a RAID-1 target it mounted read-write and not degraded → `raid_guard::check_before_unmount`: a member the kernel shows missing, or a view that cannot be read → a degraded period recorded on the members present (both copies) and a WARN (bd `su1b.14`).
-- That end check runs in `MountGuard`'s unmount (and its `Drop`), before the scrub engine's own unmounts, and in `backup-run.sh`'s `unmount_all` through hidden `btrdasd backup raid-check` (fd 8 handed down; the target's row turns WARN).
-- A mount that turns a degraded record into scrub-owed → status `REJOINED`; the job then starts `das-scrub.service` (`systemctl start --no-block`) only after its maintenance lock is released: Rust in `MaintenanceHeld`'s drop, the script in `start_owed_scrub` after closing fds 7, 8 and 9.
-- The owed-scrub start → never from the scrub's own rejoin, never in a dry run, refused in a test build; a failed start is a WARN, never an error; the pass scrubs every `[scrub].targets` filesystem (no per-target run) and a backup preempts it by the claim.
-- After any mount of a RAID-1 target → `/sys/fs/btrfs/<fsid>/devinfo/*/missing` unreadable is refused on both paths; a member missing is refused by `verify_targets_before_btrbk` unless the guard mounted it degraded this run, and by `verify_write_targets` while every configured drive is attached.
-- A Rust run's report → one `RAID-1 <label>  WARN` row per record (`report::raid_rows`), the script's → the target's own row.
-- A refusal → `MountError::RaidRefused`: it fails the job, `walk` and `restore` included (their split-brain case is the read-only mount above).
 - `nodev,nosuid,noexec` belong in `[das].mount_opts`: receive and restore keep device nodes and setuid bits intact, no job executes from a target (bd `20q`).
 - A target filesystem already mounted somewhere else keeps that mount's filesystem-wide options: a second `mount -o` returns 0 and applies none of them. Both paths WARN and go on (bd `804`).
 - Data written degraded lands as `single` chunks. After replacing the leg: `btrfs scrub`, then

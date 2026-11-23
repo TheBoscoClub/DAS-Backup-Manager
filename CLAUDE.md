@@ -31,6 +31,8 @@ cd indexer && CARGO_TARGET_DIR=/tmp/das-backup-target cargo test --features dbus
 - `esp-safety.md` — **CRITICAL**: recovery-drive ESPs
 - `build.md` — CMake, Qt6/KF6, C++20, Rust build conventions
 - `backup.md` — btrbk, install interlock, nested subvolumes, DAS, targets, exit codes, supervisor, mount guard, locks
+- `backup-raid.md` — **[scoped: raid_guard, mount, scrub, doctor, helper, GUI raid dialog, backup-run.sh]** RAID-1 target guard
+- `backup-static.md` — **[scoped: static_send.rs, config.rs, backup-run.sh]** `[[source.static]]` sends
 - `backup-coverage.md` — **[scoped: coverage/adopt/subvol, backup-run.sh]** subvolume coverage check
 - `backup-boot-archive.md` — **[scoped: backup-run.sh, backup.rs, forget.rs]** boot subvolume archival, pruner
 - `backup-restore.md` — **[scoped: restore code, config.rs]** restore destination policy
