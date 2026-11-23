@@ -192,6 +192,10 @@
 //!   not a failure; `btrdasd scrub resume` resumes it.
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
+//! * `paused_pass` (optional, bd DAS-Backup-Manager-su1b.24) is present only
+//!   while a pass ended by `btrdasd scrub pause` waits to be resumed:
+//!   `origin_epoch` (its first part's start), `paused_epoch`, and `finished`
+//!   (FS UUIDs scrubbed to the end in it). Absent in older files.
 //! * `last_success_epoch` is carried forward across failed passes — it is the
 //!   field to age against `scrub.warn_age_days` / `scrub.fail_age_days`. It is
 //!   `null` until the first successful scrub is recorded.
@@ -1402,6 +1406,11 @@ pub struct ScrubState {
     pub last_pass: Option<PassSummary>,
     #[serde(default)]
     pub filesystems: BTreeMap<String, FsState>,
+    /// The pass `btrdasd scrub pause` last ended, while it waits for
+    /// `btrdasd scrub resume` (bd DAS-Backup-Manager-su1b.24). Absent once a
+    /// pass runs to its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_pass: Option<PausedPass>,
 }
 
 impl Default for ScrubState {
@@ -1410,8 +1419,85 @@ impl Default for ScrubState {
             schema_version: STATE_SCHEMA_VERSION,
             last_pass: None,
             filesystems: BTreeMap::new(),
+            paused_pass: None,
         }
     }
+}
+
+/// A pass a pause ended, as the pass that resumes it needs it
+/// (bd DAS-Backup-Manager-su1b.24): the filesystems already scrubbed to the
+/// end in it are not scrubbed again. Paused again, the resuming pass carries
+/// it forward, so a pass paused twice still remembers what its first part did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausedPass {
+    /// When the first pass of this chain started.
+    pub origin_epoch: i64,
+    /// When the pass last ended paused.
+    pub paused_epoch: i64,
+    /// FS UUIDs whose scrub finished in this chain (kernel `finished`,
+    /// whatever it found: the findings went out with that pass's report).
+    pub finished: Vec<String>,
+}
+
+/// How long after a pause the pass that starts next still continues it
+/// (bd DAS-Backup-Manager-su1b.24). The pause request lives in `/run`, so a
+/// reboot takes it away and the next scheduled pass may start weeks later:
+/// past this a pass scrubs every filesystem again, the cautious side.
+pub const RESUME_WINDOW_SECS: i64 = 7 * 86_400;
+
+/// Whether a pass starting at `started_epoch` continues `marker`'s pass.
+pub fn continues_paused_pass(marker: &PausedPass, started_epoch: i64) -> bool {
+    let since = started_epoch - marker.paused_epoch;
+    (0..=RESUME_WINDOW_SECS).contains(&since)
+}
+
+/// The `[scrub].targets` labels a pass starting at `started_epoch` does not
+/// scrub again: those its paused pass already scrubbed to the end
+/// (bd DAS-Backup-Manager-su1b.24). Each is named in the log; anything
+/// doubtful (no marker, a stale one, a label whose UUID cannot be resolved)
+/// is scrubbed.
+pub fn labels_already_scrubbed(
+    state: &ScrubState,
+    config: &Config,
+    started_epoch: i64,
+    progress: &dyn ProgressCallback,
+) -> Vec<String> {
+    let Some(marker) = &state.paused_pass else {
+        return Vec::new();
+    };
+    if !continues_paused_pass(marker, started_epoch) {
+        progress.on_log(
+            LogLevel::Info,
+            &format!(
+                "The pass paused at {} is not continued (older than {} days, or the clock \
+                 went back): every filesystem is scrubbed",
+                crate::caldate::local_datetime(marker.paused_epoch)
+                    .unwrap_or_else(|| format!("epoch {}", marker.paused_epoch)),
+                RESUME_WINDOW_SECS / 86_400
+            ),
+        );
+        return Vec::new();
+    }
+    config
+        .scrub_target_labels()
+        .into_iter()
+        .filter(|label| {
+            let done = resolve_target_fsuuid(config, label)
+                .is_ok_and(|uuid| marker.finished.contains(&uuid));
+            if done {
+                progress.on_log(
+                    LogLevel::Info,
+                    &format!(
+                        "{label}: already scrubbed to the end in the pass paused at {} — \
+                         not scrubbed again",
+                        crate::caldate::local_datetime(marker.paused_epoch)
+                            .unwrap_or_else(|| format!("epoch {}", marker.paused_epoch))
+                    ),
+                );
+            }
+            done
+        })
+        .collect()
 }
 
 /// Path of the state file (overridable for tests via `DAS_SCRUB_STATE`).
@@ -1516,6 +1602,7 @@ pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
     for result in &pass.results {
         merge_result_into_state(state, result, pass.finished_epoch);
     }
+    state.paused_pass = next_paused_pass(state.paused_pass.take(), pass);
     state.last_pass = Some(PassSummary {
         started_epoch: pass.started_epoch,
         finished_epoch: pass.finished_epoch,
@@ -1523,6 +1610,38 @@ pub fn merge_pass_into_state(state: &mut ScrubState, pass: &ScrubPass) {
         targets_failed: pass.failed_count(),
         success: pass.success(),
     });
+}
+
+/// The paused-pass marker after `pass` (bd DAS-Backup-Manager-su1b.24): a
+/// pass that ends paused files the filesystems it scrubbed to the end, on top
+/// of the marker it continued; any other pass leaves none.
+fn next_paused_pass(prior: Option<PausedPass>, pass: &ScrubPass) -> Option<PausedPass> {
+    if pass.status != PassStatus::Paused {
+        return None;
+    }
+    let paused_epoch = pass
+        .results
+        .iter()
+        .find_map(|r| r.paused.as_ref().map(|p| p.at_epoch))
+        .unwrap_or(pass.finished_epoch);
+    let (origin_epoch, mut finished) = match prior {
+        Some(m) if continues_paused_pass(&m, pass.started_epoch) => (m.origin_epoch, m.finished),
+        _ => (pass.started_epoch, Vec::new()),
+    };
+    for r in &pass.results {
+        let scrubbed = r.paused.is_none()
+            && r.interrupted_by.is_none()
+            && r.outcome == Some(ScrubOutcome::Finished)
+            && !r.fsuuid.is_empty();
+        if scrubbed && !finished.contains(&r.fsuuid) {
+            finished.push(r.fsuuid.clone());
+        }
+    }
+    Some(PausedPass {
+        origin_epoch,
+        paused_epoch,
+        finished,
+    })
 }
 
 /// Fold one filesystem's result into `state`. `pass_finished_epoch` stands in
@@ -1751,6 +1870,10 @@ pub struct ScrubPass {
     pub results: Vec<ScrubFsResult>,
     /// Pass-level problems that are not attributable to one filesystem.
     pub errors: Vec<String>,
+    /// Labels not scrubbed because the paused pass this one resumes already
+    /// scrubbed them to the end (bd DAS-Backup-Manager-su1b.24). Not results:
+    /// their finished records stand as that pass filed them.
+    pub already_scrubbed: Vec<String>,
 }
 
 impl ScrubPass {
@@ -2090,6 +2213,7 @@ pub fn run_scrub_pass(
             finished_epoch: now_epoch(),
             results: Vec::new(),
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         });
     };
 
@@ -2112,11 +2236,16 @@ pub fn run_scrub_pass(
     let _termination = catch_termination();
     let claim = ClaimWatch::new(&claim_lock_path()).with_pause_request(&pause_request_path());
     let state = state_path();
+    // A state file that cannot be read skips nothing: every target is scrubbed.
+    let already_scrubbed = load_state_from(&state)
+        .map(|s| labels_already_scrubbed(&s, config, started_epoch, progress))
+        .unwrap_or_default();
     let results = scrub_targets_yielding(
         config,
         progress,
         &mut locks.maintenance,
         &claim,
+        &already_scrubbed,
         &PassHooks {
             stop: &pending_signal,
             reload,
@@ -2140,6 +2269,7 @@ pub fn run_scrub_pass(
         finished_epoch: now_epoch(),
         results,
         errors: Vec::new(),
+        already_scrubbed,
     };
 
     // Persist before emailing: the state file is what health checks read, and
@@ -3571,6 +3701,7 @@ fn paused_at_start(
         finished_epoch: now_epoch(),
         results: Vec::new(),
         errors: Vec::new(),
+        already_scrubbed: Vec::new(),
     })
 }
 
@@ -3918,16 +4049,24 @@ fn pause_for_claim(
 /// configuration that cannot be read ends the pass, the paused filesystem
 /// failing with the reason; a filesystem the new configuration no longer
 /// scrubs is not resumed, and says so.
+///
+/// `already_scrubbed` ([`labels_already_scrubbed`]) are left out of the queue:
+/// the paused pass this one resumes scrubbed them to the end (bd
+/// DAS-Backup-Manager-su1b.24).
 fn scrub_targets_yielding(
     config: &Config,
     progress: &dyn ProgressCallback,
     slot: &mut MaintenanceSlot,
     claim: &ClaimWatch,
+    already_scrubbed: &[String],
     hooks: &PassHooks,
 ) -> Vec<ScrubFsResult> {
     let mut config = config.clone();
-    let mut queue: std::collections::VecDeque<String> =
-        config.scrub_target_labels().into_iter().collect();
+    let mut queue: std::collections::VecDeque<String> = config
+        .scrub_target_labels()
+        .into_iter()
+        .filter(|label| !already_scrubbed.contains(label))
+        .collect();
     progress.on_stage("Scrubbing DAS filesystems", queue.len() as u64);
 
     let mut results: Vec<ScrubFsResult> = Vec::new();
@@ -4532,6 +4671,12 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
     let elapsed = (pass.finished_epoch - pass.started_epoch).max(0) as u64;
     r.push_str(&format!("PASS SUMMARY\n{thin}\n"));
     r.push_str(&format!("  Filesystems scrubbed  {}\n", pass.results.len()));
+    if !pass.already_scrubbed.is_empty() {
+        r.push_str(&format!(
+            "  Already scrubbed      {} (before the pause this pass resumes)\n",
+            pass.already_scrubbed.len()
+        ));
+    }
     r.push_str(&format!(
         "  Failures              {}\n",
         pass.failed_count()
@@ -4563,6 +4708,13 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
             },
             result.outcome.map(|o| o.as_str()).unwrap_or("<no record>"),
             result.counters.summary()
+        ));
+    }
+    for label in &pass.already_scrubbed {
+        r.push_str(&format!(
+            "  {label:<24} {:<9} scrubbed to the end before the pause this pass resumes; \
+             its findings were in that report\n",
+            "DONE"
         ));
     }
 
@@ -6210,6 +6362,7 @@ Total to scrub:   401.28MiB\n";
             progress,
             &mut slot,
             &claim,
+            &[],
             &PassHooks {
                 stop,
                 reload: &|| panic!("nothing paused, so nothing is read again"),
@@ -6322,6 +6475,7 @@ Total to scrub:   401.28MiB\n";
             finished_epoch: 1_000_500,
             results,
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         }
     }
 
@@ -6586,6 +6740,7 @@ Total to scrub:   401.28MiB\n";
             finished_epoch: 2,
             results: Vec::new(),
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         };
         assert!(pass.success());
         assert!(format_scrub_report(&pass, &config).contains("SKIPPED"));
@@ -7013,6 +7168,7 @@ mod interrupted_pass_tests {
             finished_epoch: 1_003_000,
             results: vec![result],
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         };
         let mut state = ScrubState::default();
         state.filesystems.insert(
@@ -7571,6 +7727,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| Ok(config()),
@@ -7648,6 +7805,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| Ok(config()),
@@ -7698,6 +7856,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &stop,
                 reload: &|| Ok(config()),
@@ -7757,6 +7916,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &reload,
@@ -7806,6 +7966,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| Err("boom: config.toml unreadable".to_string()),
@@ -7860,6 +8021,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &reload,
@@ -7916,6 +8078,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| Ok(config()),
@@ -8064,6 +8227,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| panic!("a paused pass reads nothing again"),
@@ -8101,6 +8265,7 @@ mod yield_tests {
             finished_epoch: 0,
             results,
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         };
         assert_eq!(pass.failed_count(), 0, "a pause is not a failure");
         assert_eq!(pass.clean_count(), 0, "nor is it a clean scrub");
@@ -8135,6 +8300,7 @@ mod yield_tests {
             &NullProgress,
             &mut slot,
             &watch,
+            &[],
             &PassHooks {
                 stop: &|| None,
                 reload: &|| panic!("a paused pass reads nothing again"),
@@ -8343,5 +8509,204 @@ mod yield_tests {
         assert!(!p.request.exists());
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert!(resume_pass_at(&p, &|| Err("no systemd".into())).is_err());
+    }
+
+    // ---- bd DAS-Backup-Manager-su1b.24: resuming a paused pass ----
+
+    /// A pass that ends paused, as `run_scrub_pass` builds it: `results` in
+    /// order, the last one cut by the pause at `paused_at`.
+    fn paused_pass(started: i64, mut results: Vec<ScrubFsResult>, paused_at: i64) -> ScrubPass {
+        if let Some(last) = results.last_mut() {
+            last.outcome = None;
+            last.paused = Some(PausedBy {
+                by: "btrdasd scrub pause pid 1, by user".into(),
+                at_epoch: paused_at,
+            });
+        }
+        ScrubPass {
+            status: PassStatus::Paused,
+            started_epoch: started,
+            finished_epoch: paused_at,
+            results,
+            errors: Vec::new(),
+            already_scrubbed: Vec::new(),
+        }
+    }
+
+    /// The defect as it was met on the host 2026-11-23: the first target
+    /// finished, a pause cut the second; `btrdasd scrub resume` started a
+    /// pass that scrubbed the first again from zero. The resuming pass must
+    /// leave the first out and begin at the second.
+    #[test]
+    fn a_pass_paused_after_its_first_target_resumes_at_the_second() {
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![clean("first"), clean("second")], 11_000),
+        );
+        let skip = labels_already_scrubbed(&state, &config(), 11_500, &NullProgress);
+        assert_eq!(skip, ["first"]);
+
+        let s = scratch();
+        let mut slot = slot_held(&s.maintenance);
+        let watch = ClaimWatch::new(&s.claim);
+        let calls = Mutex::new(Vec::new());
+        let scrub_one = |_: &Config,
+                         label: &str,
+                         _: &dyn ProgressCallback,
+                         _: &MaintenanceHeld,
+                         _: &dyn Fn() -> bool| {
+            calls.lock().unwrap().push(label.to_string());
+            clean(label)
+        };
+        let results = scrub_targets_yielding(
+            &config(),
+            &NullProgress,
+            &mut slot,
+            &watch,
+            &skip,
+            &PassHooks {
+                stop: &|| None,
+                reload: &|| Ok(config()),
+                scrub_one: &scrub_one,
+                file_result: &|_| {},
+                file_yield: &|_| panic!("nothing claimed"),
+            },
+        );
+        assert_eq!(*calls.lock().unwrap(), ["second"]);
+        assert_eq!(results.len(), 1);
+    }
+
+    /// Paused twice: the second part's marker still holds what the first
+    /// part finished, from the first part's start.
+    #[test]
+    fn a_pass_paused_twice_still_skips_what_its_first_part_finished() {
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![clean("first"), clean("second")], 11_000),
+        );
+        // The resumed part scrubs only `second`, and is paused again.
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(11_500, vec![clean("second")], 12_000),
+        );
+        let marker = state.paused_pass.clone().unwrap();
+        assert_eq!(marker.origin_epoch, 10_000);
+        assert_eq!(marker.paused_epoch, 12_000);
+        assert_eq!(marker.finished, ["u-first"]);
+        assert_eq!(
+            labels_already_scrubbed(&state, &config(), 12_500, &NullProgress),
+            ["first"]
+        );
+    }
+
+    /// Past the window a pass scrubs everything again (a reboot takes the
+    /// pause request away; the next scheduled pass is a new one), and a pass
+    /// that runs to its end leaves no marker.
+    #[test]
+    fn a_stale_marker_or_a_completed_pass_skips_nothing() {
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![clean("first"), clean("second")], 11_000),
+        );
+        let late = 11_000 + RESUME_WINDOW_SECS + 1;
+        assert!(labels_already_scrubbed(&state, &config(), late, &NullProgress).is_empty());
+        assert!(
+            !labels_already_scrubbed(
+                &state,
+                &config(),
+                11_000 + RESUME_WINDOW_SECS,
+                &NullProgress
+            )
+            .is_empty()
+        );
+        // A pass started before the pause (a clock gone back) is no resumption.
+        assert!(labels_already_scrubbed(&state, &config(), 10_999, &NullProgress).is_empty());
+
+        let mut done = paused_pass(11_500, vec![clean("second")], 12_000);
+        done.status = PassStatus::Completed;
+        done.results[0].paused = None;
+        done.results[0].outcome = Some(ScrubOutcome::Finished);
+        merge_pass_into_state(&mut state, &done);
+        assert!(state.paused_pass.is_none());
+        assert!(labels_already_scrubbed(&state, &config(), 12_500, &NullProgress).is_empty());
+    }
+
+    /// Only a scrub the kernel finished counts: one finished with findings is
+    /// done (its findings went out with that pass's report); one that
+    /// produced no record, or was canceled, is scrubbed again.
+    #[test]
+    fn only_a_finished_scrub_is_skipped_on_resume() {
+        let mut with_findings = clean("first");
+        with_findings.counters.corrected_errors = 7;
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![with_findings, clean("second")], 11_000),
+        );
+        assert_eq!(
+            labels_already_scrubbed(&state, &config(), 11_500, &NullProgress),
+            ["first"]
+        );
+
+        for outcome in [
+            None,
+            Some(ScrubOutcome::Canceled),
+            Some(ScrubOutcome::Aborted),
+        ] {
+            let mut failed = clean("first");
+            failed.outcome = outcome;
+            let mut state = ScrubState::default();
+            merge_pass_into_state(
+                &mut state,
+                &paused_pass(10_000, vec![failed, clean("second")], 11_000),
+            );
+            assert!(
+                labels_already_scrubbed(&state, &config(), 11_500, &NullProgress).is_empty(),
+                "{outcome:?} counted as scrubbed"
+            );
+        }
+    }
+
+    /// The marker survives the state file's round trip, and an older file
+    /// without it reads as no marker.
+    #[test]
+    fn the_paused_pass_marker_round_trips_and_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub-state.json");
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![clean("first"), clean("second")], 11_000),
+        );
+        save_state_to(&state, &path).unwrap();
+        assert_eq!(
+            load_state_from(&path).unwrap().paused_pass,
+            state.paused_pass
+        );
+        std::fs::write(&path, r#"{"schema_version":1,"filesystems":{}}"#).unwrap();
+        assert!(load_state_from(&path).unwrap().paused_pass.is_none());
+    }
+
+    /// The report names what the resuming pass left out, so "1 filesystem
+    /// scrubbed" does not read as the others forgotten.
+    #[test]
+    fn the_report_lists_what_a_resumed_pass_did_not_scrub_again() {
+        let mut pass = paused_pass(11_500, vec![clean("second")], 12_000);
+        pass.status = PassStatus::Completed;
+        pass.results[0].paused = None;
+        pass.results[0].outcome = Some(ScrubOutcome::Finished);
+        pass.already_scrubbed = vec!["first".into()];
+        let report = format_scrub_report(&pass, &config());
+        assert!(report.contains("Already scrubbed      1"), "{report}");
+        assert!(
+            report
+                .lines()
+                .any(|l| l.trim_start().starts_with("first") && l.contains("DONE")),
+            "{report}"
+        );
+        assert!(!report.contains("PROBLEMS"), "{report}");
     }
 }

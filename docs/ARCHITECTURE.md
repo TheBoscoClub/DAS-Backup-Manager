@@ -439,6 +439,13 @@ of letting it wait:
   paused filesystem by its btrfs record (`decide_scrub_start_mode`). A reboot empties `/run`, so after
   one the request is gone and the next start (resume or the timer) runs; the `paused` record stays
   until then.
+- *Continuing the paused pass* (bd `DAS-Backup-Manager-su1b.24`): a pass that ends paused writes
+  `paused_pass` into the state file — the FS UUIDs it scrubbed to the end (kernel `finished`, whatever
+  it found), its first part's start, the pause time; a pass paused again carries it forward, a pass run
+  to its end removes it. The next pass to start within `RESUME_WINDOW_SECS` (7 days) of the pause
+  leaves those filesystems out (`labels_already_scrubbed`: a log line each, a `DONE` report row) and so
+  begins at the paused one. Anything doubtful scrubs: no marker, a stale one, a clock gone back, an
+  unreadable state file, a UUID that cannot be resolved.
 - *Reading it*: `paused` is not in progress and never `interrupted`; `scrub status` shows `PAUSED`
   with since and by; health is a WARN naming since, how long and by whom (a FAIL only when the last
   success is older than `fail_age_days`); the report's status line reads `PAUSED`. The resumed pass

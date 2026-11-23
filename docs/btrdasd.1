@@ -3415,8 +3415,12 @@ request cannot be removed or the unit cannot be started. A reboot empties
 .IR /run ,
 so after one the request is gone and the next start runs; the
 .B paused
-record stays until then. The pass starts again from the first scrub target,
-so a filesystem that finished before the pause is scrubbed again.
+record stays until then. The pass continues the paused one: a filesystem
+the paused pass scrubbed to the end is left out (a log line and a
+.B DONE
+row in the report say so), and the scrub begins at the paused filesystem.
+A pass that starts more than 7 days after the pause scrubs every filesystem
+again.
 .PP
 .B btrdasd scrub resume
 .\"

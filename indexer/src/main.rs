@@ -5068,6 +5068,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             finished_epoch: 1_700_003_600,
             results,
             errors: Vec::new(),
+            already_scrubbed: Vec::new(),
         }
     }
 
