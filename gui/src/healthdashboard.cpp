@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QItemSelectionModel>
+#include <QLocale>
 #include <QLabel>
 #include <QPushButton>
 #include <QSplitter>
@@ -118,6 +119,7 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
 void HealthDashboard::setupDrivesTab()
 {
     m_drivesView = new QTableView(this);
+    m_drivesView->setObjectName(QStringLiteral("healthDrivesView"));
     m_drivesView->setToolTip(i18n("Physical drive status and SMART health information"));
 
     auto *model = new QStandardItemModel(0, DrivesCol::Count, m_drivesView);
@@ -167,8 +169,43 @@ void HealthDashboard::setupDrivesTab()
              "because the other drive is dead, see what the drive present holds and accept it "
              "as the target's history ('btrdasd raid accept')"));
     m_raidAcceptButton->setEnabled(false);
-    drivesButtons->addStretch(1);
+    m_scrubPauseButton = new QPushButton(QIcon::fromTheme(QStringLiteral("media-playback-pause")),
+                                         i18n("Pause Scrub"), drivesPage);
+    m_scrubPauseButton->setObjectName(QStringLiteral("healthScrubPauseButton"));
+    m_scrubPauseButton->setToolTip(
+        i18n("Ask the running scrub pass to stop where it is and end as paused ('btrdasd scrub "
+             "pause'). It can take a few minutes; nothing is killed. A paused scrub stays "
+             "paused until it is resumed"));
+    m_scrubResumeButton = new QPushButton(QIcon::fromTheme(QStringLiteral("media-playback-start")),
+                                          i18n("Resume Scrub"), drivesPage);
+    m_scrubResumeButton->setObjectName(QStringLiteral("healthScrubResumeButton"));
+    m_scrubResumeButton->setToolTip(
+        i18n("Lift the pause and start the scrub again ('btrdasd scrub resume'); it continues "
+             "from where it stopped"));
+    m_scrubResult = new QLabel(drivesPage);
+    m_scrubResult->setObjectName(QStringLiteral("healthScrubResult"));
+    m_scrubResult->setWordWrap(true);
+    m_scrubResult->setToolTip(i18n("What the last Pause Scrub or Resume Scrub did"));
+    m_scrubPauseButton->setEnabled(false);
+    m_scrubResumeButton->setEnabled(false);
+    drivesButtons->addWidget(m_scrubPauseButton);
+    drivesButtons->addWidget(m_scrubResumeButton);
+    drivesButtons->addWidget(m_scrubResult, 1);
     drivesButtons->addWidget(m_raidAcceptButton);
+    connect(m_scrubPauseButton, &QPushButton::clicked, this, [this]() {
+        m_scrubBusy = true;
+        updateScrubButtons();
+        m_scrubResult->setText(i18n("Asking the scrub pass to pause…"));
+        m_client->scrubPauseAsync();
+    });
+    connect(m_scrubResumeButton, &QPushButton::clicked, this, [this]() {
+        m_scrubBusy = true;
+        updateScrubButtons();
+        m_scrubResult->setText(i18n("Resuming the scrub…"));
+        m_client->scrubResumeAsync();
+    });
+    connect(m_client, &DBusClient::scrubActionFinished,
+            this, &HealthDashboard::onScrubAction);
     drivesLayout->addLayout(drivesButtons);
     connect(m_drivesView->selectionModel(), &QItemSelectionModel::selectionChanged, this,
             [this]() {
@@ -179,6 +216,23 @@ void HealthDashboard::setupDrivesTab()
 
     m_tabs->addTab(drivesPage, QIcon::fromTheme(QStringLiteral("drive-harddisk")),
                    i18n("Drives"));
+}
+
+void HealthDashboard::updateScrubButtons()
+{
+    m_scrubPauseButton->setEnabled(m_scrubRunning && !m_scrubBusy);
+    m_scrubResumeButton->setEnabled(m_scrubPaused && !m_scrubRunning && !m_scrubBusy);
+}
+
+void HealthDashboard::onScrubAction(const QString &action, bool ok, const QString &text)
+{
+    Q_UNUSED(action);
+    m_scrubBusy = false;
+    m_scrubResult->setText(text);
+    m_scrubResult->setStyleSheet(ok ? QString()
+                                    : QStringLiteral("color: #cc0000;"));
+    updateScrubButtons();
+    refresh();
 }
 
 void HealthDashboard::openRaidAccept()
@@ -355,6 +409,8 @@ void HealthDashboard::updateDrives(const QString &json)
         return;
 
     model->removeRows(0, model->rowCount());
+    m_scrubRunning = false;
+    m_scrubPaused = false;
 
     for (const QJsonValue &val : drives) {
         const QJsonObject drv = val.toObject();
@@ -373,6 +429,14 @@ void HealthDashboard::updateDrives(const QString &json)
         const QJsonObject scrub       = drv.value(QLatin1String("scrub")).toObject();
         const QString     scrubStatus = scrub.value(QLatin1String("status")).toString();
         const QJsonValue  scrubAgeVal = scrub.value(QLatin1String("age_days"));
+        const QString     scrubOutcome = scrub.value(QLatin1String("last_outcome")).toString();
+        const bool        scrubIsPaused = scrubOutcome == QLatin1String("paused");
+        // A pass is going (or has stepped aside for a backup) while the
+        // latest attempt reads running or yielded.
+        if (scrubOutcome == QLatin1String("running") || scrubOutcome == QLatin1String("yielded"))
+            m_scrubRunning = true;
+        if (scrubIsPaused)
+            m_scrubPaused = true;
 
         QList<QStandardItem *> row;
         row.reserve(DrivesCol::Count);
@@ -433,6 +497,10 @@ void HealthDashboard::updateDrives(const QString &json)
         if (scrubStatus == QLatin1String("ok")) {
             scrubStatusItem->setText(i18n("OK"));
             scrubStatusItem->setForeground(QColor(0x22, 0x8B, 0x22));  // forest green
+        } else if (scrubStatus == QLatin1String("warn") && scrubIsPaused) {
+            // Paused by hand: resumable, not a fault (bd DAS-Backup-Manager-su1b.15).
+            scrubStatusItem->setText(i18n("Paused"));
+            scrubStatusItem->setForeground(QColor(0xCC, 0x88, 0x00));  // amber
         } else if (scrubStatus == QLatin1String("warn")) {
             scrubStatusItem->setText(i18n("WARN"));
             scrubStatusItem->setForeground(QColor(0xCC, 0x88, 0x00));  // amber
@@ -449,9 +517,22 @@ void HealthDashboard::updateDrives(const QString &json)
             // configured scrub target) — nothing to flag.
             scrubStatusItem->setText(QStringLiteral("—"));
         }
-        scrubStatusItem->setToolTip(
-            i18n("BTRFS scrub health from the scrub engine's persisted state "
-                 "(see btrdasd scrub status for raw per-device history)"));
+        QString scrubTip = i18n("BTRFS scrub health from the scrub engine's persisted state "
+                                "(see btrdasd scrub status for raw per-device history)");
+        if (scrubIsPaused) {
+            const QJsonValue since = scrub.value(QLatin1String("paused_since_epoch"));
+            const QString by = scrub.value(QLatin1String("paused_by")).toString();
+            QString detail = i18n("Scrub paused by hand; Resume Scrub continues it");
+            if (since.isDouble())
+                detail += i18n(" — since %1",
+                               QLocale().toString(QDateTime::fromSecsSinceEpoch(
+                                                      static_cast<qint64>(since.toDouble())),
+                                                  QLocale::ShortFormat));
+            if (!by.isEmpty())
+                detail += i18n(", asked by %1", by);
+            scrubTip = detail + QLatin1Char('\n') + scrubTip;
+        }
+        scrubStatusItem->setToolTip(scrubTip);
         row.append(scrubStatusItem);
 
         // Scrub age
@@ -465,6 +546,7 @@ void HealthDashboard::updateDrives(const QString &json)
 
         model->appendRow(row);
     }
+    updateScrubButtons();
 }
 
 void HealthDashboard::updateGrowth(const QString &json)

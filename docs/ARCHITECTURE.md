@@ -446,6 +446,16 @@ of letting it wait:
   leaves those filesystems out (`labels_already_scrubbed`: a log line each, a `DONE` report row) and so
   begins at the paused one. Anything doubtful scrubs: no marker, a stale one, a clock gone back, an
   unreadable state file, a UUID that cannot be resolved.
+- *In the GUI* (bd `DAS-Backup-Manager-su1b.18`): the Health dashboard's Drives tab has **Pause Scrub** (offered
+  while a target's latest attempt reads `running` or `yielded`) and **Resume Scrub** (offered while one reads
+  `paused`). They call the helper's `ScrubPause` / `ScrubResume`, which call `pause_pass_at` /
+  `resume_pass_at` directly (resume starts `das-scrub.service`, `--no-block`); each has its own polkit
+  action (`org.dasbackup.scrub.pause`, `org.dasbackup.scrub.resume`, `auth_admin_keep` for an active
+  session, nothing for an inactive one). The client calls them asynchronously on the long-timeout
+  interface, because a pause waits up to `PAUSE_ANSWER_SECS` (240 s); a pass that does not end in time is
+  an error naming the request left in place, as on the command line. The `HealthQuery` JSON's `scrub`
+  object carries `paused_since_epoch` and `paused_by` for a paused target; the Scrub column then reads
+  `Paused` (amber) with since and by in the tooltip.
 - *Reading it*: `paused` is not in progress and never `interrupted`; `scrub status` shows `PAUSED`
   with since and by; health is a WARN naming since, how long and by whom (a FAIL only when the last
   success is older than `fail_age_days`); the report's status line reads `PAUSED`. The resumed pass
@@ -549,7 +559,9 @@ btrdasd-gui
          │         ├──▶ CoverageList()         → CoverageDialog (pairs no longer backed up; org.dasbackup.index.read)
          │         ├──▶ CoverageAccept(v,s,t)  → CoverageDialog (accept one pair, named whole; org.dasbackup.config)
          │         ├──▶ RaidAcceptPreview(l)   → RaidAcceptDialog (what `raid accept` would show; org.dasbackup.raid.accept)
-         │         └──▶ RaidAccept(l, typed)   → RaidAcceptDialog (the typed label compared again; org.dasbackup.raid.accept, auth_admin)
+         │         ├──▶ RaidAccept(l, typed)   → RaidAcceptDialog (the typed label compared again; org.dasbackup.raid.accept, auth_admin)
+         │         ├──▶ ScrubPause()           → HealthDashboard Pause Scrub (async; scrub::pause_pass_at, up to 240 s; org.dasbackup.scrub.pause)
+         │         └──▶ ScrubResume()          → HealthDashboard Resume Scrub (async; scrub::resume_pass_at; org.dasbackup.scrub.resume)
          │
          ├──▶ SnapshotTimeline            Custom QPainter widget (visual timeline)
          ├──▶ SnapshotWatcher             QFileSystemWatcher → auto-detect new snapshots

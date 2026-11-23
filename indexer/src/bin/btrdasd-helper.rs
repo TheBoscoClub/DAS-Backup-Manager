@@ -339,6 +339,112 @@ fn config_text_at(path: &Path) -> Result<String, fdo::Error> {
         .map_err(|e| fdo::Error::Failed(format!("Failed to read config '{}': {e}", path.display())))
 }
 
+/// The polkit actions of `ScrubPause` and `ScrubResume` (bd
+/// DAS-Backup-Manager-su1b.18): one each, `auth_admin_keep` for an active
+/// session, like the other maintenance actions.
+const SCRUB_PAUSE_ACTION: &str = "org.dasbackup.scrub.pause";
+const SCRUB_RESUME_ACTION: &str = "org.dasbackup.scrub.resume";
+
+/// `btrdasd scrub pause` for the GUI: the library call and the text the
+/// dialog shows. Informational outcomes are `Ok`; a pass that did not end
+/// within `bound`, or a failure, is an error (the request file stays, as on
+/// the command line).
+fn scrub_pause_text(
+    paths: &buttered_dasd::scrub::PausePaths,
+    by: &str,
+    bound: std::time::Duration,
+    poll: std::time::Duration,
+) -> fdo::Result<String> {
+    use buttered_dasd::scrub::{PauseOutcome, pause_pass_at};
+    match pause_pass_at(paths, by, bound, poll) {
+        Ok(PauseOutcome::NotRunning) => Ok("No scrub pass is running; nothing to pause.".into()),
+        Ok(PauseOutcome::SetupHolds(holder)) => Ok(format!(
+            "{} is held by {holder}, not a scrub pass; nothing to pause.",
+            paths.singleton.display()
+        )),
+        Ok(PauseOutcome::Paused(labels)) => Ok(format!(
+            "Scrub paused: {}. The pass has ended and the unit is not failed; Resume scrub \
+             continues it. Until then a pass that starts does not run.",
+            labels.join(", ")
+        )),
+        Ok(PauseOutcome::EndedUnpaused) => Ok(
+            "The scrub pass ended before it could pause (it finished): nothing is paused.".into(),
+        ),
+        Ok(PauseOutcome::NoAnswer(holder)) => Err(fdo::Error::Failed(format!(
+            "The scrub pass ({holder}) did not end within {} s. The pause request {} stays: \
+             the pass pauses at its next look. Nothing was killed.",
+            bound.as_secs(),
+            paths.request.display()
+        ))),
+        Err(e) => Err(fdo::Error::Failed(e.to_string())),
+    }
+}
+
+/// `btrdasd scrub resume` for the GUI: refuses while a pass runs, else lifts
+/// the pause and `start`s the pass.
+fn scrub_resume_text(
+    paths: &buttered_dasd::scrub::PausePaths,
+    start: &dyn Fn() -> Result<(), String>,
+) -> fdo::Result<String> {
+    use buttered_dasd::scrub::{ResumeOutcome, resume_pass_at};
+    match resume_pass_at(paths, start) {
+        Ok(ResumeOutcome::AlreadyRunning(holder)) => Ok(format!(
+            "{} is held by {holder}: a pass is already running; nothing changed.",
+            paths.singleton.display()
+        )),
+        Ok(ResumeOutcome::Started { removed }) => Ok(format!(
+            "{}das-scrub.service started: it resumes a filesystem whose scrub was stopped \
+             part-way.",
+            if removed { "Pause lifted; " } else { "" }
+        )),
+        Err(e) => Err(fdo::Error::Failed(e)),
+    }
+}
+
+/// Start the scrub unit without waiting, as `btrdasd scrub resume` does.
+fn start_scrub_unit() -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["start", "--no-block", "das-scrub.service"])
+        .output()
+        .map_err(|e| format!("cannot run systemctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl start --no-block das-scrub.service failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// The `scrub` object of one target in the `HealthQuery` JSON. A target
+/// paused by hand also carries when and by whom (bd
+/// DAS-Backup-Manager-su1b.18), else `null` and `""`.
+fn scrub_health_json(s: &health::ScrubHealth) -> serde_json::Value {
+    let status = match s.status {
+        health::ScrubHealthStatus::NotApplicable => "not_applicable",
+        health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
+        health::ScrubHealthStatus::Unresolved => "unresolved",
+        health::ScrubHealthStatus::Ok => "ok",
+        health::ScrubHealthStatus::Warn => "warn",
+        health::ScrubHealthStatus::Fail => "fail",
+    };
+    let (since, by) = match &s.paused {
+        Some((since, by)) => (*since, by.as_str()),
+        None => (None, ""),
+    };
+    serde_json::json!({
+        "status": status,
+        "age_days": s.age_days,
+        "last_outcome": s.last_outcome,
+        "last_ok": s.last_ok,
+        "error_total": s.error_total,
+        "last_success_epoch": s.last_success_epoch,
+        "paused_since_epoch": since,
+        "paused_by": by,
+    })
+}
+
 /// Run a read-modify-write of `config.toml`/`btrbk.conf` under the backup
 /// singleton (`/run/das-backup.lock`), as setup and every backup run do, so a
 /// GUI edit cannot interleave with them and be lost or lose theirs (bd
@@ -2124,6 +2230,53 @@ impl HelperInterface {
         .map_err(|e| fdo::Error::Failed(format!("RaidAccept task join failed: {e}")))?
     }
 
+    /// `btrdasd scrub pause` for the GUI (bd DAS-Backup-Manager-su1b.18): asks
+    /// the running pass to yield and end `paused`, waiting up to
+    /// `PAUSE_ANSWER_SECS`. The wait runs on the blocking pool, so the daemon
+    /// keeps serving other calls; the client calls it asynchronously.
+    async fn scrub_pause(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, SCRUB_PAUSE_ACTION).await?;
+        let by = format!(
+            "btrdasd-helper ScrubPause pid {}, by {sender}",
+            std::process::id()
+        );
+        tokio::task::spawn_blocking(move || {
+            let paths = buttered_dasd::scrub::PausePaths::production();
+            let text = scrub_pause_text(
+                &paths,
+                &by,
+                std::time::Duration::from_secs(buttered_dasd::scrub::PAUSE_ANSWER_SECS),
+                std::time::Duration::from_secs(1),
+            )?;
+            eprintln!("[info] scrub pause ({by}): {text}");
+            Ok(text)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("ScrubPause task join failed: {e}")))?
+    }
+
+    /// `btrdasd scrub resume` for the GUI (bd DAS-Backup-Manager-su1b.18):
+    /// lifts the pause and starts `das-scrub.service` without waiting.
+    async fn scrub_resume(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender = sender_from_header(&header)?;
+        check_polkit(&self.conn, &sender, SCRUB_RESUME_ACTION).await?;
+        tokio::task::spawn_blocking(move || {
+            let paths = buttered_dasd::scrub::PausePaths::production();
+            let text = scrub_resume_text(&paths, &start_scrub_unit)?;
+            eprintln!("[info] scrub resume ({sender}): {text}");
+            Ok(text)
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("ScrubResume task join failed: {e}")))?
+    }
+
     /// Query system health and return a JSON report.
     ///
     /// Auto-mounts targets first so disk space, SMART, and snapshot data are
@@ -2203,14 +2356,6 @@ impl HelperInterface {
                     .targets
                     .iter()
                     .map(|t| {
-                        let scrub_status_str = match t.scrub.status {
-                            health::ScrubHealthStatus::NotApplicable => "not_applicable",
-                            health::ScrubHealthStatus::NeverScrubbed => "never_scrubbed",
-                            health::ScrubHealthStatus::Unresolved => "unresolved",
-                            health::ScrubHealthStatus::Ok => "ok",
-                            health::ScrubHealthStatus::Warn => "warn",
-                            health::ScrubHealthStatus::Fail => "fail",
-                        };
                         serde_json::json!({
                             "label": t.label,
                             "serial": t.serial,
@@ -2224,14 +2369,7 @@ impl HelperInterface {
                             "temperature_c": t.temperature_c,
                             "power_on_hours": t.power_on_hours,
                             "errors": t.errors,
-                            "scrub": {
-                                "status": scrub_status_str,
-                                "age_days": t.scrub.age_days,
-                                "last_outcome": t.scrub.last_outcome,
-                                "last_ok": t.scrub.last_ok,
-                                "error_total": t.scrub.error_total,
-                                "last_success_epoch": t.scrub.last_success_epoch,
-                            },
+                            "scrub": scrub_health_json(&t.scrub),
                         })
                     })
                     .collect();
@@ -4492,6 +4630,128 @@ mod tests {
         );
     }
 
+    /// bd DAS-Backup-Manager-su1b.18: both scrub methods check their own
+    /// polkit action before anything else and call the library directly
+    /// (never `btrdasd`); each action is declared for an active session only.
+    #[test]
+    fn the_scrub_pause_and_resume_methods_check_their_own_polkit_action_first() {
+        let src = include_str!("btrdasd-helper.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for (m, action, call) in [
+            ("scrub_pause", "SCRUB_PAUSE_ACTION", "scrub_pause_text("),
+            ("scrub_resume", "SCRUB_RESUME_ACTION", "scrub_resume_text("),
+        ] {
+            let method = method_body(body, m);
+            let polkit = method
+                .find(&format!("check_polkit(&self.conn, &sender, {action})"))
+                .unwrap_or_else(|| panic!("{m} does not check {action}"));
+            for e in ["spawn_blocking(", call] {
+                let at = method.find(e).unwrap_or_else(|| panic!("{m}: no {e}"));
+                assert!(polkit < at, "{m}: {e} comes before check_polkit");
+            }
+            assert!(!method.contains("\"btrdasd\""), "{m} shells out to btrdasd");
+        }
+        let policy = include_str!("../../../polkit/org.dasbackup.policy");
+        for id in ["org.dasbackup.scrub.pause", "org.dasbackup.scrub.resume"] {
+            let at = policy
+                .find(&format!("action id=\"{id}\""))
+                .unwrap_or_else(|| panic!("{id} not declared"));
+            let block = &policy[at..policy[at..].find("</action>").unwrap() + at];
+            assert!(
+                block.contains("<allow_any>no</allow_any>")
+                    && block.contains("<allow_inactive>no</allow_inactive>")
+                    && block.contains("<allow_active>auth_admin_keep</allow_active>"),
+                "{block}"
+            );
+        }
+    }
+
+    fn scrub_paths(dir: &Path) -> buttered_dasd::scrub::PausePaths {
+        buttered_dasd::scrub::PausePaths {
+            singleton: dir.join("scrub.lock"),
+            claim: dir.join("claim.lock"),
+            request: dir.join("pause"),
+            state: dir.join("state.json"),
+        }
+    }
+
+    #[test]
+    fn scrub_pause_text_says_so_when_no_pass_runs_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = scrub_paths(dir.path());
+        let text = scrub_pause_text(
+            &paths,
+            "GUI",
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap();
+        assert!(text.contains("No scrub pass is running"), "{text}");
+        assert!(!paths.request.exists(), "a request was written");
+    }
+
+    #[test]
+    fn scrub_pause_that_gets_no_answer_is_an_error_naming_the_request_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = scrub_paths(dir.path());
+        let _held = buttered_dasd::scrub::FileLock::try_acquire(&paths.singleton)
+            .unwrap()
+            .expect("lock free");
+        let err = scrub_pause_text(
+            &paths,
+            "GUI",
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(5),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did not end within"), "{err}");
+        assert!(paths.request.exists(), "the request must stay");
+    }
+
+    #[test]
+    fn scrub_resume_text_refuses_while_a_pass_holds_the_lock_and_starts_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = scrub_paths(dir.path());
+        let started = std::cell::Cell::new(0);
+        let start = || {
+            started.set(started.get() + 1);
+            Ok(())
+        };
+        {
+            let _held = buttered_dasd::scrub::FileLock::try_acquire(&paths.singleton)
+                .unwrap()
+                .expect("lock free");
+            let text = scrub_resume_text(&paths, &start).unwrap();
+            assert!(text.contains("already running"), "{text}");
+            assert_eq!(started.get(), 0);
+        }
+        std::fs::write(&paths.request, "x").unwrap();
+        let text = scrub_resume_text(&paths, &start).unwrap();
+        assert!(text.contains("Pause lifted"), "{text}");
+        assert_eq!(started.get(), 1);
+        assert!(!paths.request.exists());
+        let failing = || Err("systemctl failed".to_string());
+        let err = scrub_resume_text(&paths, &failing).unwrap_err().to_string();
+        assert!(err.contains("systemctl failed"), "{err}");
+    }
+
+    #[test]
+    fn the_health_scrub_json_carries_who_and_when_for_a_paused_target() {
+        let mut h = health::ScrubHealth::not_applicable();
+        h.status = health::ScrubHealthStatus::Warn;
+        h.last_outcome = Some("paused".into());
+        h.paused = Some((Some(1_700_000_000), "btrdasd scrub pause pid 7".into()));
+        let j = scrub_health_json(&h);
+        assert_eq!(j["status"], "warn");
+        assert_eq!(j["last_outcome"], "paused");
+        assert_eq!(j["paused_since_epoch"], 1_700_000_000);
+        assert_eq!(j["paused_by"], "btrdasd scrub pause pid 7");
+        let plain = scrub_health_json(&health::ScrubHealth::not_applicable());
+        assert!(plain["paused_since_epoch"].is_null());
+        assert_eq!(plain["paused_by"], "");
+    }
+
     #[test]
     fn the_polkit_policy_declares_the_recovery_os_action_as_auth_admin_keep() {
         let policy = include_str!("../../../polkit/org.dasbackup.policy");
@@ -5202,6 +5462,10 @@ mod tests {
 <method name="RaidAccept">
 <arg name="label" type="s" direction="in"/>
 <arg name="typed" type="s" direction="in"/>
+<arg type="s" direction="out"/>
+<method name="ScrubPause">
+<arg type="s" direction="out"/>
+<method name="ScrubResume">
 <arg type="s" direction="out"/>
 <method name="HealthQuery">
 <arg type="s" direction="out"/>

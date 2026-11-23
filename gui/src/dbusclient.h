@@ -77,6 +77,13 @@ public:
     // down.
     RaidReply raidAccept(const QString &label, const QString &typed);
 
+    // `btrdasd scrub pause` / `scrub resume` (bd DAS-Backup-Manager-su1b.18).
+    // Asynchronous: a pause waits for the pass to end (up to four minutes), so
+    // neither blocks the window. The result arrives as scrubActionFinished
+    // ("pause" or "resume", ok, the helper's text or why it was refused).
+    void scrubPauseAsync();
+    void scrubResumeAsync();
+
     // Async versions of slow methods (non-blocking, result via signal)
     void healthQueryAsync();
     // Turns a HealthQuery reply into healthQueryResult, and a failed one into
@@ -147,6 +154,9 @@ Q_SIGNALS:
     // turns into a modal dialog and the panel refreshes every 30 s.
     void recoveryOsStatusError(const QString &reason);
     void recoveryOsSessionEndResult(const QString &label, bool ok, const QString &lines);
+    // A ScrubPause/ScrubResume call ended; shown in place by the dashboard,
+    // so not errorOccurred (bd DAS-Backup-Manager-su1b.18).
+    void scrubActionFinished(const QString &action, bool ok, const QString &text);
     void recoveryOsScheduleResult(const QString &unit);
     void recoveryOsConsoleResult(const QString &label, const QString &path);
 
@@ -170,6 +180,7 @@ public:
                                               const QString &errorMessage);
 
 private:
+    void scrubCall(const QString &method, const QString &action);
     void callAsync(const QString &method, const QList<QVariant> &args,
                    const QString &operation);
 
