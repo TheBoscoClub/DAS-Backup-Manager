@@ -542,12 +542,15 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, REJOINED — this mount was the rejoin, the caller starts the owed scrub once it has let its locks go — DEGRADED), 1 not mounted, 3 refused, 2 could not run.
+    /// Mount one RAID-1 target through the guard (bd DAS-Backup-Manager-su1b.10), for backup-run.sh, which holds the maintenance lock and hands it down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID GUARD: <STATUS>  (<detail>)`. EXIT CODE: 0 mounted (OK, WARN, SCRUB-OWED, REJOINED — this mount was the rejoin, the caller starts the owed scrub once it has let its locks go — DEGRADED; with --read-only also a read-only view of a split-brain member), 1 not mounted, 3 refused, 2 could not run.
     #[command(hide = true)]
     MountTarget {
         /// The target's label
         #[arg(long)]
         label: String,
+        /// The caller persists nothing derived from what it reads (backup-verify.sh): a split-brain member may be read, read-only, instead of refused (bd DAS-Backup-Manager-su1b.23)
+        #[arg(long)]
+        read_only: bool,
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
@@ -2241,7 +2244,7 @@ fn hold_for_cli(
 /// for `backup-run.sh`. Only under a handed-down maintenance lock, at a mount
 /// point that exists and is not mounted (the script's own leftover check ran
 /// first). The mount is left for the script, which unmounts it.
-fn cmd_mount_target(label: &str, config: &Path) -> i32 {
+fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     let cannot_run = |why: String| {
         println!("RAID GUARD: CANNOT-RUN  ({why})");
         2
@@ -2289,7 +2292,7 @@ fn cmd_mount_target(label: &str, config: &Path) -> i32 {
     let result = mount::mount_guarded_target(
         &cfg,
         target,
-        buttered_dasd::raid_guard::Job::MountTarget.intent(),
+        buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
         &CliProgress,
         &held,
     );
@@ -3347,8 +3350,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(code);
                 }
             }
-            BackupAction::MountTarget { label, config } => {
-                std::process::exit(cmd_mount_target(&label, &config));
+            BackupAction::MountTarget {
+                label,
+                read_only,
+                config,
+            } => {
+                std::process::exit(cmd_mount_target(&label, &config, read_only));
             }
             BackupAction::RaidCheck { label, config } => {
                 std::process::exit(cmd_raid_check(&label, &config));
@@ -4141,6 +4148,33 @@ mod tests {
     /// (`DAS_SCRUB_STATE` / `DAS_BTRFS_STATUS_DIR`) — `cargo test` runs test
     /// functions in parallel by default within one binary.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `mount-target` mounts with the write intent `backup-run.sh` needs unless
+    /// `--read-only` says the caller (`backup-verify.sh`) persists nothing from
+    /// what it reads (bd DAS-Backup-Manager-su1b.23).
+    #[test]
+    fn mount_target_read_only_flag_picks_the_read_only_job() {
+        use buttered_dasd::raid_guard::{Intent, Job};
+        assert_eq!(Job::for_mount_target(false), Job::MountTarget);
+        assert_eq!(Job::for_mount_target(false).intent(), Intent::Write);
+        assert_eq!(Job::for_mount_target(true), Job::VerifyMount);
+        assert_eq!(Job::for_mount_target(true).intent(), Intent::ReadOnly);
+    }
+
+    /// The flag is wired: `backup mount-target --label X --read-only` parses.
+    #[test]
+    fn mount_target_accepts_read_only() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "btrdasd",
+            "backup",
+            "mount-target",
+            "--label",
+            "x",
+            "--read-only",
+        ]);
+        assert!(cli.is_ok(), "{:?}", cli.err());
+    }
 
     /// Standard clap sanity check: catches conflicting arg definitions,
     /// missing help text, and other structural mistakes in the `Cli` tree

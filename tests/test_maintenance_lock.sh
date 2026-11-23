@@ -26,7 +26,10 @@
 #     would wait for its own caller forever;
 #   - backup-verify.sh records itself too, empties the record on exit, leaves
 #     another holder's record alone, and skips its read-only mount while the
-#     lock is held — without reporting that skip as a failed mount (bd 0oi).
+#     lock is held — without reporting that skip as a failed mount (bd 0oi);
+#   - backup-verify.sh mounts a RAID-1 primary only through `btrdasd backup
+#     mount-target --read-only` (fd 8 handed down), never a hand `mount`, and a
+#     guard failure is a failed mount, not a skip or a success (bd su1b.23).
 
 # The shell options both scripts run under.
 set -euo pipefail
@@ -52,7 +55,7 @@ for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenanc
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
 done
-for fn in maintenance_lock_holder take_maintenance_lock clear_maintenance_record check_btrbk_status; do
+for fn in maintenance_lock_holder take_maintenance_lock clear_maintenance_record mount_primary_guarded check_btrbk_status; do
     body="$(extract "$VERIFY" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-verify.sh"; exit 1; }
     eval "$body"
@@ -387,6 +390,62 @@ else
     check "verify, lock taken and the mount fails: that IS reported" \
         "$(grep -c "^ERROR: Failed to mount $blockdev at $WORK/primary: wrong fs type" "$WORK/log")" "1"
     check "verify, lock taken: the mount was tried" "$(wc -l <"$WORK/mounts" | tr -d ' ')" "1"
+    check "verify, single-device primary: the hand mount never asks for degraded" \
+        "$(grep -c degraded "$WORK/mounts" || true)" "0"
+
+    # --- a RAID-1 primary is mounted only through the guard (bd su1b.23) ------
+    # `btrdasd backup mount-target --read-only`, handed the maintenance lock as
+    # fd 8; never a hand `mount`. The stub records its arguments and the
+    # descriptor named in DAS_MAINTENANCE_LOCK_FD, prints the line the real one
+    # prints and exits with $WORK/guard-rc.
+    cat >"$WORK/btrdasd-stub" <<'STUB'
+#!/bin/bash
+w="$(dirname "${BASH_SOURCE[0]}")"
+echo "btrdasd $* fd=${DAS_MAINTENANCE_LOCK_FD:-unset}" >>"$w/mounts"
+cat "$w/guard-line"
+exit "$(cat "$w/guard-rc")"
+STUB
+    chmod +x "$WORK/btrdasd-stub"
+    BTRDASD_BIN="$WORK/btrdasd-stub"
+    DAS_CONFIG="$WORK/config.toml"
+    DAS_TARGET_0_LABEL="primary-x"
+    DAS_TARGET_0_SERIALS="SERIAL1 SERIAL2"
+    DAS_TARGET_0_MOUNT_UUID="5eed0001-0000-4000-8000-000000000001"
+
+    echo "RAID GUARD: OK  (both members present)" >"$WORK/guard-line"
+    echo 0 >"$WORK/guard-rc"
+    : >"$WORK/log"; : >"$WORK/mounts"
+    check_btrbk_status >"$WORK/out" 2>&1
+    check "verify, RAID-1 primary: the guard mounts it read-only, handed fd 8" \
+        "$(grep -c "^btrdasd backup mount-target --label primary-x --config $WORK/config.toml --read-only fd=8$" "$WORK/mounts")" "1"
+    check "verify, RAID-1 primary: no hand mount" "$(grep -c '^mount ' "$WORK/mounts" || true)" "0"
+    check "verify, RAID-1 primary: the guard's mount is unmounted at the end" \
+        "$(grep -c "^umount $WORK/primary" "$WORK/mounts")" "1"
+    check "verify, RAID-1 primary: the inspection ran" "$(grep -c '^btrbk ' "$WORK/mounts")" "1"
+
+    echo "RAID GUARD: REFUSED  (split brain: the other member holds the last writes)" >"$WORK/guard-line"
+    echo 3 >"$WORK/guard-rc"
+    : >"$WORK/log"; : >"$WORK/mounts"
+    check_btrbk_status >"$WORK/out" 2>&1
+    check "verify, guard refuses: reported as a failure, with the guard's reason" \
+        "$(grep -c '^ERROR: Failed to mount primary-x at '"$WORK"'/primary through the RAID-1 guard (exit 3): RAID GUARD: REFUSED  (split brain' "$WORK/log")" "1"
+    check "verify, guard refuses: not read as a missing drive" "$(grep -c 'not among the detected' "$WORK/log" || true)" "0"
+    check "verify, guard refuses: no inspection, no unmount, no hand mount" \
+        "$(grep -c '^btrbk \|^umount \|^mount ' "$WORK/mounts" || true)" "0"
+
+    echo "RAID GUARD: CANNOT-RUN  (no such thing)" >"$WORK/guard-line"
+    echo 2 >"$WORK/guard-rc"
+    : >"$WORK/log"; : >"$WORK/mounts"
+    check_btrbk_status >"$WORK/out" 2>&1
+    check "verify, guard cannot run (exit 2): reported as a failure" \
+        "$(grep -c '^ERROR: Failed to mount primary-x .*(exit 2)' "$WORK/log")" "1"
+
+    : >"$WORK/guard-line"
+    echo 139 >"$WORK/guard-rc"
+    : >"$WORK/log"; : >"$WORK/mounts"
+    check_btrbk_status >"$WORK/out" 2>&1
+    check "verify, guard prints nothing and fails: still a failure, says so" \
+        "$(grep -c '^ERROR: Failed to mount primary-x .*(exit 139): no RAID GUARD line' "$WORK/log")" "1"
 fi
 
 if [[ $fails -eq 0 ]]; then

@@ -103,6 +103,9 @@ pub enum Job {
     Scrub,
     /// `btrdasd backup mount-target`, for `backup-run.sh`.
     MountTarget,
+    /// `btrdasd backup mount-target --read-only`, for `backup-verify.sh`: it
+    /// lists snapshots and reads usage, and persists nothing from them.
+    VerifyMount,
     /// `btrdasd walk`.
     Walk,
     /// The helper's `IndexWalk`.
@@ -127,12 +130,13 @@ pub enum Job {
 
 impl Job {
     /// Every job, for the tests that hold the table to its rule.
-    pub const ALL: [Job; 15] = [
+    pub const ALL: [Job; 16] = [
         Job::Backup,
         Job::BootArchive,
         Job::Forget,
         Job::Scrub,
         Job::MountTarget,
+        Job::VerifyMount,
         Job::Walk,
         Job::IndexWalk,
         Job::Reindex,
@@ -145,12 +149,25 @@ impl Job {
         Job::RaidAccept,
     ];
 
+    /// The job `btrdasd backup mount-target` mounts for: `backup-run.sh`'s
+    /// (it writes), or, with `--read-only`, `backup-verify.sh`'s (bd
+    /// DAS-Backup-Manager-su1b.23).
+    pub const fn for_mount_target(read_only: bool) -> Job {
+        if read_only {
+            Job::VerifyMount
+        } else {
+            Job::MountTarget
+        }
+    }
+
     /// The intent this job mounts with.
     pub const fn intent(self) -> Intent {
         match self {
-            Job::RestoreFiles | Job::RestoreSnapshot | Job::Browse | Job::Doctor => {
-                Intent::ReadOnly
-            }
+            Job::RestoreFiles
+            | Job::RestoreSnapshot
+            | Job::Browse
+            | Job::Doctor
+            | Job::VerifyMount => Intent::ReadOnly,
             Job::Backup
             | Job::BootArchive
             | Job::Forget
@@ -3055,6 +3072,7 @@ mod tests {
         assert_eq!(
             read_only,
             [
+                Job::VerifyMount,
                 Job::RestoreFiles,
                 Job::RestoreSnapshot,
                 Job::Browse,
