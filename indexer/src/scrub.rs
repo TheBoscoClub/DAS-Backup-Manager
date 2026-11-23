@@ -190,6 +190,12 @@
 //!   `btrdasd scrub pause`: `yielded_to` names who asked and `yielded_epoch`
 //!   when it paused. It is not in progress, never read as `interrupted`, and
 //!   not a failure; `btrdasd scrub resume` resumes it.
+//!   `interrupted` files the counters and bytes the btrfs status record held at
+//!   the interruption (bd DAS-Backup-Manager-su1b.22); when that record is
+//!   missing, unreadable or not this run's, and for every `paused` attempt,
+//!   the optional `counters_unknown: true` marks `bytes_scrubbed`,
+//!   `error_total` and `counters` as placeholders: readers print `unknown`,
+//!   never 0 or "no errors". Absent (older files) means measured.
 //!   `ok` is the single authoritative pass/fail bit: `outcome == "finished"`
 //!   **and** no error counters **and** no engine-level errors.
 //! * `paused_pass` (optional, bd DAS-Backup-Manager-su1b.24) is present only
@@ -1318,6 +1324,13 @@ pub struct AttemptState {
     pub bytes_scrubbed: u64,
     pub error_total: u64,
     pub counters: ScrubCounters,
+    /// `true` when `bytes_scrubbed`, `error_total` and `counters` are not
+    /// measurements but placeholders: the attempt ended (interrupted,
+    /// paused) without its status record being read, so the real figures are
+    /// unknown (bd DAS-Backup-Manager-su1b.22). Readers show `unknown`, never
+    /// 0 or "no errors". Absent in older files, which read as measured.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub counters_unknown: bool,
     #[serde(default)]
     pub messages: Vec<String>,
     /// The signal that ended the pass (`SIGTERM`, `SIGINT`, `SIGHUP`), when
@@ -1351,7 +1364,26 @@ pub struct AttemptState {
     pub paused_secs: Option<u64>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl AttemptState {
+    /// The damage-counter total, `None` when the attempt's figures are
+    /// unknown ([`Self::counters_unknown`]).
+    pub fn error_total_known(&self) -> Option<u64> {
+        (!self.counters_unknown).then_some(self.error_total)
+    }
+
+    /// The counters as text for `scrub status`: `unknown` when unread.
+    pub fn counters_summary(&self) -> String {
+        if self.counters_unknown {
+            UNKNOWN.to_string()
+        } else {
+            self.counters.summary()
+        }
+    }
+
     /// Whether this record says the pass is in progress: `running`
     /// (scrubbing now) or `yielded` (paused for a backup, waiting to resume;
     /// bd DAS-Backup-Manager-su1b.2).
@@ -1385,6 +1417,9 @@ impl AttemptState {
         }
     }
 }
+
+/// What a reader prints for a figure that was never measured.
+pub const UNKNOWN: &str = "unknown";
 
 /// Per-filesystem state, keyed in [`ScrubState::filesystems`] by FS UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1672,7 +1707,18 @@ fn merge_result_into_state(
         } else {
             prior_success
         };
-        let counters = result.counters;
+        // Placeholders are filed as such: unknown, never a measured zero.
+        let counters_unknown = result.counters_unknown();
+        let counters = if counters_unknown {
+            ScrubCounters::default()
+        } else {
+            result.counters
+        };
+        let bytes_scrubbed = if counters_unknown {
+            0
+        } else {
+            result.bytes_scrubbed
+        };
         state.filesystems.insert(
             result.fsuuid.clone(),
             FsState {
@@ -1694,9 +1740,10 @@ fn merge_result_into_state(
                     started_epoch: result.started_epoch,
                     finished_epoch: result.finished_epoch,
                     duration_secs: result.duration_secs,
-                    bytes_scrubbed: result.bytes_scrubbed,
+                    bytes_scrubbed,
                     error_total: counters.error_total(),
                     counters,
+                    counters_unknown,
                     messages: result.errors.clone(),
                     ..Default::default()
                 },
@@ -1784,6 +1831,10 @@ pub struct ScrubFsResult {
     /// Set when a pause request ended the pass while this filesystem's scrub
     /// was stopped for it: filed `paused`, not counted as a failure.
     pub paused: Option<PausedBy>,
+    /// Set when an interrupted filesystem's status record was read and
+    /// belongs to this run, so `counters` and `bytes_scrubbed` are its
+    /// figures as of the interruption (bd DAS-Backup-Manager-su1b.22).
+    pub interruption_record_read: bool,
 }
 
 /// What a scrub segment that stopped for a waiting backup asks of the pass
@@ -1827,6 +1878,28 @@ impl ScrubFsResult {
             yields: Vec::new(),
             pending_yield: None,
             paused: None,
+            interruption_record_read: false,
+        }
+    }
+
+    /// Whether `counters` and `bytes_scrubbed` are placeholders rather than
+    /// measurements: an interrupted or paused filesystem whose status record
+    /// was not read (bd DAS-Backup-Manager-su1b.22). A zero standing in for
+    /// an unread measurement is a defect; reports say `unknown` instead.
+    pub fn counters_unknown(&self) -> bool {
+        // A result read from a record (`outcome` set) is measured, even when a
+        // signal was attached to it afterwards.
+        self.outcome.is_none()
+            && (self.paused.is_some()
+                || (self.interrupted_by.is_some() && !self.interruption_record_read))
+    }
+
+    /// The counters as text for reports: `unknown` when unread.
+    pub fn counters_summary(&self) -> String {
+        if self.counters_unknown() {
+            UNKNOWN.to_string()
+        } else {
+            self.counters.summary()
         }
     }
 
@@ -2373,14 +2446,14 @@ fn describe_failure(result: &ScrubFsResult) -> String {
         Some(ScrubOutcome::Aborted) => {
             format!(
                 "scrub aborted (did not complete); {}",
-                result.counters.summary()
+                result.counters_summary()
             )
         }
         Some(ScrubOutcome::Canceled) => {
-            format!("scrub canceled; {}", result.counters.summary())
+            format!("scrub canceled; {}", result.counters_summary())
         }
         Some(ScrubOutcome::Finished) => {
-            format!("errors found: {}", result.counters.summary())
+            format!("errors found: {}", result.counters_summary())
         }
         None => "no scrub status record produced".to_string(),
     }
@@ -2536,37 +2609,40 @@ fn scrub_one_target(
     // --- status by UUID (never by path) -----------------------------------
     // An interrupted scrub's record is whatever the stopped child left, not a
     // result: the interruption is the result.
-    match read_scrub_status(&fsuuid).map(|record| (result.interrupted_by.is_none(), record)) {
-        Ok((false, _)) => {}
-        Ok((true, record)) => {
-            // A record left over from an earlier scrub must never be read as
-            // this pass's result — the 2026-07-27 stale-record trap. The
-            // anchor is *this filesystem's* start, not the pass's: a pass runs
-            // for many hours, so anchoring on the pass would accept a record
-            // written half a day before this target was even touched.
-            let activity = record.last_activity_start();
-            if activity == 0 {
-                result.errors.push(format!(
+    if result.interrupted_by.is_some() {
+        take_interrupted_figures(&mut result, read_scrub_status(&fsuuid), scrub_started);
+    } else {
+        match read_scrub_status(&fsuuid) {
+            Ok(record) => {
+                // A record left over from an earlier scrub must never be read as
+                // this pass's result — the 2026-07-27 stale-record trap. The
+                // anchor is *this filesystem's* start, not the pass's: a pass runs
+                // for many hours, so anchoring on the pass would accept a record
+                // written half a day before this target was even touched.
+                let activity = record.last_activity_start();
+                if activity == 0 {
+                    result.errors.push(format!(
                     "scrub status record for {fsuuid} has no start timestamp — cannot confirm it \
                      belongs to this run"
                 ));
-            } else if activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
-                result.errors.push(format!(
-                    "scrub status record for {fsuuid} is stale (last start/resume {activity} \
+                } else if activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+                    result.errors.push(format!(
+                        "scrub status record for {fsuuid} is stale (last start/resume {activity} \
                      predates this filesystem's scrub start {scrub_started}) — no result was \
                      written for this run"
-                ));
-            } else {
-                let t_start = record.t_start();
-                result.outcome = Some(record.outcome());
-                result.counters = record.counters();
-                result.bytes_scrubbed = record.bytes_scrubbed();
-                result.duration_secs = record.duration_secs();
-                result.started_epoch = t_start;
-                result.finished_epoch = record.finished_epoch();
+                    ));
+                } else {
+                    let t_start = record.t_start();
+                    result.outcome = Some(record.outcome());
+                    result.counters = record.counters();
+                    result.bytes_scrubbed = record.bytes_scrubbed();
+                    result.duration_secs = record.duration_secs();
+                    result.started_epoch = t_start;
+                    result.finished_epoch = record.finished_epoch();
+                }
             }
+            Err(e) => result.errors.push(e.to_string()),
         }
-        Err(e) => result.errors.push(e.to_string()),
     }
 
     if result.finished_epoch == 0 {
@@ -2633,6 +2709,30 @@ fn scrub_one_target(
     }
 
     result
+}
+
+/// Take an interrupted filesystem's figures from its btrfs status record
+/// (bd DAS-Backup-Manager-su1b.22).
+///
+/// An interrupted scrub's record is whatever the stopped child left, not a
+/// result, but its counters are real measurements as of the interruption
+/// (a RAID-1 pass once left 468272 corrected errors behind a filed 0). The
+/// record counts only when it belongs to this filesystem's run (the same
+/// freshness anchor as a finished one); otherwise, or when it cannot be
+/// read, the figures stay unknown ([`ScrubFsResult::counters_unknown`]).
+fn take_interrupted_figures(
+    result: &mut ScrubFsResult,
+    record: Result<ScrubStatusRecord, ScrubError>,
+    scrub_started: i64,
+) {
+    let Ok(record) = record else { return };
+    let activity = record.last_activity_start();
+    if activity == 0 || activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+        return;
+    }
+    result.counters = record.counters();
+    result.bytes_scrubbed = record.bytes_scrubbed();
+    result.interruption_record_read = true;
 }
 
 /// Ensure `mount_point` holds the filesystem with `fsuuid`.
@@ -4696,7 +4796,11 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
             "  {:<24} {:<9} {:<11} {}\n",
             result.target_label,
             result.status_word(),
-            format_bytes(result.bytes_scrubbed),
+            if result.counters_unknown() {
+                UNKNOWN.to_string()
+            } else {
+                format_bytes(result.bytes_scrubbed)
+            },
             format_duration(result.duration_secs)
         ));
         r.push_str(&format!(
@@ -4707,7 +4811,7 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
                 &result.fsuuid
             },
             result.outcome.map(|o| o.as_str()).unwrap_or("<no record>"),
-            result.counters.summary()
+            result.counters_summary()
         ));
     }
     for label in &pass.already_scrubbed {
@@ -7190,6 +7294,151 @@ mod interrupted_pass_tests {
         assert_eq!(fs.last_success_epoch, Some(900_000));
         assert_eq!(pass.interrupted_by(), Some(libc::SIGTERM));
         assert_eq!(pass.results[0].status_word(), "INTERRUPTED");
+    }
+
+    // --- bd DAS-Backup-Manager-su1b.22: an interrupted attempt's figures ---
+
+    /// The 2026-11-23 record shape: a RAID-1 pair, one device with damage that
+    /// scrub corrected, the pass stopped by SIGTERM (`canceled:1`).
+    fn damaged_record(t_start: i64) -> ScrubStatusRecord {
+        parse_scrub_status(
+            &format!(
+                "scrub status:1\n5eed0016-0000-4000-8000-000000000016:1|data_extents_scrubbed:1|\
+                 tree_extents_scrubbed:1|data_bytes_scrubbed:4096|tree_bytes_scrubbed:0|\
+                 read_errors:0|csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|\
+                 super_errors:0|malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|\
+                 last_physical:1|t_start:{t_start}|t_resumed:0|duration:5|canceled:1|finished:0\n\
+                 5eed0016-0000-4000-8000-000000000016:2|data_extents_scrubbed:1|\
+                 tree_extents_scrubbed:1|data_bytes_scrubbed:6960000000000|tree_bytes_scrubbed:0|\
+                 read_errors:0|csum_errors:437204|verify_errors:31068|no_csum:0|csum_discards:0|\
+                 super_errors:0|malloc_errors:0|uncorrectable_errors:0|corrected_errors:468272|\
+                 last_physical:1|t_start:{t_start}|t_resumed:0|duration:5|canceled:1|finished:0\n"
+            ),
+            "5eed0016-0000-4000-8000-000000000016",
+        )
+        .unwrap()
+    }
+
+    fn interrupted_result() -> ScrubFsResult {
+        let mut r = ScrubFsResult::new("primary");
+        r.fsuuid = "5eed0016-0000-4000-8000-000000000016".into();
+        r.started_epoch = 1_000_000;
+        r.finished_epoch = 1_003_000;
+        r.interrupted_by = Some(libc::SIGTERM);
+        r.errors.push("scrub interrupted by SIGTERM".to_string());
+        r
+    }
+
+    fn filed(result: &ScrubFsResult) -> AttemptState {
+        let mut state = ScrubState::default();
+        merge_result_into_state(&mut state, result, 1_003_000);
+        state.filesystems[&result.fsuuid].last_attempt.clone()
+    }
+
+    /// The observed defect: the record held the damage, the state file said 0.
+    #[test]
+    fn an_interrupted_attempt_files_the_counters_of_its_status_record() {
+        let mut r = interrupted_result();
+        take_interrupted_figures(&mut r, Ok(damaged_record(1_000_000)), 1_000_000);
+        let a = filed(&r);
+        assert_eq!(a.outcome, "interrupted");
+        assert!(!a.counters_unknown);
+        assert_eq!(a.counters.csum_errors, 437_204);
+        assert_eq!(a.counters.verify_errors, 31_068);
+        assert_eq!(a.counters.corrected_errors, 468_272);
+        assert_eq!(a.error_total, 437_204 + 31_068 + 468_272);
+        assert_eq!(a.bytes_scrubbed, 6_960_000_004_096);
+        assert!(a.counters_summary().contains("corrected=468272"));
+    }
+
+    /// No record, or one from an earlier run: the figures are unknown, and
+    /// every reader says so instead of "no errors".
+    #[test]
+    fn an_interrupted_attempt_without_a_usable_record_files_unknown() {
+        let missing = Err(ScrubError::StatusMissing {
+            path: "/nonexistent".into(),
+        });
+        let mut r = interrupted_result();
+        take_interrupted_figures(&mut r, missing, 1_000_000);
+        assert!(r.counters_unknown());
+        assert_eq!(r.counters_summary(), "unknown");
+        let a = filed(&r);
+        assert!(a.counters_unknown);
+        assert_eq!(a.counters_summary(), "unknown");
+        assert_eq!(a.error_total_known(), None);
+
+        // A record from a scrub that ended long before this one began.
+        let mut stale = interrupted_result();
+        take_interrupted_figures(&mut stale, Ok(damaged_record(500_000)), 1_000_000);
+        assert!(stale.counters_unknown(), "a stale record is not this run's");
+        assert_eq!(stale.counters, ScrubCounters::default());
+    }
+
+    /// A paused filesystem has measured nothing yet, and is still no failure.
+    #[test]
+    fn a_paused_attempt_files_unknown_figures_and_stays_not_a_failure() {
+        let mut r = ScrubFsResult::new("primary");
+        r.fsuuid = "5eed0016-0000-4000-8000-000000000016".into();
+        r.paused = Some(PausedBy {
+            by: "btrdasd scrub pause".into(),
+            at_epoch: 1_002_000,
+        });
+        assert!(r.counters_unknown());
+        let a = filed(&r);
+        assert_eq!(a.outcome, "paused");
+        assert!(a.counters_unknown);
+        assert_eq!(a.error_total_known(), None);
+    }
+
+    /// A finished pass is exactly as before: its zeros are measurements.
+    #[test]
+    fn a_finished_attempt_stays_measured() {
+        let mut r = ScrubFsResult::new("primary");
+        r.fsuuid = "5eed0016-0000-4000-8000-000000000016".into();
+        r.outcome = Some(ScrubOutcome::Finished);
+        assert!(!r.counters_unknown());
+        let a = filed(&r);
+        assert!(!a.counters_unknown);
+        assert_eq!(a.counters_summary(), "no errors");
+        assert_eq!(a.error_total_known(), Some(0));
+    }
+
+    /// A state file written before this field existed still loads, its
+    /// figures read as measured (as they always did).
+    #[test]
+    fn an_old_format_state_file_still_loads() {
+        let old = r#"{"schema_version":1,"filesystems":{"u":{"target_label":"t",
+            "mountpoint":"/mnt/t","last_success_epoch":5,"last_attempt":{
+            "outcome":"interrupted","ok":false,"started_epoch":1,"finished_epoch":2,
+            "duration_secs":1,"bytes_scrubbed":0,"error_total":0,"counters":{"read_errors":0,"csum_errors":0,"verify_errors":0,
+            "super_errors":0,"malloc_errors":0,"uncorrectable_errors":0,
+            "corrected_errors":0,"no_csum":0,"csum_discards":0}}}}}"#;
+        let state: ScrubState = serde_json::from_str(old).unwrap();
+        let a = &state.filesystems["u"].last_attempt;
+        assert!(!a.counters_unknown);
+        assert_eq!(a.error_total_known(), Some(0));
+        // A measured attempt serialises without the new key.
+        let json = serde_json::to_string(a).unwrap();
+        assert!(!json.contains("counters_unknown"), "{json}");
+    }
+
+    /// The email/report prints `unknown` for an interrupted filesystem whose
+    /// record could not be read, never `errors=no errors` or `0 B`.
+    #[test]
+    fn the_report_says_unknown_for_unread_figures() {
+        let mut r = interrupted_result();
+        take_interrupted_figures(&mut r, Err(ScrubError::StatusMissingHeader), 1_000_000);
+        let pass = ScrubPass {
+            status: PassStatus::Completed,
+            started_epoch: 1_000_000,
+            finished_epoch: 1_003_000,
+            results: vec![r],
+            errors: Vec::new(),
+            already_scrubbed: Vec::new(),
+        };
+        let text = format_scrub_report(&pass, &Config::default());
+        assert!(text.contains("errors=unknown"), "{text}");
+        assert!(!text.contains("errors=no errors"), "{text}");
     }
 
     /// A result is filed the moment its filesystem is done, so a pass killed

@@ -1039,6 +1039,9 @@ struct ScrubTargetView {
     finished_epoch: Option<i64>,
     duration_secs: Option<u64>,
     bytes_scrubbed: Option<u64>,
+    /// The attempt's bytes and counters were never read (bd
+    /// DAS-Backup-Manager-su1b.22): shown as `unknown`, never as a 0.
+    figures_unknown: bool,
     counters_summary: Option<String>,
     /// Extra error detail for the "error" source (a read failure that is
     /// neither "state entry present" nor "no record at all").
@@ -1058,6 +1061,7 @@ impl ScrubTargetView {
             finished_epoch: None,
             duration_secs: None,
             bytes_scrubbed: None,
+            figures_unknown: false,
             counters_summary: None,
             detail: None,
         }
@@ -1213,8 +1217,9 @@ fn build_scrub_target_view(
             view.ok = Some(fs.last_attempt.ok);
             view.finished_epoch = Some(fs.last_attempt.finished_epoch);
             view.duration_secs = Some(fs.last_attempt.duration_secs);
-            view.bytes_scrubbed = Some(fs.last_attempt.bytes_scrubbed);
-            view.counters_summary = Some(fs.last_attempt.counters.summary());
+            view.figures_unknown = fs.last_attempt.counters_unknown;
+            view.bytes_scrubbed = (!view.figures_unknown).then_some(fs.last_attempt.bytes_scrubbed);
+            view.counters_summary = Some(fs.last_attempt.counters_summary());
         }
         return view;
     }
@@ -1289,10 +1294,13 @@ fn format_scrub_status(views: &[ScrubTargetView], config: &Config) -> String {
             .age_days(now)
             .map(|d| format!("{d}d"))
             .unwrap_or_else(|| "-".to_string());
-        let bytes = v
-            .bytes_scrubbed
-            .map(buttered_dasd::report::format_bytes)
-            .unwrap_or_else(|| "-".to_string());
+        let bytes = if v.figures_unknown {
+            scrub::UNKNOWN.to_string()
+        } else {
+            v.bytes_scrubbed
+                .map(buttered_dasd::report::format_bytes)
+                .unwrap_or_else(|| "-".to_string())
+        };
         let duration = v
             .duration_secs
             .map(format_duration_secs)
@@ -4820,6 +4828,45 @@ mod tests {
         assert_eq!(v.finished_epoch, None);
     }
 
+    /// An interrupted attempt whose figures were never read prints `unknown`
+    /// (bytes and errors), never `0 B` or `errors=no errors`; one whose
+    /// counters were read prints them (bd DAS-Backup-Manager-su1b.22).
+    #[test]
+    fn status_prints_unknown_for_unread_figures_and_the_counts_when_read() {
+        let uuid = "44444444-4444-4444-4444-444444444444";
+        let config = test_config(&[("hurt-target", uuid)]);
+        let mut state = scrub::ScrubState::default();
+        let mut attempt = scrub::AttemptState {
+            outcome: "interrupted".into(),
+            ok: false,
+            finished_epoch: 1_785_000_100,
+            counters_unknown: true,
+            ..Default::default()
+        };
+        let entry = |attempt| scrub::FsState {
+            target_label: "hurt-target".into(),
+            mountpoint: "/mnt/hurt-target".into(),
+            last_success_epoch: None,
+            last_attempt: attempt,
+        };
+        state
+            .filesystems
+            .insert(uuid.into(), entry(attempt.clone()));
+        let v = build_scrub_target_view(&config, "hurt-target", Some(&state));
+        let shown = format_scrub_status(&[v], &config);
+        assert!(shown.contains("errors=unknown"), "{shown}");
+        assert!(!shown.contains("no errors"), "{shown}");
+        assert!(shown.contains("unknown"), "{shown}");
+
+        attempt.counters_unknown = false;
+        attempt.counters.corrected_errors = 7;
+        attempt.error_total = 7;
+        state.filesystems.insert(uuid.into(), entry(attempt));
+        let v = build_scrub_target_view(&config, "hurt-target", Some(&state));
+        let shown = format_scrub_status(&[v], &config);
+        assert!(shown.contains("errors=corrected=7"), "{shown}");
+    }
+
     /// A pass the signal stopped is INTERRUPTED in the table whatever its `ok`.
     #[test]
     fn status_word_names_a_caught_signal_interrupted() {
@@ -5055,6 +5102,7 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             yields: Vec::new(),
             pending_yield: None,
             paused: None,
+            interruption_record_read: false,
         }
     }
 

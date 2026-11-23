@@ -274,7 +274,7 @@ pub fn scrub_health_for(
             age_days: age,
             last_outcome: Some("paused".to_string()),
             last_ok: None,
-            error_total: Some(attempt.error_total),
+            error_total: attempt.error_total_known(),
             resolve_error: None,
             paused: Some((
                 attempt.yielded_epoch,
@@ -300,7 +300,7 @@ pub fn scrub_health_for(
                 .map(|t| age_days_between(now_epoch, t)),
             last_outcome: Some(attempt.effective_outcome()),
             last_ok: Some(false),
-            error_total: Some(attempt.error_total),
+            error_total: attempt.error_total_known(),
             resolve_error: None,
             paused: None,
         };
@@ -331,7 +331,7 @@ pub fn scrub_health_for(
         age_days: Some(age),
         last_outcome: Some(attempt.outcome.clone()),
         last_ok: if running_now { None } else { Some(true) },
-        error_total: Some(attempt.error_total),
+        error_total: attempt.error_total_known(),
         resolve_error: None,
         paused: None,
     }
@@ -2402,9 +2402,11 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
         fs.last_attempt.outcome = "paused".into();
         fs.last_attempt.yielded_to = Some("btrdasd scrub pause pid 9".into());
         fs.last_attempt.yielded_epoch = Some(NOW - 7_200);
+        fs.last_attempt.counters_unknown = true;
         let h = scrub_health_for(Some(&fs), NOW, 45, 75);
         assert_eq!(h.status, ScrubHealthStatus::Warn);
         assert_eq!(h.last_outcome.as_deref(), Some("paused"));
+        assert_eq!(h.error_total, None, "unread figures are not a total of 0");
         assert_ne!(h.last_ok, Some(false));
         assert_eq!(h.age_days, Some(10));
         let mut stale = fs_state_running(None, None, 80);
