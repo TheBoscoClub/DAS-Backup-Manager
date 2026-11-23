@@ -215,10 +215,13 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 (backup run, doctor, walk, restore, the GUI helper), the scrub engine, and
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
-refused, 2 could not run). Single-device targets are mounted as before. Every
+refused, 2 could not run) and `backup-verify.sh` through the same subcommand
+with `--read-only` (`Job::VerifyMount`, bd su1b.23). Single-device targets are
+mounted as before. Every
 caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
 `ReadOnly` only for a job that persists nothing derived from the target's
-contents (restore file, restore snapshot, browse, the doctor's report);
+contents (restore file, restore snapshot, browse, the doctor's report,
+`backup-verify.sh`'s read-only look);
 `Write` for everything else — backups, boot archiving, forget/purge, the
 scrub, and walk, index walk, reindex, reconcile and the recovery-OS reading,
 which write the index or a state file from what they read.

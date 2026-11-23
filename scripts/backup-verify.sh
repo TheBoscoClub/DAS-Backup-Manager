@@ -1,7 +1,16 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.3.0
-# Date: 2026-11-22
+# Version: 3.4.0
+# Date: 2026-11-23
+#
+# 3.4.0: a RAID-1 primary (a filesystem UUID and more than one member serial)
+# is mounted through the guard, `btrdasd backup mount-target --read-only`,
+# handed the maintenance lock as fd 8, never by a hand `mount ... degraded`
+# that could read a stale member's tree and skipped the rejected-member and
+# record checks; a single-device primary is mounted read-only without
+# `degraded`. A guard failure (refused, not mounted, could not run) is
+# reported as a failed mount with the guard's reason (bd
+# DAS-Backup-Manager-su1b.23).
 #
 # 3.3.0: a drive's serial is read by one strict rule (read_drive_serial() over
 # parse_drive_serial(), the partition script's): one "Serial Number:" or SAS
@@ -67,8 +76,12 @@ set -euo pipefail
 # line starts main (bd DAS-Backup-Manager-896; tests/test_verify_rewrite.sh).
 
 load_configuration() {
-    local btrdasd_bin="${BTRDASD_BIN:-/usr/bin/btrdasd}"
-    local das_config="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+    # Globals: check_btrbk_status mounts a RAID-1 primary through the same
+    # btrdasd and config (bd DAS-Backup-Manager-su1b.23).
+    BTRDASD_BIN="${BTRDASD_BIN:-/usr/bin/btrdasd}"
+    DAS_CONFIG="${DAS_CONFIG:-/etc/das-backup/config.toml}"
+    local btrdasd_bin="$BTRDASD_BIN"
+    local das_config="$DAS_CONFIG"
     if [[ -x "$btrdasd_bin" ]]; then
         eval "$("$btrdasd_bin" config dump-env --config "$das_config")"
     else
@@ -506,6 +519,38 @@ clear_maintenance_record() {
     fi
 }
 
+# Mount a RAID-1 primary through the guard, read-only intent, handed this
+# script's maintenance lock (fd 8, from take_maintenance_lock): the one rule the
+# Rust jobs and backup-run.sh mount with. It prints one line, `RAID GUARD:
+# <STATUS>  (<detail>)`, and exits 0 mounted (any status), 1 not mounted, 3
+# refused, 2 could not run. The exit status travels inside the capture, never
+# as an `if x="$(cmd)"` test (fail-silent.md); anything but a captured 0 is a
+# failure, its reason left in the global GUARD_MOUNT_ERR (set here, never at the
+# top level of the file: a rewrite of the script must not land mid-command).
+mount_primary_guarded() { # mount_primary_guarded <label>
+    local label="$1" out last rc line
+    GUARD_MOUNT_ERR=""
+    out="$(DAS_MAINTENANCE_LOCK_FD=8 "${BTRDASD_BIN:-/usr/bin/btrdasd}" backup mount-target \
+        --label "$label" --config "${DAS_CONFIG:-/etc/das-backup/config.toml}" --read-only &&
+        printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    if [[ "$last" == status=* ]]; then
+        rc="${last#status=}"
+    else
+        rc="uncaptured"
+    fi
+    line="$(grep -m1 '^RAID GUARD: ' <<<"$out" || true)"
+    if [[ "$rc" == 0 ]]; then
+        # Any status is a mount; a WARN-class one is said, not hidden.
+        if [[ -n "$line" && "$line" != "RAID GUARD: OK "* ]]; then
+            log_warn "  $label: ${line#RAID GUARD: }"
+        fi
+        return 0
+    fi
+    GUARD_MOUNT_ERR="(exit $rc): ${line:-no RAID GUARD line}"
+    return 1
+}
+
 check_btrbk_status() {
     log_header "btrbk Backup Status"
 
@@ -517,13 +562,26 @@ check_btrbk_status() {
     # Find primary backup drive by serial number from config
     local primary_serial=""
     local primary_mount=""
+    local primary_label=""
+    local primary_guarded=false
     for (( i=0; i<DAS_TARGET_COUNT; i++ )); do
         local role_var="DAS_TARGET_${i}_ROLE"
         if [[ "${!role_var}" == "primary" ]]; then
             local serial_var="DAS_TARGET_${i}_SERIAL"
             local mount_var="DAS_TARGET_${i}_MOUNT"
+            local label_var="DAS_TARGET_${i}_LABEL"
+            local uuid_var="DAS_TARGET_${i}_MOUNT_UUID"
+            local serials_var="DAS_TARGET_${i}_SERIALS"
+            local -a member_serials
             primary_serial="${!serial_var}"
             primary_mount="${!mount_var}"
+            primary_label="${!label_var:-}"
+            # raid_guard::is_guarded: a filesystem UUID and more than one
+            # member serial. Such a target is mounted only by the guard.
+            read -ra member_serials <<<"${!serials_var:-}"
+            if [[ -n "${!uuid_var:-}" && ${#member_serials[@]} -gt 1 ]]; then
+                primary_guarded=true
+            fi
             break
         fi
     done
@@ -554,26 +612,47 @@ check_btrbk_status() {
     #     purpose: backup-verify is an interactive diagnostic, and waiting up
     #     to an hour behind a backup is not what an operator asked for --
     #     skipping with a clear reason is.
-    # (b) `degraded`. The 22 TB primary is BTRFS RAID-1; per
-    #     .claude/rules/backup.md its mount options carry `degraded` so a
-    #     single-leg failure does not block inspection. A verify tool that
-    #     cannot look at a degraded array is useless exactly when it matters.
+    # (b) THE RAID-1 GUARD. A RAID-1 primary (raid_guard::is_guarded) is
+    #     mounted only by the guard, never by a hand `mount` (bd
+    #     DAS-Backup-Manager-su1b.10, su1b.23): `btrdasd backup mount-target
+    #     --read-only`, handed the lock taken here as fd 8. The guard mounts
+    #     without `degraded`, mounts degraded only on a member truly absent,
+    #     and refuses a rejected or split-brain member; a hand mount with
+    #     `degraded` can read a stale member's tree and skips those checks.
+    #     --read-only is the guard's intent for a job that persists nothing
+    #     derived from what it reads: this script only lists, reads usage
+    #     and unmounts. A single-device primary keeps the plain read-only
+    #     mount, without `degraded`.
     #
     # A held lock is a deliberate skip, which take_maintenance_lock has already
     # explained — not a failed mount (bd DAS-Backup-Manager-0oi).
     local maint_lock="/run/das-maintenance.lock"
     local skipped=false
-    if [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
+    local attempted=false
+    # A guarded target's members are found by the guard (by filesystem UUID),
+    # so a missing anchor drive is for the guard to judge, not a reason to
+    # skip it here.
+    if { $primary_guarded && [[ -n "$primary_label" ]]; } ||
+        [[ -n "$primary_dev" && -b "$primary_dev" ]]; then
         if take_maintenance_lock "$maint_lock"; then
+            attempted=true
             mkdir -p "$primary_mount"
-            local mount_stderr
-            mount_stderr=$(mktemp)
-            if mount -o ro,nossd,noatime,degraded "$primary_dev" "$primary_mount" 2>"$mount_stderr"; then
-                mounted=true
+            if $primary_guarded && [[ -n "$primary_label" ]]; then
+                if mount_primary_guarded "$primary_label"; then
+                    mounted=true
+                else
+                    mount_err="$GUARD_MOUNT_ERR"
+                fi
             else
-                mount_err=$(tr '\n' ' ' < "$mount_stderr")
+                local mount_stderr
+                mount_stderr=$(mktemp)
+                if mount -o ro,nossd,noatime "$primary_dev" "$primary_mount" 2>"$mount_stderr"; then
+                    mounted=true
+                else
+                    mount_err=$(tr '\n' ' ' < "$mount_stderr")
+                fi
+                [[ -z "${mount_stderr:-}" ]] || rm -f "${mount_stderr:?}"
             fi
-            [[ -z "${mount_stderr:-}" ]] || rm -f "${mount_stderr:?}"
         else
             skipped=true
         fi
@@ -609,12 +688,16 @@ check_btrbk_status() {
         umount "$primary_mount" 2>/dev/null || log_warn "Failed to unmount $primary_mount"
     elif $skipped; then
         :
+    elif $attempted; then
+        if $primary_guarded && [[ -n "$primary_label" ]]; then
+            log_error "Failed to mount $primary_label at $primary_mount through the RAID-1 guard ${mount_err:-(no error output)}"
+        else
+            log_error "Failed to mount $primary_dev at $primary_mount: ${mount_err:-(no error output)}"
+        fi
     elif [[ -z "$primary_dev" ]]; then
         log_warn "Primary backup drive (serial ${primary_serial:-unset}) not among the detected DAS devices"
     elif [[ ! -b "$primary_dev" ]]; then
         log_warn "Primary backup partition $primary_dev is not a block device"
-    else
-        log_error "Failed to mount $primary_dev at $primary_mount: ${mount_err:-(no error output)}"
     fi
 }
 
