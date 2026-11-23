@@ -28,6 +28,7 @@ public Q_SLOTS:
 private Q_SLOTS:
     void onHealthResult(const QString &json);
     void openRaidAccept();
+    void onScrubAction(const QString &action, bool ok, const QString &text);
     void onRefreshFailed(const QString &operation, const QString &reason);
 
 private:
@@ -37,6 +38,7 @@ private:
     void updateDrives(const QString &json);
     void updateGrowth(const QString &json);
     void updateStatus(const QString &json);
+    void updateScrubButtons();
 
     DBusClient *m_client;
     QString m_configPath;
@@ -49,6 +51,15 @@ private:
     // Opens the RAID-1 accept for the selected row's target (bd
     // DAS-Backup-Manager-su1b.11).
     QPushButton *m_raidAcceptButton = nullptr;
+    // Pause / resume the scrub pass (bd DAS-Backup-Manager-su1b.18). Pause is
+    // offered while a pass runs, resume while a filesystem is paused; both
+    // are off while a call is in flight.
+    QPushButton *m_scrubPauseButton = nullptr;
+    QPushButton *m_scrubResumeButton = nullptr;
+    QLabel *m_scrubResult = nullptr;
+    bool m_scrubRunning = false;
+    bool m_scrubPaused = false;
+    bool m_scrubBusy = false;
 
     // Growth tab
     QWidget *m_growthWidget = nullptr;

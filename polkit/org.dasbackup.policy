@@ -46,6 +46,26 @@
     </defaults>
   </action>
 
+  <action id="org.dasbackup.scrub.pause">
+    <description>Pause the running BTRFS scrub</description>
+    <message>Authentication is required to pause the running scrub of the backup drives</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.dasbackup.scrub.resume">
+    <description>Resume a paused BTRFS scrub</description>
+    <message>Authentication is required to resume the paused scrub of the backup drives</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
   <action id="org.dasbackup.config">
     <description>Modify backup configuration</description>
     <message>Authentication is required to modify backup configuration</message>

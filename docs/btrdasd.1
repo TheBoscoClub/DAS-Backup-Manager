@@ -3410,6 +3410,12 @@ within the bound \(em it is named, and the request is left so the pass pauses
 at its next look.
 .PP
 .B btrdasd scrub pause
+.PP
+The GUI's Health dashboard (Drives tab) offers the same through the helper's
+.B ScrubPause
+method, authenticated by polkit
+.BR org.dasbackup.scrub.pause ;
+the call runs in the background and may take up to 240 seconds.
 .\"
 .SS scrub resume
 Lift a pause and start the scrub pass again (root).
@@ -3434,6 +3440,11 @@ A pass that starts more than 7 days after the pause scrubs every filesystem
 again.
 .PP
 .B btrdasd scrub resume
+.PP
+The GUI's Health dashboard offers the same through the helper's
+.B ScrubResume
+method, authenticated by polkit
+.BR org.dasbackup.scrub.resume .
 .\"
 .SS doctor
 Subvolume drift detector \(em find source subvolumes that exist on disk but

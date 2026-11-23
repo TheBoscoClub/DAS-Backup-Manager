@@ -304,6 +304,38 @@ DBusClient::RaidReply DBusClient::raidAccept(const QString &label, const QString
     return {true, reply.value()};
 }
 
+void DBusClient::scrubPauseAsync()
+{
+    scrubCall(QStringLiteral("ScrubPause"), QStringLiteral("pause"));
+}
+
+void DBusClient::scrubResumeAsync()
+{
+    scrubCall(QStringLiteral("ScrubResume"), QStringLiteral("resume"));
+}
+
+void DBusClient::scrubCall(const QString &method, const QString &action)
+{
+    if (!m_available) {
+        Q_EMIT scrubActionFinished(action, false, m_unavailableReason);
+        return;
+    }
+    // The slow interface: a pause outlasts Qt's 25 s default.
+    QDBusPendingCall pending = m_slowInterface->asyncCall(method);
+    auto *watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this, action](QDBusPendingCallWatcher *w) {
+        QDBusPendingReply<QString> reply = *w;
+        if (reply.isError())
+            Q_EMIT scrubActionFinished(action, false,
+                                       mapDBusError(reply.error().name(),
+                                                    reply.error().message()));
+        else
+            Q_EMIT scrubActionFinished(action, true, reply.value());
+        w->deleteLater();
+    });
+}
+
 bool DBusClient::jobCancel(const QString &jobId)
 {
     if (!m_available) return false;

@@ -2388,6 +2388,58 @@ private Q_SLOTS:
         QVERIFY(result.at(0).at(0).toString().isEmpty());
     }
 
+    // bd DAS-Backup-Manager-su1b.18: Pause/Resume scrub buttons, enabled only
+    // when meaningful, and a paused target reads "Paused", not a bare WARN.
+    void scrubButtonsFollowTheReadingAndAPausedTargetReadsPaused()
+    {
+        DBusClient client; // no helper reachable in this suite
+        HealthDashboard health(&client);
+        auto *pause = health.findChild<QPushButton *>(QStringLiteral("healthScrubPauseButton"));
+        auto *resume = health.findChild<QPushButton *>(QStringLiteral("healthScrubResumeButton"));
+        QVERIFY(pause && resume);
+        QVERIFY(!pause->toolTip().isEmpty());
+        QVERIFY(!resume->toolTip().isEmpty());
+        QVERIFY(!pause->isEnabled());
+        QVERIFY(!resume->isEnabled());
+
+        const auto reading = [](const QString &outcome, const QString &status, const QString &extra) {
+            return QStringLiteral(
+                       R"({"targets":[{"serial":"SER1","label":"primary","mounted":true,)"
+                       R"("total_bytes":100,"used_bytes":40,"smart_status":"PASSED",)"
+                       R"("scrub":{"status":"%1","last_outcome":"%2"%3}}]})")
+                .arg(status, outcome, extra);
+        };
+        const auto scrubCell = [&health]() {
+            auto *v = health.findChild<QTableView *>(QStringLiteral("healthDrivesView"));
+            if (v && v->model() && v->model()->rowCount() > 0)
+                return v->model()->index(0, 9);
+            return QModelIndex();
+        };
+
+        // A pass is running: Pause on, Resume off.
+        Q_EMIT client.healthQueryResult(reading(QStringLiteral("running"), QStringLiteral("ok"), {}));
+        QVERIFY(pause->isEnabled());
+        QVERIFY(!resume->isEnabled());
+
+        // Paused by hand: Resume on, Pause off; "Paused" in amber, who and when in the tooltip.
+        Q_EMIT client.healthQueryResult(reading(
+            QStringLiteral("paused"), QStringLiteral("warn"),
+            QStringLiteral(R"(,"paused_since_epoch":1700000000,"paused_by":"requester-x")")));
+        QVERIFY(!pause->isEnabled());
+        QVERIFY(resume->isEnabled());
+        const QModelIndex cell = scrubCell();
+        QVERIFY(cell.isValid());
+        QCOMPARE(cell.data().toString(), QStringLiteral("Paused"));
+        QCOMPARE(cell.data(Qt::ForegroundRole).value<QBrush>().color(), QColor(0xCC, 0x88, 0x00));
+        QVERIFY(cell.data(Qt::ToolTipRole).toString().contains(QStringLiteral("requester-x")));
+
+        // Nothing running, nothing paused: both off; a plain WARN stays WARN.
+        Q_EMIT client.healthQueryResult(reading(QStringLiteral("finished"), QStringLiteral("warn"), {}));
+        QVERIFY(!pause->isEnabled());
+        QVERIFY(!resume->isEnabled());
+        QCOMPARE(scrubCell().data().toString(), QStringLiteral("WARN"));
+    }
+
     void theDashboardKeepsItsLastReadingAndSaysWhenItWasTaken()
     {
         DBusClient client;
