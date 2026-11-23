@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - While the request is in place a pass that starts (the timer) does not run, exit 0; `resume` refuses while a pass runs, else removes the request and runs `systemctl start --no-block das-scrub.service`, which resumes the filesystem by its btrfs record
   - `paused` is resumable and never a failure: `scrub status` shows `PAUSED` with since and by, health a WARN naming since, how long and by whom (FAIL only past `fail_age_days`), the report `Status: PAUSED`, `scrub run` exit 0
 
+- **Pause Scrub and Resume Scrub in the GUI** (bd `DAS-Backup-Manager-su1b.18`): the Health dashboard's Drives tab gets the two buttons the command line gained in su1b.15
+  - Pause is offered while a target's latest attempt reads `running` or `yielded`, Resume while one reads `paused`; both are off while a call is in flight, each with a tooltip
+  - They call the helper's new `ScrubPause` / `ScrubResume`, which run `scrub::pause_pass_at` / `resume_pass_at` directly — the same code, waits and refusals as `btrdasd scrub pause|resume` — each behind its own polkit action (`org.dasbackup.scrub.pause`, `org.dasbackup.scrub.resume`, `auth_admin_keep` for an active session, refused for an inactive one), checked before anything happens
+  - The client calls them asynchronously on the long-timeout interface, since a pause waits up to 240 s (`PAUSE_ANSWER_SECS`); the window stays responsive
+  - A paused target's Scrub column reads `Paused` (amber) instead of a bare `WARN`, with since and by in the tooltip — the `HealthQuery` JSON's `scrub` object gains `paused_since_epoch` and `paused_by`
+
 - **A RAID-1 target is mounted only through a guard that will not mount it degraded with both drives attached** (bd `DAS-Backup-Manager-su1b.10`): on 2026-11-21/22 the kernel had forgotten one leg of the primary, and doctor and the nightly backup mounted it `degraded` on the other — both drives attached, both jobs saying OK, every write single-copy until a scrub corrected 9593 stale blocks
   - A target with `mount_uuid` and two or more serials is mounted by `raid_guard::mount_guarded`, one implementation for the Rust jobs (backup, doctor, walk, restore, scrub, the GUI helper) and for `backup-run.sh` (4.22.0), which calls the new hidden `btrdasd backup mount-target` with the maintenance lock handed down on fd 8
   - Its members are found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each scanned by its own path (`btrfs device scan <path>`; never unscoped, never `--forget`) and identified by its own superblock (`fsid`, `dev_item.devid`, `dev_item.uuid`, `generation`, `num_devices`)
@@ -146,6 +152,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `docs/INSTALL.md` no longer says CachyOS's packages need x86-64-v3/v4 for the updater VM's CPU passthrough
 
 ### Fixed
+
+- **An interrupted scrub no longer reports "no errors" over errors it found** (bd `DAS-Backup-Manager-su1b.22`): on 2026-11-23 a pass interrupted by a reboot filed every counter as 0, so `btrdasd scrub status` printed `errors=no errors` while the btrfs record held 468,272 corrected errors — a zero standing in for an unread measurement
+  - An `interrupted` attempt now files the counters and bytes its btrfs status record held at the interruption, when that record is this run's (the same freshness anchor as a finished pass)
+  - A record that is missing, unreadable or stale, and every `paused` attempt, files `counters_unknown: true` in `scrub-state.json`: `scrub status` and the report print `unknown`, health's `error_total` is `null` — never 0, never "no errors"; a paused attempt stays not a failure
+  - Older state files load unchanged (no key = measured), and a measured attempt is written without the key
+- **`backup-verify.sh` mounts the RAID-1 primary through the guard, never by hand with `degraded`** (bd `DAS-Backup-Manager-su1b.23`): it ran `mount -o ro,nossd,noatime,degraded`, bypassing `raid_guard::mount_guarded` — with both drives present a degraded mount can read a stale member's tree, and it skipped the rejected-member and record checks
+  - A guarded primary is now mounted by `btrdasd backup mount-target --read-only` (new flag; `Job::VerifyMount`, `Intent::ReadOnly`) with the maintenance lock handed down on fd 8, as `backup-run.sh` does; a refused or failed guard mount is reported as a failure and nothing is inspected or unmounted
+  - A single-device target keeps its plain read-only mount, now without `degraded`; `backup-run.sh` still mounts with write intent; script version 3.4.0
 
 - **`btrdasd scrub resume` continues the paused pass instead of starting it over** (bd `DAS-Backup-Manager-su1b.24`): on 2026-11-23 a pass paused during its second filesystem was resumed, and it began a fresh full scrub of the primary target it had finished an hour before
   - A pass that ends paused writes `paused_pass` into `/var/lib/das-backup/scrub-state.json`: the filesystems it scrubbed to the end (kernel `finished`, whatever it found), its first part's start and the pause time; paused again it is carried forward, a pass run to its end removes it
