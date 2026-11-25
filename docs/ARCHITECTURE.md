@@ -244,7 +244,8 @@ btrfs device scan <each member path>          → never unscoped, never --forget
 dump-super <each member>                      → fsid, devid, dev_uuid, generation, num_devices
 all num_devices present?
    yes → mount -o <mount_opts minus degraded> UUID=<fsid>
-           ok   → devinfo/*/missing all 0, else unmount and REFUSE
+           ok   → devinfo/*/missing all 0 and devices/ one entry per devid not missing,
+                  else unmount and REFUSE
                   record degraded → scrub-owed (both copies); scrub-owed → WARN
            fail → keep polling (below); still failing with all present → REFUSE
    no  → poll every 5 s for [das].member_wait_secs, rescanning

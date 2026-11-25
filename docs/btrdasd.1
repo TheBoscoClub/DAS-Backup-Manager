@@ -1082,7 +1082,10 @@ recovery\-OS reading), stays refused (see
 .IP 5. 4
 after the mount, a member the kernel reports missing
 .RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
-while every member is attached is refused.
+while every member is attached is refused; so is a view in which
+.I /sys/fs/btrfs/<fsid>/devices/
+lists fewer opened devices than devinfo shows not missing (a device scan
+clears the flag of a member a degraded mount never opened).
 .PP
 It prints one line,
 .BI "RAID GUARD: " STATUS "  (" detail ) \fR,
@@ -1121,7 +1124,9 @@ maintenance lock handed down
 with the target mounted. A member the kernel shows missing
 .RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
 \(em it dropped while the run had the target mounted \(em or a view that
-cannot be read is recorded as a degraded period on the members present, so
+cannot be read (fewer opened devices under
+.I devices/
+than devids not missing included) is recorded as a degraded period on the members present, so
 the next mount with every member owes a scrub. Every Rust job and the scrub
 make the same check before their own unmounts. It prints one line,
 .BI "RAID CHECK: " STATUS "  (" detail ) \fR,

@@ -2588,23 +2588,34 @@ refresh_serial_devs() { # refresh_serial_devs <label>
 
 # The devids the kernel marks missing for mounted filesystem <uuid>, one per
 # line, from <sysfs>/<uuid>/devinfo/<devid>/missing. 1 when that cannot be
-# read: never "none missing".
+# read: never "none missing". 1 also when <sysfs>/<uuid>/devices/ (one entry
+# per block device the kernel opened) lists fewer devices than devinfo shows
+# not missing: a device scan clears the missing flag of a member a degraded
+# mount never opened (kernel 7.3, proven on a VM), and which devid that is
+# cannot be told here (bd DAS-Backup-Manager-su1b.12; the Rust twin is
+# raid_guard::missing_devids_under).
 DAS_SYSFS_BTRFS="${DAS_SYSFS_BTRFS:-/sys/fs/btrfs}"
 raid_missing_devids() { # raid_missing_devids <uuid>
-    local dir="$DAS_SYSFS_BTRFS/${1,,}/devinfo" d flag seen=0 # sysfs names the fsid in lower case
-    [[ -d "$dir" ]] || return 1
+    local dir="$DAS_SYSFS_BTRFS/${1,,}/devinfo" d flag seen=0 present=0 opened=0 # sysfs names the fsid in lower case
+    local devs="$DAS_SYSFS_BTRFS/${1,,}/devices" missing=""
+    [[ -d "$dir" && -d "$devs" && -r "$devs" && -x "$devs" ]] || return 1
     for d in "$dir"/*/; do
         d="${d%/}"
         [[ "${d##*/}" =~ ^[[:digit:]]+$ ]] || continue
         seen=1
         flag="$(<"$d/missing")" || return 1
         case "$flag" in
-        0) ;;
-        1) printf '%s\n' "${d##*/}" ;;
+        0) present=$((present + 1)) ;;
+        1) missing+="${d##*/}"$'\n' ;;
         *) return 1 ;;
         esac
     done
-    ((seen))
+    ((seen)) || return 1
+    for d in "$devs"/* "$devs"/.[!.]*; do
+        [[ -e "$d" || -L "$d" ]] && opened=$((opened + 1))
+    done
+    ((opened >= present)) || return 1
+    printf '%s' "$missing"
 }
 
 mount_targets() {

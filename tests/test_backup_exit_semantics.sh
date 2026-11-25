@@ -683,6 +683,9 @@ fresh() {
     mkdir -p "$WORK/sysfs/primary-uuid/devinfo/1" "$WORK/sysfs/primary-uuid/devinfo/2"
     echo 0 >"$WORK/sysfs/primary-uuid/devinfo/1/missing"
     echo 0 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
+    # The block devices the kernel opened for it, one per present member
+    # (bd su1b.12: devinfo's missing flag alone is not believed).
+    mkdir -p "$WORK/sysfs/primary-uuid/devices/sdx1" "$WORK/sysfs/primary-uuid/devices/sdy1"
     write_env
 }
 knob() { printf '%s\n' "$2" >"$STATE/knobs/$1"; }
@@ -1507,6 +1510,15 @@ echo 1 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
 run_backup
 expect_aborted "a member missing after a normal mount" "ABORTING — refusing to invoke btrbk" \
     "target verification" "primary-22tb: mounted with devid(s) 2 missing, though the guard did not mount it degraded"
+
+# A member whose missing flag a device scan cleared on a mount that never
+# opened it (kernel 7.3, proven on a VM; bd DAS-Backup-Manager-su1b.12):
+# devinfo reads both present, devices/ lists one. Never OK.
+fresh
+rm -rf "${WORK:?}/sysfs/primary-uuid/devices/sdy1"
+run_backup
+expect_aborted "a member the kernel never opened" "ABORTING — refusing to invoke btrbk" \
+    "target verification" "primary-22tb: cannot read whether a member of its RAID-1 is missing"
 
 fresh
 rm -rf "${WORK:?}/sysfs/primary-uuid"
