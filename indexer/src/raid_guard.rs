@@ -219,6 +219,18 @@ fn tokens(opts: &str) -> impl Iterator<Item = &str> {
     opts.split(',').map(str::trim).filter(|o| !o.is_empty())
 }
 
+/// The configured options without `rw`, `ro`, `degraded` and `rescue=*`,
+/// plus `ro,degraded`: the first mount of the member `raid accept` keeps. A
+/// kernel refuses `remount,rw` of a mount that carries `rescue=` (proven on
+/// 7.3.3), so unlike [`stale_read_opts`] this adds none.
+pub fn ro_degraded_opts(opts: &str) -> String {
+    let mut v: Vec<&str> = tokens(opts)
+        .filter(|o| !matches!(*o, "degraded" | "rw" | "ro") && !o.starts_with("rescue="))
+        .collect();
+    v.extend(["ro", "degraded"]);
+    v.join(",")
+}
+
 /// `opts` with every exact `degraded` token removed.
 pub fn without_degraded(opts: &str) -> String {
     tokens(opts)
@@ -2684,13 +2696,14 @@ fn commit_accept(
             }
         }
         if result.is_ok() {
-            // Read-only first: if udev registered the other member again
+            // Plain `ro,degraded` first (no `rescue=`: remount,rw of such a
+            // mount is refused by the kernel): if udev registered the other member again
             // since the forget, the kernel would assemble both, and a
             // read-write mount of the higher-generation tree could undo the
             // operator's choice. What the kernel OPENED is checked before
             // the remount (a remount opens no new device).
             result = host
-                .mount_device(&stale_read_opts(plan.mount_opts), &kept.path, plan.mount)
+                .mount_device(&ro_degraded_opts(plan.mount_opts), &kept.path, plan.mount)
                 .and_then(|()| {
                     let want = kept.path.rsplit('/').next().unwrap_or(&kept.path);
                     let opened = host.opened_devices(plan.fsid).map_err(|e| {
@@ -3932,6 +3945,40 @@ mod tests {
         )
         .unwrap();
         assert!(!done.diverged);
+    }
+
+    #[test]
+    fn the_first_mount_of_the_kept_member_is_plain_ro_degraded_so_it_can_be_remounted_rw() {
+        // A kernel refuses `remount,rw` of a `rescue=` mount (proven on a
+        // VM, 7.3.3): the first mount is `ro,degraded` and the configured
+        // options without rw/ro/degraded/rescue=*.
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 2, 1);
+        diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL12")])
+            .0
+            .unwrap();
+        let calls = host.calls();
+        let first = calls
+            .iter()
+            .find(|c| c.starts_with("mount-dev") && c.contains("/dev/sdc1 /mnt/p"))
+            .unwrap();
+        let opts: Vec<&str> = first.split(' ').nth(1).unwrap().split(',').collect();
+        assert!(
+            opts.contains(&"ro") && opts.contains(&"degraded"),
+            "{first}"
+        );
+        assert!(!first.contains("rescue="), "{first}");
+        assert!(
+            opts.contains(&"noatime"),
+            "configured options kept: {first}"
+        );
+        let at = calls.iter().position(|c| c == first).unwrap();
+        let remount = calls
+            .iter()
+            .position(|c| c.starts_with("remount-rw"))
+            .unwrap();
+        assert!(at < remount, "{calls:?}");
     }
 
     #[test]
