@@ -384,6 +384,7 @@ Requires root privileges.
 .RB [ \-\-modify ]
 .RB [ \-\-upgrade ]
 .RB [ \-\-uninstall ]
+.RB [ \-\-keep\-config ]
 .RB [ \-\-uninstall\-all ]
 .RB [ \-\-check ]
 .RB [ \-\-force ]
@@ -442,6 +443,18 @@ database and waits up to 30 seconds behind another writer, then fails.
 .TP
 .B \-\-uninstall
 Remove all generated files, disable timers, and optionally remove the database.
+.TP
+.B \-\-keep\-config
+With
+.BR \-\-uninstall :
+leave
+.I /etc/das\-backup/config.toml
+and its directory in place; everything else is removed as without it. The
+package removal hooks use it, as removing a package is not purging the
+configuration. Refused without
+.BR \-\-uninstall ,
+and with
+.BR \-\-uninstall\-all .
 .TP
 .B \-\-uninstall\-all
 Remove ALL installed files: generated configs (same as \-\-uninstall), plus

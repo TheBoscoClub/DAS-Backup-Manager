@@ -24,6 +24,7 @@ optdepends=('s-nail: email backup reports (mailx)'
 makedepends=('rust' 'cmake' 'extra-cmake-modules' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
+install="$pkgname.install"
 
 build() {
     cd "DAS-Backup-Manager-$pkgver"

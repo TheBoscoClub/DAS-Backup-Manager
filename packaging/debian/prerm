@@ -1,0 +1,24 @@
+#!/bin/sh
+# bd DAS-Backup-Manager-hzxr: `btrdasd setup` writes units, timers and generated
+# scripts outside the package's file list. On removal (not upgrade, not deconfigure) run the
+# project's own uninstall: units are retired through unit_links (stop, disable
+# with no reload, never `disable --now`). --force never removes the database;
+# config.toml is kept (--keep-config; purge does not touch it either). `deconfigure`
+# is not removal: the package stays installed. A failure never blocks
+# the removal: it says what to run.
+set -e
+
+case "$1" in
+remove)
+    if command -v btrdasd >/dev/null 2>&1 && [ -e /etc/das-backup/.manifest ]; then
+        btrdasd setup --uninstall --force --keep-config || {
+            echo "das-backup-manager: 'btrdasd setup --uninstall --force --keep-config' failed (exit 75 = a backup or scrub holds its lock)." >&2
+            echo "das-backup-manager: units and timers under /etc/systemd/system may remain; remove them by hand (see docs/INSTALL.md, Uninstall)." >&2
+        }
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

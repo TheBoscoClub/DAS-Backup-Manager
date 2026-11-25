@@ -52,6 +52,20 @@ install -Dm644 %{_vpath_builddir}/completions/btrdasd.bash %{buildroot}%{_datadi
 install -Dm644 %{_vpath_builddir}/completions/_btrdasd %{buildroot}%{_datadir}/zsh/site-functions/_btrdasd
 install -Dm644 %{_vpath_builddir}/completions/btrdasd.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/btrdasd.fish
 
+%preun
+# bd DAS-Backup-Manager-hzxr: `btrdasd setup` writes units, timers and generated
+# scripts outside the package's file list. Final removal only ($1 = 0, not an
+# upgrade): run the project's own uninstall (units retired through unit_links,
+# never `disable --now`). --force never removes the database; config.toml is
+# kept. A failure never blocks the removal.
+if [ "$1" -eq 0 ] && command -v btrdasd >/dev/null 2>&1 && [ -e /etc/das-backup/.manifest ]; then
+    btrdasd setup --uninstall --force --keep-config || {
+        echo "das-backup-manager: 'btrdasd setup --uninstall --force --keep-config' failed (exit 75 = a backup or scrub holds its lock)." >&2
+        echo "das-backup-manager: units and timers under /etc/systemd/system may remain; remove them by hand (see docs/INSTALL.md, Uninstall)." >&2
+    }
+fi
+exit 0
+
 %files
 %license LICENSE
 %{_bindir}/btrdasd

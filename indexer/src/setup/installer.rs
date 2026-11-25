@@ -906,11 +906,16 @@ fn install_to_prefix(
 /// Uninstall using system defaults. `_held`: the caller holds setup's locks
 /// ([`SetupLocks`]) — this removes the scripts, `btrbk.conf` and, if asked,
 /// the database a running backup uses.
-pub fn uninstall(remove_db: bool, _held: &SetupLocks) -> Result<(), Box<dyn std::error::Error>> {
-    uninstall_with(
+pub fn uninstall(
+    remove_db: bool,
+    keep_config: bool,
+    _held: &SetupLocks,
+) -> Result<(), Box<dyn std::error::Error>> {
+    uninstall_core(
         Path::new(CONFIG_FILE),
         Path::new(MANIFEST_FILE),
         remove_db,
+        keep_config,
         Path::new(SCHEDULE_UNIT_DIR),
         &|args| command_status(SYSTEMCTL, args),
     )
@@ -925,6 +930,27 @@ fn uninstall_with(
     config_path: &Path,
     manifest_path: &Path,
     remove_db: bool,
+    systemd_dir: &Path,
+    systemctl: UnitRunner,
+) -> Result<(), Box<dyn std::error::Error>> {
+    uninstall_core(
+        config_path,
+        manifest_path,
+        remove_db,
+        false,
+        systemd_dir,
+        systemctl,
+    )
+}
+
+/// `uninstall_with`, optionally leaving `config_path` where it is (`--keep-config`,
+/// what a package's removal hook asks for: removing a package is not purging the
+/// operator's configuration). Everything else the manifest lists goes as ever.
+fn uninstall_core(
+    config_path: &Path,
+    manifest_path: &Path,
+    remove_db: bool,
+    keep_config: bool,
     systemd_dir: &Path,
     systemctl: UnitRunner,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -972,8 +998,12 @@ fn uninstall_with(
         Err(e) => eprintln!("Warning: {e} — recovery-OS schedule units, if any, are LEFT BEHIND"),
     }
 
-    let (removed, problems) = uninstall_from_manifest(manifest_path);
+    let (removed, problems) =
+        uninstall_from_manifest_except(manifest_path, keep_config.then_some(config_path));
     println!("Removed {} files.", removed);
+    if keep_config {
+        println!("Kept {}.", config_path.display());
+    }
     for p in &problems {
         eprintln!("Warning: {p}");
     }
@@ -1139,7 +1169,16 @@ fn ensure_db_dir(db_path: &str) -> Result<(), String> {
 /// "Removed 0 files." and "Uninstall complete." and looked identical to one
 /// that had nothing left to do (bd DAS-Backup-Manager-8wx). Private, like
 /// [`install_to_prefix`]: the removal happens only under setup's locks.
+#[cfg(test)]
 fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
+    uninstall_from_manifest_except(manifest_path, None)
+}
+
+/// `uninstall_from_manifest`, skipping the entry equal to `keep`.
+fn uninstall_from_manifest_except(
+    manifest_path: &Path,
+    keep: Option<&Path>,
+) -> (usize, Vec<String>) {
     let mut problems: Vec<String> = Vec::new();
     let content = match std::fs::read_to_string(manifest_path) {
         Ok(c) => c,
@@ -1166,6 +1205,9 @@ fn uninstall_from_manifest(manifest_path: &Path) -> (usize, Vec<String>) {
         .map(|l| PathBuf::from(l.trim()))
         .chain(siblings)
     {
+        if keep.is_some_and(|k| k == path) {
+            continue;
+        }
         // Not `exists()`: that follows a link, and a unit's link whose file
         // went a line earlier would be passed over and left dangling.
         if std::fs::symlink_metadata(&path).is_err() {
@@ -2255,6 +2297,7 @@ fn under_root(root: &Path, absolute: &str) -> PathBuf {
 /// mounting when it is stopped.
 pub fn uninstall_all(
     remove_db: bool,
+    _keep_config: bool,
     _held: &SetupLocks,
 ) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_all_with(
@@ -3938,6 +3981,46 @@ auth = "starttls""#,
         );
         // Not asked for, so the index survives.
         assert!(db.exists());
+    }
+
+    #[test]
+    fn uninstall_keep_config_leaves_config_toml_and_removes_the_rest() {
+        // A package's removal is not a purge (bd DAS-Backup-Manager-hzxr): the
+        // manifest lists config.toml, and only --keep-config spares it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = valid_config(dir.path());
+        let (config_path, manifest_path) = install_config_into(&config, dir.path());
+        let installed = manifest_lines(&manifest_path);
+        assert!(installed.len() > 1);
+        let db = PathBuf::from(&config.general.db_path);
+        std::fs::write(&db, "index").unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        let systemctl = FakeSystemctl::new(&[]);
+
+        uninstall_core(
+            &config_path,
+            &manifest_path,
+            false,
+            true,
+            &units_dir(dir.path()),
+            &|args| systemctl.run(args),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(config_path.parent().unwrap().exists());
+        for entry in installed
+            .iter()
+            .filter(|e| Path::new(e.as_str()) != config_path)
+        {
+            assert!(
+                std::fs::symlink_metadata(entry).is_err(),
+                "{entry} was left behind"
+            );
+        }
+        assert!(!manifest_path.exists());
+        assert!(db.exists());
+        assert_eq!(systemctl.calls(), UNINSTALL_UNIT_CALLS);
     }
 
     #[test]
@@ -6891,6 +6974,7 @@ auth = "starttls""#,
             modify: false,
             upgrade: false,
             uninstall: false,
+            keep_config: false,
             uninstall_all: false,
             check: false,
             force: false,
@@ -6980,7 +7064,7 @@ auth = "starttls""#,
             install_to_prefix(config, base, &config_path, &manifest_path)
         };
         let uninstall =
-            |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+            |remove_db: bool, _: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
                 step(&format!("uninstall remove_db={remove_db}"));
                 uninstall_with(
                     &config_path,
@@ -6991,7 +7075,7 @@ auth = "starttls""#,
                 )
             };
         let uninstall_all =
-            |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+            |remove_db: bool, _: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
                 step(&format!("uninstall-all remove_db={remove_db}"));
                 uninstall_all_with(base, &config_path, &manifest_path, remove_db, &|a| {
                     systemctl.run(a)
