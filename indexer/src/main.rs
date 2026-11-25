@@ -548,7 +548,7 @@ enum BackupAction {
         /// The target's label
         #[arg(long)]
         label: String,
-        /// The caller persists nothing derived from what it reads (backup-verify.sh): a split-brain member may be read, read-only, instead of refused (bd DAS-Backup-Manager-su1b.23)
+        /// A read-only mount (`ro` added to [das].mount_opts) for a caller that persists nothing derived from what it reads (backup-verify.sh): the guard writes no record or witness, and a split-brain member may be read instead of refused (bd DAS-Backup-Manager-su1b.23, su1b.30)
         #[arg(long)]
         read_only: bool,
         /// Path to config.toml
@@ -2298,8 +2298,13 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     if health::is_mountpoint(mount_path) {
         return cannot_run(format!("{} is already a mount point", target.mount));
     }
+    // --read-only is a read-only mount, whatever [das].mount_opts says: the
+    // caller (backup-verify.sh) is a diagnostic, and the guard writes nothing
+    // (no record, no witness) under `ro` (bd DAS-Backup-Manager-su1b.30).
+    let mut mount_cfg = cfg.clone();
+    mount_cfg.das.mount_opts = mount_target_opts(&cfg.das.mount_opts, read_only);
     let result = mount::mount_guarded_target(
-        &cfg,
+        &mount_cfg,
         target,
         buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
         &CliProgress,
@@ -2308,6 +2313,22 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
     println!("{line}");
     code
+}
+
+/// The mount options `btrdasd backup mount-target` passes the guard: the
+/// configured ones, or for `--read-only` those without `rw`/`ro` and then `ro`
+/// (bd DAS-Backup-Manager-su1b.30).
+fn mount_target_opts(opts: &str, read_only: bool) -> String {
+    if !read_only {
+        return opts.to_string();
+    }
+    let mut kept: Vec<&str> = opts
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && *o != "rw" && *o != "ro")
+        .collect();
+    kept.push("ro");
+    kept.join(",")
 }
 
 /// `btrdasd backup raid-check`: the end-of-job check of one RAID-1 target
@@ -4157,6 +4178,24 @@ mod tests {
     /// (`DAS_SCRUB_STATE` / `DAS_BTRFS_STATUS_DIR`) — `cargo test` runs test
     /// functions in parallel by default within one binary.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn mount_target_read_only_mounts_ro() {
+        // bd DAS-Backup-Manager-su1b.30: --read-only (backup-verify.sh) is a
+        // read-only mount, healthy pair or degraded, so a diagnostic never
+        // writes the target or records a degraded period.
+        assert_eq!(
+            mount_target_opts("nodev,nosuid,rw,noatime", true),
+            "nodev,nosuid,noatime,ro"
+        );
+        assert_eq!(mount_target_opts("", true), "ro");
+        assert_eq!(mount_target_opts("ro,noatime", true), "noatime,ro");
+        assert!(buttered_dasd::raid_guard::is_read_only(&mount_target_opts(
+            "rw", true
+        )));
+        // The write intent keeps the configured options.
+        assert_eq!(mount_target_opts("nodev,rw", false), "nodev,rw");
+    }
 
     /// `mount-target` mounts with the write intent `backup-run.sh` needs unless
     /// `--read-only` says the caller (`backup-verify.sh`) persists nothing from

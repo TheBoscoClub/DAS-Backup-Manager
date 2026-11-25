@@ -81,7 +81,7 @@ Edit `config.toml`/`btrbk.conf` between runs: sync rewrites `btrbk.conf` before 
 
 **[scoped]** `backup-raid.md` — the guard's member wait, degraded and split-brain rules, Intent per job, records, `raid accept`'s steps, the end check, REJOINED; **read it before a hand mount, `raid accept` or any record change on a RAID-1 target**.
 
-- A RAID-1 target (`mount_uuid` and more than one serial, `raid_guard::is_guarded`) → mounted only by `raid_guard::mount_guarded`: the Rust jobs through `mount.rs`, the scripts through `btrdasd backup mount-target` (fd 8 handed down; `backup-verify.sh` adds `--read-only`, bd `su1b.23`); never `mount -o` with `[das].mount_opts`' `degraded` (bd `su1b.10`).
+- A RAID-1 target (`mount_uuid` and more than one serial, `raid_guard::is_guarded`) → mounted only by `raid_guard::mount_guarded`: the Rust jobs through `mount.rs`, the scripts through `btrdasd backup mount-target` (fd 8 handed down; `backup-verify.sh` adds `--read-only`, which mounts `ro`, bd `su1b.23`, `su1b.30`); never `mount -o` with `[das].mount_opts`' `degraded` (bd `su1b.10`).
 - Members → found by filesystem UUID (`blkid -c /dev/null -t UUID=`), each `btrfs device scan <its path>`; never an unscoped scan, never `--forget`, in code, tests or proofs.
 - `btrdasd raid accept <label>` (root; the GUI through the helper's `RaidAccept`, polkit `org.dasbackup.raid.accept`, `auth_admin`) → only while the guard refuses the target for split brain now (bd `su1b.11`).
 - `raid accept` → backup singleton then maintenance lock, both without waiting (exit 75); no member wait; nothing written unless the target label is typed exactly at a terminal; no `--yes`, ever.

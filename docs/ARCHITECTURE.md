@@ -216,7 +216,9 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
 refused, 2 could not run) and `backup-verify.sh` through the same subcommand
-with `--read-only` (`Job::VerifyMount`, bd su1b.23). Single-device targets are
+with `--read-only` (`Job::VerifyMount`, bd su1b.23), which also adds `ro` to
+`[das].mount_opts`, so the guard writes no record or witness and the look
+writes nothing (bd su1b.30). Single-device targets are
 mounted as before. Every
 caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
 `ReadOnly` only for a job that persists nothing derived from the target's
