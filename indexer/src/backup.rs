@@ -3787,9 +3787,18 @@ pub fn deliver_report(
 /// in production. Returns what is still mounted afterwards.
 pub trait Release {
     fn release(&mut self, progress: &dyn ProgressCallback) -> Vec<String>;
+    /// What clearing other programs' processes did to mount these targets,
+    /// for the report (bd DAS-Backup-Manager-su1b.31).
+    fn clear_notes(&self) -> Vec<mount::ClearNote> {
+        Vec::new()
+    }
 }
 
 impl Release for mount::MountGuard {
+    fn clear_notes(&self) -> Vec<mount::ClearNote> {
+        mount::MountGuard::clear_notes(self).to_vec()
+    }
+
     fn release(&mut self, progress: &dyn ProgressCallback) -> Vec<String> {
         self.unmount(progress)
     }
@@ -4309,6 +4318,14 @@ pub fn run_backup_job(
         .unwrap_or_default();
         host.capture_report(&config, &filters)
     });
+    // What clearing other programs' processes did to mount the targets: a
+    // stop is a WARN row naming each, a target skipped a FAIL row (the
+    // script's CLEAR_NOTES, bd su1b.31).
+    let clear_notes = targets.clear_notes();
+    let captured = captured.map(|mut data| {
+        data.clear_rows = clear_notes.iter().map(mount::ClearNote::row).collect();
+        data
+    });
     let mut still_mounted = targets.release(progress);
     still_mounted.extend(sources.release(progress));
     let mut result = match ran {
@@ -4327,6 +4344,12 @@ pub fn run_backup_job(
     if let Some(e) = mount::still_mounted_error(&still_mounted) {
         progress.on_log(LogLevel::Error, &e);
         result.errors.push(e);
+        result.success = false;
+    }
+    for note in clear_notes.iter().filter(|n| n.is_fail()) {
+        let msg = format!("target {}: {}", note.label, note.detail);
+        progress.on_log(LogLevel::Error, &msg);
+        result.errors.push(msg);
         result.success = false;
     }
     if let Some(captured) = &captured {
@@ -10879,6 +10902,9 @@ Legend:
         snapshot_step: Result<Option<usize>, String>,
         send_step: Result<(usize, u64), String>,
         static_step: Result<(), String>,
+        /// What clearing other programs' processes did to mount the targets
+        /// (bd su1b.31).
+        clear_notes: Vec<mount::ClearNote>,
     }
 
     /// A clean coverage check, as a recorded backup run with nothing dropped
@@ -10943,6 +10969,7 @@ Legend:
                 snapshot_step: Ok(Some(3)),
                 send_step: Ok((2, 10)),
                 static_step: Ok(()),
+                clear_notes: Vec::new(),
             }
         }
     }
@@ -10969,9 +10996,13 @@ Legend:
         name: &'static str,
         left: Vec<String>,
         steps: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        notes: Vec<mount::ClearNote>,
     }
 
     impl Release for FakeMounts {
+        fn clear_notes(&self) -> Vec<mount::ClearNote> {
+            self.notes.clone()
+        }
         fn release(&mut self, _: &dyn ProgressCallback) -> Vec<String> {
             self.steps
                 .lock()
@@ -11022,6 +11053,7 @@ Legend:
                 name: "sources",
                 left: self.sources_left.clone(),
                 steps: self.steps.clone(),
+                notes: Vec::new(),
             })
         }
         fn sync(
@@ -11072,6 +11104,7 @@ Legend:
                     name: "targets",
                     left,
                     steps: self.steps.clone(),
+                    notes: self.clear_notes.clone(),
                 }) as Box<dyn Release>
             })
         }
@@ -11116,6 +11149,7 @@ Legend:
             self.step("capture report");
             crate::report::ReportData {
                 raid_rows: Vec::new(),
+                clear_rows: Vec::new(),
                 capacity_and_smart: "\nDISK CAPACITY\n  primary-loop  1 GiB\n".into(),
                 latest_snapshots: "\nLATEST SNAPSHOTS\n  root-.20261002\n".into(),
             }
@@ -11808,6 +11842,66 @@ Legend:
             host.steps()
                 .contains(&"run (after-sync, sync failed=Some(true))".to_string())
         );
+        assert!(!host.recorded.lock().unwrap()[0].success);
+    }
+
+    fn stopped_note(label: &str) -> mount::ClearNote {
+        mount::ClearNote {
+            label: label.into(),
+            outcome: mount::ClearOutcome::Stopped,
+            detail: "stopped what held it: SIGTERM to pid 300 (dolphin; user bosco, unit \
+                     app-dolphin.scope)"
+                .into(),
+        }
+    }
+
+    /// The processes a clearing stopped reach the report, as the script's
+    /// `CLEAR_NOTES` row does: the target's row is WARN naming each, and the
+    /// run reads COMPLETED WITH WARNINGS, never ALL OPERATIONS SUCCESSFUL
+    /// (bd su1b.31).
+    #[test]
+    fn processes_a_clearing_stopped_are_named_in_the_report_as_a_warn_row() {
+        let host = FakeHost {
+            clear_notes: vec![stopped_note("primary-22tb")],
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(outcome.success(), "a stop is a warning, not a failure");
+        let texts = host.report_texts.lock().unwrap();
+        let text = &texts[0];
+        assert!(
+            text.contains(
+                "  Target primary-22tb   WARN  (before the mount: stopped what held it: \
+                 SIGTERM to pid 300 (dolphin; user bosco, unit app-dolphin.scope))"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("COMPLETED WITH WARNINGS"), "{text}");
+    }
+
+    /// A target skipped because a writer holds it is a FAIL row naming the
+    /// writer, and fails the run (the script's FAIL row, exit 3).
+    #[test]
+    fn a_target_skipped_for_a_writer_is_a_fail_row_naming_it_and_fails_the_run() {
+        let host = FakeHost {
+            clear_notes: vec![mount::ClearNote {
+                label: "primary-22tb".into(),
+                outcome: mount::ClearOutcome::Refused,
+                detail: "it is held open for writing by pid 301 (rsync: fd 4 /run/media/u/das/big \
+                         (write))"
+                    .into(),
+            }],
+            ..Default::default()
+        };
+        let (outcome, _) = job(&host, false);
+        assert!(!outcome.success());
+        let texts = host.report_texts.lock().unwrap();
+        let text = &texts[0];
+        assert!(
+            text.contains("  Target primary-22tb   FAIL  (not used this run: it is held open for writing by pid 301 (rsync"),
+            "{text}"
+        );
+        assert!(text.contains("FAILURES DETECTED"), "{text}");
         assert!(!host.recorded.lock().unwrap()[0].success);
     }
 
@@ -12835,6 +12929,7 @@ Legend:
 
         let data = crate::report::ReportData {
             raid_rows: Vec::new(),
+            clear_rows: Vec::new(),
             capacity_and_smart: "\nDISK CAPACITY\n  t  CAPTURED\n".into(),
             latest_snapshots: "\nLATEST SNAPSHOTS\n  CAPTURED-SNAP\n".into(),
         };
@@ -12954,6 +13049,7 @@ Legend:
             };
             let data = crate::report::ReportData {
                 raid_rows: Vec::new(),
+                clear_rows: Vec::new(),
                 capacity_and_smart: String::new(),
                 latest_snapshots: String::new(),
             };
@@ -13010,6 +13106,7 @@ Legend:
         };
         let data = crate::report::ReportData {
             raid_rows: Vec::new(),
+            clear_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13052,6 +13149,7 @@ Legend:
         };
         let data = crate::report::ReportData {
             raid_rows: Vec::new(),
+            clear_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13770,6 +13868,7 @@ Legend:
         ));
         let data = crate::report::ReportData {
             raid_rows: Vec::new(),
+            clear_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -13805,6 +13904,7 @@ Legend:
         ));
         let data = crate::report::ReportData {
             raid_rows: Vec::new(),
+            clear_rows: Vec::new(),
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
         };
@@ -14135,6 +14235,7 @@ Legend:
                 name: "drives",
                 left: self.left_mounted.clone(),
                 steps: self.steps.clone(),
+                notes: Vec::new(),
             }))
         }
         fn is_mounted(&self, mount: &Path) -> bool {

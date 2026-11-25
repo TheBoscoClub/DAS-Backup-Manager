@@ -53,12 +53,24 @@ pub enum MountError {
     /// a split brain, an unreadable record, or the kernel missing a member
     /// while every drive is attached. Never a target merely skipped.
     RaidRefused { label: String, detail: String },
+    /// Every target was skipped because its clearing refused (a writer, a
+    /// maintenance operation…): the notes say each and why (bd su1b.31).
+    AllTargetsRefused { notes: Vec<ClearNote> },
 }
 
 impl fmt::Display for MountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDrivesFound => write!(f, "No DAS drives found — is the enclosure powered on?"),
+            Self::AllTargetsRefused { notes } => write!(
+                f,
+                "No target could be used: {}",
+                notes
+                    .iter()
+                    .map(|n| format!("'{}': {}", n.label, n.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             Self::DriveNotFound { label, serial } => {
                 write!(
                     f,
@@ -189,6 +201,48 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
 /// The words that name the processes a clearing stopped, in the job's log
 /// and in `CLEAR TARGET: OK` (which `backup-run.sh` reads, bd su1b.12).
 pub const STOPPED: &str = "stopped what held it";
+
+/// What a target's clearing did to another program's processes, kept for the
+/// job's report (bd DAS-Backup-Manager-su1b.31; `backup-run.sh`'s
+/// `CLEAR_NOTES`): the log alone is not the operator's stop policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearOutcome {
+    /// Processes were stopped (and the mount taken down): the row is WARN.
+    Stopped,
+    /// A dry run: what it would have stopped, nothing was: WARN.
+    WouldStop,
+    /// The target was skipped (a writer, a protected process, maintenance,
+    /// a mount that would not come down): the row is FAIL.
+    Refused,
+}
+
+/// One target's clearing, as a report row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearNote {
+    pub label: String,
+    pub outcome: ClearOutcome,
+    pub detail: String,
+}
+
+impl ClearNote {
+    /// Whether this note fails the run (a target skipped).
+    pub fn is_fail(&self) -> bool {
+        self.outcome == ClearOutcome::Refused
+    }
+
+    /// The `BACKUP OPERATIONS` row, as `backup-run.sh` writes the target's.
+    pub fn row(&self) -> String {
+        let (status, text) = match self.outcome {
+            ClearOutcome::Stopped => ("WARN", format!("before the mount: {}", self.detail)),
+            ClearOutcome::WouldStop => ("WARN", format!("dry run: {}", self.detail)),
+            ClearOutcome::Refused => ("FAIL", format!("not used this run: {}", self.detail)),
+        };
+        format!(
+            "  {:<21} {status}  ({text})",
+            format!("Target {}", self.label)
+        )
+    }
+}
 
 /// What clearing a target's other mounts and their holders reads and does
 /// (bd DAS-Backup-Manager-su1b.12): the mount table, the process table, the
@@ -744,6 +798,9 @@ pub struct MountGuard {
     /// `findmnt` shows that partition mounted at that directory (bd
     /// DAS-Backup-Manager-s5jv.2; `backup-run.sh`'s `unmount_all`, s5jv.1).
     esps: Vec<(String, String)>,
+    /// What clearing other programs' processes did, per target, for the
+    /// report (bd DAS-Backup-Manager-su1b.31).
+    clear_notes: Vec<ClearNote>,
 }
 
 /// How many times an unmount is tried before the mount point is reported as
@@ -831,16 +888,17 @@ fn take_down_leftover_with(
     mount_point: &str,
     progress: &dyn ProgressCallback,
     clear: Option<(&ClearSite<'_>, &str, Option<&str>)>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let mut why = match umount_retrying(runner, mount_point, |msg| {
         progress.on_log(crate::progress::LogLevel::Warning, msg);
     }) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(Vec::new()),
         Err(why) => why,
     };
     // What holds it busy (bd DAS-Backup-Manager-su1b.12): the operator's
     // stop policy, then the plain unmount again — only when something was
     // stopped; a writer refuses here, never forced.
+    let mut stopped: Vec<String> = Vec::new();
     if let Some((site, who, fsid)) = clear {
         progress.on_log(
             crate::progress::LogLevel::Warning,
@@ -867,10 +925,11 @@ fn take_down_leftover_with(
                                 sent.join(", ")
                             ),
                         );
+                        stopped = sent.clone();
                         match umount_retrying(runner, mount_point, |msg| {
                             progress.on_log(crate::progress::LogLevel::Warning, msg);
                         }) {
-                            Ok(()) => return Ok(()),
+                            Ok(()) => return Ok(sent),
                             Err(w) => why = w,
                         }
                     }
@@ -890,7 +949,7 @@ fn take_down_leftover_with(
         &format!("{mount_point}: {why} after {UMOUNT_ATTEMPTS} attempts — retrying with umount -f"),
     );
     let forced = match runner.status(Command::new("umount").arg("-f").arg(mount_point)) {
-        Ok(s) if s.success() => return Ok(()),
+        Ok(s) if s.success() => return Ok(stopped),
         Ok(s) => exit_why("umount -f", s),
         Err(e) => format!("umount -f failed to run: {e}"),
     };
@@ -1031,6 +1090,7 @@ pub fn take_down_leftover(
         progress,
         Some((&host_clear_site(false), mount_point, None)),
     )
+    .map(drop)
 }
 
 /// Where the mount at `mount_point` came from: udisks, a systemd unit with a
@@ -1114,8 +1174,8 @@ fn maintenance_on(
 
 /// The stop policy over every process using `mounts`
 /// ([`crate::holders::clear_holders`]), each holder and each signal said as a
-/// warning. `Ok` the signals sent (`SIGTERM to pid 300 (dolphin)`, for the
-/// report); `Err` why it refused.
+/// warning. `Ok` the signals sent (`SIGTERM to pid 300 (dolphin; user bosco,
+/// unit app-dolphin.scope)`, for the report); `Err` why it refused.
 fn clear_logged(
     site: &ClearSite<'_>,
     runner: &dyn CommandRunner,
@@ -1145,7 +1205,10 @@ fn clear_logged(
             Ok(done
                 .signalled
                 .iter()
-                .map(|(pid, sig, cmd)| format!("{} to pid {pid} ({cmd})", sig.name()))
+                .map(|(pid, sig, cmd)| {
+                    let who = done.who.get(pid).map_or("", String::as_str);
+                    format!("{} to pid {pid} ({cmd}; {who})", sig.name())
+                })
                 .collect())
         }
         Err(r) => {
@@ -1362,7 +1425,13 @@ impl MountGuard {
             runner,
             held_kind: "targets",
             esps: Vec::new(),
+            clear_notes: Vec::new(),
         }
+    }
+
+    /// What clearing did to other programs' processes, per target.
+    pub fn clear_notes(&self) -> &[ClearNote] {
+        &self.clear_notes
     }
 
     /// Note `target`'s ESP for release, when it is a mirror with an
@@ -1766,6 +1835,8 @@ fn ensure_targets_mounted_with(
     } = raid;
     let mut guard = MountGuard::new(runner);
     let mut any_available = false;
+    // The targets skipped because their clearing refused (bd su1b.31).
+    let mut refused: Vec<ClearNote> = Vec::new();
     let total = config.targets.len() as u64;
 
     if total == 0 {
@@ -1815,7 +1886,7 @@ fn ensure_targets_mounted_with(
                 detail,
             };
             mounted_is_target(&*guard.runner, target).map_err(foreign)?;
-            take_down_leftover_with(
+            let stopped = take_down_leftover_with(
                 &*guard.runner,
                 &target.mount,
                 progress,
@@ -1826,6 +1897,13 @@ fn ensure_targets_mounted_with(
                 mount: target.mount.clone(),
                 detail,
             })?;
+            if !stopped.is_empty() {
+                guard.clear_notes.push(ClearNote {
+                    label: target.label.clone(),
+                    outcome: ClearOutcome::Stopped,
+                    detail: format!("{STOPPED}: {}", stopped.join(", ")),
+                });
+            }
             progress.on_log(
                 crate::progress::LogLevel::Warning,
                 &format!(
@@ -1893,6 +1971,30 @@ fn ensure_targets_mounted_with(
                         other => Ok(other),
                     })
             };
+            // What it did to other programs' processes, for the report (bd
+            // su1b.31): stopped, would stop (a dry run), or skipped.
+            match &cleared {
+                Ok(Some(sent)) if !sent.is_empty() => guard.clear_notes.push(ClearNote {
+                    label: target.label.clone(),
+                    outcome: ClearOutcome::Stopped,
+                    detail: format!("{STOPPED}: {}", sent.join(", ")),
+                }),
+                Err(why) => {
+                    let outcome = if clear.report_only {
+                        ClearOutcome::WouldStop
+                    } else {
+                        ClearOutcome::Refused
+                    };
+                    let note = ClearNote {
+                        label: target.label.clone(),
+                        outcome,
+                        detail: why.clone(),
+                    };
+                    refused.push(note.clone());
+                    guard.clear_notes.push(note);
+                }
+                _ => {}
+            }
             if let Err(why) = cleared {
                 progress.on_log(
                     crate::progress::LogLevel::Warning,
@@ -2214,6 +2316,9 @@ fn ensure_targets_mounted_with(
     if !any_available {
         // Drop the guard (it will try to unmount anything we managed to mount,
         // but if !any_available the guard is empty)
+        if !refused.is_empty() {
+            return Err(MountError::AllTargetsRefused { notes: refused });
+        }
         return Err(MountError::NoDrivesFound);
     }
 
@@ -4087,6 +4192,125 @@ mod tests {
         );
     }
 
+    /// What the clearing stopped is kept for the job's report, naming each
+    /// process (pid, user, unit, command, signal), not only said in the log
+    /// (bd su1b.31).
+    #[test]
+    fn the_processes_a_clearing_stopped_are_kept_for_the_report() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        let notes = guard.clear_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].label, config.targets[0].label);
+        assert_eq!(notes[0].outcome, ClearOutcome::Stopped);
+        assert!(
+            notes[0].detail.contains(
+                "stopped what held it: SIGTERM to pid 300 (dolphin; user user, unit \
+                 session-2.scope)"
+            ),
+            "{notes:?}"
+        );
+        assert!(!notes[0].is_fail());
+    }
+
+    /// A target skipped because of a writer is a FAIL note naming the
+    /// writer, carried out through the error when nothing else mounted.
+    #[test]
+    fn a_target_skipped_for_a_writer_is_kept_for_the_report_naming_it() {
+        let scratch = Scratch::new();
+        let writer = crate::holders::testproc::Proc {
+            pid: 301,
+            cmd: "rsync",
+            fds: vec![(4, "/run/media/u/das/big", "0100001", Some(77))],
+            ..Default::default()
+        };
+        let (config, host, runner, _mnt) = raid1_mounted_by_udisks(&scratch, writer);
+
+        let result = host.mount_targets(&config, &Recorder::default(), &runner);
+
+        let Err(MountError::AllTargetsRefused { notes }) = result else {
+            panic!("{:?}", result.err());
+        };
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].outcome, ClearOutcome::Refused);
+        assert!(notes[0].is_fail());
+        assert!(
+            notes[0].detail.contains("pid 301") && notes[0].detail.contains("writing"),
+            "{notes:?}"
+        );
+    }
+
+    /// A dry run keeps what it would have stopped, as a note that is not a
+    /// failure.
+    #[test]
+    fn a_dry_run_keeps_what_it_would_stop_as_a_note_that_does_not_fail() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.report_only = true;
+
+        let result = host.mount_targets(&config, &Recorder::default(), &runner);
+
+        let Err(MountError::AllTargetsRefused { notes }) = result else {
+            panic!("{:?}", result.err());
+        };
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].outcome, ClearOutcome::WouldStop);
+        assert!(!notes[0].is_fail());
+        assert!(notes[0].detail.contains("would stop: pid 300"), "{notes:?}");
+    }
+
+    /// A process stopped to take down a busy leftover is kept too.
+    #[test]
+    fn the_processes_stopped_for_a_busy_leftover_are_kept_for_the_report() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        scratch.mkdir("mnt/p/sub");
+        let real_id = crate::holders::testproc::FakeProc::real_mount_id(Path::new(&mnt));
+        host.mountinfo = vec![format!(
+            "{real_id} 22 0:52 / {mnt} rw - btrfs /dev/sdb1 rw,subvolid=5"
+        )];
+        let proc = crate::holders::testproc::FakeProc::new();
+        proc.add(crate::holders::testproc::Proc {
+            pid: 310,
+            cmd: "bash",
+            cwd: Box::leak(format!("{mnt}/sub").into_boxed_str()),
+            ..Default::default()
+        });
+        host.proc = Some(Arc::new(proc));
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "UUID",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "u-p\n",
+                    stderr: "",
+                },
+            ),
+            ("umount", Reply::Seq(&[32, 32, 32, 32, 32, 0])),
+        ]);
+
+        let guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .unwrap();
+
+        let notes = guard.clear_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].outcome, ClearOutcome::Stopped);
+        assert!(
+            notes[0].detail.contains("SIGTERM to pid 310 (bash;"),
+            "{notes:?}"
+        );
+    }
+
     /// A process writing to it is never signalled: nothing of the other
     /// program's is touched, the target is NOT available, the writer named.
     #[test]
@@ -4104,7 +4328,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4143,7 +4367,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4181,7 +4405,7 @@ mod tests {
         );
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4211,7 +4435,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4250,7 +4474,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4289,7 +4513,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );
@@ -4313,7 +4537,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(
-            matches!(result, Err(MountError::NoDrivesFound)),
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
             "{:?}",
             result.err()
         );

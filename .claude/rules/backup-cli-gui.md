@@ -27,6 +27,7 @@ Detail per section: `.claude/docs/rules-reference/backup.md` (same headings, NOT
   `run_backup` only refuses an unmounted selected source.
 - The job, and `backup send`, mount only the selected targets (none named → all; `selected_targets_only` / `targets_named_only`, bd `u8kk`, `s5jv.10`).
 - Never re-render `btrbk.conf` per run to narrow the targets (it shifts other targets' retention).
+- A target whose clearing stopped another program's processes (`MountGuard::clear_notes`) is a WARN row in the run's report, one skipped for a writer a FAIL row that fails the run; `forget`/`purge --dry-run` mount report-only (`ensure_targets_mounted_dry_run`; bd `su1b.31`).
 
 ## The CLI/GUI Run Records Truthfully, And Exits By The Doctor's Rule (bd `no4`, `vzsu`)
 

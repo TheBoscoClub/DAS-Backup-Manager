@@ -110,6 +110,10 @@ pub struct ReportData {
     /// shows a degraded period, a scrub owed or an unreadable record, read
     /// after this run's mount wrote it (bd DAS-Backup-Manager-su1b.10).
     pub raid_rows: Vec<String>,
+    /// One row per target whose clearing stopped another program's
+    /// processes (WARN) or skipped it (FAIL), naming each (bd su1b.31;
+    /// `backup-run.sh`'s `CLEAR_NOTES`).
+    pub clear_rows: Vec<String>,
 }
 
 /// The `BACKUP OPERATIONS` rows for the RAID-1 records under `record_dir`:
@@ -142,6 +146,7 @@ pub fn capture_report_data(config: &Config, filters: &[String]) -> ReportData {
         capacity_and_smart: render_capacity_and_smart(health.as_ref()),
         latest_snapshots: render_latest_snapshots(latest.as_deref().map_err(String::as_str)),
         raid_rows: raid_rows(config, &crate::raid_guard::record_dir()),
+        clear_rows: Vec::new(),
     }
 }
 
@@ -322,6 +327,7 @@ pub fn format_report_from(
         || result.usb_link.has_warnings()
         || sync.is_some_and(|s| crate::coverage::has_warnings_or_missing(s.coverage.as_ref()))
         || !data.raid_rows.is_empty()
+        || !data.clear_rows.is_empty()
     {
         "COMPLETED WITH WARNINGS"
     } else {
@@ -382,7 +388,7 @@ pub fn format_report_from(
         result.recovery_os.row()
     ));
     r.push_str(&format!("  Content indexer       {index_status}\n"));
-    for row in &data.raid_rows {
+    for row in data.raid_rows.iter().chain(&data.clear_rows) {
         r.push_str(row);
         r.push('\n');
     }
@@ -1132,6 +1138,7 @@ mod tests {
             capacity_and_smart: String::new(),
             latest_snapshots: String::new(),
             raid_rows: rows.clone(),
+            clear_rows: Vec::new(),
         };
         let text = format_report_from(&result, None, &data);
         assert!(text.contains("Status: COMPLETED WITH WARNINGS"), "{text}");
