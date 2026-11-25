@@ -41,8 +41,9 @@ jobs:
     # built by the same toolchain rather than two that drift independently.
     # /tmp is a noatime tmpfs, as every DAS target is mounted: the recovery-OS
     # tests read a link there, and fail under CI where none can be found.
+    # digests are refreshed by hand (Dependabot does not update workflow container images); bd DAS-Backup-Manager-w3pb
     container:
-      image: archlinux:latest
+      image: archlinux:latest@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
       options: --tmpfs /tmp:rw,exec,nosuid,nodev,noatime,mode=1777,size=4g
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -167,7 +168,7 @@ jobs:
   build:
     name: Build — Rust library, CLI, and Qt6 GUI
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: archlinux:latest@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -252,7 +253,7 @@ jobs:
   shell:
     name: Shell — shellcheck
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: archlinux:latest@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -275,7 +276,7 @@ jobs:
   deny:
     name: Dependencies — cargo-deny (advisories, bans, licenses, sources)
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: archlinux:latest@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
