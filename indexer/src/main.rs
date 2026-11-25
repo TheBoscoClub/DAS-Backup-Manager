@@ -2254,10 +2254,43 @@ fn hold_for_cli(
 /// point that exists and is not mounted (the script's own leftover check ran
 /// first). The mount is left for the script, which unmounts it.
 fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
-    let cannot_run = |why: String| {
-        println!("RAID GUARD: CANNOT-RUN  ({why})");
-        2
-    };
+    let lock = CliLock::production();
+    let (line, code) = mount_target_outcome(
+        label,
+        config,
+        read_only,
+        &lock,
+        &|cfg, target, intent, held| {
+            mount::mount_guarded_target(cfg, target, intent, &CliProgress, held)
+        },
+    );
+    println!("{line}");
+    code
+}
+
+/// The guarded mount `mount-target` asks for: the configuration to mount
+/// with, the target, the intent and the proof of the maintenance lock.
+type GuardedMounter<'a> = dyn Fn(
+        &Config,
+        &buttered_dasd::config::Target,
+        buttered_dasd::raid_guard::Intent,
+        &maintenance::MaintenanceHeld,
+    ) -> Result<buttered_dasd::raid_guard::Outcome, buttered_dasd::raid_guard::Failure>
+    + 'a;
+
+/// What `mount-target` prints and exits with, the mount itself handed in as
+/// `mounter`: exit 2 and a `CANNOT-RUN` line when it could not start (a
+/// configuration, label, lock or mount point that is wrong), else the guard's
+/// own line and exit code (`raid_guard::cli_line`).
+fn mount_target_outcome(
+    label: &str,
+    config: &Path,
+    read_only: bool,
+    lock: &CliLock,
+    mounter: &GuardedMounter<'_>,
+) -> (String, i32) {
+    let cannot_run =
+        |why: String| (format!("RAID GUARD: CANNOT-RUN  ({why})"), 2);
     let cfg = match Config::load(config) {
         Ok(c) => c,
         Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
@@ -2270,7 +2303,6 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
             "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
         ));
     }
-    let lock = CliLock::production();
     let Some(raw) = &lock.delegated else {
         return cannot_run(format!(
             "only under a maintenance lock handed down by {}",
@@ -2303,16 +2335,13 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     // (no record, no witness) under `ro` (bd DAS-Backup-Manager-su1b.30).
     let mut mount_cfg = cfg.clone();
     mount_cfg.das.mount_opts = mount_target_opts(&cfg.das.mount_opts, read_only);
-    let result = mount::mount_guarded_target(
+    let result = mounter(
         &mount_cfg,
         target,
         buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
-        &CliProgress,
         &held,
     );
-    let (line, code) = buttered_dasd::raid_guard::cli_line(&result);
-    println!("{line}");
-    code
+    buttered_dasd::raid_guard::cli_line(&result)
 }
 
 /// The mount options `btrdasd backup mount-target` passes the guard: the
@@ -4224,6 +4253,182 @@ mod tests {
         assert_eq!(Job::for_mount_target(true).intent(), Intent::ReadOnly);
     }
 
+    /// A configuration file with one RAID-1 target (a filesystem UUID and two
+    /// serials) mounted at `mount`, in `dir`.
+    fn mount_target_config(dir: &Path, mount: &str) -> PathBuf {
+        let mut config = Config::default();
+        let mut target = test_target("pair", "5eed0016-0000-4000-8000-000000000016", mount);
+        target.serials = vec!["SERIAL11".into(), "SERIAL12".into()];
+        config.targets = vec![target];
+        config.das.mount_opts = "nodev,rw,noatime".into();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, config.to_toml().unwrap()).unwrap();
+        path
+    }
+
+    /// The hold `backup-run.sh` hands down: a lock file this process holds
+    /// open, named by descriptor number.
+    fn handed_down_lock(dir: &Path) -> (std::fs::File, CliLock) {
+        use std::os::fd::AsRawFd;
+        let path = dir.join("maintenance.lock");
+        let file = std::fs::File::create(&path).unwrap();
+        file.lock().unwrap();
+        let lock = CliLock {
+            site: maintenance::LockSite {
+                path,
+                poll: std::time::Duration::from_millis(1),
+            },
+            delegated: Some(file.as_raw_fd().to_string().into()),
+        };
+        (file, lock)
+    }
+
+    fn refuse_to_mount(
+        _: &Config,
+        _: &buttered_dasd::config::Target,
+        _: buttered_dasd::raid_guard::Intent,
+        _: &maintenance::MaintenanceHeld,
+    ) -> Result<buttered_dasd::raid_guard::Outcome, buttered_dasd::raid_guard::Failure> {
+        panic!("the mount ran although the command could not start");
+    }
+
+    /// bd DAS-Backup-Manager-su1b.16, 3gzs.11: `mount-target`'s exit status is
+    /// what `backup-run.sh` and `backup-verify.sh` act on. Everything that stops
+    /// it before the mount is exit 2 with a `CANNOT-RUN` line, and the mount is
+    /// never asked for.
+    #[test]
+    fn mount_target_cannot_run_is_exit_2_with_its_reason_and_mounts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mount_target_config(dir.path(), &dir.path().to_string_lossy());
+        let (_held, lock) = handed_down_lock(dir.path());
+        let none = CliLock {
+            site: lock.site.clone(),
+            delegated: None,
+        };
+        let garbage = CliLock {
+            site: lock.site.clone(),
+            delegated: Some("not-a-number".into()),
+        };
+        let not_the_lock = CliLock {
+            site: lock.site.clone(),
+            delegated: Some("999999".into()),
+        };
+        let run = |label: &str, config: &Path, lock: &CliLock| {
+            mount_target_outcome(label, config, false, lock, &refuse_to_mount)
+        };
+
+        let (line, code) = run("pair", &dir.path().join("absent.toml"), &lock);
+        assert_eq!(code, 2);
+        assert!(
+            line.starts_with("RAID GUARD: CANNOT-RUN  (cannot read ")
+                && line.contains("absent.toml"),
+            "{line}"
+        );
+        assert_eq!(
+            run("nobody", &cfg, &lock),
+            (
+                "RAID GUARD: CANNOT-RUN  (no [[target]] labelled 'nobody')".to_string(),
+                2
+            )
+        );
+        let (line, code) = run("pair", &cfg, &none);
+        assert_eq!(code, 2);
+        assert!(
+            line.contains("only under a maintenance lock handed down by DAS_MAINTENANCE_LOCK_FD"),
+            "{line}"
+        );
+        let (line, code) = run("pair", &cfg, &garbage);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not a descriptor number"), "{line}");
+        let (line, code) = run("pair", &cfg, &not_the_lock);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not an open descriptor"), "{line}");
+
+        // Not a guarded target: one serial.
+        let mut one = Config::load(&cfg).unwrap();
+        one.targets[0].serials = vec!["SERIAL11".into()];
+        let one_path = dir.path().join("one.toml");
+        std::fs::write(&one_path, one.to_toml().unwrap()).unwrap();
+        let (line, code) = run("pair", &one_path, &lock);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not a RAID-1 target"), "{line}");
+
+        // A mount point that is not a directory, and one already mounted.
+        let gone = mount_target_config(dir.path(), "/nonexistent/das-mount-target-test");
+        let (line, code) = run("pair", &gone, &lock);
+        assert_eq!(code, 2);
+        assert!(
+            line.ends_with("/nonexistent/das-mount-target-test is not a directory)"),
+            "{line}"
+        );
+        let mounted = mount_target_config(dir.path(), "/proc");
+        let (line, code) = run("pair", &mounted, &lock);
+        assert_eq!(code, 2);
+        assert!(line.ends_with("/proc is already a mount point)"), "{line}");
+    }
+
+    /// Past the checks the guard's own result decides the line and the exit
+    /// status (0 mounted, 1 not mounted, 3 refused), and the mount is asked
+    /// for with the job's intent and the options `--read-only` leaves.
+    #[test]
+    fn mount_target_exit_status_is_the_guards_and_the_mount_gets_the_jobs_intent() {
+        use buttered_dasd::raid_guard::{Failure, Intent, Outcome};
+        use std::cell::RefCell;
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("target");
+        std::fs::create_dir(&mount).unwrap();
+        let cfg = mount_target_config(dir.path(), &mount.to_string_lossy());
+        let (_held, lock) = handed_down_lock(dir.path());
+
+        let seen: RefCell<Vec<(Intent, String, bool)>> = RefCell::new(Vec::new());
+        let answer: RefCell<Option<Result<Outcome, Failure>>> = RefCell::new(None);
+        let mounter = |c: &Config,
+                       _: &buttered_dasd::config::Target,
+                       i: Intent,
+                       h: &maintenance::MaintenanceHeld| {
+            seen.borrow_mut()
+                .push((i, c.das.mount_opts.clone(), h.is_delegated()));
+            answer.borrow_mut().take().unwrap()
+        };
+        let run = |read_only: bool, result: Result<Outcome, Failure>| {
+            *answer.borrow_mut() = Some(result);
+            mount_target_outcome("pair", &cfg, read_only, &lock, &mounter)
+        };
+        let normal = || Outcome::Normal {
+            members: Vec::new(),
+            waited: std::time::Duration::ZERO,
+            owed: None,
+            record_problem: None,
+            rejoined_now: false,
+        };
+
+        let (line, code) = run(false, Ok(normal()));
+        assert_eq!(code, 0, "{line}");
+        assert!(line.starts_with("RAID GUARD: OK  ("), "{line}");
+        let (line, code) = run(false, Err(Failure::MountFailed("no".into())));
+        assert_eq!((line.as_str(), code), ("RAID GUARD: NOT-MOUNTED  (no)", 1));
+        let (line, code) = run(
+            true,
+            Err(Failure::Refused {
+                why: "split brain".into(),
+                left_mounted: false,
+            }),
+        );
+        assert_eq!(
+            (line.as_str(), code),
+            ("RAID GUARD: REFUSED  (split brain)", 3)
+        );
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (Intent::Write, "nodev,rw,noatime".to_string(), true),
+                (Intent::Write, "nodev,rw,noatime".to_string(), true),
+                (Intent::ReadOnly, "nodev,noatime,ro".to_string(), true),
+            ]
+        );
+    }
+
     /// The flag is wired: `backup mount-target --label X --read-only` parses.
     #[test]
     fn mount_target_accepts_read_only() {
@@ -4954,6 +5159,35 @@ mod tests {
         let v = build_scrub_target_view(&config, "hurt-target", Some(&state));
         let shown = format_scrub_status(&[v], &config);
         assert!(shown.contains("errors=corrected=7"), "{shown}");
+    }
+
+    /// bd 3gzs.11: bytes scrubbed are shown when measured and withheld when the
+    /// attempt's figures are unknown.
+    #[test]
+    fn the_view_keeps_measured_bytes_and_withholds_unknown_ones() {
+        let uuid = "55555555-5555-5555-5555-555555555555";
+        let config = test_config(&[("bytes-target", uuid)]);
+        let view_of = |unknown: bool| {
+            let mut state = scrub::ScrubState::default();
+            state.filesystems.insert(
+                uuid.into(),
+                scrub::FsState {
+                    target_label: "bytes-target".into(),
+                    mountpoint: "/mnt/bytes-target".into(),
+                    last_success_epoch: None,
+                    last_attempt: scrub::AttemptState {
+                        outcome: "finished".into(),
+                        ok: true,
+                        bytes_scrubbed: 4096,
+                        counters_unknown: unknown,
+                        ..Default::default()
+                    },
+                },
+            );
+            build_scrub_target_view(&config, "bytes-target", Some(&state))
+        };
+        assert_eq!(view_of(false).bytes_scrubbed, Some(4096));
+        assert_eq!(view_of(true).bytes_scrubbed, None);
     }
 
     /// A pass the signal stopped is INTERRUPTED in the table whatever its `ok`.

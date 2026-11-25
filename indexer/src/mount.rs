@@ -5908,6 +5908,151 @@ mod tests {
         );
     }
 
+    /// bd su1b.16: a different filesystem is refused for a RAID-1 target too,
+    /// not waved through because the target is guarded.
+    #[test]
+    fn verify_refuses_a_different_filesystem_on_a_raid1_target() {
+        let scratch = Scratch::new();
+        let (mut targets, mut host, mnt) = mounted_write_target(&scratch, Some(EXPECTED_UUID));
+        targets[0].serials = vec!["SERIAL11".into(), "SERIAL12".into()];
+        host.devices = vec![
+            ("SERIAL11".into(), "/dev/sdb".into()),
+            ("SERIAL12".into(), "/dev/sdc".into()),
+        ];
+        let runner = ScriptedRunner::with_rules(&[(
+            &mnt,
+            Reply::Exit {
+                code: 0,
+                stdout: "5eed0008-0000-0000-0000-000000000000\n",
+                stderr: "",
+            },
+        )]);
+        let err = host
+            .verify(&targets, &["primary-22tb"], &Recorder::default(), &runner)
+            .unwrap_err();
+        assert!(err.contains("a different filesystem is mounted here"), "{err}");
+    }
+
+    /// bd su1b.16: the guarded mount counts as the first of one target.
+    #[test]
+    fn a_guarded_mount_reports_its_step_as_the_first_of_one() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, part_b, mnt) = attached_primary(&scratch);
+        let part_c = scratch.touch("dev/sdc1");
+        config.targets[0].mount_uuid = Some("u-p".into());
+        config.targets[0].serials = vec!["SER-P".into(), "SER-Q".into()];
+        host.devices.push(("SER-Q".into(), scratch.path("dev/sdc")));
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n{part_c}\n"))),
+            (
+                &part_b,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 1, "5eed00a1-0000-4000-8000-0000000000a1", 40),
+                ),
+            ),
+            (
+                &part_c,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 2, "5eed00a2-0000-4000-8000-0000000000a2", 40),
+                ),
+            ),
+        ]);
+        let progress = Recorder::default();
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+        assert_eq!(guard.count(), 1);
+        let steps = progress.steps();
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!((steps[0].0, steps[0].1), (1, 1), "{steps:?}");
+        assert!(steps[0].2.starts_with(&format!("Mounted primary at {mnt}")));
+    }
+
+    fn system_members<R>(
+        host: &Host,
+        runner: &ScriptedRunner,
+        f: impl FnOnce(&SystemMembers<'_>) -> R,
+    ) -> R {
+        host.with_probes(runner, |probes| {
+            f(&SystemMembers { runner, probes })
+        })
+    }
+
+    /// bd su1b.16: the production host's answers, from a scripted runner.
+    #[test]
+    fn the_system_host_reads_members_from_blkid_and_says_what_failed() {
+        use raid_guard::MemberHost;
+        let host = Host::default();
+        let listed = ScriptedRunner::with_rules(&[("blkid", Reply::Out(0, " /dev/a1\n\n/dev/b1 \n".into()))]);
+        assert_eq!(
+            system_members(&host, &listed, |m| m.members("fs")),
+            Ok(vec!["/dev/a1".to_string(), "/dev/b1".to_string()])
+        );
+        // blkid's "nothing matched" is no member, not an error.
+        let none = ScriptedRunner::with_rules(&[("blkid", Reply::exit(2))]);
+        assert_eq!(system_members(&host, &none, |m| m.members("fs")), Ok(Vec::new()));
+        let broken = ScriptedRunner::with_rules(&[(
+            "blkid",
+            Reply::Exit {
+                code: 4,
+                stdout: "",
+                stderr: "boom\n",
+            },
+        )]);
+        assert_eq!(
+            system_members(&host, &broken, |m| m.members("fs")),
+            Err("blkid exited with code 4: boom".to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_command_is_described_by_its_code_and_its_stderr() {
+        let out = |code: i32, stderr: &str| Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(failed("mount", &out(32, "")), "mount exited with code 32");
+        assert_eq!(
+            failed("mount", &out(32, "  wrong fs type \n")),
+            "mount exited with code 32: wrong fs type"
+        );
+    }
+
+    #[test]
+    fn the_system_host_answers_serial_umount_missing_pause_and_clock_for_real() {
+        use raid_guard::MemberHost;
+        let host = Host {
+            devices: vec![("SER-A".into(), "/dev/sdx".into())],
+            missing: vec![("fs".into(), vec![2])],
+            ..Host::default()
+        };
+        let runner = ScriptedRunner::succeeding();
+        system_members(&host, &runner, |m| {
+            assert!(m.serial_attached("SER-A"));
+            assert!(!m.serial_attached("SER-Z"));
+            assert_eq!(m.missing_devids("fs"), Ok(vec![2]));
+            assert_eq!(m.umount("/mnt/x"), Ok(()));
+            m.pause(Duration::from_secs(7));
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let now = m.now();
+            assert!(now >= before && now <= before + 5, "{now} vs {before}");
+        });
+        assert_eq!(*runner.pauses.lock().unwrap(), vec![Duration::from_secs(7)]);
+        assert!(
+            runner
+                .calls()
+                .contains(&status_call(&["umount", "/mnt/x"]))
+        );
+        // A mount that will not come down is an error.
+        let stuck = ScriptedRunner::with_rules(&[("umount", Reply::exit(32))]);
+        let err = system_members(&host, &stuck, |m| m.umount("/mnt/x")).unwrap_err();
+        assert!(err.contains("umount exited with code 32"), "{err}");
+    }
+
     /// A target that is not part of this run is never fatal — btrbk is not
     /// being told to write there.
     #[test]

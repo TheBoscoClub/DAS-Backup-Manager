@@ -187,8 +187,13 @@ const FORMAT_LINE: &str = "format=das-backup-raid-record 1";
 
 /// The record directory in force: [`RECORD_DIR_ENV`], else [`RECORD_DIR`].
 pub fn record_dir() -> PathBuf {
-    std::env::var_os(RECORD_DIR_ENV)
-        .filter(|v| !v.is_empty())
+    record_dir_from(std::env::var_os(RECORD_DIR_ENV))
+}
+
+/// [`record_dir`] for a given value of [`RECORD_DIR_ENV`]: an empty one is
+/// unset.
+fn record_dir_from(env: Option<std::ffi::OsString>) -> PathBuf {
+    env.filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(RECORD_DIR))
 }
@@ -5672,6 +5677,219 @@ mod tests {
             missing_devids_under(dir.path(), FS).is_err(),
             "an unreadable flag"
         );
+    }
+
+    // ---- bd DAS-Backup-Manager-su1b.16: tests for CI mutation survivors ----
+
+    fn present(devid: u64, dev_uuid: &str) -> Member {
+        Member {
+            path: format!("/dev/sd{devid}1"),
+            devid,
+            dev_uuid: dev_uuid.into(),
+            generation: 50,
+            num_devices: 2,
+            serial: Some(format!("SERIAL1{devid}")),
+        }
+    }
+
+    fn period_member(devid: u64, dev_uuid: &str) -> PeriodMember {
+        PeriodMember {
+            devid,
+            dev_uuid: dev_uuid.into(),
+            generation: 50,
+        }
+    }
+
+    #[test]
+    fn the_record_directory_is_the_variable_unless_it_is_unset_or_empty() {
+        assert_eq!(
+            record_dir_from(Some("/elsewhere".into())),
+            PathBuf::from("/elsewhere")
+        );
+        assert_eq!(record_dir_from(Some("".into())), PathBuf::from(RECORD_DIR));
+        assert_eq!(record_dir_from(None), PathBuf::from(RECORD_DIR));
+        // The real one answers from the process environment, never empty.
+        let expected = match std::env::var_os(RECORD_DIR_ENV) {
+            Some(v) if !v.is_empty() => PathBuf::from(v),
+            _ => PathBuf::from(RECORD_DIR),
+        };
+        assert_eq!(record_dir(), expected);
+    }
+
+    #[test]
+    fn a_uuid_needs_its_length_as_well_as_its_characters() {
+        assert!(is_uuid(DX));
+        assert!(!is_uuid("abc"), "hex digits, but not 36 of them");
+        assert!(!is_uuid(""));
+        assert!(!is_uuid("5eed00a1-0000-4000-8000-0000000000zz"));
+    }
+
+    #[test]
+    fn a_superblock_with_devid_zero_or_no_devices_is_not_a_member() {
+        let ok = sup(1, DX, 5);
+        assert!(parse_super("/dev/x", &ok, FS).is_ok());
+        let devid_zero = sup(0, DX, 5);
+        assert!(parse_super("/dev/x", &devid_zero, FS).is_err());
+        let no_devices = ok.replace("num_devices\t\t2", "num_devices\t\t0");
+        assert_ne!(no_devices, ok);
+        assert!(parse_super("/dev/x", &no_devices, FS).is_err());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_looked_at_is_bad_never_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("record");
+        fs::write(&file, "x").unwrap();
+        // Under a regular file: ENOTDIR, not ENOENT.
+        match read_copy(&file.join("below"), FS) {
+            Copy::Bad(_) => {}
+            other => panic!("{other:?}"),
+        }
+        // Absent is only ENOENT.
+        assert_eq!(read_copy(&dir.path().join("none"), FS), Copy::Absent);
+    }
+
+    #[test]
+    fn a_link_or_a_directory_is_not_a_record_even_when_it_points_at_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.record");
+        let record = Record {
+            fsid: FS.into(),
+            state: State::Degraded,
+            members: vec![period_member(1, DX)],
+            since: 1,
+            last: 2,
+            rejoined: None,
+            rejected: Vec::new(),
+        };
+        write_copy(&real, &record, false).unwrap();
+        assert_eq!(read_copy(&real, FS), Copy::Read(record));
+        let link = dir.path().join("link.record");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        match read_copy(&link, FS) {
+            Copy::Bad(why) => assert!(why.contains("not a regular file"), "{why}"),
+            other => panic!("a link was read: {other:?}"),
+        }
+        match read_copy(dir.path(), FS) {
+            Copy::Bad(why) => assert!(why.contains("not a regular file"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_copy_that_reads_back_different_is_an_error_not_a_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("r.record");
+        // Read back, the device UUID is lower case: not what was written.
+        let record = Record {
+            fsid: FS.into(),
+            state: State::Degraded,
+            members: vec![period_member(1, &DX.to_ascii_uppercase())],
+            since: 1,
+            last: 2,
+            rejoined: None,
+            rejected: Vec::new(),
+        };
+        let err = write_copy(&path, &record, false).unwrap_err();
+        assert!(err.contains("not what was written"), "{err}");
+    }
+
+    #[test]
+    fn removing_a_copy_fails_for_anything_but_a_copy_already_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(remove_copy(&dir.path().join("gone")), Ok(()));
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert!(remove_copy(&sub).is_err(), "a directory is not removed");
+        let f = dir.path().join("f");
+        fs::write(&f, "x").unwrap();
+        assert_eq!(remove_copy(&f), Ok(()));
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn the_real_kernel_view_of_an_unknown_filesystem_is_an_error() {
+        assert!(missing_devids("00000000-dead-beef-0000-000000000000").is_err());
+    }
+
+    #[test]
+    fn disagreeing_copies_name_both_member_sets() {
+        let rec = |dev: &str| Record {
+            fsid: FS.into(),
+            state: State::Degraded,
+            members: vec![period_member(1, dev)],
+            since: 1,
+            last: 2,
+            rejoined: None,
+            rejected: Vec::new(),
+        };
+        let err = merged(&Copy::Read(rec(DX)), &Copy::Read(rec(DY))).unwrap_err();
+        assert!(err.contains(DX) && err.contains(DY), "{err}");
+        assert!(err.contains("disagree"), "{err}");
+    }
+
+    #[test]
+    fn a_member_line_names_devid_uuid_path_and_serial_and_failures_say_why() {
+        let list = member_list(&[present(1, DX), present(2, DY)]);
+        assert_eq!(
+            list,
+            format!(
+                "devid 1 {DX} /dev/sd11 serial SERIAL11; devid 2 {DY} /dev/sd21 serial SERIAL12"
+            )
+        );
+        assert_eq!(member_list(&[]), "");
+        assert_eq!(Failure::NoMember("none".into()).why(), "none");
+        assert_eq!(Failure::MountFailed("bad".into()).why(), "bad");
+        assert_eq!(
+            Failure::Refused {
+                why: "no".into(),
+                left_mounted: true
+            }
+            .why(),
+            "no"
+        );
+    }
+
+    /// A new degraded period never inherits the state or the rejoin time of
+    /// the record it replaces.
+    #[test]
+    fn a_new_degraded_period_resets_the_state_and_the_rejoin_time() {
+        let settled = Record {
+            fsid: FS.into(),
+            state: State::Settled,
+            members: vec![period_member(2, DY)],
+            since: 10,
+            last: 20,
+            rejoined: Some(99),
+            rejected: vec![period_member(3, "5eed00a3-0000-4000-8000-0000000000a3")],
+        };
+        let primary = Copy::Read(settled.clone());
+        match degraded_verdict(FS, &primary, &Copy::Absent, &[present(1, DX)], 500) {
+            Verdict::Allow(r) => {
+                assert_eq!(r.state, State::Degraded);
+                assert_eq!(r.rejoined, None);
+                assert_eq!((r.since, r.last), (500, 500));
+                assert_eq!(r.rejected, settled.rejected);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Continuing an owed period on a member it ran on: degraded again.
+        let owed = Record {
+            state: State::ScrubOwed,
+            members: vec![period_member(1, DX), period_member(2, DY)],
+            rejoined: Some(99),
+            rejected: Vec::new(),
+            ..settled
+        };
+        match degraded_verdict(FS, &Copy::Read(owed), &Copy::Absent, &[present(1, DX)], 600) {
+            Verdict::Allow(r) => {
+                assert_eq!(r.state, State::Degraded);
+                assert_eq!(r.rejoined, None);
+                assert_eq!(r.last, 600);
+                assert_eq!(r.members.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
