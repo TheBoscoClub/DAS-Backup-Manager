@@ -1255,6 +1255,12 @@ private Q_SLOTS:
         QVERIFY(!doc->pair.schedule.has_value());
         QVERIFY(!doc->pair.scheduleError.has_value());
         QCOMPARE(doc->drives.size(), 2);
+        // A timer left behind by a drive no longer configured (bd epmw).
+        QCOMPARE(doc->orphans.size(), 1);
+        QCOMPARE(doc->orphans[0].label, QStringLiteral("gone-3tb"));
+        QVERIFY(doc->orphans[0].schedule.has_value());
+        QCOMPARE(doc->orphans[0].schedule->unit, QStringLiteral("das-recovery-os-update-gone-3tb.timer"));
+        QVERIFY(!doc->orphansError.has_value());
 
         const DriveView &a = doc->drives[0];
         QCOMPARE(a.label, QStringLiteral("system-recovery-A-2tb"));
@@ -1338,6 +1344,13 @@ private Q_SLOTS:
         o[QStringLiteral("drives")] = drives;
         QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
         QVERIFY2(err.contains(QStringLiteral("drives[1]")) && err.contains(QStringLiteral("unattended")), qPrintable(err));
+
+        // A document without the orphan keys is refused whole, never read
+        // as "no orphans".
+        o = d.object();
+        o.remove(QStringLiteral("orphans"));
+        QVERIFY(!RecoveryDocument::parse(QJsonDocument(o).toJson(), &err).has_value());
+        QVERIFY2(err.contains(QStringLiteral("orphans")), qPrintable(err));
 
         o = d.object();
         o.remove(QStringLiteral("pair"));

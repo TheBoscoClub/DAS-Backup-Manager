@@ -355,6 +355,27 @@ void RecoveryPanel::rebuildCards()
             lines << i18n("Session: none");
         addCard(i18n("Both drives"), lines, errors);
     }
+    // Timers of drives no longer configured: shown, and clearable by name.
+    for (const OrphanView &o : m_doc->orphans) {
+        QStringList lines;
+        QStringList errors;
+        lines << i18n("This drive is no longer in the configuration, but its schedule timer is still installed.");
+        if (o.schedule)
+            lines << i18n("Schedule: %1", esc(scheduleWords(*o.schedule)));
+        else if (o.scheduleError)
+            errors << i18n("schedule: %1", *o.scheduleError);
+        addCard(i18n("Orphaned schedule: %1", o.label), lines, errors);
+        auto *clear = new QPushButton(i18n("Clear orphaned schedule"), m_cardWidgets.last());
+        clear->setObjectName(QStringLiteral("clearOrphan"));
+        clear->setToolTip(tip(i18n("Stop and remove the schedule timer of %1, which is no longer a configured drive", o.label)));
+        connect(clear, &QPushButton::clicked, this, [this, label = o.label] {
+            m_scheduleClearing = true;
+            m_client->recoveryOsScheduleSet({label}, 0, QString());
+        });
+        m_cardWidgets.last()->layout()->addWidget(clear);
+    }
+    if (m_doc->orphansError)
+        addCard(i18n("Schedule units"), {}, {i18n("orphaned schedules: %1", *m_doc->orphansError)});
 }
 
 int RecoveryPanel::earlyFinishedCount() const

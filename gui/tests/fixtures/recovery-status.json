@@ -116,6 +116,20 @@
     }
   ],
   "max_age_days": 60,
+  "orphans": [
+    {
+      "label": "gone-3tb",
+      "schedule": {
+        "at_epoch": null,
+        "detail": "The timer for a time that cannot be read from the timer is inactive and never fired; it will not run until it is scheduled again.",
+        "mode": null,
+        "state": "missed",
+        "unit": "das-recovery-os-update-gone-3tb.timer"
+      },
+      "schedule_error": null
+    }
+  ],
+  "orphans_error": null,
   "pair": {
     "mode_default": "sequential",
     "schedule": null,

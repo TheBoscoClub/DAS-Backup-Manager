@@ -93,8 +93,9 @@ pub struct RecoveryOs {
     /// The time zone `recovery-os-vm.sh provision` gives a rebuilt recovery
     /// drive: an IANA name (`Europe/Berlin`) that is a zone file under
     /// `/usr/share/zoneinfo` on the machine that validates, and again in the
-    /// new OS before it is linked. Unset, the drive is on UTC — there is no
-    /// built-in zone (bd DAS-Backup-Manager-cnjc).
+    /// new OS before it is linked. Unset, the drive gets the host's own zone
+    /// (where `/etc/localtime` points), else UTC; there is no built-in zone
+    /// (bd DAS-Backup-Manager-cnjc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     /// The directory of this installation's own filled-in recovery documents
@@ -181,6 +182,31 @@ pub fn timezone_error(tz: &str, zoneinfo_dir: &Path) -> Option<String> {
             zoneinfo_dir.display()
         )
     })
+}
+
+/// The host's own time zone: `localtime` (`/etc/localtime`) resolved, as a
+/// name relative to `zoneinfo_dir`. `UTC` when it is missing, not a link into
+/// `zoneinfo_dir`, or not a name [`timezone_error`] accepts: an unreadable
+/// host zone is never a reason to invent one (bd DAS-Backup-Manager-cnjc).
+pub fn host_timezone_at(localtime: &Path, zoneinfo_dir: &Path) -> String {
+    let name = fs::canonicalize(localtime).ok().and_then(|real| {
+        let base = fs::canonicalize(zoneinfo_dir).ok()?;
+        real.strip_prefix(&base).ok()?.to_str().map(str::to_owned)
+    });
+    match name {
+        Some(n) if timezone_error(&n, zoneinfo_dir).is_none() => n,
+        _ => "UTC".to_string(),
+    }
+}
+
+impl RecoveryOs {
+    /// The zone `provision` gives a rebuilt drive: the configured one, else
+    /// the host's own, else UTC. Never a zone of the project's choosing.
+    pub fn effective_timezone(&self) -> String {
+        self.timezone.clone().unwrap_or_else(|| {
+            host_timezone_at(Path::new("/etc/localtime"), Path::new(ZONEINFO_DIR))
+        })
+    }
 }
 
 impl Default for RecoveryOs {
@@ -5118,6 +5144,45 @@ mod tests {
         ] {
             assert!(timezone_error(bad, zdir).is_some(), "{bad:?} accepted");
         }
+    }
+
+    /// Unset, the zone is the host's own: where `/etc/localtime` points,
+    /// relative to the zoneinfo directory; UTC when that cannot be read or is
+    /// not a zone file there. Never a built-in installation zone (bd cnjc).
+    #[test]
+    fn host_timezone_is_the_localtime_target_inside_zoneinfo_else_utc() {
+        let dir = tempfile::tempdir().unwrap();
+        let zdir = dir.path().join("zoneinfo");
+        std::fs::create_dir_all(zdir.join("Europe")).unwrap();
+        std::fs::write(zdir.join("Europe/Berlin"), b"TZif2....").unwrap();
+        std::fs::write(zdir.join("UTC"), b"TZif2....").unwrap();
+        std::fs::write(dir.path().join("outside"), b"TZif2....").unwrap();
+        let lt = dir.path().join("localtime");
+        let point = |target: &Path| {
+            let _ = std::fs::remove_file(&lt);
+            std::os::unix::fs::symlink(target, &lt).unwrap();
+        };
+        point(&zdir.join("Europe/Berlin"));
+        assert_eq!(host_timezone_at(&lt, &zdir), "Europe/Berlin");
+        point(Path::new("zoneinfo/Europe/Berlin"));
+        assert_eq!(host_timezone_at(&lt, &zdir), "Europe/Berlin");
+        point(&dir.path().join("outside"));
+        assert_eq!(host_timezone_at(&lt, &zdir), "UTC");
+        point(&dir.path().join("absent"));
+        assert_eq!(host_timezone_at(&lt, &zdir), "UTC");
+        let _ = std::fs::remove_file(&lt);
+        assert_eq!(host_timezone_at(&lt, &zdir), "UTC");
+        std::fs::write(&lt, b"TZif2....").unwrap();
+        assert_eq!(host_timezone_at(&lt, &zdir), "UTC");
+    }
+
+    #[test]
+    fn effective_timezone_prefers_the_configured_zone() {
+        let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
+        cfg.recovery_os.timezone = Some("Europe/Berlin".into());
+        assert_eq!(cfg.recovery_os.effective_timezone(), "Europe/Berlin");
+        cfg.recovery_os.timezone = None;
+        assert!(!cfg.recovery_os.effective_timezone().is_empty());
     }
 
     #[test]

@@ -41,7 +41,7 @@
 # package refuse without a valid one before they change anything) and
 # DAS_INSTALL_UID (its uid, 1000 unless set; 1000-60000) and
 # DAS_INSTALL_TIMEZONE (optional: the recovery OS's IANA time zone, from
-# [recovery_os].timezone; unset = UTC, never a zone of the project's choosing;
+# [recovery_os].timezone, which dump-env resolves to the configured zone, else the host's own; unset here = UTC, never a zone of the project's choosing;
 # configure refuses a name that is not a zone file in the new OS before it
 # changes anything; bd DAS-Backup-Manager-cnjc) and
 # DAS_INSTALL_LOCAL_DOCS (optional: a directory of the installation's own

@@ -161,7 +161,7 @@ std::optional<RecoveryDocument> RecoveryDocument::parse(const QByteArray &json, 
             *error = QStringLiteral("the status document is schema %1, this GUI reads schema 1").arg(d.schema);
         return std::nullopt;
     }
-    for (const char *key : {"max_age_days", "today", "pair", "drives"})
+    for (const char *key : {"max_age_days", "today", "pair", "drives", "orphans", "orphans_error"})
         if (!need(o, key, where, error))
             return std::nullopt;
     d.maxAgeDays = o[QStringLiteral("max_age_days")].toInt();
@@ -182,6 +182,18 @@ std::optional<RecoveryDocument> RecoveryDocument::parse(const QByteArray &json, 
             return std::nullopt;
         d.drives << *dv;
     }
+    for (const QJsonValue &v : o[QStringLiteral("orphans")].toArray()) {
+        const QJsonObject ob = v.toObject();
+        for (const char *key : {"label", "schedule", "schedule_error"})
+            if (!need(ob, key, QStringLiteral("orphans[]"), error))
+                return std::nullopt;
+        OrphanView ov;
+        ov.label = ob[QStringLiteral("label")].toString();
+        ov.schedule = schedule(ob[QStringLiteral("schedule")]);
+        ov.scheduleError = optString(ob[QStringLiteral("schedule_error")]);
+        d.orphans << ov;
+    }
+    d.orphansError = optString(o[QStringLiteral("orphans_error")]);
     return d;
 }
 
