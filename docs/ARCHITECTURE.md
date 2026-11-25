@@ -220,7 +220,9 @@ RAID-1 target (`mount_uuid` and two or more serials): `ensure_targets_mounted`
 `backup-run.sh` through the hidden `btrdasd backup mount-target` (which prints
 `RAID GUARD: <STATUS>  (<detail>)` and exits 0 mounted, 1 not mounted, 3
 refused, 2 could not run) and `backup-verify.sh` through the same subcommand
-with `--read-only` (`Job::VerifyMount`, bd su1b.23). Single-device targets are
+with `--read-only` (`Job::VerifyMount`, bd su1b.23), which also adds `ro` to
+`[das].mount_opts`, so the guard writes no record or witness and the look
+writes nothing (bd su1b.30). Single-device targets are
 mounted as before. Every
 caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
 `ReadOnly` only for a job that persists nothing derived from the target's
@@ -279,6 +281,13 @@ accepted_record: degraded period on the present members from now,
 write primary → mount <mount_opts>,degraded rw → write witness → unmount
 logger -t btrdasd; raid_accepted row (schema 9)
 ```
+
+Every member present, superblock generations differing, no primary record
+(bd su1b.21): `diverged_now` (each member's own view read alone), then the
+operator types the label AND the serial of the member to keep (terminal only; the
+helper refuses and names the CLI); the other member is forgotten by exact path,
+the kept one mounted read-only by its own path (never `UUID=`), `/sys/fs/btrfs/<fsid>/devices/` required to list only it, then remounted read-write, `rejected=` holds the
+other. Same steps after the mount as above.
 
 A rejected member is refused for every job, alone or beside the others: each
 superblock is read before its device is scanned, a rejected one is never
@@ -954,7 +963,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `maintenance` | `src/maintenance.rs` | ~1500 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
 | `mount` | `src/mount.rs` | ~6000 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` (with the RAID-1 kernel-view check), the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`), and the host side of the RAID-1 guard (`SystemMembers`, `mount_guarded_target`) |
-| `raid_guard` | `src/raid_guard.rs` | ~2000 | The guarded mount of a multi-device (RAID-1) target (bd su1b.10): members by filesystem UUID, scanned by path, mounted without `degraded`, a bounded wait for a late member, degraded only on a drive truly absent, the degraded-period record (primary under `/var/lib/das-backup/raid`, witness on the filesystem), the split-brain refusal, the scrub owed after a rejoin and its clearing, the kernel's devinfo view, cross-checked against `devices/` (one entry per opened bdev; bd su1b.12) |
+| `raid_guard` | `src/raid_guard.rs` | ~2000 | The guarded mount of a multi-device (RAID-1) target (bd su1b.10): members by filesystem UUID and drive serial (a partition on an unconfigured or unreadable serial refuses the target, bd su1b.27), scanned by path, mounted without `degraded`, a bounded wait for a late member, degraded only on a drive truly absent, the degraded-period record (primary under `/var/lib/das-backup/raid`, witness on the filesystem), the split-brain refusal, the scrub owed after a rejoin and its clearing, the kernel's devinfo view, cross-checked against `devices/` (one entry per opened bdev; bd su1b.12) |
 | `progress` | `src/progress.rs` | ~770 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~650 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `recovery_os` | `src/recovery_os.rs` | ~6400 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |

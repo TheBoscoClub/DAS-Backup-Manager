@@ -160,6 +160,9 @@ impl CommandRunner for SystemRunner {
 /// `/dev/disk/by-id`. Held as borrowed functions rather than called directly
 /// so the mount logic can be run against a described host; production code
 /// only ever uses [`HOST_PROBES`].
+/// `health::member_drive_serial`'s shape: partition path, configured serials.
+type SerialOfPartition<'a> = dyn Fn(&str, &[String]) -> Result<String, String> + 'a;
+
 struct MountProbes<'a> {
     is_mountpoint: &'a dyn Fn(&Path) -> bool,
     find_mount_for_device: &'a dyn Fn(&str, &TargetRole) -> Option<String>,
@@ -169,6 +172,9 @@ struct MountProbes<'a> {
     /// The devids the kernel marks missing for a mounted filesystem
     /// (`raid_guard::missing_devids`).
     missing_devids: &'a dyn Fn(&str) -> Result<Vec<u64>, String>,
+    /// The serial of the drive a member partition sits on, given the
+    /// target's configured serials (`health::member_drive_serial`).
+    serial_of_partition: &'a SerialOfPartition<'a>,
 }
 
 const HOST_PROBES: MountProbes<'static> = MountProbes {
@@ -177,6 +183,7 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
     device_from_serial: &health::device_from_serial,
     device_for_uuid: &health::device_for_fs_uuid,
     missing_devids: &raid_guard::missing_devids,
+    serial_of_partition: &health::member_drive_serial,
 };
 
 /// The words that name the processes a clearing stopped, in the job's log
@@ -351,6 +358,10 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         (self.probes.device_from_serial)(serial).is_some()
     }
 
+    fn member_serial(&self, path: &str, configured: &[String]) -> Result<String, String> {
+        (self.probes.serial_of_partition)(path, configured)
+    }
+
     fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String> {
         let mut cmd = Command::new("mount");
         cmd.args(["-t", "btrfs"]);
@@ -385,6 +396,19 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
 
     fn devinfo(&self, fsid: &str) -> Result<Vec<(u64, bool)>, String> {
         raid_guard::devinfo_under(Path::new("/sys/fs/btrfs"), fsid)
+    }
+
+    fn opened_devices(&self, fsid: &str) -> Result<Vec<String>, String> {
+        raid_guard::opened_devices_under(Path::new("/sys/fs/btrfs"), fsid)
+    }
+
+    fn remount_rw(&self, mount: &str) -> Result<(), String> {
+        let out = self.run(Command::new("mount").args(["-o", "remount,rw", mount]))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed("mount -o remount,rw", &out))
+        }
     }
 
     fn read_witness(&self, mount: &str, fsid: &str) -> raid_guard::Copy {
@@ -566,18 +590,12 @@ pub fn raid_accept_preview(
         runner: &SystemRunner,
         probes: &HOST_PROBES,
     };
-    let result = raid_guard::split_brain_now(&host, &plan, progress).map(|found| {
-        raid_guard::accept_explanation(
-            label,
-            plan.fsid,
-            &found,
-            &crate::db::count_backup_runs_between_read_only(
-                db,
-                found.period.since,
-                found.period.last,
-            ),
-        )
-    });
+    let result = raid_guard::preview(
+        &host,
+        &plan,
+        &|from, to| crate::db::count_backup_runs_between_read_only(db, from, to),
+        progress,
+    );
     if created {
         remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
     }
@@ -590,12 +608,16 @@ pub fn raid_accept_preview(
 /// caller holds the backup singleton (`_singleton`) and the maintenance lock
 /// (`_held`), as a configuration edit and a mount do. `confirm` is shown the
 /// explanation and returns what was typed; an `Err` (no terminal, no typed
-/// text) accepts nothing.
+/// text) accepts nothing. `ask` is the terminal for the case where every
+/// member is present and their generations differ (bd su1b.21): handed
+/// `(text, prompt)` it returns what was typed (the label, then the serial of
+/// the member to keep). `None` (the helper: no picker) refuses that case,
+/// saying to use the command line.
 pub fn raid_accept(
     config: &Config,
     label: &str,
     db: &Path,
-    confirm: &mut dyn FnMut(&str) -> Result<String, String>,
+    terminal: raid_guard::Terminal<'_>,
     progress: &dyn ProgressCallback,
     _singleton: &crate::backup::SingletonHeld,
     _held: &MaintenanceHeld,
@@ -609,7 +631,8 @@ pub fn raid_accept(
         probes: &HOST_PROBES,
     };
     let runs = |from, to| crate::db::count_backup_runs_between_read_only(db, from, to);
-    let result = raid_guard::accept(&host, &plan, &runs, confirm, progress);
+    let raid_guard::Terminal { confirm, ask } = terminal;
+    let result = raid_guard::accept_any(&host, &plan, &runs, confirm, ask, progress);
     if created {
         remove_created_mount_point(&format!("Target '{label}'"), &target.mount, progress);
     }
@@ -634,16 +657,29 @@ pub fn raid_accept(
         })
         .cloned()
         .collect();
-    let line = format!(
-        "raid accept: target '{label}' (filesystem {}): devid(s) {} accepted as the history \
-         from {}; devid(s) {} given up, with the degraded period {} to {} that only they hold",
-        plan.fsid,
-        list(&accepted.after.members),
-        raid_guard::when(accepted.after.since),
-        list(&given_up),
-        raid_guard::when(accepted.before.since),
-        raid_guard::when(accepted.before.last),
-    );
+    let line = if accepted.diverged {
+        format!(
+            "raid accept: target '{label}' (filesystem {}): every member was present with \
+             differing superblock generations and no record; devid(s) {} kept by the \
+             operator as the history from {}; devid(s) {} given up with whatever only they \
+             hold",
+            plan.fsid,
+            list(&accepted.after.members),
+            raid_guard::when(accepted.after.since),
+            list(&given_up),
+        )
+    } else {
+        format!(
+            "raid accept: target '{label}' (filesystem {}): devid(s) {} accepted as the history \
+             from {}; devid(s) {} given up, with the degraded period {} to {} that only they hold",
+            plan.fsid,
+            list(&accepted.after.members),
+            raid_guard::when(accepted.after.since),
+            list(&given_up),
+            raid_guard::when(accepted.before.since),
+            raid_guard::when(accepted.before.last),
+        )
+    };
     match SystemRunner.status(
         Command::new("logger")
             .args(["-t", "btrdasd", "-p", "user.warning", "--"])
@@ -3110,12 +3146,22 @@ mod tests {
                     .map(|(_, m)| m.clone())
                     .unwrap_or_default())
             };
+            // A partition sits on the attached drive whose whole-disk device
+            // path it starts with (`dev/sdb1` on `dev/sdb`).
+            let serial_of_partition = |part: &str, _configured: &[String]| {
+                self.devices
+                    .iter()
+                    .find(|(_, dev)| part.starts_with(dev.as_str()))
+                    .map(|(s, _)| s.clone())
+                    .ok_or_else(|| format!("{part}: no attached drive carries it"))
+            };
             f(&MountProbes {
                 is_mountpoint: &is_mountpoint,
                 find_mount_for_device: &find_mount_for_device,
                 device_from_serial: &device_from_serial,
                 device_for_uuid: &device_for_uuid,
                 missing_devids: &missing_devids,
+                serial_of_partition: &serial_of_partition,
             })
         }
 

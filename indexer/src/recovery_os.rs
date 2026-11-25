@@ -572,10 +572,20 @@ pub mod esp;
 /// [`RecoveryOs::btrbk_at_boot`], read by [`inspect`] — or `None` when that
 /// is ruled out. A warning is not a staleness reason; see
 /// [`Assessment::warnings`].
+///
+/// A "may" beside no btrbk config at all ([`BtrbkConfig::Absent`]) is no
+/// warning: `btrbk run` stops before doing anything without one, the same
+/// rule `recovery-os-install.sh verify` accepts a rebuild by (bd
+/// DAS-Backup-Manager-eg4j.8). Every mkinitcpio OS reads "may" from
+/// `mkinitcpio-generate-shutdown-ramfs.service`, so without this the nightly
+/// warned about every recovery drive, every night (bd
+/// DAS-Backup-Manager-eg4j.17). A config present or unknown, and any "will",
+/// still warn; the RECOVERY OS section still shows the verdict and the config.
 pub fn boot_warning(os: &RecoveryOs) -> Option<String> {
     let at_boot = &os.btrbk_at_boot;
     let (verb, check) = match at_boot.verdict {
         BootVerdict::No => return None,
+        BootVerdict::May if os.btrbk_config == BtrbkConfig::Absent => return None,
         BootVerdict::Will => ("will", "its config"),
         BootVerdict::May => ("may", "what it starts at boot and its btrbk config"),
     };
@@ -3197,6 +3207,42 @@ mod tests {
     }
 
     #[test]
+    fn a_may_beside_no_btrbk_config_is_not_a_warning() {
+        // bd DAS-Backup-Manager-eg4j.17: every mkinitcpio OS reads "may" from
+        // mkinitcpio-generate-shutdown-ramfs.service; with no btrbk config
+        // anywhere, `btrbk run` stops before doing anything (eg4j.8's rule).
+        let os = |verdict, config| RecoveryOs {
+            btrbk_at_boot: BtrbkAtBoot {
+                verdict,
+                reasons: vec!["r".to_string()],
+                runners: Vec::new(),
+            },
+            btrbk_config: config,
+            ..Default::default()
+        };
+        assert_eq!(
+            boot_warning(&os(BootVerdict::May, BtrbkConfig::Absent)),
+            None
+        );
+        // A config present or unknown keeps the warning, and so does "will".
+        let present = BtrbkConfig::Present {
+            path: "/etc/btrbk.conf".into(),
+            size_bytes: 1,
+        };
+        assert!(boot_warning(&os(BootVerdict::May, present)).is_some());
+        let unknown = BtrbkConfig::Unreadable { reason: "x".into() };
+        assert!(boot_warning(&os(BootVerdict::May, unknown)).is_some());
+        assert!(boot_warning(&os(BootVerdict::Will, BtrbkConfig::Absent)).is_some());
+        let a = assess(
+            &os(BootVerdict::May, BtrbkConfig::Absent),
+            &HostVersions::default(),
+            TODAY,
+            60,
+        );
+        assert!(a.warnings.is_empty(), "{a:?}");
+    }
+
+    #[test]
     fn boot_warning_says_will_or_may_and_nothing_for_no() {
         let os = |verdict, reasons: &[&str]| RecoveryOs {
             btrbk_at_boot: BtrbkAtBoot {
@@ -5553,6 +5599,11 @@ mod tests {
         let mut unknown = os_with(Some(TODAY), &["7.2.1"]);
         unknown.enabled_units = EnabledUnits::Unreadable {
             reason: "etc/systemd/system: denied".into(),
+        };
+        // Its config unknown too: a "may" beside no config at all is no
+        // warning (bd DAS-Backup-Manager-eg4j.17).
+        unknown.btrbk_config = BtrbkConfig::Unreadable {
+            reason: "etc: denied".into(),
         };
         unknown.btrbk_at_boot = BtrbkAtBoot {
             verdict: BootVerdict::May,

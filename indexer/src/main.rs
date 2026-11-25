@@ -548,7 +548,7 @@ enum BackupAction {
         /// The target's label
         #[arg(long)]
         label: String,
-        /// The caller persists nothing derived from what it reads (backup-verify.sh): a split-brain member may be read, read-only, instead of refused (bd DAS-Backup-Manager-su1b.23)
+        /// A read-only mount (`ro` added to [das].mount_opts) for a caller that persists nothing derived from what it reads (backup-verify.sh): the guard writes no record or witness, and a split-brain member may be read instead of refused (bd DAS-Backup-Manager-su1b.23, su1b.30)
         #[arg(long)]
         read_only: bool,
         /// Path to config.toml
@@ -2311,8 +2311,13 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     if health::is_mountpoint(mount_path) {
         return cannot_run(format!("{} is already a mount point", target.mount));
     }
+    // --read-only is a read-only mount, whatever [das].mount_opts says: the
+    // caller (backup-verify.sh) is a diagnostic, and the guard writes nothing
+    // (no record, no witness) under `ro` (bd DAS-Backup-Manager-su1b.30).
+    let mut mount_cfg = cfg.clone();
+    mount_cfg.das.mount_opts = mount_target_opts(&cfg.das.mount_opts, read_only);
     let result = mount::mount_guarded_target(
-        &cfg,
+        &mount_cfg,
         target,
         buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
         &CliProgress,
@@ -2369,6 +2374,22 @@ fn cmd_clear_target(label: &str, config: &Path, leftover: bool) -> i32 {
     code
 }
 
+/// The mount options `btrdasd backup mount-target` passes the guard: the
+/// configured ones, or for `--read-only` those without `rw`/`ro` and then `ro`
+/// (bd DAS-Backup-Manager-su1b.30).
+fn mount_target_opts(opts: &str, read_only: bool) -> String {
+    if !read_only {
+        return opts.to_string();
+    }
+    let mut kept: Vec<&str> = opts
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && *o != "rw" && *o != "ro")
+        .collect();
+    kept.push("ro");
+    kept.join(",")
+}
+
 /// `btrdasd backup raid-check`: the end-of-job check of one RAID-1 target
 /// `backup-run.sh` mounted, before it unmounts it (bd
 /// DAS-Backup-Manager-su1b.14). Only under a handed-down maintenance lock,
@@ -2420,8 +2441,9 @@ fn cmd_raid_check(label: &str, config: &Path) -> i32 {
 
 /// `btrdasd raid accept <label>` (bd DAS-Backup-Manager-su1b.11): root only,
 /// under the backup singleton and the maintenance lock, both taken without
-/// waiting (held: exit 75). The label is read from a terminal; anything else
-/// accepts nothing.
+/// waiting (held: exit 75). The label (and, with every member present and
+/// differing generations, the serial of the member to keep, bd su1b.21) is
+/// read from a terminal; anything else accepts nothing.
 fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
     use std::io::{BufRead, IsTerminal, Write};
     // SAFETY: geteuid(2) takes nothing and cannot fail.
@@ -2470,15 +2492,19 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
             return 1;
         }
     };
-    let mut confirm = |explanation: &str| -> Result<String, String> {
-        println!("{explanation}");
+    // The terminal: shows `text` (when any), asks `prompt`, returns the line
+    // typed. Never a `--yes`, never a non-terminal answer.
+    let terminal = |text: &str, prompt: &str| -> Result<String, String> {
+        if !text.is_empty() {
+            println!("{text}");
+        }
         if !std::io::stdin().is_terminal() {
             return Err(
-                "standard input is not a terminal: run it at a terminal and type the label (there is no --yes)"
+                "standard input is not a terminal: run it at a terminal and type the answers (there is no --yes)"
                     .into(),
             );
         }
-        print!("To accept, type the target label exactly ({label}): ");
+        print!("{prompt}");
         std::io::stdout().flush().map_err(|e| e.to_string())?;
         let mut line = String::new();
         std::io::stdin()
@@ -2487,11 +2513,21 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
             .map_err(|e| format!("cannot read the answer: {e}"))?;
         Ok(line)
     };
+    let mut confirm = |explanation: &str| {
+        terminal(
+            explanation,
+            &format!("To accept, type the target label exactly ({label}): "),
+        )
+    };
+    let mut ask = |text: &str, prompt: &str| terminal(text, prompt);
     match mount::raid_accept(
         &cfg,
         label,
         db,
-        &mut confirm,
+        buttered_dasd::raid_guard::Terminal {
+            confirm: &mut confirm,
+            ask: Some(&mut ask),
+        },
         &CliProgress,
         &singleton,
         &held,
@@ -4223,6 +4259,24 @@ mod tests {
     /// (`DAS_SCRUB_STATE` / `DAS_BTRFS_STATUS_DIR`) — `cargo test` runs test
     /// functions in parallel by default within one binary.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn mount_target_read_only_mounts_ro() {
+        // bd DAS-Backup-Manager-su1b.30: --read-only (backup-verify.sh) is a
+        // read-only mount, healthy pair or degraded, so a diagnostic never
+        // writes the target or records a degraded period.
+        assert_eq!(
+            mount_target_opts("nodev,nosuid,rw,noatime", true),
+            "nodev,nosuid,noatime,ro"
+        );
+        assert_eq!(mount_target_opts("", true), "ro");
+        assert_eq!(mount_target_opts("ro,noatime", true), "noatime,ro");
+        assert!(buttered_dasd::raid_guard::is_read_only(&mount_target_opts(
+            "rw", true
+        )));
+        // The write intent keeps the configured options.
+        assert_eq!(mount_target_opts("nodev,rw", false), "nodev,rw");
+    }
 
     /// `mount-target` mounts with the write intent `backup-run.sh` needs unless
     /// `--read-only` says the caller (`backup-verify.sh`) persists nothing from
