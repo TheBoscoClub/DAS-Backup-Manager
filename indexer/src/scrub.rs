@@ -1497,6 +1497,26 @@ pub fn labels_already_scrubbed(
     started_epoch: i64,
     progress: &dyn ProgressCallback,
 ) -> Vec<String> {
+    labels_already_scrubbed_in(
+        state,
+        config,
+        started_epoch,
+        &crate::raid_guard::record_dir(),
+        progress,
+    )
+}
+
+/// [`labels_already_scrubbed`] with the RAID record directory given. A label
+/// whose RAID-1 record owes a scrub, or cannot be read, is never left out:
+/// the pass that pays the debt is the one that must scrub it (bd
+/// DAS-Backup-Manager-su1b.25).
+pub fn labels_already_scrubbed_in(
+    state: &ScrubState,
+    config: &Config,
+    started_epoch: i64,
+    record_dir: &Path,
+    progress: &dyn ProgressCallback,
+) -> Vec<String> {
     let Some(marker) = &state.paused_pass else {
         return Vec::new();
     };
@@ -1517,8 +1537,9 @@ pub fn labels_already_scrubbed(
         .scrub_target_labels()
         .into_iter()
         .filter(|label| {
-            let done = resolve_target_fsuuid(config, label)
-                .is_ok_and(|uuid| marker.finished.contains(&uuid));
+            let done = resolve_target_fsuuid(config, label).is_ok_and(|uuid| {
+                marker.finished.contains(&uuid) && !raid_record_may_owe_scrub(record_dir, &uuid)
+            });
             if done {
                 progress.on_log(
                     LogLevel::Info,
@@ -1533,6 +1554,18 @@ pub fn labels_already_scrubbed(
             done
         })
         .collect()
+}
+
+/// Whether `fsuuid`'s RAID-1 record owes a scrub, or cannot be read: either
+/// way the filesystem is scrubbed, whatever a paused pass finished
+/// (bd DAS-Backup-Manager-su1b.25). No record is no debt.
+fn raid_record_may_owe_scrub(record_dir: &Path, fsuuid: &str) -> bool {
+    use crate::raid_guard::{Copy, State, primary_path, read_copy};
+    match read_copy(&primary_path(record_dir, fsuuid), fsuuid) {
+        Copy::Absent => false,
+        Copy::Read(r) => r.state == State::ScrubOwed,
+        Copy::Bad(_) => true,
+    }
 }
 
 /// Path of the state file (overridable for tests via `DAS_SCRUB_STATE`).
@@ -1666,6 +1699,7 @@ fn next_paused_pass(prior: Option<PausedPass>, pass: &ScrubPass) -> Option<Pause
     for r in &pass.results {
         let scrubbed = r.paused.is_none()
             && r.interrupted_by.is_none()
+            && r.errors.is_empty()
             && r.outcome == Some(ScrubOutcome::Finished)
             && !r.fsuuid.is_empty();
         if scrubbed && !finished.contains(&r.fsuuid) {
@@ -3713,7 +3747,8 @@ pub fn pause_pass_at(
     if holder_is_setup(&holder) {
         return Ok(PauseOutcome::SetupHolds(holder));
     }
-    write_pause_request(&paths.request, by, now_epoch()).map_err(|e| ScrubError::Lock {
+    let requested = now_epoch();
+    write_pause_request(&paths.request, by, requested).map_err(|e| ScrubError::Lock {
         path: paths.request.display().to_string(),
         detail: format!("cannot write the pause request: {e}"),
     })?;
@@ -3739,7 +3774,14 @@ pub fn pause_pass_at(
         .map(|s| {
             s.filesystems
                 .values()
-                .filter(|f| f.last_attempt.outcome == "paused")
+                // Only a pause this request caused: one left by an earlier
+                // pause (never resumed) is not what this one ended.
+                .filter(|f| {
+                    f.last_attempt.outcome == "paused"
+                        && f.last_attempt
+                            .yielded_epoch
+                            .is_some_and(|at| at >= requested)
+                })
                 .map(|f| f.target_label.clone())
                 .collect()
         })
@@ -8828,7 +8870,7 @@ mod yield_tests {
                     r.outcome = None;
                     r.paused = Some(PausedBy {
                         by: "tester".into(),
-                        at_epoch: 5,
+                        at_epoch: now_epoch(),
                     });
                 }
                 merge_result_into_state(&mut st, &r, 10);
@@ -9073,5 +9115,122 @@ mod yield_tests {
             "{report}"
         );
         assert!(!report.contains("PROBLEMS"), "{report}");
+    }
+
+    /// bd DAS-Backup-Manager-su1b.25: a target that finished before a pause
+    /// and then rejoined owes a scrub; the resuming pass must scrub it.
+    #[test]
+    fn a_target_owing_a_scrub_is_not_left_out_of_a_resumed_pass() {
+        use crate::raid_guard::{PeriodMember, Record, State, primary_path, write_copy};
+        const FS: &str = "5eed00b1-0000-4000-8000-0000000000b1";
+        let mut cfg = config();
+        cfg.targets[0].mount_uuid = Some(FS.into());
+        let mut first = clean("first");
+        first.fsuuid = FS.into();
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![first, clean("second")], 11_000),
+        );
+        let records = tempfile::tempdir().unwrap();
+        // No record: finished before the pause, so left out.
+        assert_eq!(
+            labels_already_scrubbed_in(&state, &cfg, 11_500, records.path(), &NullProgress),
+            ["first"]
+        );
+        let owed = Record {
+            fsid: FS.into(),
+            state: State::ScrubOwed,
+            members: vec![PeriodMember {
+                devid: 1,
+                dev_uuid: "5eed00b2-0000-4000-8000-0000000000b2".into(),
+                generation: 5,
+            }],
+            since: 10_500,
+            last: 10_600,
+            rejoined: Some(10_700),
+            rejected: Vec::new(),
+        };
+        write_copy(&primary_path(records.path(), FS), &owed, true).unwrap();
+        assert!(
+            labels_already_scrubbed_in(&state, &cfg, 11_500, records.path(), &NullProgress)
+                .is_empty(),
+            "a scrub-owed target was left out"
+        );
+        // An unreadable record is no reason to skip either.
+        std::fs::write(primary_path(records.path(), FS), "garbage").unwrap();
+        assert!(
+            labels_already_scrubbed_in(&state, &cfg, 11_500, records.path(), &NullProgress)
+                .is_empty()
+        );
+    }
+
+    /// bd DAS-Backup-Manager-su1b.25 (2): a filesystem whose scrub finished
+    /// but whose engine reported an error (the unmount failed) is not filed
+    /// as scrubbed to the end.
+    #[test]
+    fn a_finished_scrub_with_engine_errors_is_scrubbed_again_on_resume() {
+        let mut errored = clean("first");
+        errored.errors.push("umount failed".into());
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![errored, clean("second")], 11_000),
+        );
+        assert!(
+            state.paused_pass.unwrap().finished.is_empty(),
+            "an errored result was filed as finished"
+        );
+    }
+
+    /// bd DAS-Backup-Manager-su1b.25 (4): a result filed mid-pass
+    /// (`record_result_logged`) leaves the paused-pass marker as it was.
+    #[test]
+    fn filing_a_result_mid_pass_keeps_the_paused_pass_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = ScrubState::default();
+        merge_pass_into_state(
+            &mut state,
+            &paused_pass(10_000, vec![clean("first"), clean("second")], 11_000),
+        );
+        let marker = state.paused_pass.clone().unwrap();
+        save_state_to(&state, &path).unwrap();
+        record_result_logged(&path, &clean("second"), &NullProgress);
+        let after = load_state_from(&path).unwrap();
+        assert_eq!(after.paused_pass, Some(marker));
+        assert!(after.filesystems.contains_key("u-second"));
+    }
+
+    /// bd DAS-Backup-Manager-su1b.20: a filesystem left `paused` by an
+    /// earlier pause is not what THIS pause ended; a pass that ended without
+    /// pausing reads as such, and its request is gone.
+    #[test]
+    fn pause_does_not_list_a_target_paused_by_an_earlier_pause() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        let mut st = ScrubState::default();
+        let mut old = clean("first");
+        old.outcome = None;
+        old.paused = Some(PausedBy {
+            by: "tester".into(),
+            at_epoch: 5,
+        });
+        merge_result_into_state(&mut st, &old, 10);
+        save_state_to(&st, &p.state).unwrap();
+        let held = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, SCRUB_JOB)
+            .unwrap()
+            .unwrap();
+        let (claim, request) = (p.claim.clone(), p.request.clone());
+        let pass = std::thread::spawn(move || {
+            wait_until(Duration::from_secs(5), "the claim", || {
+                claim_is_held(&claim).unwrap()
+            });
+            remove_pause_request(&request).unwrap();
+            drop(held);
+        });
+        let outcome = pause_pass_at(&p, "tester", Duration::from_secs(5), POLL).unwrap();
+        pass.join().unwrap();
+        assert_eq!(outcome, PauseOutcome::EndedUnpaused);
     }
 }

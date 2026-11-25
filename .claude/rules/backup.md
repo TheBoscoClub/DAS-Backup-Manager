@@ -222,7 +222,7 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
    - A pass that starts while the request exists → runs nothing, removes nothing, exits 0; one that ran to its end without meeting it removes it.
    - `pause` waits at most 240 s (`PAUSE_ANSWER_SECS`), kills nothing; not ended → exit 1, request left.
    - `btrdasd scrub resume` → refuses while the singleton is held; else removes the request and `systemctl start --no-block das-scrub.service`.
-   - The pass it starts → leaves out each filesystem the paused pass scrubbed to the end (state file `paused_pass`, bd `su1b.24`), only within 7 days of the pause; anything doubtful scrubs.
+   - The pass it starts → leaves out each filesystem the paused pass scrubbed to the end (state file `paused_pass`, bd `su1b.24`), only within 7 days of the pause; anything doubtful scrubs: a result with engine errors, a RAID-1 record owing a scrub or unreadable (bd `su1b.25`).
    - `paused` is not in progress and not a failure: health WARN (FAIL only past `fail_age_days`), status `PAUSED`.
 
 - **Every target mount needs it** — `mount::ensure_targets_mounted` takes a `MaintenanceHeld` (bd `frb`);
