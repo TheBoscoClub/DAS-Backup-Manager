@@ -3778,7 +3778,9 @@ pub fn pause_pass_at(
                 // pause (never resumed) is not what this one ended.
                 .filter(|f| {
                     f.last_attempt.outcome == "paused"
-                        && f.last_attempt.yielded_epoch.is_some_and(|at| at >= requested)
+                        && f.last_attempt
+                            .yielded_epoch
+                            .is_some_and(|at| at >= requested)
                 })
                 .map(|f| f.target_label.clone())
                 .collect()

@@ -1489,8 +1489,9 @@ fn cancel_running_scrub_at(lock: &Path, config: &Config) -> Result<String, Strin
         }
         None => Ok(
             "A scrub pass is running (lock held) but no configured target's mount currently \
-             shows an active scrub — it may be between filesystems (mounting/unmounting); \
-             try again in a few seconds."
+             shows an active scrub — it may be between filesystems (mounting/unmounting; try \
+             again in a few seconds), or it has yielded to a backup and resumes when that \
+             backup is done (there is nothing to cancel until then)."
                 .to_string(),
         ),
     }
@@ -5552,6 +5553,11 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert!(
             met.as_ref().is_ok_and(|m| m.contains("lock held")),
             "a real pass is still a pass: {met:?}"
+        );
+        assert!(
+            met.as_ref()
+                .is_ok_and(|m| m.contains("yielded to a backup")),
+            "the no-active-scrub answer names a yielded pass: {met:?}"
         );
 
         assert_eq!(
