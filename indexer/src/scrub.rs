@@ -3747,7 +3747,8 @@ pub fn pause_pass_at(
     if holder_is_setup(&holder) {
         return Ok(PauseOutcome::SetupHolds(holder));
     }
-    write_pause_request(&paths.request, by, now_epoch()).map_err(|e| ScrubError::Lock {
+    let requested = now_epoch();
+    write_pause_request(&paths.request, by, requested).map_err(|e| ScrubError::Lock {
         path: paths.request.display().to_string(),
         detail: format!("cannot write the pause request: {e}"),
     })?;
@@ -3773,7 +3774,12 @@ pub fn pause_pass_at(
         .map(|s| {
             s.filesystems
                 .values()
-                .filter(|f| f.last_attempt.outcome == "paused")
+                // Only a pause this request caused: one left by an earlier
+                // pause (never resumed) is not what this one ended.
+                .filter(|f| {
+                    f.last_attempt.outcome == "paused"
+                        && f.last_attempt.yielded_epoch.is_some_and(|at| at >= requested)
+                })
                 .map(|f| f.target_label.clone())
                 .collect()
         })
@@ -8862,7 +8868,7 @@ mod yield_tests {
                     r.outcome = None;
                     r.paused = Some(PausedBy {
                         by: "tester".into(),
-                        at_epoch: 5,
+                        at_epoch: now_epoch(),
                     });
                 }
                 merge_result_into_state(&mut st, &r, 10);
@@ -9192,5 +9198,37 @@ mod yield_tests {
         let after = load_state_from(&path).unwrap();
         assert_eq!(after.paused_pass, Some(marker));
         assert!(after.filesystems.contains_key("u-second"));
+    }
+
+    /// bd DAS-Backup-Manager-su1b.20: a filesystem left `paused` by an
+    /// earlier pause is not what THIS pause ended; a pass that ended without
+    /// pausing reads as such, and its request is gone.
+    #[test]
+    fn pause_does_not_list_a_target_paused_by_an_earlier_pause() {
+        let s = scratch();
+        let p = pause_paths(&s);
+        let mut st = ScrubState::default();
+        let mut old = clean("first");
+        old.outcome = None;
+        old.paused = Some(PausedBy {
+            by: "tester".into(),
+            at_epoch: 5,
+        });
+        merge_result_into_state(&mut st, &old, 10);
+        save_state_to(&st, &p.state).unwrap();
+        let held = crate::backup::SingletonHeld::try_acquire_at(&p.singleton, SCRUB_JOB)
+            .unwrap()
+            .unwrap();
+        let (claim, request) = (p.claim.clone(), p.request.clone());
+        let pass = std::thread::spawn(move || {
+            wait_until(Duration::from_secs(5), "the claim", || {
+                claim_is_held(&claim).unwrap()
+            });
+            remove_pause_request(&request).unwrap();
+            drop(held);
+        });
+        let outcome = pause_pass_at(&p, "tester", Duration::from_secs(5), POLL).unwrap();
+        pass.join().unwrap();
+        assert_eq!(outcome, PauseOutcome::EndedUnpaused);
     }
 }
