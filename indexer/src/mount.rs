@@ -3162,6 +3162,9 @@ mod tests {
         seq_pos: Mutex<std::collections::HashMap<String, usize>>,
         /// Every pause asked for, in order; none is really taken.
         pauses: Mutex<Vec<Duration>>,
+        /// How many commands had been run when each pause was asked for
+        /// (parallel to `pauses`): where in the sequence it fell.
+        pause_at: Mutex<Vec<usize>>,
     }
 
     impl ScriptedRunner {
@@ -3180,6 +3183,7 @@ mod tests {
                 unmounted: Mutex::new(Vec::new()),
                 seq_pos: Mutex::new(std::collections::HashMap::new()),
                 pauses: Mutex::new(Vec::new()),
+                pause_at: Mutex::new(Vec::new()),
             })
         }
 
@@ -3268,6 +3272,10 @@ mod tests {
         }
 
         fn pause(&self, how_long: Duration) {
+            self.pause_at
+                .lock()
+                .unwrap()
+                .push(self.calls.lock().unwrap().len());
             self.pauses.lock().unwrap().push(how_long);
         }
     }
@@ -8270,5 +8278,416 @@ mod tests {
         assert!(argvs(&runner, "mount").is_empty());
         assert!(seen.is_empty());
         assert!(!scratch.path().join("recovery-a").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // bd DAS-Backup-Manager-su1b.34: the survivors of the CI mutation run.
+    // -----------------------------------------------------------------------
+
+    /// The scripted answers a `raid1_mounted_by_udisks` host needs, with
+    /// `umount` answering `umount` instead.
+    fn udisks_runner(scratch: &Scratch, umount: Reply) -> Arc<ScriptedRunner> {
+        let (part_b, part_c) = (scratch.path("dev/sdb1"), scratch.path("dev/sdc1"));
+        ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n{part_c}\n"))),
+            (
+                &part_b,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 1, "5eed00a1-0000-4000-8000-0000000000a1", 40),
+                ),
+            ),
+            (
+                &part_c,
+                Reply::Out(
+                    0,
+                    super_of("u-p", 2, "5eed00a2-0000-4000-8000-0000000000a2", 40),
+                ),
+            ),
+            ("umount", umount),
+        ])
+    }
+
+    /// A process that exists but holds nothing of the mount.
+    fn idle(pid: i32) -> crate::holders::testproc::Proc<'static> {
+        crate::holders::testproc::Proc {
+            pid,
+            cmd: "idle",
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_mount_table_read_is_this_processs_own() {
+        let text = read_self_mountinfo().unwrap();
+        let entries = crate::holders::parse_mountinfo(&text);
+        assert!(
+            entries.iter().any(|m| m.mount_point == "/"),
+            "no root mount in {text:?}"
+        );
+        assert!(text.lines().count() >= 2, "{text:?}");
+    }
+
+    #[test]
+    fn the_origin_of_a_mount_comes_from_systemctl_only_when_it_ran_and_succeeded() {
+        use crate::holders::Origin;
+        let shown = "Id=mnt-x.mount\nLoadState=loaded\nFragmentPath=/etc/systemd/system/mnt-x.mount\nSourcePath=\n";
+        let unit = Origin::Unit {
+            unit: "mnt-x.mount".into(),
+            from: "/etc/systemd/system/mnt-x.mount".into(),
+        };
+        let ran = ScriptedRunner::with_rules(&[("systemctl", Reply::Out(0, shown.into()))]);
+        assert_eq!(origin_of(ran.as_ref(), "/mnt/x"), unit);
+        assert_eq!(
+            ran.calls(),
+            vec![output_call(&[
+                "systemctl",
+                "show",
+                "--property=Id",
+                "--property=LoadState",
+                "--property=FragmentPath",
+                "--property=SourcePath",
+                "--",
+                "/mnt/x"
+            ])]
+        );
+        // The same text from a systemctl that failed is not believed.
+        let failed = ScriptedRunner::with_rules(&[("systemctl", Reply::Out(1, shown.into()))]);
+        assert_eq!(origin_of(failed.as_ref(), "/mnt/x"), Origin::Other);
+        let absent = ScriptedRunner::with_rules(&[("systemctl", Reply::CannotRun)]);
+        assert_eq!(origin_of(absent.as_ref(), "/mnt/x"), Origin::Other);
+        assert_eq!(
+            origin_of(failed.as_ref(), "/run/media/u/das"),
+            Origin::Udisks
+        );
+    }
+
+    /// `maintenance_on` against a described `/sys/fs/btrfs` and a scripted
+    /// `btrfs scrub status`.
+    fn maintenance(
+        sysfs: &Path,
+        fsid: Option<&str>,
+        scrub: Reply,
+    ) -> (Result<(), String>, Arc<ScriptedRunner>) {
+        let runner = ScriptedRunner::with_rules(&[("scrub", scrub)]);
+        let host = Host::default();
+        let signals = HostSignals(&host);
+        let none = || Ok(String::new());
+        let site = ClearSite {
+            mountinfo: &none,
+            proc: crate::holders::ProcSite::host(),
+            signaller: &signals,
+            self_pid: 1,
+            report_only: false,
+            sysfs_btrfs: sysfs.to_path_buf(),
+        };
+        let got = maintenance_on(runner.as_ref(), &site, fsid, "/mnt/t");
+        (got, runner)
+    }
+
+    fn finished() -> Reply {
+        Reply::Out(0, "UUID: u\nStatus:           finished\n".into())
+    }
+
+    #[test]
+    fn an_idle_filesystem_has_no_maintenance_on_it() {
+        let sys = tempfile::TempDir::new().unwrap();
+        let fs_dir = sys.path().join("u-p");
+        std::fs::create_dir_all(&fs_dir).unwrap();
+        // "none", empty, and no file at all: nothing running.
+        for text in [Some("none\n"), Some(""), Some("\n"), None] {
+            if let Some(t) = text {
+                std::fs::write(fs_dir.join("exclusive_operation"), t).unwrap();
+            }
+            let (got, runner) = maintenance(sys.path(), Some("U-P"), finished());
+            assert_eq!(got, Ok(()), "{text:?}");
+            assert_eq!(
+                runner.calls(),
+                vec![output_call(&["btrfs", "scrub", "status", "/mnt/t"])]
+            );
+        }
+        // No filesystem UUID to look under: only the scrub is asked.
+        let (got, _) = maintenance(sys.path(), None, finished());
+        assert_eq!(got, Ok(()));
+    }
+
+    #[test]
+    fn an_exclusive_operation_or_an_unreadable_one_refuses() {
+        let sys = tempfile::TempDir::new().unwrap();
+        let fs_dir = sys.path().join("u-p");
+        std::fs::create_dir_all(&fs_dir).unwrap();
+        std::fs::write(fs_dir.join("exclusive_operation"), "balance\n").unwrap();
+        let (got, runner) = maintenance(sys.path(), Some("u-p"), finished());
+        let e = got.unwrap_err();
+        assert!(e.contains("a btrfs balance is running"), "{e}");
+        assert!(runner.calls().is_empty(), "asked the scrub anyway");
+        // Present but not a readable file: refused, never taken as none.
+        std::fs::remove_file(fs_dir.join("exclusive_operation")).unwrap();
+        std::fs::create_dir(fs_dir.join("exclusive_operation")).unwrap();
+        let (got, runner) = maintenance(sys.path(), Some("u-p"), finished());
+        let e = got.unwrap_err();
+        assert!(
+            e.contains("whether btrfs maintenance runs on it cannot be read"),
+            "{e}"
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn a_running_scrub_or_one_that_cannot_be_asked_about_refuses() {
+        let sys = tempfile::TempDir::new().unwrap();
+        let ask = |reply| maintenance(sys.path(), None, reply).0;
+        let running = "UUID: u\nScrub started: now\nStatus:           running\n";
+        let e = ask(Reply::Out(0, running.into())).unwrap_err();
+        assert!(e.contains("a scrub is running on it (/mnt/t)"), "{e}");
+        // `running` anywhere but a Status line, and a Status that is not it.
+        let text = "UUID: u\nStatus:           finished\nNote: not running\n";
+        assert_eq!(ask(Reply::Out(0, text.into())), Ok(()));
+        assert!(ask(Reply::Out(0, "Status:  running (was)\n".into())).is_err());
+        // A status that failed is not read, even when it printed `running`.
+        let e = ask(Reply::Out(1, running.into())).unwrap_err();
+        assert!(e.contains("cannot be told"), "{e}");
+        let e = ask(Reply::CannotRun).unwrap_err();
+        assert!(e.contains("cannot be told (btrfs scrub status:"), "{e}");
+    }
+
+    /// `clear-target` for a leftover at the target's own path, with the
+    /// holders `proc` describes.
+    fn leftover_host(
+        scratch: &Scratch,
+        proc: Option<crate::holders::testproc::Proc<'static>>,
+    ) -> (Config, Host, String) {
+        let (mut config, mut host, _part, mnt) = attached_primary(scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        host.mountinfo = vec![format!("88 22 0:52 / {mnt} rw - btrfs /dev/sdb1 rw")];
+        let table = crate::holders::testproc::FakeProc::new();
+        if let Some(p) = proc {
+            table.add(p);
+        }
+        host.proc = Some(Arc::new(table));
+        (config, host, mnt)
+    }
+
+    fn is_target() -> Arc<ScriptedRunner> {
+        ScriptedRunner::with_rules(&[(
+            "UUID",
+            Reply::Exit {
+                code: 0,
+                stdout: "u-p\n",
+                stderr: "",
+            },
+        )])
+    }
+
+    fn leftover_reader() -> crate::holders::testproc::Proc<'static> {
+        crate::holders::testproc::Proc {
+            pid: 320,
+            cmd: "less",
+            fds: vec![(3, "/x", "0100000", Some(88))],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_leftover_nothing_holds_says_so_and_one_with_a_reader_names_the_stop() {
+        let scratch = Scratch::new();
+        let (config, host, mnt) = leftover_host(&scratch, None);
+        let got = clear_cli(&host, &is_target(), &config.targets[0], true);
+        assert_eq!(got, ClearTarget::Cleared(format!("nothing holds {mnt}")));
+        assert!(host.signals().is_empty());
+
+        let scratch = Scratch::new();
+        let (config, host, mnt) = leftover_host(&scratch, Some(leftover_reader()));
+        let got = clear_cli(&host, &is_target(), &config.targets[0], true);
+        assert_eq!(
+            got,
+            ClearTarget::Cleared(format!(
+                "{STOPPED}: SIGTERM to pid 320 (less; user user, unit session-2.scope); \
+                 nothing holds {mnt} now"
+            ))
+        );
+        assert_eq!(host.signals(), vec![(320, crate::holders::Sig::Term)]);
+    }
+
+    #[test]
+    fn a_leftover_dry_run_signals_nobody_and_says_so() {
+        let scratch = Scratch::new();
+        let (config, mut host, mnt) = leftover_host(&scratch, Some(leftover_reader()));
+        host.report_only = true;
+        let got = clear_cli(&host, &is_target(), &config.targets[0], true);
+        assert_eq!(
+            got,
+            ClearTarget::Cleared(format!("dry run: nothing signalled at {mnt}"))
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+    }
+
+    #[test]
+    fn another_programs_mount_is_cleared_for_the_script_and_each_outcome_is_worded() {
+        // Held by nothing: unmounted, no signal.
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) = raid1_mounted_by_udisks(&scratch, idle(300));
+        let got = clear_cli(&host, &runner, &config.targets[0], false);
+        assert_eq!(
+            got,
+            ClearTarget::Cleared(
+                "another program's mount, held by nothing, was unmounted; the kernel has it \
+                 mounted nowhere"
+                    .into()
+            )
+        );
+        assert!(host.signals().is_empty());
+        assert!(
+            runner
+                .calls()
+                .contains(&status_call(&["umount", "/run/media/u/das"]))
+        );
+
+        // Held by a reader: stopped, then unmounted.
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let got = clear_cli(&host, &runner, &config.targets[0], false);
+        assert_eq!(
+            got,
+            ClearTarget::Cleared(format!(
+                "another program's mount was unmounted, {STOPPED}: SIGTERM to pid 300 \
+                 (dolphin; user user, unit session-2.scope); the kernel has it mounted nowhere"
+            ))
+        );
+
+        // Not mounted anywhere else: nothing to do.
+        let scratch = Scratch::new();
+        let (config, mut host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.mountinfo.truncate(1);
+        let got = clear_cli(&host, &runner, &config.targets[0], false);
+        assert_eq!(
+            got,
+            ClearTarget::Cleared("not mounted anywhere else".into())
+        );
+    }
+
+    #[test]
+    fn a_dry_run_clear_target_says_what_it_would_do_and_does_none_of_it() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.report_only = true;
+        let got = clear_cli(&host, &runner, &config.targets[0], false);
+        let ClearTarget::Cleared(text) = &got else {
+            panic!("{got:?}");
+        };
+        assert!(
+            text.starts_with("dry run: would unmount /run/media/u/das (udisks"),
+            "{text}"
+        );
+        assert!(text.contains("would stop: pid 300"), "{text}");
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(
+            !runner.calls().iter().any(|c| c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// The first `umount` of another program's mount fails and the second
+    /// works: one pause between them, after the first try, and no more.
+    #[test]
+    fn a_failed_umount_is_retried_once_after_its_pause() {
+        let scratch = Scratch::new();
+        let (config, host, _r, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let runner = udisks_runner(&scratch, Reply::Seq(&[32, 0]));
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        let calls = runner.calls();
+        let umounts: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c == &&status_call(&["umount", "/run/media/u/das"]))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(umounts.len(), 2, "{calls:?}");
+        let pauses = runner.pauses.lock().unwrap().clone();
+        assert_eq!(pauses, vec![UMOUNT_RETRY_PAUSE]);
+        // Between the first umount and the second, not before the first.
+        let at = runner.pause_at.lock().unwrap().clone();
+        assert!(
+            at[0] > umounts[0] && at[0] <= umounts[1],
+            "paused after {} commands; umounts at {umounts:?}",
+            at[0]
+        );
+        assert_eq!(guard.count(), 1);
+    }
+
+    /// An `umount` that never works refuses the target after every attempt.
+    #[test]
+    fn a_mount_that_will_not_unmount_refuses_the_target_after_all_attempts() {
+        let scratch = Scratch::new();
+        let (config, host, _r, _mnt) = raid1_mounted_by_udisks(&scratch, idle(300));
+        let runner = udisks_runner(&scratch, Reply::exit(32));
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        let Err(MountError::AllTargetsRefused { notes }) = result else {
+            panic!("{:?}", result.err());
+        };
+        assert!(
+            notes[0].detail.contains(&format!(
+                "/run/media/u/das will not unmount: umount exited with code 32 after \
+                 {UMOUNT_ATTEMPTS} attempts"
+            )),
+            "{notes:?}"
+        );
+        assert_eq!(
+            argvs(&runner, "umount").len(),
+            UMOUNT_ATTEMPTS as usize,
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            runner.pauses.lock().unwrap().len(),
+            UMOUNT_ATTEMPTS as usize - 1
+        );
+        assert!(
+            !runner.calls().iter().any(|c| c.argv[0] == "mount"),
+            "mounted beside it: {:?}",
+            runner.calls()
+        );
+    }
+
+    /// The stop is said as a warning when something was stopped, and not
+    /// when nothing was; the report notes follow the same line.
+    #[test]
+    fn what_a_clearing_stopped_is_said_and_noted_only_when_something_was() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let progress = Recorder::default();
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+        assert!(
+            logged(&progress, &format!("{STOPPED}: SIGTERM to pid 300")),
+            "{:?}",
+            progress.logs()
+        );
+        let notes = crate::backup::Release::clear_notes(&guard);
+        assert_eq!(notes, guard.clear_notes().to_vec());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].outcome, ClearOutcome::Stopped);
+
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) = raid1_mounted_by_udisks(&scratch, idle(300));
+        let progress = Recorder::default();
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+        assert!(!logged(&progress, STOPPED), "{:?}", progress.logs());
+        assert!(guard.clear_notes().is_empty(), "{:?}", guard.clear_notes());
+        assert!(crate::backup::Release::clear_notes(&guard).is_empty());
+        assert_eq!(guard.count(), 1);
     }
 }
