@@ -688,6 +688,103 @@ pub fn device_info_from_serial(serial: &str) -> Option<(String, bool)> {
     None
 }
 
+/// The sysfs directory of the whole disk a block device (a partition, or a
+/// disk) sits on, from `<sys>/class/block`.
+fn parent_disk_dir(sys: &Path, partition: &str) -> Result<std::path::PathBuf, String> {
+    let name = Path::new(partition)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{partition}: not a device path"))?;
+    let node = sys.join("class/block").join(name);
+    let real = node
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", node.display()))?;
+    if real.join("partition").exists() {
+        Ok(real
+            .parent()
+            .ok_or_else(|| format!("{}: a partition with no parent disk", real.display()))?
+            .to_path_buf())
+    } else {
+        Ok(real)
+    }
+}
+
+/// The serial of the drive a member partition sits on, the way the rest of
+/// the guard names a configured drive (bd DAS-Backup-Manager-su1b.27): a
+/// configured serial whose drive ([`device_from_serial`]'s by-id lookup,
+/// passed as `resolve`) is this partition's parent disk wins, so a USB bridge
+/// that reports its own serial to udev cannot make a configured member look
+/// foreign; any other drive is named by its udev `ID_SERIAL_SHORT`
+/// ([`serial_of_partition_under`]) so it can be told to the operator and
+/// refused. `Err` when neither names it.
+pub fn member_drive_serial_under(
+    sys: &Path,
+    udev_data: &Path,
+    partition: &str,
+    configured: &[String],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let disk = parent_disk_dir(sys, partition)?;
+    if let Some(name) = disk.file_name().and_then(|n| n.to_str()) {
+        let dev = format!("/dev/{name}");
+        if let Some(s) = configured
+            .iter()
+            .find(|s| resolve(s).as_deref() == Some(dev.as_str()))
+        {
+            return Ok(s.clone());
+        }
+    }
+    serial_of_partition_under(sys, udev_data, partition)
+}
+
+/// The serial of the drive a block device (a member partition, or a whole
+/// disk) sits on: the inverse of [`device_from_serial`], read from the
+/// kernel's own tables and never from a name. `partition` is a device path
+/// (`/dev/sdb1`); its parent disk is found in `<sys>/class/block` (a
+/// partition has a `partition` file and its disk is the directory above),
+/// and the disk's `ID_SERIAL_SHORT` in udev's database
+/// (`<udev_data>/b<major>:<minor>`). Any step that cannot be read, or an
+/// empty serial, is an `Err` saying which: never a guess (bd
+/// DAS-Backup-Manager-su1b.27).
+pub fn serial_of_partition_under(
+    sys: &Path,
+    udev_data: &Path,
+    partition: &str,
+) -> Result<String, String> {
+    let disk = parent_disk_dir(sys, partition)?;
+    let dev_file = disk.join("dev");
+    let majmin = fs::read_to_string(&dev_file)
+        .map_err(|e| format!("{}: {e}", dev_file.display()))?
+        .trim()
+        .to_string();
+    let db = udev_data.join(format!("b{majmin}"));
+    let text = fs::read_to_string(&db).map_err(|e| format!("{}: {e}", db.display()))?;
+    let serial = text
+        .lines()
+        .find_map(|l| l.strip_prefix("E:ID_SERIAL_SHORT="))
+        .map(str::trim)
+        .unwrap_or_default();
+    if serial.is_empty() {
+        return Err(format!(
+            "{}: the drive's udev record carries no ID_SERIAL_SHORT",
+            db.display()
+        ));
+    }
+    Ok(serial.to_string())
+}
+
+/// [`member_drive_serial_under`] on this host's `/sys`, udev database and
+/// `/dev/disk/by-id`.
+pub fn member_drive_serial(partition: &str, configured: &[String]) -> Result<String, String> {
+    member_drive_serial_under(
+        Path::new("/sys"),
+        Path::new("/run/udev/data"),
+        partition,
+        configured,
+        &device_from_serial,
+    )
+}
+
 /// Find where a device partition is currently mounted, regardless of path.
 ///
 /// Resolves the target's serial to a block device, determines its partition
@@ -3101,5 +3198,97 @@ Overall:
             None
         );
         assert_eq!(btrfs_uuid_for_serial("", &TargetRole::Mirror), None);
+    }
+
+    /// A sysfs and udev tree shaped as the kernel's: `sdb` is a disk (8:16)
+    /// with partition `sdb1`; `class/block/<name>` links to the device.
+    fn serial_tree(udev_body: Option<&str>) -> tempfile::TempDir {
+        let d = tempfile::TempDir::new().unwrap();
+        let disk = d.path().join("sys/devices/pci0/ata1/sdb");
+        std::fs::create_dir_all(disk.join("sdb1")).unwrap();
+        std::fs::write(disk.join("dev"), "8:16\n").unwrap();
+        std::fs::write(disk.join("sdb1/dev"), "8:17\n").unwrap();
+        std::fs::write(disk.join("sdb1/partition"), "1\n").unwrap();
+        let cls = d.path().join("sys/class/block");
+        std::fs::create_dir_all(&cls).unwrap();
+        std::os::unix::fs::symlink(&disk, cls.join("sdb")).unwrap();
+        std::os::unix::fs::symlink(disk.join("sdb1"), cls.join("sdb1")).unwrap();
+        let udev = d.path().join("udev");
+        std::fs::create_dir_all(&udev).unwrap();
+        if let Some(body) = udev_body {
+            std::fs::write(udev.join("b8:16"), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_partitions_serial_is_its_parent_disks_udev_serial() {
+        let d = serial_tree(Some(
+            "S:disk/by-id/x\nE:ID_SERIAL_SHORT=SERIAL01\nE:ID_BUS=ata\n",
+        ));
+        let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+        for dev in ["/dev/sdb1", "/dev/sdb"] {
+            assert_eq!(
+                serial_of_partition_under(&sys, &udev, dev).as_deref(),
+                Ok("SERIAL01"),
+                "{dev}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_serial_whose_drive_is_the_parent_disk_names_the_member() {
+        // A USB bridge: udev reports the bridge's serial, by-id carries the
+        // drive's. The configured serial still binds the partition.
+        let d = serial_tree(Some("E:ID_SERIAL_SHORT=BRIDGE0001\n"));
+        let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+        let configured = vec!["SERIAL11".to_string(), "SERIAL12".to_string()];
+        let resolve = |s: &str| (s == "SERIAL12").then(|| "/dev/sdb".to_string());
+        assert_eq!(
+            member_drive_serial_under(&sys, &udev, "/dev/sdb1", &configured, &resolve).as_deref(),
+            Ok("SERIAL12")
+        );
+        // No configured serial resolves to it: named by udev, to be refused.
+        let resolve_none = |_: &str| None;
+        assert_eq!(
+            member_drive_serial_under(&sys, &udev, "/dev/sdb1", &configured, &resolve_none)
+                .as_deref(),
+            Ok("BRIDGE0001")
+        );
+        // Another disk's configured serial does not bind this one.
+        let resolve_other = |s: &str| (s == "SERIAL11").then(|| "/dev/sdc".to_string());
+        assert_eq!(
+            member_drive_serial_under(&sys, &udev, "/dev/sdb1", &configured, &resolve_other)
+                .as_deref(),
+            Ok("BRIDGE0001")
+        );
+        // Nothing names it: an error, never a guess.
+        let d = serial_tree(None);
+        let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+        assert!(
+            member_drive_serial_under(&sys, &udev, "/dev/sdb1", &configured, &resolve_none)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_serial_that_cannot_be_read_is_an_error_never_a_guess() {
+        // No udev record for the disk.
+        let d = serial_tree(None);
+        let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+        assert!(serial_of_partition_under(&sys, &udev, "/dev/sdb1").is_err());
+        // A record without the serial, and one with an empty serial.
+        for body in ["E:ID_BUS=ata\n", "E:ID_SERIAL_SHORT=\n"] {
+            let d = serial_tree(Some(body));
+            let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+            assert!(
+                serial_of_partition_under(&sys, &udev, "/dev/sdb1").is_err(),
+                "{body:?}"
+            );
+        }
+        // A device the kernel does not list.
+        let d = serial_tree(Some("E:ID_SERIAL_SHORT=SERIAL01\n"));
+        let (sys, udev) = (d.path().join("sys"), d.path().join("udev"));
+        assert!(serial_of_partition_under(&sys, &udev, "/dev/sdz9").is_err());
     }
 }
