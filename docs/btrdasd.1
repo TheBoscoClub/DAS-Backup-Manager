@@ -1093,7 +1093,10 @@ recovery\-OS reading), stays refused (see
 .IP 5. 4
 after the mount, a member the kernel reports missing
 .RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
-while every member is attached is refused.
+while every member is attached is refused; so is a view in which
+.I /sys/fs/btrfs/<fsid>/devices/
+lists fewer opened devices than devinfo shows not missing (a device scan
+clears the flag of a member a degraded mount never opened).
 .PP
 It prints one line,
 .BI "RAID GUARD: " STATUS "  (" detail ) \fR,
@@ -1122,6 +1125,76 @@ script, which unmounts it.
 .RB [ \-\-config
 .IR PATH ]
 .\"
+.SS backup clear\-target
+Clear what holds a target's filesystem, for
+.BR backup\-run.sh ,
+the one implementation of the stop policy the Rust jobs use too (bd
+DAS\-Backup\-Manager\-su1b.12). Not for use by hand: only under the
+maintenance lock handed down
+.RB ( DAS_MAINTENANCE_LOCK_FD ).
+Without
+.BR \-\-leftover ,
+for a RAID\-1 target: every mount of its filesystem other than the target's
+own path (found in
+.I /proc/self/mountinfo
+by its member devices) is said with its origin (udisks under
+.IR /run/media ,
+a systemd
+.B .mount
+unit with a unit file or a generator source, or a hand mount or another
+program) and options; every process using one is said with its pid, user,
+unit, command line and use (files open for reading or writing, mappings,
+working directory); then the stop policy, and each mount is unmounted,
+deepest first. Such a mount is never bound at the target's path: the
+kernel's devinfo view of a mount another program made cannot be trusted.
+With
+.BR \-\-leftover :
+the mount an earlier job left busy at the target's own path, shown to be the
+target first; its holders are cleared and the script unmounts it.
+.IP
+The stop policy: a process holding a file there open for writing, a shared
+writable mapping, or a use that cannot be read is never signalled, and the
+target is refused; so is one held by PID 1, a kernel thread, or this job or
+an ancestor of it. Otherwise every holder gets SIGTERM, 10 s to exit, then
+SIGKILL and 5 s; each pid's start time is read again before each signal (a
+reused pid is skipped), and each signal is named. btrfs maintenance on it
+\(em an exclusive operation
+.RI ( /sys/fs/btrfs/<fsid>/exclusive_operation
+not
+.BR none ),
+a running scrub, or a
+.B btrfs
+or
+.B btrbk
+process, whose work goes through ioctls on read\-only descriptors \(em is
+never interrupted: refused. A working directory, root or executable counts
+by the mount it is on, never by its path. With
+.BR \-\-report\-only ,
+for a dry run, it says what it would stop
+.RB ( "would stop:" )
+and unmount
+.RB ( "would unmount" )
+and does neither; exit 0 when it would clear, 3 when it would refuse. A filesystem still
+mounted when every visible mount is gone
+.RI ( /sys/fs/btrfs/<fsid>
+present: another mount namespace, or a lazy unmount held open) is refused.
+It prints one line per mount, holder and signal, then
+.BI "CLEAR TARGET: " STATUS "  (" detail ) \fR,
+.I STATUS
+one of
+.BR OK ,
+.B REFUSED
+or
+.BR CANNOT\-RUN ;
+exit status 0, 3 or 2.
+.PP
+.B btrdasd backup clear\-target \-\-label
+.I LABEL
+.RB [ \-\-leftover ]
+.RB [ \-\-report\-only ]
+.RB [ \-\-config
+.IR PATH ]
+.\"
 .SS backup raid\-check
 The end\-of\-run check of one RAID\-1 target
 .B backup\-run.sh
@@ -1132,7 +1205,9 @@ maintenance lock handed down
 with the target mounted. A member the kernel shows missing
 .RI ( /sys/fs/btrfs/<fsid>/devinfo/*/missing )
 \(em it dropped while the run had the target mounted \(em or a view that
-cannot be read is recorded as a degraded period on the members present, so
+cannot be read (fewer opened devices under
+.I devices/
+than devids not missing included) is recorded as a degraded period on the members present, so
 the next mount with every member owes a scrub. Every Rust job and the scrub
 make the same check before their own unmounts. It prints one line,
 .BI "RAID CHECK: " STATUS "  (" detail ) \fR,

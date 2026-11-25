@@ -107,10 +107,14 @@ The system has six major components:
          │                                    WARN on every run until restored, gone or accepted (`btrdasd subvol coverage accept`); never a failure, never an
          │                                    exit code; the same check runs inside `backup run` (CLI, GUI), and a dry run compares without recording)
          ├──▶ create snapshot dirs, mount targets (by mount_uuid, else by serial), verify_targets_before_btrbk(), create target dirs
-         │                                   (a target an earlier job left mounted: identity checked, unmounted — 5 tries, then umount -f — and mounted
-         │                                    afresh; one that will not come down, or is not the target, aborts with 3 before btrbk, bd jgm)
+         │                                   (a target an earlier job left mounted: identity checked, unmounted — 5 tries; still busy, its holders
+         │                                    cleared by `btrdasd backup clear-target --leftover` and 5 tries again; then umount -f — and mounted
+         │                                    afresh; one that will not come down, a writer holding it, or not the target, aborts with 3 before btrbk,
+         │                                    bd jgm, su1b.12)
          │                                   (a RAID-1 target — mount_uuid and two or more serials — is mounted by `btrdasd backup
-         │                                    mount-target` with fd 8 handed down: the guard, below; REFUSED aborts with 3, bd su1b.10)
+         │                                    mount-target` with fd 8 handed down: the guard, below; REFUSED aborts with 3, bd su1b.10;
+         │                                    first `btrdasd backup clear-target` clears another program's mounts of it — holders stopped by
+         │                                    the stop policy, each mount unmounted, never bound; REFUSED leaves it unavailable, a FAIL row, bd su1b.12)
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
          ├──▶ btrdasd backup static        → sends the `[[source.static]]` subvolumes (read-only subvolumes somebody else made) to the primary targets as they are, while the targets are still mounted; nothing is written on the source (a dry run prints the plan)
@@ -246,7 +250,8 @@ btrfs device scan <each member path>          → never unscoped, never --forget
 dump-super <each member>                      → fsid, devid, dev_uuid, generation, num_devices
 all num_devices present?
    yes → mount -o <mount_opts minus degraded> UUID=<fsid>
-           ok   → devinfo/*/missing all 0, else unmount and REFUSE
+           ok   → devinfo/*/missing all 0 and devices/ one entry per devid not missing,
+                  else unmount and REFUSE
                   record degraded → scrub-owed (both copies); scrub-owed → WARN
            fail → keep polling (below); still failing with all present → REFUSE
    no  → poll every 5 s for [das].member_wait_secs, rescanning
@@ -954,10 +959,11 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `fsutil` | `src/fsutil.rs` | ~1260 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~460 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
 | `health` | `src/health.rs` | ~2250 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
+| `holders` | `src/holders.rs` | ~1250 | Who holds a target's filesystem (bd su1b.12): its mounts by member device from mountinfo, each mount's origin (udisks, a `.mount` unit, a hand mount), every process using one (fds by `mnt_id` with their open modes, mappings, cwd, root), and the operator's stop policy: writers never signalled (refused), readers SIGTERM then SIGKILL, start time re-read before each signal, a pidfd-based signaller that refuses in test builds |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `maintenance` | `src/maintenance.rs` | ~1500 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
 | `mount` | `src/mount.rs` | ~6000 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` (with the RAID-1 kernel-view check), the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`), and the host side of the RAID-1 guard (`SystemMembers`, `mount_guarded_target`) |
-| `raid_guard` | `src/raid_guard.rs` | ~2000 | The guarded mount of a multi-device (RAID-1) target (bd su1b.10): members by filesystem UUID and drive serial (a partition on an unconfigured or unreadable serial refuses the target, bd su1b.27), scanned by path, mounted without `degraded`, a bounded wait for a late member, degraded only on a drive truly absent, the degraded-period record (primary under `/var/lib/das-backup/raid`, witness on the filesystem), the split-brain refusal, the scrub owed after a rejoin and its clearing, the kernel's devinfo view |
+| `raid_guard` | `src/raid_guard.rs` | ~2000 | The guarded mount of a multi-device (RAID-1) target (bd su1b.10): members by filesystem UUID and drive serial (a partition on an unconfigured or unreadable serial refuses the target, bd su1b.27), scanned by path, mounted without `degraded`, a bounded wait for a late member, degraded only on a drive truly absent, the degraded-period record (primary under `/var/lib/das-backup/raid`, witness on the filesystem), the split-brain refusal, the scrub owed after a rejoin and its clearing, the kernel's devinfo view, cross-checked against `devices/` (one entry per opened bdev; bd su1b.12) |
 | `progress` | `src/progress.rs` | ~770 | Progress reporting trait and `OrderedProgress`, the per-job ordered event queue (the D-Bus signal sink itself is in `btrdasd-helper`) |
 | `reconcile` | `src/reconcile.rs` | ~650 | Drops index rows for snapshots no longer on disk (`btrdasd reconcile`), mountpoint-gated |
 | `recovery_os` | `src/recovery_os.rs` | ~6400 | Read-only inspection of the independent OS on each mirror target, its staleness verdict against the host, the `RECOVERY OS` report section and the record `btrdasd health` and `scripts/recovery-os-vm.sh` read, each drive's naming the filesystem it was read from and whether its QEMU guest agent runs at boot (schema 4; `--unattended` sessions need it) (`btrdasd recovery-os`) |

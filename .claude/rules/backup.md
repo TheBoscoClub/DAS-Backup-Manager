@@ -229,9 +229,18 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
   `walk`/`restore` (CLI, GUI) wait, `--no-wait` exits 75; a holder that runs them hands its hold down
   (`DAS_MAINTENANCE_LOCK_FD`) or they fail.
 - **A target left mounted by an earlier job is taken down by the next** (bd `jgm`, operator 2026-11-09):
-  shown to be the target (UUID, else serial), it is unmounted — 5 tries, then one `umount -f` — and
-  mounted afresh; only if that fails too does the job refuse (`backup-run.sh`: exit 3, ABORTED). A
-  foreign filesystem at the path refuses, never unmounted. Never `umount -l`. A handed-down hold uses it as found.
+  shown to be the target (UUID, else serial), it is unmounted — 5 tries; still busy → its holders cleared by
+  the stop policy below and the plain tries again; then one `umount -f` — and mounted afresh; only if that
+  fails too, or a writer holds it, does the job refuse (`backup-run.sh`: exit 3, ABORTED). A foreign
+  filesystem at the path refuses, never unmounted. Never `umount -l`. A handed-down hold uses it as found.
+- **The stop policy** (bd `su1b.12`, operator 2026-11-23; `holders::clear_holders`, script `btrdasd backup clear-target`):
+  a process holding a file there open for writing (fdinfo `O_WRONLY`/`O_RDWR`, a shared writable map, a use
+  that cannot be read) → never signalled, the target refused, the holders named; PID 1, a kernel thread,
+  the job or an ancestor → refused; else SIGTERM, 10 s, SIGKILL, 5 s, the start time read again before each
+  signal, every signal named in the job's log (the script's report row too). Never in a test build.
+  btrfs maintenance on it (`exclusive_operation` not `none`, a running scrub, a `btrfs`/`btrbk` process) → a
+  writer: refused. A cwd/root/exe counts by its mount id (statx), never its path. A dry run (`--report-only`,
+  `ensure_targets_mounted_dry_run`) → says "would stop"/"would unmount", touches nothing; such a target is not mounted.
 
 **Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
 deadlock-free; release order is irrelevant.

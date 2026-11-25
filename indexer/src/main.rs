@@ -555,6 +555,22 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Clear what holds a target's filesystem, for backup-run.sh (bd DAS-Backup-Manager-su1b.12), under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Without --leftover: a RAID-1 target's filesystem mounted anywhere but its own path — every such mount, its origin and every process using it said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted. With --leftover: the busy mount an earlier job left at the target's own path, shown to be the target first; its holders are cleared the same way and the caller unmounts it. One line per mount, holder and signal, then `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
+    #[command(hide = true)]
+    ClearTarget {
+        /// The target's label
+        #[arg(long)]
+        label: String,
+        /// The mount an earlier job left at the target's own path
+        #[arg(long)]
+        leftover: bool,
+        /// A dry run: say what would be stopped and unmounted, signal and unmount nothing; exit 0 if it would clear, 3 if it would refuse
+        #[arg(long)]
+        report_only: bool,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// At the end of backup-run.sh's run, before it unmounts a RAID-1 target it mounted through the guard (bd DAS-Backup-Manager-su1b.14): a member the kernel shows missing, or a view that cannot be read, is recorded as a degraded period on the members present. Under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Prints one line, `RAID CHECK: <STATUS>  (<detail>)`, STATUS OK, RECORDED or WARN. EXIT CODE: 0 checked, 2 could not run.
     #[command(hide = true)]
     RaidCheck {
@@ -2315,6 +2331,53 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     code
 }
 
+/// `btrdasd backup clear-target` (bd DAS-Backup-Manager-su1b.12): only
+/// under a maintenance lock handed down, as `mount-target`. Without
+/// `--leftover` the target must be a RAID-1 target; a leftover may be any.
+fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: bool) -> i32 {
+    let cannot_run = |why: String| {
+        println!("{}", mount::ClearTarget::CannotRun(why).line().0);
+        2
+    };
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
+    };
+    let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
+        return cannot_run(format!("no [[target]] labelled '{label}'"));
+    };
+    if !leftover && !buttered_dasd::raid_guard::is_guarded(target) {
+        return cannot_run(format!(
+            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+        ));
+    }
+    let lock = CliLock::production();
+    let Some(raw) = &lock.delegated else {
+        return cannot_run(format!(
+            "only under a maintenance lock handed down by {}",
+            maintenance::DELEGATED_FD_ENV
+        ));
+    };
+    let held = match raw
+        .to_str()
+        .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
+        .ok_or_else(|| {
+            format!(
+                "{}={raw:?} is not a descriptor number",
+                maintenance::DELEGATED_FD_ENV
+            )
+        })
+        .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
+    {
+        Ok(h) => h,
+        Err(e) => return cannot_run(e),
+    };
+    let (line, code) =
+        mount::clear_target(target, leftover, report_only, &CliProgress, &held).line();
+    println!("{line}");
+    code
+}
+
 /// The mount options `btrdasd backup mount-target` passes the guard: the
 /// configured ones, or for `--read-only` those without `rw`/`ro` and then `ro`
 /// (bd DAS-Backup-Manager-su1b.30).
@@ -3404,6 +3467,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             BackupAction::RaidCheck { label, config } => {
                 std::process::exit(cmd_raid_check(&label, &config));
+            }
+            BackupAction::ClearTarget {
+                label,
+                leftover,
+                report_only,
+                config,
+            } => {
+                std::process::exit(cmd_clear_target(&label, &config, leftover, report_only));
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {

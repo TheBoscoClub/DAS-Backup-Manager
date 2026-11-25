@@ -290,6 +290,34 @@ case "$1 ${2:-}" in
     printf '%s\n' "$(knob guard_line 'RAID GUARD: OK  (all 2 members present (stub))')"
     exit "$rc"
     ;;
+"backup clear-target")
+    # Clearing what holds a target's filesystem (bd su1b.12): what it was
+    # handed, and whether --leftover. Knobs: clear_line / clear_rc (the
+    # mounted-elsewhere call), clear_leftover_line / clear_leftover_rc;
+    # clear_releases makes a busy leftover (umount_busy_until_cleared)
+    # unmountable, as stopping its holders does.
+    label="" leftover=no report=""
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" == --label ]] && label="$2"
+        [[ "$1" == --leftover ]] && leftover=yes
+        [[ "$1" == --report-only ]] && report=" report-only"
+        shift
+    done
+    printf '%s fd=%s leftover=%s%s\n' "$label" "${DAS_MAINTENANCE_LOCK_FD:-unset}" "$leftover" "$report" \
+        >>"$S/calls/clear_target"
+    if [[ -n "$report" ]]; then
+        printf '%s\n' "$(knob clear_report_line 'CLEAR TARGET: OK  (not mounted anywhere else)')"
+        exit "$(knob clear_report_rc 0)"
+    fi
+    echo "  [WARN]  Target '$label': holder: pid 300 [reading] (stub, leftover=$leftover)" >&2
+    if [[ "$leftover" == yes ]]; then
+        [[ -f "$S/knobs/clear_releases" ]] && : >"$S/cleared"
+        printf '%s\n' "$(knob clear_leftover_line 'CLEAR TARGET: OK  (nothing holds it (stub))')"
+        exit "$(knob clear_leftover_rc 0)"
+    fi
+    printf '%s\n' "$(knob clear_line 'CLEAR TARGET: OK  (not mounted anywhere else)')"
+    exit "$(knob clear_rc 0)"
+    ;;
 "backup raid-check")
     # The end-of-run RAID-1 check (bd su1b.14): what it was handed, and
     # whether the target was still mounted when it ran. Knobs:
@@ -435,6 +463,12 @@ if [[ -f "$S/knobs/umount_waits" ]]; then
 fi
 if listed umount_fails_once "$dst" && ! listed umount_failed "$dst"; then
     echo "$dst" >>"$S/knobs/umount_failed"
+    echo "umount: $dst: target is busy (stub)." >&2
+    exit 32
+fi
+# Busy to the plain unmount until clear-target --leftover stopped its
+# holders (bd su1b.12).
+if listed umount_busy_until_cleared "$dst" && [[ ! -e "$S/cleared" ]]; then
     echo "umount: $dst: target is busy (stub)." >&2
     exit 32
 fi
@@ -683,6 +717,9 @@ fresh() {
     mkdir -p "$WORK/sysfs/primary-uuid/devinfo/1" "$WORK/sysfs/primary-uuid/devinfo/2"
     echo 0 >"$WORK/sysfs/primary-uuid/devinfo/1/missing"
     echo 0 >"$WORK/sysfs/primary-uuid/devinfo/2/missing"
+    # The block devices the kernel opened for it, one per present member
+    # (bd su1b.12: devinfo's missing flag alone is not believed).
+    mkdir -p "$WORK/sysfs/primary-uuid/devices/sdx1" "$WORK/sysfs/primary-uuid/devices/sdy1"
     write_env
 }
 knob() { printf '%s\n' "$2" >"$STATE/knobs/$1"; }
@@ -1508,6 +1545,15 @@ run_backup
 expect_aborted "a member missing after a normal mount" "ABORTING — refusing to invoke btrbk" \
     "target verification" "primary-22tb: mounted with devid(s) 2 missing, though the guard did not mount it degraded"
 
+# A member whose missing flag a device scan cleared on a mount that never
+# opened it (kernel 7.3, proven on a VM; bd DAS-Backup-Manager-su1b.12):
+# devinfo reads both present, devices/ lists one. Never OK.
+fresh
+rm -rf "${WORK:?}/sysfs/primary-uuid/devices/sdy1"
+run_backup
+expect_aborted "a member the kernel never opened" "ABORTING — refusing to invoke btrbk" \
+    "target verification" "primary-22tb: cannot read whether a member of its RAID-1 is missing"
+
 fresh
 rm -rf "${WORK:?}/sysfs/primary-uuid"
 run_backup
@@ -2091,6 +2137,94 @@ check "leftover, will not unmount even forced: btrbk never ran" "$(ran_btrbk)" "
 check "leftover, will not unmount even forced: ABORTED" "$(mail_status 1)" "ABORTED"
 check "leftover, will not unmount even forced: what aborted" "$(body_field 1 'What aborted')" "a leftover mount"
 check "leftover, will not unmount even forced: recorded as failed" "$(recorded_as)" "failure"
+
+# The busy leftover's holders (bd DAS-Backup-Manager-su1b.12): after the
+# five plain tries, `btrdasd backup clear-target --leftover` (fd 8) applies
+# the stop policy; when it stopped something, plain tries again.
+fresh
+leftover_primary
+knob umount_busy_until_cleared "$PRIMARY_MNT"
+knob clear_releases 1
+knob clear_leftover_line 'CLEAR TARGET: OK  (stopped what held it: SIGTERM to pid 300 (dolphin); nothing holds it now (stub))'
+run_backup
+check "leftover, busy, holders stopped: exit status" "$RC" "0"
+show_tail 0
+check "leftover, busy, holders stopped: clear-target --leftover, on fd 8" \
+    "$(grep -c '^primary-22tb fd=8 leftover=yes$' "$STATE/calls/clear_target")" "1"
+check "leftover, busy, holders stopped: no umount -f" "$(grep -c -- "^-f " "$STATE/calls/umount")" "0"
+check "leftover, busy, holders stopped: its holder lines in the log" \
+    "$(grep -c "primary-22tb: .*holder: pid 300 \[reading\] (stub, leftover=yes)" "$STATE/out")" "1"
+check "leftover, busy, holders stopped: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
+check "leftover, busy, holders stopped: the kill is in the report, the row WARN" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (.*before the mount: stopped what held it: SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+knob clear_line 'CLEAR TARGET: OK  (another program'"'"'s mount was unmounted, stopped what held it: SIGTERM to pid 300 (dolphin); the kernel has it mounted nowhere (stub))'
+run_backup
+expect_completed "another program's mount cleared, a reader stopped" 0 "COMPLETED WITH WARNINGS" "success"
+check "another program's mount cleared: the kill is named in the target's row" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (all 2 members present (stub); before the mount: .*SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+leftover_primary
+knob umount_fails_always "$PRIMARY_MNT"
+knob clear_leftover_rc 3
+knob clear_leftover_line 'CLEAR TARGET: REFUSED  (it is held open for writing by pid 301 (stub))'
+run_backup
+check "leftover held by a writer: exit status" "$RC" "3"
+show_tail 3
+check "leftover held by a writer: never forced" "$(grep -c -- "^-f " "$STATE/calls/umount")" "0"
+check "leftover held by a writer: never mounted over it" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "leftover held by a writer: ABORTED" "$(mail_status 1)" "ABORTED"
+check "leftover held by a writer: what aborted" "$(body_field 1 'What aborted')" "a leftover mount"
+check "leftover held by a writer: names the writer" \
+    "$(grep -c 'held open for writing by pid 301' "$STATE/mail.1.body")" "1"
+
+# ---------------------------------------------------------------------------
+echo "== a RAID-1 target another program mounted (bd DAS-Backup-Manager-su1b.12)"
+# ---------------------------------------------------------------------------
+fresh
+run_backup
+check "clear-target: asked before the guarded mount, on fd 8" \
+    "$(cat "$STATE/calls/clear_target" 2>/dev/null)" "primary-22tb fd=8 leftover=no"
+
+fresh
+knob clear_rc 3
+knob clear_line 'CLEAR TARGET: REFUSED  (it is held open for writing by pid 301 (rsync: fd 4 /run/media/u/das/big (WRITE)) (stub))'
+run_backup
+expect_completed "another program writing to the RAID-1 target" 3 "FAILURES DETECTED" "failure"
+check "another program writing: the guarded mount never ran" \
+    "$(cat "$STATE/calls/guard_fd" 2>/dev/null)" ""
+check "another program writing: the target not mounted" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "another program writing: its mount point removed (the bare-mountpoint guard)" \
+    "$([[ -e "$PRIMARY_MNT" ]] && echo exists || echo gone)" "gone"
+check "another program writing: the row names the writer" \
+    "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301' "$WORK/lib/last-report.txt")" "1"
+check "another program writing: the recovery drive still backed up" "$(ran_btrbk)" "yes"
+
+# A dry run changes nothing on the host (bd su1b.12 review): clear-target
+# --report-only says whom it would stop; nothing is signalled or unmounted,
+# and the target is not used beside another program's mount.
+fresh
+knob clear_report_line 'CLEAR TARGET: OK  (dry run: would unmount /run/media/u/das (udisks); would stop: pid 300 [reading] user u, unit none: dolphin (stub))'
+run_backup --dryrun
+check "dry run, another program's mount: exit status" "$RC" "0"
+show_tail 0
+check "dry run, another program's mount: report-only, on fd 8" \
+    "$(cat "$STATE/calls/clear_target" 2>/dev/null)" "primary-22tb fd=8 leftover=no report-only"
+check "dry run, another program's mount: says whom it would stop" \
+    "$(grep -c "primary-22tb: dry run: .*would stop: pid 300.* not mounted for the dry run" "$STATE/out")" "1"
+check "dry run, another program's mount: the guarded mount never ran" \
+    "$(cat "$STATE/calls/guard_fd" 2>/dev/null)" ""
+check "dry run, another program's mount: its mount never unmounted" "$(calls_for umount /run/media/u/das)" "0"
+check "dry run, another program's mount: the target not mounted beside it" "$(calls_for mount "$PRIMARY_MNT")" "0"
+
+fresh
+knob clear_rc 2
+knob clear_line 'CLEAR TARGET: CANNOT-RUN  (stub)'
+run_backup
+expect_aborted "clear-target cannot run" "the clearing of its other mounts could not run (exit 2)" \
+    "a RAID-1 target's mount" "CLEAR TARGET: CANNOT-RUN  (stub)"
 
 # ---------------------------------------------------------------------------
 echo "== a target's filesystem already mounted somewhere else (bd DAS-Backup-Manager-804)"

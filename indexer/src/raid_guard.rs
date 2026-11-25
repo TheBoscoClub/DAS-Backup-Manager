@@ -972,7 +972,11 @@ pub fn clear_after_scrub(
 
 /// The devids the kernel marks missing for a mounted filesystem:
 /// `<root>/<fsid>/devinfo/<devid>/missing` reading `1`. An unreadable
-/// directory or flag is an error, never "none missing".
+/// directory or flag is an error, never "none missing"; so is a view in
+/// which fewer devices are opened (`devices/`, [`opened_devices_under`])
+/// than devinfo shows not missing — which devid that is cannot be told from
+/// sysfs, so every caller's cautious branch takes it (refused, possibly
+/// dropped, not cleared).
 pub fn missing_devids_under(root: &Path, fsid: &str) -> Result<Vec<u64>, String> {
     let dir = root.join(fsid.to_ascii_lowercase()).join("devinfo");
     let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -998,8 +1002,60 @@ pub fn missing_devids_under(root: &Path, fsid: &str) -> Result<Vec<u64>, String>
     if seen == 0 {
         return Err(format!("{}: lists no device", dir.display()));
     }
+    let flagged_present = seen - missing.len();
+    let opened = opened_devices_under(root, fsid)?;
+    if opened.len() < flagged_present {
+        let devices = root.join(fsid.to_ascii_lowercase()).join("devices");
+        return Err(format!(
+            "{}/ lists {} opened device(s) ({}) while devinfo shows {flagged_present} devid(s) \
+             not missing: a member the kernel never opened, its missing flag cleared by a \
+             device scan — taken as a member missing (bd DAS-Backup-Manager-su1b.12)",
+            devices.display(),
+            opened.len(),
+            if opened.is_empty() {
+                "none".to_string()
+            } else {
+                opened.join(", ")
+            }
+        ));
+    }
     missing.sort_unstable();
     Ok(missing)
+}
+
+/// The block devices the kernel opened for a mounted filesystem: the entry
+/// names of `<root>/<fsid>/devices/` (`sdb1`, `loop0`). An unreadable
+/// directory is an error, never "none"; an empty one is an empty list. The
+/// one reader of that directory: the end check's cross-check
+/// ([`missing_devids_under`]) and the both-present accept
+/// ([`MemberHost::opened_devices`]) both use it.
+///
+/// Why this and not only `devinfo/<devid>/missing` (bd
+/// DAS-Backup-Manager-su1b.12). From fs/btrfs/sysfs.c (mainline, kernel
+/// 6.x/7.x): `btrfs_sysfs_add_device` adds the `devices/<bdev name>` link
+/// only `if (device->bdev)`, while the `devinfo/<devid>` kobject is added for
+/// every device; `devinfo/<devid>/missing` is `test_bit(BTRFS_DEV_STATE_MISSING)`
+/// and nothing more. fs/btrfs/volumes.c `device_list_add` clears that bit
+/// for a missing devid that "re-appeared" on a scan without opening its
+/// bdev. Proven on a loop-device VM, kernel 7.3.3, a two-member RAID-1:
+/// (1) one member forgotten by path, the other mounted `-o degraded`:
+/// devinfo/1 missing=0, devinfo/2 missing=1, `devices/` holds one entry;
+/// (2) `btrfs device scan <the forgotten member>` while still mounted:
+/// devinfo/2 missing=0 — the flag cleared — and `devices/` still one entry;
+/// (3) a file written and synced: superblock generations 11 and 9, the
+/// writes on one leg only; (4) a fresh mount with both scanned: both 0,
+/// `devices/` two entries. So fewer `devices/` entries than devids reading
+/// `missing`=0 is a member missing, whatever its flag says.
+pub fn opened_devices_under(root: &Path, fsid: &str) -> Result<Vec<String>, String> {
+    let dir = root.join(fsid.to_ascii_lowercase()).join("devices");
+    let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        out.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// Every devid the kernel lists for a mounted filesystem, and whether it is
@@ -1027,21 +1083,6 @@ pub fn devinfo_under(root: &Path, fsid: &str) -> Result<Vec<(u64, bool)>, String
     }
     if out.is_empty() {
         return Err(format!("{}: lists no device", dir.display()));
-    }
-    out.sort_unstable();
-    Ok(out)
-}
-
-/// The device names (`sdc1`) the kernel opened for a mounted filesystem:
-/// `<root>/<fsid>/devices/`. Unreadable is an error; an empty directory is
-/// an empty list.
-pub fn opened_devices_under(root: &Path, fsid: &str) -> Result<Vec<String>, String> {
-    let dir = root.join(fsid.to_ascii_lowercase()).join("devices");
-    let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut out = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-        out.push(entry.file_name().to_string_lossy().into_owned());
     }
     out.sort_unstable();
     Ok(out)
@@ -5653,17 +5694,46 @@ mod tests {
         assert!(is_read_only("noatime,ro") && !is_read_only("noatime,rodata"));
     }
 
+    /// bd DAS-Backup-Manager-su1b.12: a member whose `missing` flag a device
+    /// scan cleared on a mount that never opened it (kernel 7.3, proven on a
+    /// loop-device VM) is listed in devinfo as present but has no entry in
+    /// `devices/`: the view is not believed, never read as whole.
+    #[test]
+    fn a_member_the_kernel_never_opened_is_not_read_as_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fsdir = dir.path().join(FS);
+        for id in ["1", "2"] {
+            fs::create_dir_all(fsdir.join("devinfo").join(id)).unwrap();
+            fs::write(fsdir.join("devinfo").join(id).join("missing"), "0\n").unwrap();
+        }
+        fs::create_dir_all(fsdir.join("devices")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/block/loop0", fsdir.join("devices/loop0"))
+            .unwrap();
+        let read = missing_devids_under(dir.path(), FS);
+        let why = read.expect_err("one opened device for two present devids read as whole");
+        assert!(why.contains("devices/"), "{why}");
+        // Both opened: whole again.
+        std::os::unix::fs::symlink("/nonexistent/block/loop1", fsdir.join("devices/loop1"))
+            .unwrap();
+        assert_eq!(missing_devids_under(dir.path(), FS), Ok(vec![]));
+        // No devices/ directory at all: unreadable, never whole.
+        fs::remove_dir_all(fsdir.join("devices")).unwrap();
+        assert!(missing_devids_under(dir.path(), FS).is_err());
+    }
+
     #[test]
     fn the_kernel_view_is_read_from_devinfo_and_fails_closed() {
         let dir = tempfile::TempDir::new().unwrap();
         let devinfo = dir.path().join(FS).join("devinfo");
         assert!(missing_devids_under(dir.path(), FS).is_err(), "not mounted");
+        fs::create_dir_all(dir.path().join(FS).join("devices").join("sdx1")).unwrap();
         for (id, flag) in [("1", "0\n"), ("2", "1\n")] {
             fs::create_dir_all(devinfo.join(id)).unwrap();
             fs::write(devinfo.join(id).join("missing"), flag).unwrap();
         }
         assert_eq!(missing_devids_under(dir.path(), FS), Ok(vec![2]));
         fs::write(devinfo.join("2").join("missing"), "0\n").unwrap();
+        fs::create_dir_all(dir.path().join(FS).join("devices").join("sdy1")).unwrap();
         assert_eq!(missing_devids_under(dir.path(), FS), Ok(vec![]));
         fs::write(devinfo.join("2").join("missing"), "?\n").unwrap();
         assert!(missing_devids_under(dir.path(), FS).is_err());
