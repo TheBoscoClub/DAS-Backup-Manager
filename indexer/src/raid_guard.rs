@@ -273,6 +273,10 @@ pub struct Member {
     pub dev_uuid: String,
     pub generation: u64,
     pub num_devices: u64,
+    /// The serial of the drive the partition sits on, as the host reads it
+    /// ([`MemberHost::member_serial`]); `None` until a survey asks, and when
+    /// it could not be read (bd DAS-Backup-Manager-su1b.27).
+    pub serial: Option<String>,
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -341,6 +345,7 @@ pub fn parse_super(path: &str, text: &str, fsid: &str) -> Result<Member, String>
         dev_uuid: dev_uuid.to_ascii_lowercase(),
         generation: number(3)?,
         num_devices,
+        serial: None,
     })
 }
 
@@ -840,7 +845,13 @@ fn rejected_why(found: &[&Member]) -> String {
          of the enclosure",
         found
             .iter()
-            .map(|m| format!("devid {} ({}) at {}", m.devid, m.dev_uuid, m.path))
+            .map(|m| format!(
+                "devid {} ({}) at {}, {}",
+                m.devid,
+                m.dev_uuid,
+                m.path,
+                serial_text(m)
+            ))
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -1042,6 +1053,11 @@ pub trait MemberHost {
     fn read_super(&self, path: &str) -> Result<String, String>;
     /// Whether a drive with this serial is attached.
     fn serial_attached(&self, serial: &str) -> bool;
+    /// The serial of the drive the member partition `path` sits on
+    /// (partition, parent disk, serial: the inverse of `serial_attached`'s
+    /// lookup). An `Err` says why it could not be read; it is never a
+    /// default (bd DAS-Backup-Manager-su1b.27).
+    fn member_serial(&self, path: &str) -> Result<String, String>;
     /// `mount -t btrfs [-o opts] UUID=<fsid> <mount>`.
     fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String>;
     fn umount(&self, mount: &str) -> Result<(), String>;
@@ -1189,8 +1205,12 @@ impl Outcome {
                     members
                         .iter()
                         .map(|m| format!(
-                            "devid {} {} {}, superblock generation {}",
-                            m.devid, m.dev_uuid, m.path, m.generation
+                            "devid {} {} {} {}, superblock generation {}",
+                            m.devid,
+                            m.dev_uuid,
+                            m.path,
+                            serial_text(m),
+                            m.generation
                         ))
                         .collect::<Vec<_>>()
                         .join("; "),
@@ -1241,10 +1261,24 @@ impl Outcome {
     }
 }
 
+/// `serial <drive serial>`, or `serial unknown` when it could not be read:
+/// every member line names the physical drive (bd DAS-Backup-Manager-su1b.27).
+fn serial_text(m: &Member) -> String {
+    format!("serial {}", m.serial.as_deref().unwrap_or("unknown"))
+}
+
 fn member_list(members: &[Member]) -> String {
     members
         .iter()
-        .map(|m| format!("devid {} {} {}", m.devid, m.dev_uuid, m.path))
+        .map(|m| {
+            format!(
+                "devid {} {} {} {}",
+                m.devid,
+                m.dev_uuid,
+                m.path,
+                serial_text(m)
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -1316,6 +1350,11 @@ struct Survey {
     expected: u64,
     /// Members the record's rejection names: never scanned, never counted.
     rejected: Vec<Member>,
+    /// Partitions carrying the filesystem on a drive whose serial is not one
+    /// of the target's configured serials, or cannot be read: never scanned,
+    /// never counted, and the mount is refused (bd
+    /// DAS-Backup-Manager-su1b.27). Each is a ready sentence.
+    unbound: Vec<String>,
 }
 
 impl Survey {
@@ -1341,16 +1380,35 @@ fn survey(
     });
     let mut members: Vec<Member> = Vec::new();
     let mut refused: Vec<Member> = Vec::new();
+    let mut unbound: Vec<String> = Vec::new();
     for path in paths {
         let member = host
             .read_super(&path)
             .and_then(|text| parse_super(&path, &text, plan.fsid));
+        // The drive's serial, read before anything is registered: a member
+        // is a filesystem UUID AND a configured serial (bd su1b.27).
+        let (member, serial_error) = match member {
+            Ok(mut m) => match host.member_serial(&path) {
+                Ok(s) => {
+                    m.serial = Some(s);
+                    (Ok(m), None)
+                }
+                Err(e) => (Ok(m), Some(e)),
+            },
+            Err(e) => (Err(e), None),
+        };
         let m = match member {
             Ok(m) if rejected.contains(&m.dev_uuid) => {
                 refused.push(m);
                 continue;
             }
-            Ok(m) => m,
+            Ok(m) => {
+                if let Some(why) = unbound_why(plan, &m, serial_error.as_deref()) {
+                    unbound.push(why);
+                    continue;
+                }
+                m
+            }
             Err(e) => {
                 // Registered all the same, as before: a superblock this
                 // parser cannot read is not a reason to hide a member.
@@ -1375,7 +1433,69 @@ fn survey(
         members,
         expected,
         rejected: refused,
+        unbound,
     }
+}
+
+/// Whether `serial` is one of the target's configured serials (ignoring
+/// case).
+fn configured(plan: &Plan<'_>, serial: &str) -> bool {
+    plan.serials.iter().any(|c| c.eq_ignore_ascii_case(serial))
+}
+
+/// Why a partition carrying the filesystem is not bound to this target's
+/// drives (bd DAS-Backup-Manager-su1b.27): its drive's serial is not
+/// configured, or cannot be read (fail closed: a member whose serial cannot
+/// be read never passes). `None` when it is bound, or when the target has no
+/// configured serial to bind to.
+fn unbound_why(plan: &Plan<'_>, m: &Member, serial_error: Option<&str>) -> Option<String> {
+    if plan.serials.is_empty() {
+        return None;
+    }
+    let which = format!(
+        "{} (devid {}, dev_uuid {}) carries filesystem {}",
+        m.path, m.devid, m.dev_uuid, plan.fsid
+    );
+    match (&m.serial, serial_error) {
+        (Some(s), _) if configured(plan, s) => None,
+        (Some(s), _) => Some(format!(
+            "{which} on a drive with serial {s}, which is not one of this target's configured \
+             serials ({}): not mounting the target. If that drive is now a valid member (a \
+             replacement, a restored drive), add its serial to [[target]].serials in \
+             config.toml; otherwise detach it or wipe it (wipefs) — a clone or a superseded \
+             former member must never be counted as a member",
+            plan.serials.join(", ")
+        )),
+        (None, e) => Some(format!(
+            "{which} on a drive whose serial cannot be read ({}): not mounting the target — a \
+             member is bound to a configured serial ({}) or it is refused. Fix the reading \
+             (udev/sysfs) or detach the drive",
+            e.unwrap_or("no reason given"),
+            plan.serials.join(", ")
+        )),
+    }
+}
+
+/// The refusal for members not bound to a configured drive, if any.
+fn unbound_refusal(s: &Survey) -> Option<Failure> {
+    (!s.unbound.is_empty()).then(|| refused(s.unbound.join("; and ")))
+}
+
+/// Configured serials whose drive is attached although none of the members
+/// found sits on it: named in a warning (bd su1b.27).
+fn unmatched_serials(host: &dyn MemberHost, plan: &Plan<'_>, s: &Survey) -> Vec<String> {
+    plan.serials
+        .iter()
+        .filter(|c| host.serial_attached(c))
+        .filter(|c| {
+            !s.members.iter().any(|m| {
+                m.serial
+                    .as_deref()
+                    .is_some_and(|x| x.eq_ignore_ascii_case(c))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Mount `plan`'s filesystem by the rules in this module's documentation.
@@ -1408,6 +1528,9 @@ pub fn mount_guarded(
             Intent::Write => Err(refused(why)),
             Intent::ReadOnly => {
                 let s = survey(host, plan, &rejected, progress);
+                if let Some(f) = unbound_refusal(&s) {
+                    return Err(f);
+                }
                 mount_read_only_unvouched(host, plan, s, why, progress)
             }
         };
@@ -1418,6 +1541,9 @@ pub fn mount_guarded(
             return Err(refused(rejected_why(
                 &s.rejected.iter().collect::<Vec<_>>(),
             )));
+        }
+        if let Some(f) = unbound_refusal(&s) {
+            return Err(f);
         }
         // Members whose superblock generations differ, whatever the primary
         // says (it may be a stale copy from before an accept; review round
@@ -1481,9 +1607,13 @@ pub fn mount_guarded(
     };
 
     let s = match found {
-        Ok(s) => return after_normal_mount(host, plan, s, waited, progress),
+        Ok(s) => {
+            warn_unmatched(host, plan, &s, progress);
+            return after_normal_mount(host, plan, s, waited, progress);
+        }
         Err(s) => s,
     };
+    warn_unmatched(host, plan, &s, progress);
     if s.members.is_empty() {
         return Err(Failure::NoMember(format!(
             "no member of filesystem {} was found (blkid) after waiting {}s",
@@ -1519,6 +1649,27 @@ pub fn mount_guarded(
         )));
     }
     mount_degraded(host, plan, s, absent_serials, progress)
+}
+
+fn warn_unmatched(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    s: &Survey,
+    progress: &dyn ProgressCallback,
+) {
+    let named = unmatched_serials(host, plan, s);
+    if !named.is_empty() {
+        progress.on_log(
+            LogLevel::Warning,
+            &format!(
+                "Target '{}': configured drive(s) {} attached, but no partition carrying \
+                 filesystem {} was found on them",
+                plan.label,
+                named.join(", "),
+                plan.fsid
+            ),
+        );
+    }
 }
 
 /// Whether the members' superblock generations are not all one.
@@ -1640,6 +1791,7 @@ fn member_witness_check(
                         members: s.members.clone(),
                         expected: s.expected,
                         rejected: Vec::new(),
+                        unbound: Vec::new(),
                     },
                     why,
                     progress,
@@ -1721,8 +1873,12 @@ fn diverged_without_record(plan: &Plan<'_>, members: &[Member]) -> Option<String
         members
             .iter()
             .map(|m| format!(
-                "devid {} {} at {}: generation {}",
-                m.devid, m.dev_uuid, m.path, m.generation
+                "devid {} {} at {} ({}): generation {}",
+                m.devid,
+                m.dev_uuid,
+                m.path,
+                serial_text(m),
+                m.generation
             ))
             .collect::<Vec<_>>()
             .join("; "),
@@ -2183,6 +2339,9 @@ pub fn split_brain_now(
     if !s.rejected.is_empty() {
         return Err(rejected_why(&s.rejected.iter().collect::<Vec<_>>()));
     }
+    if let Some(f) = unbound_refusal(&s) {
+        return Err(f.why().to_string());
+    }
     if s.members.is_empty() {
         return Err(format!(
             "no member of filesystem {} is present: nothing to accept",
@@ -2313,8 +2472,12 @@ pub fn accept_explanation(
     );
     for m in &found.present {
         text.push_str(&format!(
-            "  devid {} {} at {}, superblock generation {}\n",
-            m.devid, m.dev_uuid, m.path, m.generation
+            "  devid {} {} at {}, {}, superblock generation {}\n",
+            m.devid,
+            m.dev_uuid,
+            m.path,
+            serial_text(m),
+            m.generation
         ));
     }
     text.push_str("\nThe last degraded period ran on:\n");
@@ -2613,6 +2776,10 @@ mod tests {
         mounted_elsewhere: Cell<bool>,
         fail_mount_plain: Cell<bool>,
         hide_members: Cell<bool>,
+        /// Partitions whose drive serial cannot be read.
+        serial_unreadable: RefCell<BTreeSet<String>>,
+        /// Serials attached with no partition carrying the filesystem.
+        extra_attached: RefCell<Vec<&'static str>>,
         /// The kernel as the incident left it (a `--forget`): a member is
         /// known to btrfs only once scanned, and a mount without degraded
         /// fails (rc 32, VM-proven) while any present member is not. The
@@ -2642,6 +2809,8 @@ mod tests {
                 mounted_elsewhere: Cell::new(false),
                 fail_mount_plain: Cell::new(false),
                 hide_members: Cell::new(false),
+                serial_unreadable: RefCell::new(BTreeSet::new()),
+                extra_attached: RefCell::new(Vec::new()),
                 model_kernel: Cell::new(false),
                 scan_failures: Cell::new(0),
                 registered: RefCell::new(BTreeSet::new()),
@@ -2723,6 +2892,19 @@ mod tests {
         }
         fn serial_attached(&self, serial: &str) -> bool {
             self.present().iter().any(|d| d.0 == serial)
+                || self.extra_attached.borrow().contains(&serial)
+        }
+        fn member_serial(&self, path: &str) -> Result<String, String> {
+            if self.serial_unreadable.borrow().contains(path) {
+                return Err(format!("{path}: no udev serial (fake)"));
+            }
+            Ok(self
+                .drives
+                .iter()
+                .find(|d| d.1 == path)
+                .unwrap()
+                .0
+                .to_string())
         }
         fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String> {
             self.log(format!("mount {opts} {fsid} {mount}"));
@@ -2866,6 +3048,114 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    // --- bd DAS-Backup-Manager-su1b.27: a member is a filesystem UUID AND a
+    // configured drive serial ---------------------------------------------
+
+    /// X on its configured drive, Y's filesystem partition on a drive whose
+    /// serial is not configured (a clone, a superseded former member).
+    fn foreign_y() -> FakeHost {
+        FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 50, 0),
+            ("SERIAL99", "/dev/sdc1", 2, DY, 50, 0),
+        ])
+    }
+
+    #[test]
+    fn a_member_on_a_drive_whose_serial_is_not_configured_is_refused_for_every_intent() {
+        for intent in [Intent::Write, Intent::ReadOnly] {
+            let case = Case::new();
+            let host = foreign_y();
+            let why = refusal(case.run_as(&host, intent).0);
+            for needle in ["/dev/sdc1", "SERIAL99", DY, "SERIAL11, SERIAL12"] {
+                assert!(why.contains(needle), "{needle} missing: {why}");
+            }
+            assert!(
+                host.calls().iter().all(|c| !c.starts_with("mount")),
+                "nothing mounted: {:?}",
+                host.calls()
+            );
+            assert!(
+                !host.calls().contains(&"scan /dev/sdc1".to_string()),
+                "a foreign drive is never registered: {:?}",
+                host.calls()
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_whose_drive_serial_cannot_be_read_is_refused_never_passed() {
+        for intent in [Intent::Write, Intent::ReadOnly] {
+            let case = Case::new();
+            let host = both();
+            host.serial_unreadable
+                .borrow_mut()
+                .insert("/dev/sdc1".into());
+            let why = refusal(case.run_as(&host, intent).0);
+            assert!(
+                why.contains("/dev/sdc1") && why.contains("cannot be read"),
+                "{why}"
+            );
+            assert!(why.contains("no udev serial"), "the reason is named: {why}");
+            assert!(host.calls().iter().all(|c| !c.starts_with("mount")));
+        }
+    }
+
+    #[test]
+    fn a_member_on_an_unconfigured_drive_is_refused_beside_an_unreadable_record_too() {
+        let case = Case::new();
+        std::fs::write(primary_path(case.dir.path(), FS), "garbage").unwrap();
+        let host = foreign_y();
+        let why = refusal(case.run_as(&host, Intent::ReadOnly).0);
+        assert!(why.contains("SERIAL99"), "{why}");
+        assert!(host.calls().iter().all(|c| !c.starts_with("mount")));
+    }
+
+    #[test]
+    fn an_absent_configured_drive_is_still_a_degraded_mount_not_a_refusal() {
+        // Y's drive is simply not there: no partition, so nothing is unbound.
+        let case = Case::new();
+        let out = case.run(&only_x()).0;
+        assert!(matches!(out, Ok(Outcome::Degraded { .. })), "{out:?}");
+    }
+
+    #[test]
+    fn every_member_line_names_the_drive_serial() {
+        let case = Case::new();
+        let (r, _) = case.run(&both());
+        let (_, detail) = r.unwrap().status_line();
+        for needle in ["SERIAL11", "SERIAL12", DX, DY, "/dev/sdb1", "/dev/sdc1"] {
+            assert!(detail.contains(needle), "{needle} missing: {detail}");
+        }
+        let case = Case::new();
+        let (r, _) = case.run(&only_x());
+        let (_, detail) = r.unwrap().status_line();
+        assert!(detail.contains("serial SERIAL11"), "{detail}");
+    }
+
+    #[test]
+    fn a_configured_drive_attached_with_no_member_on_it_is_named_in_a_warning() {
+        let case = Case::new();
+        let host = only_x();
+        host.extra_attached.borrow_mut().push("SERIAL12");
+        let (r, progress) = case.run(&host);
+        // Every configured drive is attached, so the guard refuses degraded
+        // (unchanged); the warning names the drive that carries no member.
+        assert!(r.is_err(), "{r:?}");
+        let w = warnings(&progress).join("\n");
+        assert!(
+            w.contains("SERIAL12") && w.contains("no partition carrying filesystem"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn accept_lists_the_serial_of_the_drive_it_would_keep() {
+        let (case, _period) = split_brain_case();
+        let (r, shown) = accept_with(&case, &only_y(), Ok("primary"));
+        r.unwrap();
+        assert!(shown[0].contains("serial SERIAL12"), "{}", shown[0]);
     }
 
     #[test]
@@ -3267,7 +3557,11 @@ mod tests {
             Copy::Read(settled.clone())
         );
         // Settled, every current member present: a normal mount, nothing owed.
-        let case = Case::new();
+        // The replacement drive's serial is configured (the replace updated
+        // config.toml), the old one still is too: the rejection, not the
+        // serial binding, refuses it below.
+        let mut case = Case::new();
+        case.serials.push("SERIAL13".into());
         put_primary(&case, &settled);
         let host = FakeHost::new(vec![
             ("SERIAL13", "/dev/sdd1", 1, DZ, 70, 0),

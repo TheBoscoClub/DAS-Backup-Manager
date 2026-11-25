@@ -169,6 +169,9 @@ struct MountProbes<'a> {
     /// The devids the kernel marks missing for a mounted filesystem
     /// (`raid_guard::missing_devids`).
     missing_devids: &'a dyn Fn(&str) -> Result<Vec<u64>, String>,
+    /// The serial of the drive a member partition sits on
+    /// (`health::serial_of_partition`).
+    serial_of_partition: &'a dyn Fn(&str) -> Result<String, String>,
 }
 
 const HOST_PROBES: MountProbes<'static> = MountProbes {
@@ -177,6 +180,7 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
     device_from_serial: &health::device_from_serial,
     device_for_uuid: &health::device_for_fs_uuid,
     missing_devids: &raid_guard::missing_devids,
+    serial_of_partition: &health::serial_of_partition,
 };
 
 /// The guarded mount's host on this machine: this module's runner and
@@ -312,6 +316,10 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
 
     fn serial_attached(&self, serial: &str) -> bool {
         (self.probes.device_from_serial)(serial).is_some()
+    }
+
+    fn member_serial(&self, path: &str) -> Result<String, String> {
+        (self.probes.serial_of_partition)(path)
     }
 
     fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String> {
@@ -2610,12 +2618,22 @@ mod tests {
                     .map(|(_, m)| m.clone())
                     .unwrap_or_default())
             };
+            // A partition sits on the attached drive whose whole-disk device
+            // path it starts with (`dev/sdb1` on `dev/sdb`).
+            let serial_of_partition = |part: &str| {
+                self.devices
+                    .iter()
+                    .find(|(_, dev)| part.starts_with(dev.as_str()))
+                    .map(|(s, _)| s.clone())
+                    .ok_or_else(|| format!("{part}: no attached drive carries it"))
+            };
             f(&MountProbes {
                 is_mountpoint: &is_mountpoint,
                 find_mount_for_device: &find_mount_for_device,
                 device_from_serial: &device_from_serial,
                 device_for_uuid: &device_for_uuid,
                 missing_devids: &missing_devids,
+                serial_of_partition: &serial_of_partition,
             })
         }
 

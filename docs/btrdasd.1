@@ -1040,7 +1040,17 @@ its members are found by filesystem UUID
 .RB ( "blkid \-c /dev/null \-t UUID=" ),
 each registered by its own path
 .RB ( "btrfs device scan" " <path>;"
-never an unscoped scan) and identified by its own superblock;
+never an unscoped scan) and identified by its own superblock and by the
+serial of the drive it sits on (partition, parent disk, udev
+.BR ID_SERIAL_SHORT ):
+every member line the guard prints names that serial; a partition carrying
+the filesystem on a drive whose serial is not among the target's configured
+serials, or cannot be read, refuses the target for every job, naming the
+partition, serial and device UUID (add the serial to
+.B config.toml
+if that drive is now a valid member, otherwise detach or wipe it); a
+configured drive that is attached but carries no member is named in a
+warning;
 .IP 2. 4
 it is mounted without
 .BR degraded ,

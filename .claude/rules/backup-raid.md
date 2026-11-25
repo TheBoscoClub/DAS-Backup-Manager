@@ -27,6 +27,9 @@ The lines a hand command needs (members, the only mount path, `raid accept`'s ty
 
 ## Mount Options for a RAID-1 Primary Target
 
+- A member is a filesystem UUID AND a configured serial (operator 2026-11-23, bd `su1b.27`): each partition `blkid` lists is read for its drive's serial (partition, parent disk, udev `ID_SERIAL_SHORT`; `MemberHost::member_serial`, `health::serial_of_partition`) before it is scanned, and every member line (OK, DEGRADED, READ-ONLY, STALE-READ-ONLY, raid accept's listing, a refusal) names `serial <S>` beside devid, dev_uuid and path.
+- A partition carrying the filesystem on a drive whose serial is not in `[[target]].serials`, or whose serial cannot be read → the target is refused for every intent, naming partition, serial (or why unreadable) and dev_uuid, before any scan or mount; the way out → add the serial to config (a legitimate replacement) or detach/wipe the drive. A target with no configured serial has nothing to bind to and is not checked.
+- A configured serial whose drive is attached but carries no member → a warning naming it; an absent configured drive is not unbound and still decides the degraded mount (`serial_attached`).
 - The mount → without `degraded` first; a member not present, or a plain mount that fails → poll every 5 s for `[das].member_wait_secs` (900, at most 3600; operator 2026-11-22, bd `su1b.11`), rescanning.
 - Degraded → only when, after the wait, a member is absent AND a configured serial is absent; every drive attached with a member unfound or a plain mount still failing → refused, never degraded.
 - A degraded mount → a WARN row every run (operator 2026-11-22: it keeps backing up) and the period recorded first: primary `/var/lib/das-backup/raid/<fsid>.record` (`DAS_RAID_RECORD_DIR`), witness `<mount>/.das-backup-raid.record`, both written before the mount is used.
