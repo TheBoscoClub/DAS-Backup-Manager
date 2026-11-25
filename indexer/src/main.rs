@@ -564,6 +564,9 @@ enum BackupAction {
         /// The mount an earlier job left at the target's own path
         #[arg(long)]
         leftover: bool,
+        /// A dry run: say what would be stopped and unmounted, signal and unmount nothing; exit 0 if it would clear, 3 if it would refuse
+        #[arg(long)]
+        report_only: bool,
         /// Path to config.toml
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
@@ -2331,7 +2334,7 @@ fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
 /// `btrdasd backup clear-target` (bd DAS-Backup-Manager-su1b.12): only
 /// under a maintenance lock handed down, as `mount-target`. Without
 /// `--leftover` the target must be a RAID-1 target; a leftover may be any.
-fn cmd_clear_target(label: &str, config: &Path, leftover: bool) -> i32 {
+fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: bool) -> i32 {
     let cannot_run = |why: String| {
         println!("{}", mount::ClearTarget::CannotRun(why).line().0);
         2
@@ -2369,7 +2372,8 @@ fn cmd_clear_target(label: &str, config: &Path, leftover: bool) -> i32 {
         Ok(h) => h,
         Err(e) => return cannot_run(e),
     };
-    let (line, code) = mount::clear_target(target, leftover, &CliProgress, &held).line();
+    let (line, code) =
+        mount::clear_target(target, leftover, report_only, &CliProgress, &held).line();
     println!("{line}");
     code
 }
@@ -3467,9 +3471,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             BackupAction::ClearTarget {
                 label,
                 leftover,
+                report_only,
                 config,
             } => {
-                std::process::exit(cmd_clear_target(&label, &config, leftover));
+                std::process::exit(cmd_clear_target(&label, &config, leftover, report_only));
             }
             BackupAction::BootPlan { config } => {
                 let cfg = Config::load(&config).unwrap_or_else(|e| {

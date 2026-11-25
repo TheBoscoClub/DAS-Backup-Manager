@@ -1157,7 +1157,24 @@ writable mapping, or a use that cannot be read is never signalled, and the
 target is refused; so is one held by PID 1, a kernel thread, or this job or
 an ancestor of it. Otherwise every holder gets SIGTERM, 10 s to exit, then
 SIGKILL and 5 s; each pid's start time is read again before each signal (a
-reused pid is skipped), and each signal is named. A filesystem still
+reused pid is skipped), and each signal is named. btrfs maintenance on it
+\(em an exclusive operation
+.RI ( /sys/fs/btrfs/<fsid>/exclusive_operation
+not
+.BR none ),
+a running scrub, or a
+.B btrfs
+or
+.B btrbk
+process, whose work goes through ioctls on read\-only descriptors \(em is
+never interrupted: refused. A working directory, root or executable counts
+by the mount it is on, never by its path. With
+.BR \-\-report\-only ,
+for a dry run, it says what it would stop
+.RB ( "would stop:" )
+and unmount
+.RB ( "would unmount" )
+and does neither; exit 0 when it would clear, 3 when it would refuse. A filesystem still
 mounted when every visible mount is gone
 .RI ( /sys/fs/btrfs/<fsid>
 present: another mount namespace, or a lazy unmount held open) is refused.
@@ -1174,6 +1191,7 @@ exit status 0, 3 or 2.
 .B btrdasd backup clear\-target \-\-label
 .I LABEL
 .RB [ \-\-leftover ]
+.RB [ \-\-report\-only ]
 .RB [ \-\-config
 .IR PATH ]
 .\"

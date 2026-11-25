@@ -238,6 +238,9 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
   that cannot be read) → never signalled, the target refused, the holders named; PID 1, a kernel thread,
   the job or an ancestor → refused; else SIGTERM, 10 s, SIGKILL, 5 s, the start time read again before each
   signal, every signal named in the job's log (the script's report row too). Never in a test build.
+  btrfs maintenance on it (`exclusive_operation` not `none`, a running scrub, a `btrfs`/`btrbk` process) → a
+  writer: refused. A cwd/root/exe counts by its mount id (statx), never its path. A dry run (`--report-only`,
+  `ensure_targets_mounted_dry_run`) → says "would stop"/"would unmount", touches nothing; such a target is not mounted.
 
 **Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
 deadlock-free; release order is irrelevant.

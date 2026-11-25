@@ -3818,9 +3818,13 @@ pub trait BackupJobHost {
         dry_run: bool,
         progress: &dyn ProgressCallback,
     ) -> (Config, SyncSection);
+    /// `dry_run`: another program's mount of a target, and a busy
+    /// leftover's holders, are only said, never stopped or unmounted (bd
+    /// DAS-Backup-Manager-su1b.12).
     fn mount_targets(
         &self,
         config: &Config,
+        dry_run: bool,
         progress: &dyn ProgressCallback,
         held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String>;
@@ -3969,7 +3973,7 @@ pub fn run_manual_step(
                 .map(|t| t.label.clone())
                 .collect();
             let to_mount = targets_named_only(&synced, Some(&primaries));
-            match host.mount_targets(&to_mount, progress, locks.maintenance()) {
+            match host.mount_targets(&to_mount, *dry_run, progress, locks.maintenance()) {
                 Err(why) => (Err(why), Vec::new()),
                 Ok(mut mounted) => {
                     let done = host
@@ -3983,7 +3987,7 @@ pub fn run_manual_step(
             // Only the targets the send names are mounted (none named: all),
             // the rule of the job (bd DAS-Backup-Manager-s5jv.10, `u8kk`).
             let to_mount = targets_named_only(&synced, (!targets.is_empty()).then_some(targets));
-            match host.mount_targets(&to_mount, progress, locks.maintenance()) {
+            match host.mount_targets(&to_mount, false, progress, locks.maintenance()) {
                 Err(why) => (Err(why), Vec::new()),
                 Ok(mut mounted) => {
                     let done = host
@@ -4258,6 +4262,7 @@ pub fn run_backup_job(
     }
     let mut targets = match host.mount_targets(
         &selected_targets_only(&config, &options),
+        options.dry_run,
         progress,
         locks.maintenance(),
     ) {
@@ -4467,10 +4472,16 @@ impl BackupJobHost for SystemBackupHost {
     fn mount_targets(
         &self,
         config: &Config,
+        dry_run: bool,
         progress: &dyn ProgressCallback,
         held: &MaintenanceHeld,
     ) -> Result<Box<dyn Release>, String> {
-        mount::ensure_targets_mounted(
+        let mount = if dry_run {
+            mount::ensure_targets_mounted_dry_run
+        } else {
+            mount::ensure_targets_mounted
+        };
+        mount(
             config,
             crate::raid_guard::Job::Backup.intent(),
             progress,
@@ -10859,6 +10870,8 @@ Legend:
         second_target: bool,
         /// The target labels each `mount_targets` call was asked to mount.
         mounted: std::sync::Mutex<Vec<Vec<String>>>,
+        /// The dry_run flag of each mount_targets call (bd su1b.12).
+        mount_dry: std::sync::Mutex<Vec<bool>>,
         /// The btrbk filters each `capture_report` call was given.
         captured_filters: std::sync::Mutex<Vec<Vec<String>>>,
         /// What the manual steps do (bd r1tr).
@@ -10924,6 +10937,7 @@ Legend:
                 sync_coverage: Some(clean_coverage()),
                 second_target: false,
                 mounted: std::sync::Mutex::new(Vec::new()),
+                mount_dry: std::sync::Mutex::new(Vec::new()),
                 captured_filters: std::sync::Mutex::new(Vec::new()),
                 manual_sync: Ok(()),
                 snapshot_step: Ok(Some(3)),
@@ -11042,9 +11056,11 @@ Legend:
         fn mount_targets(
             &self,
             config: &Config,
+            dry_run: bool,
             progress: &dyn ProgressCallback,
             _: &MaintenanceHeld,
         ) -> Result<Box<dyn Release>, String> {
+            self.mount_dry.lock().unwrap().push(dry_run);
             self.maybe_cancel("mount targets", progress);
             self.step(&format!("mount targets ({})", config.general.version));
             self.mounted
@@ -13052,6 +13068,17 @@ Legend:
         assert_eq!(mode, 0o640);
     }
 
+    /// A dry run mounts its targets the dry-run way: another program's
+    /// mount and its holders are only said (bd su1b.12 review).
+    #[test]
+    fn a_dry_run_backup_mounts_its_targets_as_a_dry_run() {
+        for dry in [true, false] {
+            let host = FakeHost::default();
+            let _ = job(&host, dry);
+            assert_eq!(*host.mount_dry.lock().unwrap(), vec![dry]);
+        }
+    }
+
     #[test]
     fn system_host_mounts_nothing_for_a_config_without_targets_and_runs_a_dry_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -13060,7 +13087,7 @@ Legend:
         config.targets.clear();
         let progress = TestProgress::new();
         let mut targets = host
-            .mount_targets(&config, &progress, &MaintenanceHeld::assumed())
+            .mount_targets(&config, true, &progress, &MaintenanceHeld::assumed())
             .unwrap();
         assert!(targets.release(&progress).is_empty());
 

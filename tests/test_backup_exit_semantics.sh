@@ -296,14 +296,19 @@ case "$1 ${2:-}" in
     # mounted-elsewhere call), clear_leftover_line / clear_leftover_rc;
     # clear_releases makes a busy leftover (umount_busy_until_cleared)
     # unmountable, as stopping its holders does.
-    label="" leftover=no
+    label="" leftover=no report=""
     while [[ $# -gt 0 ]]; do
         [[ "$1" == --label ]] && label="$2"
         [[ "$1" == --leftover ]] && leftover=yes
+        [[ "$1" == --report-only ]] && report=" report-only"
         shift
     done
-    printf '%s fd=%s leftover=%s\n' "$label" "${DAS_MAINTENANCE_LOCK_FD:-unset}" "$leftover" \
+    printf '%s fd=%s leftover=%s%s\n' "$label" "${DAS_MAINTENANCE_LOCK_FD:-unset}" "$leftover" "$report" \
         >>"$S/calls/clear_target"
+    if [[ -n "$report" ]]; then
+        printf '%s\n' "$(knob clear_report_line 'CLEAR TARGET: OK  (not mounted anywhere else)')"
+        exit "$(knob clear_report_rc 0)"
+    fi
     echo "  [WARN]  Target '$label': holder: pid 300 [reading] (stub, leftover=$leftover)" >&2
     if [[ "$leftover" == yes ]]; then
         [[ -f "$S/knobs/clear_releases" ]] && : >"$S/cleared"
@@ -2196,6 +2201,23 @@ check "another program writing: its mount point removed (the bare-mountpoint gua
 check "another program writing: the row names the writer" \
     "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301' "$WORK/lib/last-report.txt")" "1"
 check "another program writing: the recovery drive still backed up" "$(ran_btrbk)" "yes"
+
+# A dry run changes nothing on the host (bd su1b.12 review): clear-target
+# --report-only says whom it would stop; nothing is signalled or unmounted,
+# and the target is not used beside another program's mount.
+fresh
+knob clear_report_line 'CLEAR TARGET: OK  (dry run: would unmount /run/media/u/das (udisks); would stop: pid 300 [reading] user u, unit none: dolphin (stub))'
+run_backup --dryrun
+check "dry run, another program's mount: exit status" "$RC" "0"
+show_tail 0
+check "dry run, another program's mount: report-only, on fd 8" \
+    "$(cat "$STATE/calls/clear_target" 2>/dev/null)" "primary-22tb fd=8 leftover=no report-only"
+check "dry run, another program's mount: says whom it would stop" \
+    "$(grep -c "primary-22tb: dry run: .*would stop: pid 300.* not mounted for the dry run" "$STATE/out")" "1"
+check "dry run, another program's mount: the guarded mount never ran" \
+    "$(cat "$STATE/calls/guard_fd" 2>/dev/null)" ""
+check "dry run, another program's mount: its mount never unmounted" "$(calls_for umount /run/media/u/das)" "0"
+check "dry run, another program's mount: the target not mounted beside it" "$(calls_for mount "$PRIMARY_MNT")" "0"
 
 fresh
 knob clear_rc 2

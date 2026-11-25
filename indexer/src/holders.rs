@@ -355,6 +355,22 @@ pub fn lineage(proc_root: &Path, pid: i32) -> BTreeSet<i32> {
     out
 }
 
+/// The id of the mount `path` is on, following links (statx `STATX_MNT_ID`,
+/// Linux 5.8): the id mountinfo's first field and fdinfo's `mnt_id` carry.
+/// `Ok(None)` when the kernel does not report it.
+pub(crate) fn mount_id_of(path: &Path) -> io::Result<Option<u64>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: a zeroed statx is a valid out-buffer; the path is NUL-terminated.
+    let mut buf: libc::statx = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statx(libc::AT_FDCWD, c.as_ptr(), 0, libc::STATX_MNT_ID, &mut buf) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((buf.stx_mask & libc::STATX_MNT_ID != 0).then_some(buf.stx_mnt_id))
+}
+
 /// What a link in `/proc/<pid>` names, without a " (deleted)" suffix.
 fn link_path(p: &Path) -> io::Result<String> {
     let t = fs::read_link(p)?.to_string_lossy().into_owned();
@@ -436,11 +452,35 @@ pub fn scan_holders(site: &ProcSite, mounts: &[MountEntry]) -> Result<Vec<Holder
             *mode = Some(mode.map_or(m, |o| o.max(m)));
             uses.push(what);
         };
+        // A working directory, root or executable counts by the mount it is
+        // on (statx STATX_MNT_ID through the /proc link), never by its path:
+        // a shell in the bare directory under a mount, or a path that only
+        // reads alike in another namespace, is not a holder (bd su1b.12
+        // review). One whose mount cannot be told but whose path is there is
+        // unknown: a writer, never signalled.
         for (name, what) in [("cwd", "cwd"), ("root", "root"), ("exe", "executable")] {
-            if let Ok(p) = link_path(&dir.join(name))
-                && on(&p)
-            {
-                note(Mode::CwdOnly, format!("{what} {p}"), &mut mode);
+            let link = dir.join(name);
+            let shown = link_path(&link).unwrap_or_else(|_| "?".into());
+            match mount_id_of(&link) {
+                Ok(Some(id)) => {
+                    if ids.contains(&id) {
+                        note(Mode::CwdOnly, format!("{what} {shown}"), &mut mode);
+                    }
+                }
+                Err(e) if is_gone(&e) => {}
+                other => {
+                    if on(&shown) {
+                        let why = match other {
+                            Err(e) => e.to_string(),
+                            _ => "the kernel reports no mount id".into(),
+                        };
+                        note(
+                            Mode::Writer,
+                            format!("{what} {shown} (its mount cannot be told: {why})"),
+                            &mut mode,
+                        );
+                    }
+                }
             }
         }
         match fs::read_dir(dir.join("fd")) {
@@ -515,9 +555,33 @@ pub fn scan_holders(site: &ProcSite, mounts: &[MountEntry]) -> Result<Vec<Holder
                 }
             }
         }
-        let Some(mode) = mode else {
+        let Some(mut mode) = mode else {
             continue;
         };
+        // btrfs maintenance (balance, replace, device add/remove, resize,
+        // defrag, scrub) and btrbk work through ioctls on a read-only fd:
+        // never a reader to be stopped (bd su1b.12 review).
+        let comm = fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        let exe = link_path(&dir.join("exe")).unwrap_or_default();
+        let argv0 = fs::read(dir.join("cmdline"))
+            .ok()
+            .and_then(|b| {
+                b.split(|c| *c == 0)
+                    .next()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+            })
+            .unwrap_or_default();
+        let base = |s: &str| s.trim().rsplit('/').next().unwrap_or("").to_string();
+        if [comm.trim().to_string(), base(&exe), base(&argv0)]
+            .iter()
+            .any(|n| n == "btrfs" || n == "btrbk")
+        {
+            mode = Mode::Writer;
+            uses.push(format!(
+                "a btrfs maintenance tool ({}): its work goes through ioctls",
+                comm.trim()
+            ));
+        }
         uses.sort();
         uses.dedup();
         let status = fs::read_to_string(dir.join("status")).unwrap_or_default();
@@ -643,6 +707,8 @@ pub struct Cleared {
     pub lines: Vec<String>,
     /// The signals sent: (pid, signal, command line).
     pub signalled: Vec<(i32, Sig, String)>,
+    /// Report-only: the holders it would stop, one line each.
+    pub would_stop: Vec<String>,
 }
 
 /// Why [`clear_holders`] refused: `lines` as far as it got, `why` naming the
@@ -660,6 +726,9 @@ pub struct ClearEnv<'a> {
     pub self_pid: i32,
     pub signaller: &'a dyn Signaller,
     pub sleep: &'a dyn Fn(Duration),
+    /// A dry run (bd su1b.12 review): every holder classified and said
+    /// ("would stop: …"), the same refusals, and no signal at all.
+    pub report_only: bool,
 }
 
 /// A holder no signal may reach: why, or `None`.
@@ -732,6 +801,11 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
     };
     if let Some(why) = check(&holders) {
         return Err(refuse(done.lines, why));
+    }
+    if env.report_only {
+        done.would_stop = holders.iter().map(|h| format!("would stop: {h}")).collect();
+        done.lines.extend(done.would_stop.iter().cloned());
+        return Ok(done);
     }
     let signal_all = |hs: &[Holder], sig: Sig, done: &mut Cleared| {
         for h in hs {
@@ -849,6 +923,8 @@ pub(crate) mod testproc {
         pub(crate) flags: u64,
         pub(crate) state: char,
         pub(crate) cmd: &'a str,
+        /// `/proc/<pid>/comm`.
+        pub(crate) comm: &'a str,
         pub(crate) uid: u32,
         pub(crate) cgroup: &'a str,
         pub(crate) cwd: &'a str,
@@ -866,6 +942,7 @@ pub(crate) mod testproc {
                 flags: 0x0040_0000,
                 state: 'S',
                 cmd: "",
+                comm: "x",
                 uid: 1000,
                 cgroup: "0::/user.slice/user-1000.slice/session-2.scope\n",
                 cwd: "/home/user",
@@ -916,6 +993,7 @@ pub(crate) mod testproc {
             )
             .unwrap();
             fs::write(d.join("cmdline"), p.cmd.replace(' ', "\0")).unwrap();
+            fs::write(d.join("comm"), format!("{}\n", p.comm)).unwrap();
             fs::write(d.join("cgroup"), p.cgroup).unwrap();
             fs::write(d.join("maps"), p.maps).unwrap();
             symlink(p.cwd, d.join("cwd")).unwrap();
@@ -930,6 +1008,13 @@ pub(crate) mod testproc {
                 fs::write(d.join("fdinfo").join(n.to_string()), info).unwrap();
             }
         }
+        /// The mount id of the real mount holding `path` (statx
+        /// `STATX_MNT_ID`): the id a test's mount entry must carry for a
+        /// working directory there to count.
+        pub(crate) fn real_mount_id(path: &Path) -> u64 {
+            super::mount_id_of(path).unwrap().expect("STATX_MNT_ID")
+        }
+
         pub(crate) fn remove(&self, pid: i32) {
             fs::remove_dir_all(self.dir.path().join("proc").join(pid.to_string())).unwrap();
         }
@@ -1017,11 +1102,22 @@ mod tests {
             fds: vec![(3, "/run/media/user/das/a", "0100002", Some(99))],
             ..Default::default()
         });
-        // Only its working directory there.
+        // Only its working directory there: a real directory, on a mount
+        // the scan is given by its real id (a cwd counts by its mount id).
+        let real = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(real.path().join("sub")).unwrap();
+        let real_dir = fs::canonicalize(real.path()).unwrap();
+        let real_sub = Box::leak(
+            real_dir
+                .join("sub")
+                .to_string_lossy()
+                .into_owned()
+                .into_boxed_str(),
+        );
         p.add(Proc {
             pid: 203,
             cmd: "bash",
-            cwd: "/run/media/user/das/sub",
+            cwd: real_sub,
             ..Default::default()
         });
         // A shared writable mapping, no fd.
@@ -1047,10 +1143,20 @@ mod tests {
         p.add(Proc {
             pid: 207,
             state: 'Z',
-            cwd: "/run/media/user/das",
+            fds: vec![(3, "/run/media/user/das/a", "0100000", Some(77))],
             ..Default::default()
         });
-        let hs = scan_holders(&p.site(), &das_mount()).unwrap();
+        let mut mounts = das_mount();
+        mounts.push(MountEntry {
+            id: FakeProc::real_mount_id(&real_dir),
+            root: "/".into(),
+            mount_point: real_dir.to_string_lossy().into_owned(),
+            options: "rw".into(),
+            fstype: "btrfs".into(),
+            source: "/dev/sdx1".into(),
+            super_options: String::new(),
+        });
+        let hs = scan_holders(&p.site(), &mounts).unwrap();
         let got: Vec<(i32, Mode)> = hs.iter().map(|h| (h.pid, h.mode)).collect();
         assert_eq!(
             got,
@@ -1107,6 +1213,7 @@ mod tests {
             self_pid: 900,
             signaller: s,
             sleep: sleeps,
+            report_only: false,
         }
     }
 
@@ -1199,7 +1306,7 @@ mod tests {
                 pid,
                 ppid,
                 flags,
-                cwd: "/run/media/user/das",
+                fds: vec![(3, "/run/media/user/das/a", "0100000", Some(77))],
                 ..Default::default()
             });
             reader(&p, 300);
@@ -1273,6 +1380,98 @@ mod tests {
         let r = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap_err();
         assert_eq!(*f.1.borrow(), vec![(301, Sig::Term)], "no SIGKILL");
         assert!(r.why.contains("writing"), "{}", r.why);
+    }
+
+    /// btrfs maintenance (balance, replace, device add/remove, resize,
+    /// scrub) works by ioctl through a read-only fd: a `btrfs` or `btrbk`
+    /// process is a writer, never killed (bd su1b.12 review).
+    #[test]
+    fn btrfs_and_btrbk_hold_it_as_writers_whatever_their_open_modes() {
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 400,
+            cmd: "btrfs balance start -dconvert=raid1 /run/media/user/das",
+            comm: "btrfs",
+            fds: vec![(3, "/run/media/user/das", "0200000", Some(77))],
+            ..Default::default()
+        });
+        p.add(Proc {
+            pid: 401,
+            cmd: "/usr/bin/perl /usr/bin/btrbk run",
+            comm: "btrbk",
+            fds: vec![(3, "/run/media/user/das/snap", "0200000", Some(77))],
+            ..Default::default()
+        });
+        let hs = scan_holders(&p.site(), &das_mount()).unwrap();
+        let got: Vec<(i32, Mode)> = hs.iter().map(|h| (h.pid, h.mode)).collect();
+        assert_eq!(got, vec![(400, Mode::Writer), (401, Mode::Writer)]);
+    }
+
+    /// A working directory counts by the mount it is on, never by its path:
+    /// a shell in the bare directory under a mount (or a path that only
+    /// reads alike in another namespace) is not a holder.
+    #[test]
+    fn a_working_directory_counts_by_its_mount_never_by_its_path() {
+        let real = tempfile::TempDir::new().unwrap();
+        let dir = fs::canonicalize(real.path()).unwrap();
+        let dir_s = Box::leak(dir.to_string_lossy().into_owned().into_boxed_str());
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 500,
+            cmd: "bash",
+            cwd: dir_s,
+            ..Default::default()
+        });
+        let entry = |id: u64| MountEntry {
+            id,
+            root: "/".into(),
+            mount_point: dir_s.to_string(),
+            options: "rw".into(),
+            fstype: "btrfs".into(),
+            source: "/dev/sdx1".into(),
+            super_options: String::new(),
+        };
+        let real_id = FakeProc::real_mount_id(&dir);
+        let other = scan_holders(&p.site(), &[entry(real_id + 100_000)]).unwrap();
+        assert!(
+            other.is_empty(),
+            "the same path on another mount: {other:?}"
+        );
+        let on = scan_holders(&p.site(), &[entry(real_id)]).unwrap();
+        assert_eq!(on.len(), 1, "{on:?}");
+        assert_eq!(on[0].mode, Mode::CwdOnly);
+    }
+
+    /// A dry run says whom it would stop, signals nobody, and refuses where
+    /// the real run would.
+    #[test]
+    fn report_only_names_what_it_would_stop_and_signals_nothing() {
+        let p = FakeProc::new();
+        reader(&p, 300);
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        let mut e = env(&site, &f, &|_| {});
+        e.report_only = true;
+        let done = clear_holders(&e, &das_mount()).unwrap();
+        assert!(f.sent.borrow().is_empty(), "{:?}", f.sent);
+        assert!(done.signalled.is_empty());
+        assert_eq!(done.would_stop.len(), 1, "{done:?}");
+        assert!(
+            done.would_stop[0].starts_with("would stop: pid 300"),
+            "{done:?}"
+        );
+        p.add(Proc {
+            pid: 301,
+            fds: vec![(4, "/run/media/user/das/f", "0100002", Some(77))],
+            ..Default::default()
+        });
+        let r = clear_holders(&e, &das_mount()).unwrap_err();
+        assert!(r.why.contains("pid 301"), "{}", r.why);
+        assert!(f.sent.borrow().is_empty());
     }
 
     /// A reader that appears during the grace gets SIGTERM and a grace of

@@ -16,6 +16,10 @@
 #     tries again, then umount -f. raid_missing_devids also counts
 #     /sys/fs/btrfs/<fsid>/devices/: fewer opened devices than devids not
 #     missing is unreadable (a scan clears a never-opened member's flag).
+#     A dry run passes --report-only: it says whom it would stop and what it
+#     would unmount, does neither, and does not mount such a target. btrfs
+#     maintenance on it (an exclusive operation, a scrub, a btrfs or btrbk
+#     process) refuses like a writer.
 #   - A RAID-1 member that drops during the run is recorded, and an owed
 #     scrub starts by itself (v4.23.0, bd DAS-Backup-Manager-su1b.14): before
 #     unmount_all() unmounts a target the guard mounted (not one it mounted
@@ -2370,7 +2374,11 @@ FOREIGN_TARGET_MOUNTS=()
 # open for writing never signalled (REFUSED), readers SIGTERM, 10 s, then
 # SIGKILL, then each mount unmounted. With --leftover: the busy mount an
 # earlier job left at the target's own path, its holders cleared the same
-# way; this script unmounts it. Every line it prints goes to the log; the
+# way; this script unmounts it. In a dry run (--report-only) it says whom it
+# would stop and what it would unmount, and does neither; a target another
+# program has mounted is then not mounted for the dry run. btrfs maintenance
+# running on it (an exclusive operation, a scrub, a btrfs or btrbk process)
+# refuses like a writer. Every line it prints goes to the log; the
 # last one is `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. Sets
 # CLEAR_DETAIL. Returns 0 cleared, 3 refused; anything else aborts the run
 # (exit 3): a target that cannot be looked at is not used. A clearing that
@@ -2383,6 +2391,9 @@ clear_target() { # clear_target <label> [--leftover]
     local label="$1" flag="${2:-}" out last rc l line status
     local -a extra=()
     [[ -n "$flag" ]] && extra=("$flag")
+    # A dry run changes nothing on the host (bd su1b.12 review): it says
+    # whom it would stop and what it would unmount, and does neither.
+    [[ "$BACKUP_MODE_REAL" == "true" ]] || extra+=(--report-only)
     out="$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" backup clear-target --label "$label" \
         "${extra[@]}" --config "$DAS_CONFIG" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
     last="${out##*$'\n'}"
@@ -2735,6 +2746,15 @@ mount_targets() {
             # guard then sees an unavailable target, as for an absent drive).
             local crc=0
             clear_target "$label" || crc=$?
+            if ((crc == 0)) && [[ "$CLEAR_DETAIL" == "dry run: "*"would "* ]]; then
+                # The other program's mount is still there: never mounted
+                # beside it, not even for a dry run.
+                log_warn "  $label: $CLEAR_DETAIL — nothing was stopped or unmounted; not mounted for the dry run"
+                record_op "target_${label}" "WARN" "not mounted: $CLEAR_DETAIL"
+                TARGET_AVAILABLE[$label]=false
+                rmdir -- "$mnt" 2>/dev/null || log_warn "  $label: $mnt could not be removed (the bare-mountpoint guard decides)"
+                continue
+            fi
             if ((crc == 3)); then
                 log_error "  $label: another program's mount of it cannot be cleared: $CLEAR_DETAIL — this target is NOT available this run"
                 record_op "target_${label}" "FAIL" "not mounted: another program's mount of it cannot be cleared: $CLEAR_DETAIL"

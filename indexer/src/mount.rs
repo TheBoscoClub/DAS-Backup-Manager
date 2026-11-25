@@ -200,6 +200,9 @@ struct ClearSite<'a> {
     signaller: &'a dyn crate::holders::Signaller,
     /// This process: never signalled, nor any ancestor of it.
     self_pid: i32,
+    /// A dry run: holders and mounts are said ("would stop", "would
+    /// unmount"), nothing is signalled or unmounted (bd su1b.12 review).
+    report_only: bool,
     /// `/sys/fs/btrfs`: `<fsid>` is there exactly while the filesystem is
     /// mounted in some mount namespace (proven on a VM, kernel 7.3: absent
     /// when only registered by a scan or after its last unmount; present
@@ -213,8 +216,9 @@ fn read_self_mountinfo() -> Result<String, String> {
         .map_err(|e| format!("/proc/self/mountinfo: {e}"))
 }
 
-fn host_clear_site() -> ClearSite<'static> {
+fn host_clear_site(report_only: bool) -> ClearSite<'static> {
     ClearSite {
+        report_only,
         mountinfo: &read_self_mountinfo,
         proc: crate::holders::ProcSite::host(),
         signaller: &crate::holders::SystemSignaller,
@@ -826,7 +830,7 @@ fn take_down_leftover_with(
     runner: &dyn CommandRunner,
     mount_point: &str,
     progress: &dyn ProgressCallback,
-    clear: Option<(&ClearSite<'_>, &str)>,
+    clear: Option<(&ClearSite<'_>, &str, Option<&str>)>,
 ) -> Result<(), String> {
     let mut why = match umount_retrying(runner, mount_point, |msg| {
         progress.on_log(crate::progress::LogLevel::Warning, msg);
@@ -837,7 +841,7 @@ fn take_down_leftover_with(
     // What holds it busy (bd DAS-Backup-Manager-su1b.12): the operator's
     // stop policy, then the plain unmount again — only when something was
     // stopped; a writer refuses here, never forced.
-    if let Some((site, who)) = clear {
+    if let Some((site, who, fsid)) = clear {
         progress.on_log(
             crate::progress::LogLevel::Warning,
             &format!(
@@ -850,6 +854,9 @@ fn take_down_leftover_with(
                     .into_iter()
                     .filter(|m| m.mount_point == mount_point)
                     .collect();
+                if let Err(busy) = maintenance_on(runner, site, fsid, mount_point) {
+                    return Err(format!("{why} after {UMOUNT_ATTEMPTS} attempts; {busy}"));
+                }
                 match clear_logged(site, runner, who, &at, progress) {
                     Ok(sent) if sent.is_empty() => {}
                     Ok(sent) => {
@@ -923,13 +930,14 @@ impl ClearTarget {
 pub fn clear_target(
     target: &Target,
     leftover: bool,
+    report_only: bool,
     progress: &dyn ProgressCallback,
     _held: &MaintenanceHeld,
 ) -> ClearTarget {
     clear_target_with(
         &SystemRunner,
         &HOST_PROBES,
-        &host_clear_site(),
+        &host_clear_site(report_only),
         target,
         leftover,
         progress,
@@ -959,6 +967,18 @@ fn clear_target_with(
             .into_iter()
             .filter(|m| m.mount_point == target.mount)
             .collect();
+        if let Err(busy) = maintenance_on(runner, site, target.mount_uuid.as_deref(), &target.mount)
+        {
+            return ClearTarget::Refused(busy);
+        }
+        if site.report_only {
+            return match clear_logged(site, runner, &target.label, &at, progress) {
+                Ok(_) => {
+                    ClearTarget::Cleared(format!("dry run: nothing signalled at {}", target.mount))
+                }
+                Err(why) => ClearTarget::Refused(why),
+            };
+        }
         return match clear_logged(site, runner, &target.label, &at, progress) {
             Ok(sent) if sent.is_empty() => {
                 ClearTarget::Cleared(format!("nothing holds {}", target.mount))
@@ -981,6 +1001,9 @@ fn clear_target_with(
     };
     match clear_mounted_elsewhere(runner, site, target, fsid, &members, progress) {
         Ok(None) => ClearTarget::Cleared("not mounted anywhere else".into()),
+        Ok(Some(would)) if site.report_only => {
+            ClearTarget::Cleared(format!("dry run: {}", would.join("; ")))
+        }
         Ok(Some(sent)) if sent.is_empty() => ClearTarget::Cleared(
             "another program's mount, held by nothing, was unmounted; the kernel has it \
              mounted nowhere"
@@ -1006,7 +1029,7 @@ pub fn take_down_leftover(
         &SystemRunner,
         mount_point,
         progress,
-        Some((&host_clear_site(), mount_point)),
+        Some((&host_clear_site(false), mount_point, None)),
     )
 }
 
@@ -1030,6 +1053,65 @@ fn origin_of(runner: &dyn CommandRunner, mount_point: &str) -> crate::holders::O
     crate::holders::origin(mount_point, text.as_deref())
 }
 
+/// btrfs maintenance running on the filesystem (bd su1b.12 review): an
+/// exclusive operation (`/sys/fs/btrfs/<fsid>/exclusive_operation` not
+/// `none`: balance, device add/remove/replace, resize, swap activate) or a
+/// scrub (`btrfs scrub status <mount point>` reading `running`). Either
+/// refuses the clearing, as a writer does: it is never interrupted. A file
+/// that cannot be read, or a status that cannot be run, refuses too.
+fn maintenance_on(
+    runner: &dyn CommandRunner,
+    site: &ClearSite<'_>,
+    fsid: Option<&str>,
+    mount_point: &str,
+) -> Result<(), String> {
+    if let Some(fsid) = fsid {
+        let f = site
+            .sysfs_btrfs
+            .join(fsid.to_ascii_lowercase())
+            .join("exclusive_operation");
+        match std::fs::read_to_string(&f) {
+            Ok(op) if op.trim() == "none" || op.trim().is_empty() => {}
+            Ok(op) => {
+                return Err(format!(
+                    "a btrfs {} is running on it ({}) — never interrupted",
+                    op.trim(),
+                    f.display()
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "whether btrfs maintenance runs on it cannot be read ({}: {e})",
+                    f.display()
+                ));
+            }
+        }
+    }
+    let out = runner.output(Command::new("btrfs").args(["scrub", "status", mount_point]));
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if text
+                .lines()
+                .any(|l| l.trim_start().starts_with("Status:") && l.contains("running"))
+            {
+                return Err(format!(
+                    "a scrub is running on it ({mount_point}) — never interrupted"
+                ));
+            }
+            Ok(())
+        }
+        Ok(o) => Err(format!(
+            "whether a scrub runs on it cannot be told ({})",
+            failed("btrfs scrub status", &o)
+        )),
+        Err(e) => Err(format!(
+            "whether a scrub runs on it cannot be told (btrfs scrub status: {e})"
+        )),
+    }
+}
+
 /// The stop policy over every process using `mounts`
 /// ([`crate::holders::clear_holders`]), each holder and each signal said as a
 /// warning. `Ok` the signals sent (`SIGTERM to pid 300 (dolphin)`, for the
@@ -1047,6 +1129,7 @@ fn clear_logged(
         self_pid: site.self_pid,
         signaller: site.signaller,
         sleep: &sleep,
+        report_only: site.report_only,
     };
     let say = |lines: &[String]| {
         for l in lines {
@@ -1106,7 +1189,21 @@ fn clear_mounted_elsewhere(
     };
     let all = parse_mountinfo(&(site.mountinfo)()?);
     let ours = elsewhere(&all);
+    let sys = site.sysfs_btrfs.join(fsid.to_ascii_lowercase());
+    let hidden = || {
+        format!(
+            "every mount of it this host shows is gone, yet the kernel still has it mounted \
+             ({} exists): another mount namespace or a lazy unmount held open keeps it — \
+             not mounted beside it",
+            sys.display()
+        )
+    };
     if ours.is_empty() {
+        // Mounted nowhere this host can see, not even at its own path, yet
+        // the kernel has it mounted (bd su1b.12 review).
+        if mounts_of(&all, members).is_empty() && sys.exists() {
+            return Err(hidden());
+        }
         return Ok(None);
     }
     for m in &ours {
@@ -1131,6 +1228,27 @@ fn clear_mounted_elsewhere(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    }
+    maintenance_on(runner, site, Some(fsid), &ours[0].mount_point)?;
+    if site.report_only {
+        let mut would: Vec<String> = ours
+            .iter()
+            .map(|m| {
+                format!(
+                    "would unmount {} ({})",
+                    m.mount_point,
+                    origin_of(runner, &m.mount_point)
+                )
+            })
+            .collect();
+        clear_logged(site, runner, &target.label, &ours, progress)?;
+        let env_lines = crate::holders::scan_holders(&site.proc, &ours)
+            .map_err(|e| format!("who uses it cannot be read ({e})"))?;
+        would.extend(env_lines.iter().map(|h| format!("would stop: {h}")));
+        for w in would.iter().filter(|w| w.starts_with("would unmount")) {
+            warn(format!("dry run: {w}"));
+        }
+        return Ok(Some(would));
     }
     let mut sent = clear_logged(site, runner, &target.label, &ours, progress)?;
     for m in &ours {
@@ -1177,14 +1295,8 @@ fn clear_mounted_elsewhere(
                 .join(", ")
         ));
     }
-    let sys = site.sysfs_btrfs.join(fsid.to_ascii_lowercase());
     if sys.exists() {
-        return Err(format!(
-            "every mount of it this host shows is gone, yet the kernel still has it mounted \
-             ({} exists): another mount namespace or a lazy unmount held open keeps it — \
-             not mounted beside it",
-            sys.display()
-        ));
+        return Err(hidden());
     }
     if !sent.is_empty() {
         warn(format!("{STOPPED}: {}", sent.join(", ")));
@@ -1552,6 +1664,29 @@ pub fn ensure_targets_mounted(
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
+    ensure_targets_mounted_on(config, intent, progress, held, false)
+}
+
+/// [`ensure_targets_mounted`] for a dry run (bd DAS-Backup-Manager-su1b.12
+/// review): another program's mount of a RAID-1 target, and the holders of a
+/// busy leftover, are only said — nothing signalled, nothing of another
+/// program's unmounted; such a target is NOT available for the dry run.
+pub fn ensure_targets_mounted_dry_run(
+    config: &Config,
+    intent: raid_guard::Intent,
+    progress: &dyn ProgressCallback,
+    held: &MaintenanceHeld,
+) -> Result<MountGuard, MountError> {
+    ensure_targets_mounted_on(config, intent, progress, held, true)
+}
+
+fn ensure_targets_mounted_on(
+    config: &Config,
+    intent: raid_guard::Intent,
+    progress: &dyn ProgressCallback,
+    held: &MaintenanceHeld,
+    report_only: bool,
+) -> Result<MountGuard, MountError> {
     ensure_targets_mounted_with(
         config,
         intent,
@@ -1562,7 +1697,7 @@ pub fn ensure_targets_mounted(
         RaidSite {
             record_dir: &raid_guard::record_dir(),
             missing: std::rc::Rc::new(raid_guard::missing_devids),
-            clear: &host_clear_site(),
+            clear: &host_clear_site(report_only),
         },
     )
 }
@@ -1684,7 +1819,7 @@ fn ensure_targets_mounted_with(
                 &*guard.runner,
                 &target.mount,
                 progress,
-                Some((clear, &target.label)),
+                Some((clear, &target.label, target.mount_uuid.as_deref())),
             )
             .map_err(|detail| MountError::LeftoverMounted {
                 label: target.label.clone(),
@@ -1737,9 +1872,26 @@ fn ensure_targets_mounted_with(
                     }
                 })
             } else {
-                members.and_then(|members| {
-                    clear_mounted_elsewhere(&*guard.runner, clear, target, fsid, &members, progress)
-                })
+                members
+                    .and_then(|members| {
+                        clear_mounted_elsewhere(
+                            &*guard.runner,
+                            clear,
+                            target,
+                            fsid,
+                            &members,
+                            progress,
+                        )
+                    })
+                    .and_then(|done| match done {
+                        // A dry run touched nothing: that mount is still
+                        // there, and the target is never mounted beside it.
+                        Some(would) if clear.report_only => Err(format!(
+                            "dry run: {} — nothing was stopped or unmounted",
+                            would.join("; ")
+                        )),
+                        other => Ok(other),
+                    })
             };
             if let Err(why) = cleared {
                 progress.on_log(
@@ -3048,6 +3200,10 @@ mod tests {
         signals: Mutex<Vec<(i32, crate::holders::Sig)>>,
         /// Filesystem UUIDs `/sys/fs/btrfs` lists (mounted somewhere).
         in_sysfs: Vec<String>,
+        /// `/sys/fs/btrfs/<fsid>/exclusive_operation`, per filesystem UUID.
+        exclusive: Vec<(String, String)>,
+        /// Clear as a dry run does.
+        report_only: bool,
     }
 
     /// The described host's signals: recorded, and the process ends unless
@@ -3080,6 +3236,10 @@ mod tests {
             for u in &self.in_sysfs {
                 std::fs::create_dir_all(sysfs.path().join(u)).unwrap();
             }
+            for (u, op) in &self.exclusive {
+                std::fs::create_dir_all(sysfs.path().join(u)).unwrap();
+                std::fs::write(sysfs.path().join(u).join("exclusive_operation"), op).unwrap();
+            }
             let mountinfo = || {
                 let gone = runner.unmounted.lock().unwrap().clone();
                 Ok(self
@@ -3096,6 +3256,7 @@ mod tests {
                 proc: site,
                 signaller: &signals,
                 self_pid: 900,
+                report_only: self.report_only,
                 sysfs_btrfs: sysfs.path().to_path_buf(),
             })
         }
@@ -3745,9 +3906,12 @@ mod tests {
 
         let calls = runner.calls();
         assert_eq!(calls[1..6], vec![status_call(&["umount", &mnt]); 5][..]);
-        assert_eq!(calls[6], status_call(&["umount", "-f", &mnt]));
+        // Still busy: whether btrfs maintenance runs on it is asked first
+        // (bd su1b.12); nothing holds it, so straight to the forced unmount.
+        assert_eq!(calls[6], output_call(&["btrfs", "scrub", "status", &mnt]));
+        assert_eq!(calls[7], status_call(&["umount", "-f", &mnt]));
         assert_eq!(
-            calls[7],
+            calls[8],
             output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt])
         );
         assert_eq!(guard.count(), 1);
@@ -4034,6 +4198,140 @@ mod tests {
         assert!(logged(&progress, "NOT available"), "{:?}", progress.logs());
     }
 
+    /// A dry run never stops a holder nor unmounts another program's mount:
+    /// it says what it would do, and the target is NOT available for it.
+    #[test]
+    fn a_dry_run_says_whom_it_would_stop_and_touches_nothing() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.report_only = true;
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::NoDrivesFound)),
+            "{:?}",
+            result.err()
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| (c.argv[0] == "umount" || c.argv[0] == "mount")
+                    && c.argv.iter().any(|a| a == "/run/media/u/das" || a == &mnt)),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(
+            logged(&progress, "would stop: pid 300"),
+            "{:?}",
+            progress.logs()
+        );
+        assert!(
+            logged(&progress, "would unmount /run/media/u/das"),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
+    /// btrfs maintenance running on it (balance, replace, device remove…)
+    /// is never interrupted: the target is NOT available, nothing signalled.
+    #[test]
+    fn an_exclusive_btrfs_operation_on_it_refuses_the_clearing() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.exclusive = vec![("u-p".into(), "balance\n".into())];
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::NoDrivesFound)),
+            "{:?}",
+            result.err()
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(
+            !runner
+                .calls()
+                .contains(&status_call(&["umount", "/run/media/u/das"])),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(logged(&progress, "balance"), "{:?}", progress.logs());
+    }
+
+    /// A scrub running on it is never interrupted either.
+    #[test]
+    fn a_scrub_running_on_it_refuses_the_clearing() {
+        let scratch = Scratch::new();
+        let (config, host, _runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let part_b = scratch.path("dev/sdb1");
+        let part_c = scratch.path("dev/sdc1");
+        let runner = ScriptedRunner::with_rules(&[
+            ("blkid", Reply::Out(0, format!("{part_b}\n{part_c}\n"))),
+            (
+                "scrub",
+                Reply::Out(
+                    0,
+                    "UUID:             u-p\nScrub started:    now\nStatus:           running\n"
+                        .into(),
+                ),
+            ),
+        ]);
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::NoDrivesFound)),
+            "{:?}",
+            result.err()
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(logged(&progress, "scrub"), "{:?}", progress.logs());
+    }
+
+    /// Mounted nowhere this host can see, yet the kernel has it mounted:
+    /// another mount namespace, or a lazy unmount held open. Never mounted
+    /// beside it.
+    #[test]
+    fn a_raid1_target_mounted_only_where_this_host_cannot_see_is_skipped() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.mountinfo.truncate(1);
+        host.mounted_elsewhere.clear();
+        host.in_sysfs = vec!["u-p".into()];
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::NoDrivesFound)),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" && c.argv.iter().any(|a| a == &mnt)),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(
+            logged(&progress, "another mount namespace"),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
     /// A busy leftover at the target's own path: after the plain tries, its
     /// reader is stopped and a plain unmount releases it — no `umount -f`.
     #[test]
@@ -4043,8 +4341,10 @@ mod tests {
         config.targets[0].mount_uuid = Some("u-p".into());
         scratch.mkdir("mnt/p");
         host.mountpoints = vec![PathBuf::from(&mnt)];
+        scratch.mkdir("mnt/p/sub");
+        let real_id = crate::holders::testproc::FakeProc::real_mount_id(Path::new(&mnt));
         host.mountinfo = vec![format!(
-            "88 22 0:52 / {mnt} rw - btrfs /dev/sdb1 rw,subvolid=5"
+            "{real_id} 22 0:52 / {mnt} rw - btrfs /dev/sdb1 rw,subvolid=5"
         )];
         let proc = crate::holders::testproc::FakeProc::new();
         proc.add(crate::holders::testproc::Proc {
@@ -4072,10 +4372,12 @@ mod tests {
         assert_eq!(host.signals(), vec![(310, crate::holders::Sig::Term)]);
         let calls = runner.calls();
         assert_eq!(
-            calls[1..7],
-            vec![status_call(&["umount", &mnt]); 6][..],
+            calls[1..6],
+            vec![status_call(&["umount", &mnt]); 5][..],
             "{calls:?}"
         );
+        assert_eq!(calls[6], output_call(&["btrfs", "scrub", "status", &mnt]));
+        assert_eq!(calls[7], status_call(&["umount", &mnt]), "{calls:?}");
         assert!(
             !calls.iter().any(|c| c.argv.iter().any(|a| a == "-f")),
             "{calls:?}"
