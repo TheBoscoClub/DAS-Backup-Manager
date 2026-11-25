@@ -591,13 +591,7 @@ pub fn scan_holders(site: &ProcSite, mounts: &[MountEntry]) -> Result<Vec<Holder
             .and_then(|v| v.split_whitespace().next())
             .and_then(|v| v.parse().ok());
         let cmdline = fs::read(dir.join("cmdline"))
-            .map(|b| {
-                b.split(|c| *c == 0)
-                    .filter(|a| !a.is_empty())
-                    .map(|a| String::from_utf8_lossy(a).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
+            .map(|b| display_cmdline(&b))
             .unwrap_or_default();
         out.push(Holder {
             pid,
@@ -1021,10 +1015,54 @@ pub(crate) mod testproc {
     }
 }
 
+/// The longest command line shown for a holder, in characters.
+pub const DISPLAY_CMDLINE_MAX: usize = 160;
+
+/// A process's `/proc/<pid>/cmdline` as it is shown in the log, the
+/// `clear-target` lines and the emailed report: arguments joined by spaces,
+/// every control character (a newline that would forge a report line, an
+/// escape sequence) replaced by `?`, cut to [`DISPLAY_CMDLINE_MAX`]
+/// characters ending in `…`. Any local user writes their own argv, so it is
+/// text from outside, never trusted (security scan of su1b.31).
+pub fn display_cmdline(raw: &[u8]) -> String {
+    let joined = raw
+        .split(|c| *c == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clean: Vec<char> = joined
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if clean.len() <= DISPLAY_CMDLINE_MAX {
+        clean.into_iter().collect()
+    } else {
+        let mut cut: String = clean[..DISPLAY_CMDLINE_MAX - 1].iter().collect();
+        cut.push('\u{2026}');
+        cut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::testproc::{FakeProc, Proc};
     use super::*;
+
+    #[test]
+    fn a_command_line_cannot_forge_a_report_line_and_is_bounded() {
+        // A process's argv is any local user's text, and it reaches the
+        // emailed report: control characters become '?', the whole is cut
+        // to DISPLAY_CMDLINE_MAX characters.
+        let shown = display_cmdline(b"evil\nTarget primary  OK\0--flag\0\x1b[31mred\0\0");
+        assert_eq!(shown, "evil?Target primary  OK --flag ?[31mred");
+        let long = display_cmdline("x".repeat(500).as_bytes());
+        assert_eq!(long.chars().count(), DISPLAY_CMDLINE_MAX);
+        assert!(long.ends_with('\u{2026}'));
+        assert_eq!(display_cmdline(b""), "");
+        // Not UTF-8: replaced, never a panic.
+        assert_eq!(display_cmdline(b"a\xffb"), "a\u{fffd}b");
+    }
     use std::cell::RefCell;
     use std::os::unix::fs::symlink;
 
