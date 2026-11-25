@@ -161,6 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An unset `[recovery_os].timezone` uses the host's own zone, not a built-in one** (bd `DAS-Backup-Manager-cnjc`): the zone `/etc/localtime` points to under `/usr/share/zoneinfo`, else UTC; `btrdasd config dump-env` always exports `DAS_RECOVERY_OS_TIMEZONE`, so `provision` always passes the installer a zone
+- **A recovery-OS update schedule left behind after its drive left the config can be seen and cleared** (bd `DAS-Backup-Manager-epmw`): the helper's `RecoveryOsStatus` lists such `das-recovery-os-update-<label>.timer` units as orphans, `RecoveryOsScheduleSet` with time 0 clears one through the same path and polkit action as any clear (a running session refused), and the GUI shows an orphan card with a Clear button
 - **The nightly no longer warns "btrbk may run at boot" for a recovery OS with no btrbk config** (bd `DAS-Backup-Manager-eg4j.17`): every nightly ended `COMPLETED WITH WARNINGS` for this row alone, because every mkinitcpio OS reads `may` from `mkinitcpio-generate-shutdown-ramfs.service`
   - `recovery_os::boot_warning` returns nothing for a `may` beside `btrbk config: none` — btrbk stops before doing anything without a config, the rule `recovery-os-install.sh verify` already accepts a rebuild by (bd `DAS-Backup-Manager-eg4j.8`)
   - A config present or unknown, and any `will`, still warn; the RECOVERY OS section still shows the verdict and the config
