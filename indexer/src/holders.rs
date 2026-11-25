@@ -777,29 +777,28 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testproc {
     use super::*;
-    use std::cell::RefCell;
     use std::os::unix::fs::symlink;
 
     /// A fake `/proc`, built in a temporary directory.
-    struct FakeProc {
+    pub(crate) struct FakeProc {
         dir: tempfile::TempDir,
     }
 
-    struct Proc<'a> {
-        pid: i32,
-        ppid: i32,
-        start: u64,
-        flags: u64,
-        state: char,
-        cmd: &'a str,
-        uid: u32,
-        cgroup: &'a str,
-        cwd: &'a str,
+    pub(crate) struct Proc<'a> {
+        pub(crate) pid: i32,
+        pub(crate) ppid: i32,
+        pub(crate) start: u64,
+        pub(crate) flags: u64,
+        pub(crate) state: char,
+        pub(crate) cmd: &'a str,
+        pub(crate) uid: u32,
+        pub(crate) cgroup: &'a str,
+        pub(crate) cwd: &'a str,
         /// fd number, target, flags (octal text), mnt_id
-        fds: Vec<(u32, &'a str, &'a str, Option<u64>)>,
-        maps: &'a str,
+        pub(crate) fds: Vec<(u32, &'a str, &'a str, Option<u64>)>,
+        pub(crate) maps: &'a str,
     }
 
     impl Default for Proc<'_> {
@@ -821,7 +820,7 @@ mod tests {
     }
 
     impl FakeProc {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let f = Self {
                 dir: tempfile::TempDir::new().unwrap(),
             };
@@ -833,13 +832,13 @@ mod tests {
             .unwrap();
             f
         }
-        fn site(&self) -> ProcSite {
+        pub(crate) fn site(&self) -> ProcSite {
             ProcSite {
                 proc_root: self.dir.path().join("proc"),
                 passwd: self.dir.path().join("passwd"),
             }
         }
-        fn add(&self, p: Proc<'_>) {
+        pub(crate) fn add(&self, p: Proc<'_>) {
             let d = self.dir.path().join("proc").join(p.pid.to_string());
             let _ = fs::remove_dir_all(&d);
             fs::create_dir_all(d.join("fd")).unwrap();
@@ -875,10 +874,18 @@ mod tests {
                 fs::write(d.join("fdinfo").join(n.to_string()), info).unwrap();
             }
         }
-        fn remove(&self, pid: i32) {
+        pub(crate) fn remove(&self, pid: i32) {
             fs::remove_dir_all(self.dir.path().join("proc").join(pid.to_string())).unwrap();
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testproc::{FakeProc, Proc};
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::fs::symlink;
 
     fn das_mount() -> Vec<MountEntry> {
         parse_mountinfo(
