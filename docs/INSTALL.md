@@ -169,6 +169,8 @@ unauthenticated and the relay's upstream key is the relay's own business.
 
 Prompts whether to also remove the backup database at `/var/lib/das-backup/backup-index.db`. The TOML config file is preserved for potential reinstallation.
 
+Removing the Arch, Debian or Fedora package runs this for you (`pre_remove`, `prerm`, `%preun`; removal only, never an upgrade): `btrdasd setup --uninstall --force`, which keeps the database and `config.toml`. If a backup or scrub holds its lock (exit 75) the package still goes, the hook says so, and you run the command once that job ends. The Flatpak, Snap and AppImage builds ship the GUI only and never ran setup.
+
 ### Full Uninstall (everything)
 
 ```bash
