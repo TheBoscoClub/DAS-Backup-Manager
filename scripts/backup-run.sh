@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.24.0
+# Version: 4.24.1
 # Date: 2026-11-25
 #
 # Features:
+#   - The I/O scheduler reaches every disk carrying a target's filesystem
+#     UUID (v4.24.1, bd DAS-Backup-Manager-su1b.4): `blkid -t UUID=` lists
+#     every member, each partition resolved to its parent disk through sysfs
+#     (whole-disk members too), de-duplicated; a disk it cannot set is a WARN
+#     naming it, no longer silent.
 #   - What holds a target is cleared by one stop policy (v4.24.0, bd
 #     DAS-Backup-Manager-su1b.12, operator 2026-11-23): a RAID-1 target's
 #     filesystem another program mounted elsewhere (udisks, a .mount unit, a
@@ -1587,16 +1592,49 @@ check_das_connected() {
     fi
 }
 
-# Every disk of a target, once each: the disk under the partition blkid
-# resolves its UUID to, and every disk found by one of its serials. A
-# multi-drive target (a RAID1 pair) has one filesystem UUID that blkid
-# resolves to ONE member, so the UUID alone reached one leg and left the other
-# on whatever the host's rules set (bd DAS-Backup-Manager-su1b.4).
+# The parent disk of every partition (or whole-disk member) carrying
+# filesystem UUID <uuid>, one per line, from `blkid -t UUID=` (every member,
+# where `blkid -U` names one) and sysfs (a partition's directory sits under its
+# disk's). A lookup that fails says so (WARN, stderr) and goes on: blkid exit 2
+# is "no such filesystem", not a failure (bd DAS-Backup-Manager-su1b.4).
+uuid_member_disks() {
+    local uuid=$1 sysblk="${DAS_SYS_CLASS_BLOCK:-/sys/class/block}"
+    local out rc part name link disk
+    out="$(blkid -c /dev/null -t "UUID=$uuid" -o device 2>&1; printf '\nstatus=%s' "$?")"
+    rc="${out##*$'\n'status=}"
+    out="${out%$'\n'status=*}"
+    out="${out%$'\n'}"
+    if [[ "$rc" != 0 ]]; then
+        [[ "$rc" == 2 ]] || log_warn "  blkid could not list the members of filesystem $uuid (status $rc): ${out:-no output}" >&2
+        return 0
+    fi
+    while IFS= read -r part; do
+        [[ -n "$part" ]] || continue
+        name="${part##*/}"
+        if [[ ! -e "$sysblk/$name" ]]; then
+            log_warn "  $part carries filesystem $uuid but $sysblk/$name is missing -- its I/O scheduler is not set" >&2
+        elif [[ -e "$sysblk/$name/partition" ]]; then
+            if ! link="$(readlink -f "$sysblk/$name")" || [[ -z "$link" ]]; then
+                log_warn "  cannot resolve the disk under $part -- its I/O scheduler is not set" >&2
+                continue
+            fi
+            link="${link%/*}"
+            disk="/dev/${link##*/}"
+            printf '%s\n' "$disk"
+        else
+            printf '/dev/%s\n' "$name"
+        fi
+    done <<<"$out"
+}
+
+# Every disk of a target, once each: the disk under every partition carrying
+# its filesystem UUID (all legs of a RAID1 pair), the first disk discovery
+# recorded, and every disk found by one of its serials.
 io_scheduler_devices() {
-    local label=$1 pair dev seen=" "
+    local label=$1 pair dev seen=" " uuid="${TARGET_MOUNT_UUIDS[$1]:-}"
     for dev in "${DISCOVERED_DEVICES[$label]:-}" $(
         for pair in ${TARGET_SERIAL_DEVS[$label]:-}; do printf '%s\n' "${pair#*=}"; done
-    ); do
+    ) $([[ -z "$uuid" ]] || uuid_member_disks "$uuid"); do
         [[ -n "$dev" && "$seen" != *" $dev "* ]] || continue
         seen+="$dev "
         printf '%s\n' "$dev"
@@ -1609,16 +1647,26 @@ set_io_scheduler() {
     local label drive dev
     for label in "${!DISCOVERED_DEVICES[@]}"; do
         while IFS= read -r drive; do
-            [[ -n "$drive" && -b "$drive" ]] || continue
+            [[ -n "$drive" ]] || continue
+            if [[ ! -b "$drive" ]]; then
+                log_warn "  $label: $drive is not a block device -- I/O scheduler not set"
+                continue
+            fi
             dev="${drive#/dev/}"
             if [[ -f "/sys/block/$dev/queue/scheduler" ]]; then
-                echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
+                if ! echo "$DAS_IO_SCHEDULER" > "/sys/block/$dev/queue/scheduler" 2>/dev/null; then
+                    log_warn "  $label: could not set I/O scheduler $DAS_IO_SCHEDULER on $drive"
+                fi
+            else
+                log_warn "  $label: $drive has no queue/scheduler -- I/O scheduler not set"
             fi
             # A scheduler switch resets nr_requests (to 2 on a single-command
             # USB drive), so the configured size follows it (bd
             # DAS-Backup-Manager-su1b.8); 0 or unset leaves it alone.
             if [[ "${DAS_NR_REQUESTS:-0}" =~ ^[[:digit:]]+$ && "${DAS_NR_REQUESTS:-0}" != 0 && -f "/sys/block/$dev/queue/nr_requests" ]]; then
-                echo "$DAS_NR_REQUESTS" > "/sys/block/$dev/queue/nr_requests" 2>/dev/null || true
+                if ! echo "$DAS_NR_REQUESTS" > "/sys/block/$dev/queue/nr_requests" 2>/dev/null; then
+                    log_warn "  $label: could not set nr_requests $DAS_NR_REQUESTS on $drive"
+                fi
             fi
         done < <(io_scheduler_devices "$label")
     done
