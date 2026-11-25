@@ -90,6 +90,10 @@ pub trait PanelReads {
     /// never systemd's lines about the unit, never an earlier run's. A
     /// journal that cannot be read is an error, never "no lines".
     fn journal(&self, unit: &str, since_epoch: i64) -> Result<Vec<String>, String>;
+    /// The unit names (no suffix) of every `das-recovery-os-update-*.timer`
+    /// that exists, configured or not; an unreadable directory is an error,
+    /// never "none".
+    fn schedule_bases(&self) -> Result<Vec<String>, String>;
 }
 
 fn agent_words(a: &GuestAgent) -> String {
@@ -411,6 +415,7 @@ pub fn status_json(
     let both = format!("{UNIT_PREFIX}both");
     let (pair_schedule, pair_schedule_error) = schedule_of(&both, pair_history, now_epoch, reads);
     let (pair_session, pair_session_error) = pair_session_of(now.holder, now.job, reads);
+    let (orphans, orphans_error) = orphans_of(cfg, now_epoch, reads);
     let mode_default = if drives.len() == 2 {
         pair_mode_default(&[drives[0].clean_runs, drives[1].clean_runs])
     } else {
@@ -428,7 +433,45 @@ pub fn status_json(
             "session_error": pair_session_error,
         },
         "drives": drives.iter().map(DriveStatus::to_json).collect::<Vec<_>>(),
+        "orphans": orphans,
+        "orphans_error": orphans_error,
     })
+}
+
+/// Schedule timers whose label is no longer a configured recovery drive
+/// (the pair's `both` unit is not one): such a timer still fires, and only
+/// the unit name can clear it (bd DAS-Backup-Manager-epmw). Each is read as
+/// any schedule is, with no history (it has no drive to read one from).
+fn orphans_of(
+    cfg: &Config,
+    now_epoch: i64,
+    reads: &dyn PanelReads,
+) -> (Vec<Value>, Option<String>) {
+    let bases = match reads.schedule_bases() {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("the schedule units cannot be listed: {e}")),
+            );
+        }
+    };
+    let both = format!("{UNIT_PREFIX}both");
+    let orphans = bases
+        .iter()
+        .filter(|b| **b != both)
+        .filter_map(|b| b.strip_prefix(UNIT_PREFIX).map(|l| (b, l)))
+        .filter(|(_, l)| {
+            !cfg.targets
+                .iter()
+                .any(|t| t.role == TargetRole::Mirror && t.label == *l)
+        })
+        .map(|(base, label)| {
+            let (schedule, schedule_error) = schedule_of(base, Ok(&[]), now_epoch, reads);
+            json!({"label": label, "schedule": schedule, "schedule_error": schedule_error})
+        })
+        .collect();
+    (orphans, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1215,8 @@ pub(crate) mod tests {
         journals: HashMap<String, Result<Vec<String>, String>>,
         /// Each journal read asked for: (unit, since).
         journal_reads: std::sync::Mutex<Vec<(String, i64)>>,
+        /// The schedule bases that exist; unset, none.
+        bases: Option<Result<Vec<String>, String>>,
     }
 
     impl PanelReads for Scripted {
@@ -1204,6 +1249,9 @@ pub(crate) mod tests {
         }
         fn running_job(&self) -> Option<String> {
             self.job.clone()
+        }
+        fn schedule_bases(&self) -> Result<Vec<String>, String> {
+            self.bases.clone().unwrap_or_else(|| Ok(Vec::new()))
         }
         fn journal(&self, unit: &str, since_epoch: i64) -> Result<Vec<String>, String> {
             self.journal_reads
@@ -1514,6 +1562,74 @@ pub(crate) mod tests {
         assert!(a["history"].as_array().unwrap().is_empty());
         // B has no scripted error: an empty history is a reading, no error.
         assert!(j["drives"][1]["history_error"].is_null());
+    }
+
+    /// A `das-recovery-os-update-<label>` timer whose target left the
+    /// configuration still fires; the status lists it as an orphan so the
+    /// panel can show and clear it (bd epmw). The pair's `both` unit and the
+    /// configured drives' own units are not orphans.
+    #[test]
+    fn a_schedule_unit_of_a_label_no_longer_in_config_is_listed_as_an_orphan() {
+        let cfg = two_mirrors_and_a_primary();
+        let gone = format!("{UNIT_PREFIX}gone-3tb");
+        let mut units = HashMap::new();
+        units.insert(
+            format!("{gone}.timer"),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "active".into(),
+                next_elapse_epoch: Some(1_791_600_000),
+                ..Default::default()
+            }),
+        );
+        units.insert(
+            format!("{gone}.service"),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                ..Default::default()
+            }),
+        );
+        let reads = Scripted {
+            units,
+            bases: Some(Ok(vec![
+                format!("{UNIT_PREFIX}system-recovery-A-2tb"),
+                format!("{UNIT_PREFIX}both"),
+                gone.clone(),
+            ])),
+            ..Default::default()
+        };
+        let j = status_json(
+            &cfg,
+            &Ok(None),
+            &host(),
+            "2026-10-08",
+            1_791_500_000,
+            &reads,
+        );
+        let orphans = j["orphans"].as_array().unwrap();
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0]["label"], "gone-3tb");
+        assert_eq!(orphans[0]["schedule"]["unit"], format!("{gone}.timer"));
+        assert_eq!(orphans[0]["schedule"]["state"], "pending");
+        assert!(orphans[0]["schedule_error"].is_null());
+        assert!(j["orphans_error"].is_null());
+    }
+
+    #[test]
+    fn no_orphans_is_an_empty_list_and_an_unreadable_listing_is_an_error_not_none() {
+        let cfg = two_mirrors_and_a_primary();
+        let none = Scripted::default();
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", 1_791_500_000, &none);
+        assert!(j["orphans"].as_array().unwrap().is_empty());
+        assert!(j["orphans_error"].is_null());
+        let bad = Scripted {
+            bases: Some(Err("Cannot list /etc/systemd/system: denied".into())),
+            ..Default::default()
+        };
+        let j = status_json(&cfg, &Ok(None), &host(), "2026-10-08", 1_791_500_000, &bad);
+        assert!(j["orphans"].as_array().unwrap().is_empty());
+        assert!(j["orphans_error"].as_str().unwrap().contains("denied"));
     }
 
     #[test]
@@ -2955,6 +3071,23 @@ pub(crate) mod tests {
             }),
         );
         units.insert(
+            "das-recovery-os-update-gone-3tb.timer".to_string(),
+            // No elapse time either: the fixture is the same in every zone.
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                ..Default::default()
+            }),
+        );
+        units.insert(
+            "das-recovery-os-update-gone-3tb.service".to_string(),
+            Ok(UnitFacts {
+                exists: true,
+                active_state: "inactive".into(),
+                ..Default::default()
+            }),
+        );
+        units.insert(
             "das-recovery-os-update-system-recovery-A-2tb.service".to_string(),
             Ok(UnitFacts {
                 exists: true,
@@ -2998,6 +3131,11 @@ pub(crate) mod tests {
             ]
             .into(),
             units,
+            // A timer left behind by a drive no longer in the configuration.
+            bases: Some(Ok(vec![
+                "das-recovery-os-update-system-recovery-A-2tb".into(),
+                "das-recovery-os-update-gone-3tb".into(),
+            ])),
             lock: Some("recovery-os VM session system-recovery-A-2tb pid 4242".into()),
             domain: Some("running".into()),
             job: Some("job-7".into()),

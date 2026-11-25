@@ -89,12 +89,22 @@ struct PairView {
     std::optional<QString> sessionError;
 };
 
+// A schedule timer whose drive is no longer in the configuration: it still
+// fires, and only its unit name can clear it (bd DAS-Backup-Manager-epmw).
+struct OrphanView {
+    QString label;
+    std::optional<ScheduleView> schedule;
+    std::optional<QString> scheduleError;
+};
+
 struct RecoveryDocument {
     int schema = 0;
     int maxAgeDays = 0;
     QString today;
     PairView pair;
     QList<DriveView> drives;
+    QList<OrphanView> orphans;
+    std::optional<QString> orphansError; // the schedule units could not be listed
 
     // Null on failure; `error` names the problem ("not JSON", "schema 2",
     // "drives[1] lacks unattended"). A document missing a key this schema

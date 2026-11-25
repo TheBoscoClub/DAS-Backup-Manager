@@ -1020,6 +1020,37 @@ fn existing_schedule_bases(dirs: &unit_links::UnitDirs<'_>) -> Result<Vec<String
     Ok(bases.into_iter().collect())
 }
 
+/// The base of an orphaned schedule a clear names (bd DAS-Backup-Manager-epmw):
+/// `Some` when `labels` is exactly one label that is no configured target
+/// and whose timer exists among `existing` (so only a name that is already
+/// a `das-recovery-os-update-*` timer is ever acted on); `None` when the
+/// normal, config-validated clear applies (a configured label, or not one
+/// label); `InvalidArgs` for a label that is not one safe unit-name
+/// component (letters, digits, `.`, `_`, `-`, never `both`) or has no timer.
+fn orphan_clear_base(
+    configured: &[String],
+    labels: &[String],
+    existing: &[String],
+) -> fdo::Result<Option<String>> {
+    let [label] = labels else { return Ok(None) };
+    if configured.contains(label) {
+        return Ok(None);
+    }
+    let safe = label != "both"
+        && !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let base = format!("{}{label}", panel::UNIT_PREFIX);
+    if safe && !label.contains("..") && existing.contains(&base) {
+        Ok(Some(base))
+    } else {
+        Err(fdo::Error::InvalidArgs(format!(
+            "{label:?} is not in the configuration and no {base}.timer exists"
+        )))
+    }
+}
+
 /// The two unit names of a schedule, service first.
 fn schedule_unit_names(base: &str) -> [String; 2] {
     [format!("{base}.service"), format!("{base}.timer")]
@@ -1264,6 +1295,14 @@ impl panel::PanelReads for SystemPanelReads {
             Err(e) => return Err(format!("Cannot read {}: {e}", file.display())),
         }
         Ok(facts)
+    }
+
+    fn schedule_bases(&self) -> Result<Vec<String>, String> {
+        let units_dir = unit_links::units_dir(Path::new(CANONICAL_CONFIG))?;
+        existing_schedule_bases(&unit_links::UnitDirs {
+            systemd: Path::new(panel::UNIT_DIR),
+            units: &units_dir,
+        })
     }
 
     fn journal(&self, unit: &str, since_epoch: i64) -> Result<Vec<String>, String> {
@@ -2766,6 +2805,16 @@ impl HelperInterface {
                 units: &units_dir,
             };
             if at_epoch == 0 {
+                let configured: Vec<String> = config
+                    .targets
+                    .iter()
+                    .filter(|t| t.role == buttered_dasd::config::TargetRole::Mirror)
+                    .map(|t| t.label.clone())
+                    .collect();
+                let existing = existing_schedule_bases(&dirs).map_err(fdo::Error::Failed)?;
+                if let Some(base) = orphan_clear_base(&configured, &labels, &existing)? {
+                    return schedule_clear(&dirs, &base, &system_service_state, &system_systemctl);
+                }
                 session::SessionRequest {
                     labels: labels.clone(),
                     unattended: true,
@@ -4127,6 +4176,81 @@ mod tests {
         );
         t.assert_linked_pair(BASE_A);
         assert_eq!(existing_schedule_bases(&t.dirs()).unwrap(), [BASE_A]);
+    }
+
+    /// A schedule of a label that left the configuration is cleared by its
+    /// existing unit name only (bd epmw): the label is one safe unit-name
+    /// component, never `both`, and its timer must exist; a configured label
+    /// or a pair takes the normal validated path (`None`).
+    #[test]
+    fn an_orphan_is_cleared_only_when_its_timer_exists_and_its_label_is_a_safe_name() {
+        let configured = ["system-recovery-A-2tb".to_string()];
+        let one = |l: &str| vec![l.to_string()];
+        let existing = [
+            format!("{}system-recovery-A-2tb", panel::UNIT_PREFIX),
+            format!("{}both", panel::UNIT_PREFIX),
+            format!("{}gone-3tb", panel::UNIT_PREFIX),
+        ];
+        assert_eq!(
+            orphan_clear_base(&configured, &one("gone-3tb"), &existing).unwrap(),
+            Some(format!("{}gone-3tb", panel::UNIT_PREFIX))
+        );
+        // Configured, or not exactly one label: the normal path decides.
+        assert_eq!(
+            orphan_clear_base(&configured, &one("system-recovery-A-2tb"), &existing).unwrap(),
+            None
+        );
+        let two = vec!["gone-3tb".to_string(), "other".to_string()];
+        assert_eq!(
+            orphan_clear_base(&configured, &two, &existing).unwrap(),
+            None
+        );
+        // No such timer, or a name that is not one safe component.
+        for bad in [
+            "never-existed",
+            "both",
+            "",
+            "a/b",
+            "..",
+            "x y",
+            "gone-3tb\n",
+            "gone-3tb.timer",
+        ] {
+            let err = orphan_clear_base(&configured, &one(bad), &existing).unwrap_err();
+            assert!(
+                matches!(err, fdo::Error::InvalidArgs(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    /// End to end on a scratch host: an orphan found by listing is cleared
+    /// through the same `schedule_clear`, files, links and all.
+    #[test]
+    fn an_orphan_timer_found_by_listing_is_cleared_with_its_files_and_links() {
+        let t = Sched::new();
+        let sc = ScriptedSystemctl::new(&[]);
+        let gone = vec!["gone-3tb".to_string()];
+        schedule_install(
+            &t.dirs(),
+            &gone,
+            1_791_600_000,
+            None,
+            Path::new("/x.sh"),
+            &idle,
+            &|a| sc.run(a),
+        )
+        .unwrap();
+        let existing = existing_schedule_bases(&t.dirs()).unwrap();
+        let base = orphan_clear_base(&["other".to_string()], &gone, &existing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            schedule_clear(&t.dirs(), &base, &idle, &|a| sc.run(a)).unwrap(),
+            format!("{base}.timer")
+        );
+        assert!(existing_schedule_bases(&t.dirs()).unwrap().is_empty());
+        t.assert_no_pair(&base);
     }
 
     #[test]
