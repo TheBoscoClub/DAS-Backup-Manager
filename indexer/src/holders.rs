@@ -701,6 +701,9 @@ pub struct Cleared {
     pub lines: Vec<String>,
     /// The signals sent: (pid, signal, command line).
     pub signalled: Vec<(i32, Sig, String)>,
+    /// Who each signalled pid is, for the report (`user bosco, unit
+    /// app-dolphin.scope`; bd su1b.31).
+    pub who: std::collections::BTreeMap<i32, String>,
     /// Report-only: the holders it would stop, one line each.
     pub would_stop: Vec<String>,
 }
@@ -820,6 +823,18 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
                         h.cmdline
                     ));
                     done.signalled.push((h.pid, sig, h.cmdline.clone()));
+                    done.who.insert(
+                        h.pid,
+                        format!(
+                            "user {}, unit {}",
+                            match (&h.user, h.uid) {
+                                (Some(u), _) => u.clone(),
+                                (None, Some(id)) => format!("uid {id}"),
+                                _ => "unknown".into(),
+                            },
+                            h.unit.as_deref().unwrap_or("none")
+                        ),
+                    );
                 }
                 Err(e) => done
                     .lines

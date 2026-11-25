@@ -88,6 +88,26 @@ struct Cli {
     json: bool,
 }
 
+/// The mount `forget`/`purge` take their targets through: a `--dry-run`
+/// only says whom it would stop and what it would unmount, as the backup
+/// job's dry run does (bd su1b.31, su1b.12); never another program's
+/// processes signalled nor its mount taken down for a run that deletes
+/// nothing.
+type DeletionMounter = fn(
+    &Config,
+    buttered_dasd::raid_guard::Intent,
+    &dyn buttered_dasd::progress::ProgressCallback,
+    &buttered_dasd::maintenance::MaintenanceHeld,
+) -> Result<mount::MountGuard, mount::MountError>;
+
+fn deletion_mounter(dry_run: bool) -> DeletionMounter {
+    if dry_run {
+        mount::ensure_targets_mounted_dry_run
+    } else {
+        mount::ensure_targets_mounted
+    }
+}
+
 /// Prune index rows for snapshots that have disappeared from mounted targets.
 ///
 /// Callers MUST invoke this while the targets are mounted — `plan_reconcile`
@@ -122,7 +142,7 @@ where
     };
 
     let progress = CliProgress;
-    let mut guard = mount::ensure_targets_mounted(
+    let mut guard = deletion_mounter(dry_run)(
         &cfg,
         buttered_dasd::raid_guard::Job::Forget.intent(),
         &progress,
@@ -6240,6 +6260,16 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         );
         assert_eq!(browse_listing(true, &[]), "[]\n");
         assert_eq!(browse_listing(false, &[]), "(0 entries)\n");
+    }
+
+    /// A `forget`/`purge` dry run mounts report-only: it never signals
+    /// another program's process nor unmounts its mount (bd su1b.31).
+    #[test]
+    fn a_forget_or_purge_dry_run_mounts_report_only() {
+        let real: DeletionMounter = mount::ensure_targets_mounted;
+        let dry: DeletionMounter = mount::ensure_targets_mounted_dry_run;
+        assert_eq!(deletion_mounter(true) as usize, dry as usize);
+        assert_eq!(deletion_mounter(false) as usize, real as usize);
     }
 
     #[test]
