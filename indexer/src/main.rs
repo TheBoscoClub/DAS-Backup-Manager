@@ -2380,10 +2380,31 @@ fn mount_target_outcome(
 /// under a maintenance lock handed down, as `mount-target`. Without
 /// `--leftover` the target must be a RAID-1 target; a leftover may be any.
 fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: bool) -> i32 {
-    let cannot_run = |why: String| {
-        println!("{}", mount::ClearTarget::CannotRun(why).line().0);
-        2
-    };
+    let lock = CliLock::production();
+    let (line, code) = clear_target_outcome(label, config, leftover, &lock, &|target, held| {
+        mount::clear_target(target, leftover, report_only, &CliProgress, held)
+    });
+    println!("{line}");
+    code
+}
+
+/// The clearing `clear-target` asks for: the target and the proof of the
+/// maintenance lock.
+type TargetClearer<'a> = dyn Fn(&buttered_dasd::config::Target, &maintenance::MaintenanceHeld) -> mount::ClearTarget
+    + 'a;
+
+/// What `clear-target` prints and exits with, the clearing itself handed in
+/// as `clearer`: exit 2 and a `CANNOT-RUN` line when it could not start (a
+/// configuration, label, target kind or lock that is wrong), else the
+/// clearing's own line and exit code (0 cleared, 3 refused, 2 could not run).
+fn clear_target_outcome(
+    label: &str,
+    config: &Path,
+    leftover: bool,
+    lock: &CliLock,
+    clearer: &TargetClearer<'_>,
+) -> (String, i32) {
+    let cannot_run = |why: String| mount::ClearTarget::CannotRun(why).line();
     let cfg = match Config::load(config) {
         Ok(c) => c,
         Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
@@ -2396,7 +2417,6 @@ fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: boo
             "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
         ));
     }
-    let lock = CliLock::production();
     let Some(raw) = &lock.delegated else {
         return cannot_run(format!(
             "only under a maintenance lock handed down by {}",
@@ -2417,10 +2437,7 @@ fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: boo
         Ok(h) => h,
         Err(e) => return cannot_run(e),
     };
-    let (line, code) =
-        mount::clear_target(target, leftover, report_only, &CliProgress, &held).line();
-    println!("{line}");
-    code
+    clearer(target, &held).line()
 }
 
 /// The mount options `btrdasd backup mount-target` passes the guard: the
@@ -2572,13 +2589,24 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
         &held,
     );
     let (code, out, err) = raid_accept_outcome(label, &result);
+    print_raid_accept(&out, &err, &mut std::io::stdout(), &mut std::io::stderr());
+    code
+}
+
+/// The `raid accept` outcome as it is shown: each stderr line, then the
+/// stdout text when there is any.
+fn print_raid_accept(
+    out: &str,
+    err: &[String],
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) {
     for line in err {
-        eprintln!("{line}");
+        writeln!(stderr, "{line}").expect("writing to stderr");
     }
     if !out.is_empty() {
-        println!("{out}");
+        writeln!(stdout, "{out}").expect("writing to stdout");
     }
-    code
 }
 
 /// Shows `text` (when any) and asks `prompt` on `out`, reads one line from
@@ -6920,5 +6948,171 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
             )
         );
         assert!(!marker.exists(), "nothing was spawned");
+    }
+
+    // --- bd DAS-Backup-Manager-su1b.34: clear-target and raid accept ------
+
+    type Clearing = std::cell::RefCell<Vec<(String, bool)>>;
+
+    /// A clearer that records each call (target label, hold delegated) and
+    /// answers `answer`.
+    fn recording_clearer<'a>(
+        seen: &'a Clearing,
+        answer: mount::ClearTarget,
+    ) -> impl Fn(&Target, &maintenance::MaintenanceHeld) -> mount::ClearTarget + 'a {
+        move |t, h| {
+            seen.borrow_mut().push((t.label.clone(), h.is_delegated()));
+            answer.clone()
+        }
+    }
+
+    fn refuse_to_clear(_: &Target, _: &maintenance::MaintenanceHeld) -> mount::ClearTarget {
+        panic!("the clearing ran although the command could not start");
+    }
+
+    #[test]
+    fn clear_target_cannot_run_is_exit_2_with_its_reason_and_clears_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mount_target_config(dir.path(), &dir.path().to_string_lossy());
+        let (_held, lock) = handed_down_lock(dir.path());
+        let none = CliLock {
+            site: lock.site.clone(),
+            delegated: None,
+        };
+        let garbage = CliLock {
+            site: lock.site.clone(),
+            delegated: Some("not-a-number".into()),
+        };
+        let not_the_lock = CliLock {
+            site: lock.site.clone(),
+            delegated: Some("999999".into()),
+        };
+        let run = |label: &str, config: &Path, leftover: bool, lock: &CliLock| {
+            clear_target_outcome(label, config, leftover, lock, &refuse_to_clear)
+        };
+
+        let (line, code) = run("pair", &dir.path().join("absent.toml"), false, &lock);
+        assert_eq!(code, 2);
+        assert!(
+            line.starts_with("CLEAR TARGET: CANNOT-RUN  (cannot read ")
+                && line.contains("absent.toml"),
+            "{line}"
+        );
+        assert_eq!(
+            run("nobody", &cfg, false, &lock),
+            (
+                "CLEAR TARGET: CANNOT-RUN  (no [[target]] labelled 'nobody')".to_string(),
+                2
+            )
+        );
+        let (line, code) = run("pair", &cfg, false, &none);
+        assert_eq!(code, 2);
+        assert!(
+            line.contains("only under a maintenance lock handed down by DAS_MAINTENANCE_LOCK_FD"),
+            "{line}"
+        );
+        let (line, code) = run("pair", &cfg, true, &garbage);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not a descriptor number"), "{line}");
+        let (line, code) = run("pair", &cfg, false, &not_the_lock);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not an open descriptor"), "{line}");
+
+        // Without --leftover the target must be a RAID-1 one (one serial is
+        // not); with it, any target will do.
+        let mut one = Config::load(&cfg).unwrap();
+        one.targets[0].serials = vec!["SERIAL11".into()];
+        let one_path = dir.path().join("one.toml");
+        std::fs::write(&one_path, one.to_toml().unwrap()).unwrap();
+        let (line, code) = run("pair", &one_path, false, &lock);
+        assert_eq!(code, 2);
+        assert!(line.contains("is not a RAID-1 target"), "{line}");
+    }
+
+    /// Past the checks the clearing's own result decides the line and the
+    /// exit status (0 cleared, 3 refused, 2 could not run), for a RAID-1
+    /// target and, with `--leftover`, for any other.
+    #[test]
+    fn clear_target_exit_status_is_the_clearings_and_a_leftover_may_be_any_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mount_target_config(dir.path(), &dir.path().to_string_lossy());
+        let mut one = Config::load(&cfg).unwrap();
+        one.targets[0].serials = vec!["SERIAL11".into()];
+        let one_path = dir.path().join("one.toml");
+        std::fs::write(&one_path, one.to_toml().unwrap()).unwrap();
+        let (_held, lock) = handed_down_lock(dir.path());
+        let seen: Clearing = Default::default();
+
+        for (config, leftover) in [(&cfg, false), (&cfg, true), (&one_path, true)] {
+            for (answer, line, code) in [
+                (
+                    mount::ClearTarget::Cleared("fine".into()),
+                    "CLEAR TARGET: OK  (fine)",
+                    0,
+                ),
+                (
+                    mount::ClearTarget::Refused("a writer".into()),
+                    "CLEAR TARGET: REFUSED  (a writer)",
+                    3,
+                ),
+                (
+                    mount::ClearTarget::CannotRun("no table".into()),
+                    "CLEAR TARGET: CANNOT-RUN  (no table)",
+                    2,
+                ),
+            ] {
+                seen.borrow_mut().clear();
+                let got = clear_target_outcome(
+                    "pair",
+                    config,
+                    leftover,
+                    &lock,
+                    &recording_clearer(&seen, answer),
+                );
+                assert_eq!(got, (line.to_string(), code), "{config:?} {leftover}");
+                assert_eq!(*seen.borrow(), vec![("pair".to_string(), true)]);
+            }
+        }
+    }
+
+    /// The command itself: a configuration that cannot be read stops it at
+    /// exit 2 before any lock or mount is looked at.
+    #[test]
+    fn cmd_clear_target_with_an_unreadable_configuration_exits_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = cmd_clear_target("pair", &dir.path().join("absent.toml"), false, false);
+        assert_eq!(code, 2);
+    }
+
+    /// `raid accept` is root only: anyone else is refused with exit 1 before
+    /// a lock or the configuration is touched. (Run as root it would take
+    /// the real locks, so it does not run there.)
+    #[test]
+    fn cmd_raid_accept_refuses_a_user_who_is_not_root() {
+        // SAFETY: geteuid(2) takes nothing and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let code = cmd_raid_accept("pair", &dir.path().join("c.toml"), &dir.path().join("d.db"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn raid_accept_prints_its_warnings_on_stderr_and_its_line_on_stdout_when_it_has_one() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        print_raid_accept(
+            "Accepted: x",
+            &["WARNING: a".to_string(), "WARNING: b".to_string()],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "Accepted: x\n");
+        assert_eq!(String::from_utf8(err).unwrap(), "WARNING: a\nWARNING: b\n");
+        // An error has no stdout text: nothing, not an empty line.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        print_raid_accept("", &["Error: no".to_string()], &mut out, &mut err);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(String::from_utf8(err).unwrap(), "Error: no\n");
     }
 }

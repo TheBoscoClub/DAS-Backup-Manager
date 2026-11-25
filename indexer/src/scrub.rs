@@ -2647,35 +2647,7 @@ fn scrub_one_target(
         take_interrupted_figures(&mut result, read_scrub_status(&fsuuid), scrub_started);
     } else {
         match read_scrub_status(&fsuuid) {
-            Ok(record) => {
-                // A record left over from an earlier scrub must never be read as
-                // this pass's result — the 2026-07-27 stale-record trap. The
-                // anchor is *this filesystem's* start, not the pass's: a pass runs
-                // for many hours, so anchoring on the pass would accept a record
-                // written half a day before this target was even touched.
-                let activity = record.last_activity_start();
-                let freshness = record_freshness(activity, scrub_started);
-                if freshness == Freshness::NoStart {
-                    result.errors.push(format!(
-                    "scrub status record for {fsuuid} has no start timestamp — cannot confirm it \
-                     belongs to this run"
-                ));
-                } else if freshness == Freshness::Stale {
-                    result.errors.push(format!(
-                        "scrub status record for {fsuuid} is stale (last start/resume {activity} \
-                     predates this filesystem's scrub start {scrub_started}) — no result was \
-                     written for this run"
-                    ));
-                } else {
-                    let t_start = record.t_start();
-                    result.outcome = Some(record.outcome());
-                    result.counters = record.counters();
-                    result.bytes_scrubbed = record.bytes_scrubbed();
-                    result.duration_secs = record.duration_secs();
-                    result.started_epoch = t_start;
-                    result.finished_epoch = record.finished_epoch();
-                }
-            }
+            Ok(record) => apply_status_record(&mut result, &fsuuid, &record, scrub_started),
             Err(e) => result.errors.push(e.to_string()),
         }
     }
@@ -2739,6 +2711,43 @@ fn scrub_one_target(
     }
 
     result
+}
+
+/// Take a finished filesystem's figures from its btrfs status record, only
+/// when the record belongs to this filesystem's run.
+///
+/// A record left over from an earlier scrub must never be read as this
+/// pass's result: the 2026-07-27 stale-record trap. The anchor is *this
+/// filesystem's* start, not the pass's: a pass runs for many hours, so
+/// anchoring on the pass would accept a record written half a day before
+/// this target was even touched. One with no start, or a stale one, is an
+/// error and sets no result.
+fn apply_status_record(
+    result: &mut ScrubFsResult,
+    fsuuid: &str,
+    record: &ScrubStatusRecord,
+    scrub_started: i64,
+) {
+    let activity = record.last_activity_start();
+    match record_freshness(activity, scrub_started) {
+        Freshness::NoStart => result.errors.push(format!(
+            "scrub status record for {fsuuid} has no start timestamp — cannot confirm it \
+             belongs to this run"
+        )),
+        Freshness::Stale => result.errors.push(format!(
+            "scrub status record for {fsuuid} is stale (last start/resume {activity} \
+             predates this filesystem's scrub start {scrub_started}) — no result was \
+             written for this run"
+        )),
+        Freshness::Fresh => {
+            result.outcome = Some(record.outcome());
+            result.counters = record.counters();
+            result.bytes_scrubbed = record.bytes_scrubbed();
+            result.duration_secs = record.duration_secs();
+            result.started_epoch = record.t_start();
+            result.finished_epoch = record.finished_epoch();
+        }
+    }
 }
 
 /// Whether a filesystem's result pays the scrub a RAID-1 target owes after a
@@ -7389,6 +7398,56 @@ mod interrupted_pass_tests {
             "5eed0016-0000-4000-8000-000000000016",
         )
         .unwrap()
+    }
+
+    /// bd su1b.34: a record is read as this filesystem's result only when it
+    /// is fresh; no start, or a stale one, is an error and sets nothing.
+    #[test]
+    fn a_status_record_sets_the_result_only_when_it_is_fresh() {
+        let started = 1_000_000;
+        let record = |t_start: i64, t_resumed: i64| {
+            parse_scrub_status(
+                &format!(
+                    "scrub status:1\nu:1|data_extents_scrubbed:1|tree_extents_scrubbed:1|\
+                     data_bytes_scrubbed:4096|tree_bytes_scrubbed:4096|read_errors:0|\
+                     csum_errors:0|verify_errors:0|no_csum:0|csum_discards:0|super_errors:0|\
+                     malloc_errors:0|uncorrectable_errors:0|corrected_errors:0|\
+                     last_physical:8192|t_start:{t_start}|t_resumed:{t_resumed}|duration:10|\
+                     canceled:0|finished:1\n"
+                ),
+                "u",
+            )
+            .unwrap()
+        };
+        let apply = |rec: &ScrubStatusRecord| {
+            let mut r = ScrubFsResult::new("pair");
+            apply_status_record(&mut r, "u", rec, started);
+            r
+        };
+
+        let none = apply(&record(0, 0));
+        assert_eq!(none.errors.len(), 1, "{:?}", none.errors);
+        assert!(
+            none.errors[0].contains("has no start timestamp"),
+            "{:?}",
+            none.errors
+        );
+        assert_eq!(none.outcome, None);
+        assert_eq!(none.started_epoch, 0);
+
+        let stale = apply(&record(started - RECORD_FRESHNESS_SLACK_SECS - 1, 0));
+        assert_eq!(stale.errors.len(), 1, "{:?}", stale.errors);
+        assert!(stale.errors[0].contains("is stale"), "{:?}", stale.errors);
+        assert_eq!(stale.outcome, None);
+        assert_eq!(stale.started_epoch, 0);
+
+        let fresh = apply(&record(started + 5, 0));
+        assert!(fresh.errors.is_empty(), "{:?}", fresh.errors);
+        assert_eq!(fresh.outcome, Some(ScrubOutcome::Finished));
+        assert_eq!(fresh.started_epoch, started + 5);
+        assert_eq!(fresh.finished_epoch, started + 5 + 10);
+        assert_eq!(fresh.duration_secs, 10);
+        assert_eq!(fresh.bytes_scrubbed, 8192);
     }
 
     /// bd 3gzs.11: the freshness anchor at each edge. A record whose last

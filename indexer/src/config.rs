@@ -5176,6 +5176,25 @@ mod tests {
         assert_eq!(host_timezone_at(&lt, &zdir), "UTC");
     }
 
+    /// A link into the zoneinfo directory that is not a zone file (no TZif
+    /// magic, or a name the installer would refuse) is never the host zone
+    /// (bd su1b.34).
+    #[test]
+    fn host_timezone_is_utc_when_the_link_target_is_not_a_zone_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let zdir = dir.path().join("zoneinfo");
+        std::fs::create_dir_all(&zdir).unwrap();
+        std::fs::write(zdir.join("notzone"), b"junk, no magic").unwrap();
+        std::fs::write(zdir.join("with space"), b"TZif2....").unwrap();
+        std::fs::write(zdir.join("Real"), b"TZif2....").unwrap();
+        let lt = dir.path().join("localtime");
+        for (name, want) in [("notzone", "UTC"), ("with space", "UTC"), ("Real", "Real")] {
+            let _ = std::fs::remove_file(&lt);
+            std::os::unix::fs::symlink(zdir.join(name), &lt).unwrap();
+            assert_eq!(host_timezone_at(&lt, &zdir), want, "{name}");
+        }
+    }
+
     #[test]
     fn effective_timezone_prefers_the_configured_zone() {
         let mut cfg = Config::from_toml(&minimal_toml("")).unwrap();
