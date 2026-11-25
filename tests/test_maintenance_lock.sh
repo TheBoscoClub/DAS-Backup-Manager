@@ -422,6 +422,11 @@ STUB
     check "verify, RAID-1 primary: the guard's mount is unmounted at the end" \
         "$(grep -c "^umount $WORK/primary" "$WORK/mounts")" "1"
     check "verify, RAID-1 primary: the inspection ran" "$(grep -c '^btrbk ' "$WORK/mounts")" "1"
+    # Only the primary is mounted here, so the listing is scoped to its target
+    # directories: unscoped, btrbk fails on the unmounted recovery targets and
+    # the section printed "snapshot status UNKNOWN" (bd DAS-Backup-Manager-su1b.23).
+    check "verify, RAID-1 primary: btrbk lists only the primary's targets" \
+        "$(grep -cF "btrbk -c $WORK/btrbk.conf list latest $WORK/primary/*" "$WORK/mounts")" "1"
 
     echo "RAID GUARD: REFUSED  (split brain: the other member holds the last writes)" >"$WORK/guard-line"
     echo 3 >"$WORK/guard-rc"

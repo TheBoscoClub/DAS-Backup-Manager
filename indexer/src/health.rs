@@ -465,16 +465,22 @@ pub fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Parse the raw text output of `btrfs filesystem usage --raw <mount>` and
-/// return `(total_bytes, used_bytes)`.
+/// return the usable `(total_bytes, used_bytes)`.
 ///
 /// The lines we care about look like:
 /// ```text
 ///     Device size:                    21001628770304
 ///     Used:                            4763696603136
+///     Data ratio:                               1.00
 /// ```
+/// "Device size" and "Used" are raw, summed over every member, so both are
+/// divided by "Data ratio" (2.00 on RAID-1): unscaled, a RAID-1 target showed
+/// twice its real free space (bd DAS-Backup-Manager-su1b.29). No ratio, or one
+/// below 1, is no reading: the caller falls back to statvfs.
 pub fn parse_btrfs_usage(output: &str) -> Option<(u64, u64)> {
     let mut total: Option<u64> = None;
     let mut used: Option<u64> = None;
+    let mut ratio: Option<f64> = None;
 
     for line in output.lines() {
         let trimmed = line.trim();
@@ -488,11 +494,20 @@ pub fn parse_btrfs_usage(output: &str) -> Option<(u64, u64)> {
                 .split(':')
                 .nth(1)
                 .and_then(|v| v.trim().parse::<u64>().ok());
+        } else if trimmed.starts_with("Data ratio:") {
+            ratio = trimmed
+                .split(':')
+                .nth(1)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|r| r.is_finite() && *r >= 1.0);
         }
     }
 
-    match (total, used) {
-        (Some(t), Some(u)) => Some((t, u)),
+    match (total, used, ratio) {
+        (Some(t), Some(u), Some(r)) => {
+            let scale = |raw: u64| (raw as f64 / r).round() as u64;
+            Some((scale(t), scale(u)))
+        }
         _ => None,
     }
 }
@@ -2014,6 +2029,36 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
     }
 
     #[test]
+    fn a_raid1_target_reads_usable_bytes_not_raw() {
+        // bd DAS-Backup-Manager-su1b.29: two 20 TiB members, RAID-1 data and
+        // metadata. "Device size" and "Used" are raw, summed over both
+        // members; the usable figures are half of them, as df shows.
+        let output = "\
+Overall:
+    Device size:\t\t    44000000000000
+    Device allocated:\t\t    14000000000000
+    Device unallocated:\t\t    30000000000000
+    Device missing:\t\t                 0
+    Device slack:\t\t                 0
+    Used:\t\t\t    14000000000000
+    Free (estimated):\t\t    15000000000000\t(min: 15000000000000)
+    Free (statfs, df):\t\t    15000000000000
+    Data ratio:\t\t\t              2.00
+    Metadata ratio:\t\t              2.00
+";
+        assert_eq!(
+            parse_btrfs_usage(output),
+            Some((22_000_000_000_000, 7_000_000_000_000))
+        );
+        // No readable ratio: no reading here (the caller falls back to
+        // statvfs), never the raw figures.
+        let no_ratio = output.replace("Data ratio:\t\t\t              2.00\n", "");
+        assert_eq!(parse_btrfs_usage(&no_ratio), None);
+        let bad_ratio = output.replace("2.00\n    Metadata", "0.00\n    Metadata");
+        assert_eq!(parse_btrfs_usage(&bad_ratio), None);
+    }
+
+    #[test]
     fn test_parse_btrfs_usage_missing_fields() {
         let output = "Some random output without the fields we need\n";
         assert!(parse_btrfs_usage(output).is_none());
@@ -2021,7 +2066,7 @@ Metadata,single: Size:134415360000, Used:0 (0.00%)
 
     #[test]
     fn test_parse_btrfs_usage_only_total() {
-        let output = "    Device size:                    1000000\n";
+        let output = "    Device size:                    1000000\n    Data ratio:                    1.00\n";
         // Used field is missing → should return None
         assert!(parse_btrfs_usage(output).is_none());
     }

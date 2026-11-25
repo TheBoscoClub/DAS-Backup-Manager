@@ -153,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The nightly no longer warns "btrbk may run at boot" for a recovery OS with no btrbk config** (bd `DAS-Backup-Manager-eg4j.17`): every nightly ended `COMPLETED WITH WARNINGS` for this row alone, because every mkinitcpio OS reads `may` from `mkinitcpio-generate-shutdown-ramfs.service`
+  - `recovery_os::boot_warning` returns nothing for a `may` beside `btrbk config: none` — btrbk stops before doing anything without a config, the rule `recovery-os-install.sh verify` already accepts a rebuild by (bd `DAS-Backup-Manager-eg4j.8`)
+  - A config present or unknown, and any `will`, still warn; the RECOVERY OS section still shows the verdict and the config
+- **A RAID-1 target's size and free space are its usable bytes, not twice them** (bd `DAS-Backup-Manager-su1b.29`): the Health dashboard showed the primary with 40980 GiB total and 27600 GiB free where `df` shows 20490 and 13798
+  - `health::parse_btrfs_usage` divides `Device size` and `Used` — raw, summed over every member — by `Data ratio`; no readable ratio is no reading, and the caller falls back to `statvfs`
+  - The same figures feed `btrdasd health`, the GUI's Drives table and the CLI/GUI backup report's available column; the usage percentage and the 95 %-full check were already right
+- **`backup-verify.sh` lists only the primary's snapshots** (3.4.1, bd `DAS-Backup-Manager-su1b.23`): `btrbk list latest` ran over every target while only the primary was mounted, failed on the recovery drives and printed `btrbk list failed - snapshot status UNKNOWN` on every run; it is now scoped to `<primary mount>/*`
 - **An interrupted scrub no longer reports "no errors" over errors it found** (bd `DAS-Backup-Manager-su1b.22`): on 2026-11-23 a pass interrupted by a reboot filed every counter as 0, so `btrdasd scrub status` printed `errors=no errors` while the btrfs record held 468,272 corrected errors — a zero standing in for an unread measurement
   - An `interrupted` attempt now files the counters and bytes its btrfs status record held at the interruption, when that record is this run's (the same freshness anchor as a finished pass)
   - A record that is missing, unreadable or stale, and every `paused` attempt, files `counters_unknown: true` in `scrub-state.json`: `scrub status` and the report print `unknown`, health's `error_total` is `null` — never 0, never "no errors"; a paused attempt stays not a failure

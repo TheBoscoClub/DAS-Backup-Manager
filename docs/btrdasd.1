@@ -2726,6 +2726,15 @@ row just above
 .B Result
 says so, with what it rests on and when it would run, e.g.
 .RB \(dq "btrbk will run when this OS boots \(em btrbk.timer starts btrbk.service, which runs btrbk straight after boot (Persistent catch\-up), with /etc/btrbk/btrbk.conf present: check its config before booting it, on bare metal or in the update VM" \(dq.
+A
+.B may
+with no btrbk config at all
+.RB ( "btrbk config" " reads " none )
+is no warning: btrbk stops before doing anything without one. Every
+mkinitcpio OS reads
+.B may
+from mkinitcpio\-generate\-shutdown\-ramfs.service, so the row would appear
+on every drive every night; the verdict and the config are still shown.
 When: a unit that a boot target pulls in runs at every boot, and so does
 what it pulls in; a unit
 .B OnFailure=

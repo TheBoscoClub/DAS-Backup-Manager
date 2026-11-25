@@ -1,7 +1,12 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.4.0
-# Date: 2026-11-23
+# Version: 3.4.1
+# Date: 2026-11-24
+#
+# 3.4.1: `btrbk list latest` is scoped to the primary's target directories
+# (`<mount>/*`); unscoped it failed on the unmounted recovery targets and the
+# section read "snapshot status UNKNOWN" on every run (bd
+# DAS-Backup-Manager-su1b.23).
 #
 # 3.4.0: a RAID-1 primary (a filesystem UUID and more than one member serial)
 # is mounted through the guard, `btrdasd backup mount-target --read-only`,
@@ -665,7 +670,11 @@ check_btrbk_status() {
         # `|| echo "(no snapshots yet)"` reported the first as the second.
         local btrbk_out btrbk_stderr
         btrbk_stderr=$(mktemp)
-        if btrbk_out=$(btrbk -c "$DAS_BTRBK_CONF" list latest 2>"$btrbk_stderr"); then
+        # Scoped to the primary's target directories (a quoted glob, read by
+        # btrbk): only the primary is mounted here, and an unscoped listing
+        # fails on every unmounted recovery target, so the section said
+        # "snapshot status UNKNOWN" on every run (bd DAS-Backup-Manager-su1b.23).
+        if btrbk_out=$(btrbk -c "$DAS_BTRBK_CONF" list latest "$primary_mount/*" 2>"$btrbk_stderr"); then
             if [[ -n "$btrbk_out" ]]; then
                 printf '%s\n' "$btrbk_out"
             else
