@@ -361,6 +361,19 @@ impl raid_guard::MemberHost for SystemMembers<'_> {
         raid_guard::devinfo_under(Path::new("/sys/fs/btrfs"), fsid)
     }
 
+    fn opened_devices(&self, fsid: &str) -> Result<Vec<String>, String> {
+        raid_guard::opened_devices_under(Path::new("/sys/fs/btrfs"), fsid)
+    }
+
+    fn remount_rw(&self, mount: &str) -> Result<(), String> {
+        let out = self.run(Command::new("mount").args(["-o", "remount,rw", mount]))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(failed("mount -o remount,rw", &out))
+        }
+    }
+
     fn read_witness(&self, mount: &str, fsid: &str) -> raid_guard::Copy {
         raid_guard::read_copy(&raid_guard::witness_path(mount), fsid)
     }

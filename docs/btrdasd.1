@@ -3176,8 +3176,9 @@ automatically the one to keep. Type the target's label exactly, then the
 .B serial
 of the member to keep. Nothing is written unless both match, the members are
 unchanged when looked at again, and the filesystem is mounted nowhere. The
-other member is set aside by its exact path, the kept one mounted degraded by
-its own path, and the record written as above: the kept member is the history,
+other member is set aside by its exact path, the kept one mounted read\-only and
+degraded by its own path, remounted read\-write only once the kernel's opened
+devices are exactly that one (otherwise unmounted, nothing written), and the record written as above: the kept member is the history,
 the other is
 .BR rejected ,
 refused by every job until it is wiped

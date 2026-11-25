@@ -1020,6 +1020,21 @@ pub fn devinfo_under(root: &Path, fsid: &str) -> Result<Vec<(u64, bool)>, String
     Ok(out)
 }
 
+/// The device names (`sdc1`) the kernel opened for a mounted filesystem:
+/// `<root>/<fsid>/devices/`. Unreadable is an error; an empty directory is
+/// an empty list.
+pub fn opened_devices_under(root: &Path, fsid: &str) -> Result<Vec<String>, String> {
+    let dir = root.join(fsid.to_ascii_lowercase()).join("devices");
+    let entries = fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        out.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// [`missing_devids_under`] `/sys/fs/btrfs`.
 pub fn missing_devids(fsid: &str) -> Result<Vec<u64>, String> {
     missing_devids_under(Path::new("/sys/fs/btrfs"), fsid)
@@ -1068,6 +1083,13 @@ pub trait MemberHost {
     /// Every devid the kernel lists for the mounted filesystem, and whether
     /// it is missing ([`devinfo_under`]).
     fn devinfo(&self, fsid: &str) -> Result<Vec<(u64, bool)>, String>;
+    /// The device names the kernel has OPENED for the mounted filesystem
+    /// (`/sys/fs/btrfs/<fsid>/devices/`, [`opened_devices_under`]): unlike
+    /// devinfo's `missing` flag, it lists only devices whose block device the
+    /// kernel opened, never one that was merely scanned.
+    fn opened_devices(&self, fsid: &str) -> Result<Vec<String>, String>;
+    /// `mount -o remount,rw <mount>`: opens no new device.
+    fn remount_rw(&self, mount: &str) -> Result<(), String>;
     /// The witness copy on the filesystem now mounted at `mount`.
     fn read_witness(&self, mount: &str, fsid: &str) -> Copy;
     fn write_witness(&self, mount: &str, record: &Record) -> Result<(), String>;
@@ -2632,7 +2654,10 @@ pub fn accept(
 /// read-write, the kernel's view checked, both copies written, unmounted.
 /// `set_aside` are present members that must not be assembled with it (the
 /// diverged case: both drives are attached): each is forgotten by its exact
-/// path and the kept member is mounted by its own path, never by UUID.
+/// path and the kept member is mounted by its own path, never by UUID,
+/// read-only first; only once the kernel's opened devices
+/// ([`MemberHost::opened_devices`]) are exactly the kept member is it
+/// remounted read-write.
 fn commit_accept(
     host: &dyn MemberHost,
     plan: &Plan<'_>,
@@ -2659,7 +2684,44 @@ fn commit_accept(
             }
         }
         if result.is_ok() {
-            result = host.mount_device(&degraded_opts, &kept.path, plan.mount);
+            // Read-only first: if udev registered the other member again
+            // since the forget, the kernel would assemble both, and a
+            // read-write mount of the higher-generation tree could undo the
+            // operator's choice. What the kernel OPENED is checked before
+            // the remount (a remount opens no new device).
+            result = host
+                .mount_device(&stale_read_opts(plan.mount_opts), &kept.path, plan.mount)
+                .and_then(|()| {
+                    let want = kept.path.rsplit('/').next().unwrap_or(&kept.path);
+                    let opened = host.opened_devices(plan.fsid).map_err(|e| {
+                        format!("which devices the kernel opened cannot be read ({e})")
+                    });
+                    let opened = match opened {
+                        Ok(o) => o,
+                        Err(e) => {
+                            let _ = host.umount(plan.mount);
+                            return Err(e);
+                        }
+                    };
+                    if opened.len() == 1 && opened[0] == want {
+                        host.remount_rw(plan.mount).map_err(|e| {
+                            let _ = host.umount(plan.mount);
+                            format!("the read-write remount failed ({e})")
+                        })
+                    } else {
+                        // Still read-only: nothing was written to either.
+                        let down = host.umount(plan.mount);
+                        Err(format!(
+                            "the kernel opened {} for the filesystem instead of only {want} \
+                             (the other member was registered again by udev): unmounted \
+                             while still read-only{}",
+                            opened.join(", "),
+                            down.err()
+                                .map(|u| format!(", but {} will not unmount: {u}", plan.mount))
+                                .unwrap_or_default()
+                        ))
+                    }
+                });
         }
         if result.is_err() {
             // Back as found: the guard refuses this pair on every mount
@@ -2678,9 +2740,9 @@ fn commit_accept(
             // udev may have registered it in between, so only the records
             // are certain to be unchanged.
             format!(
-                "not accepted, no record written: the degraded mount of the kept member failed \
-                 ({e}); the other member was set aside and registered again — check \
-                 'btrdasd doctor' before the next job"
+                "not accepted, no record written, nothing written to either drive: the \
+                 degraded mount of the kept member failed ({e}); the other member was set \
+                 aside and registered again — check 'btrdasd doctor' before the next job"
             )
         }
     })?;
@@ -3193,6 +3255,9 @@ mod tests {
         mounted_elsewhere: Cell<bool>,
         fail_mount_plain: Cell<bool>,
         hide_members: Cell<bool>,
+        /// Device names the kernel opened beyond the member mounted alone
+        /// (udev registered one between the forget and the mount).
+        opened_extra: RefCell<Vec<String>>,
         /// Partitions whose drive serial cannot be read.
         serial_unreadable: RefCell<BTreeSet<String>>,
         /// Serials attached with no partition carrying the filesystem.
@@ -3226,6 +3291,7 @@ mod tests {
                 mounted_elsewhere: Cell::new(false),
                 fail_mount_plain: Cell::new(false),
                 hide_members: Cell::new(false),
+                opened_extra: RefCell::new(Vec::new()),
                 serial_unreadable: RefCell::new(BTreeSet::new()),
                 extra_attached: RefCell::new(Vec::new()),
                 model_kernel: Cell::new(false),
@@ -3355,6 +3421,25 @@ mod tests {
                 .iter()
                 .map(|d| (d.2, missing.contains(&d.2)))
                 .collect())
+        }
+        fn opened_devices(&self, _fsid: &str) -> Result<Vec<String>, String> {
+            let base = |p: &str| p.rsplit('/').next().unwrap().to_string();
+            let mut v: Vec<String> = match self.alone.borrow().as_deref() {
+                Some(uuid) => self
+                    .drives
+                    .iter()
+                    .filter(|d| d.3 == uuid)
+                    .map(|d| base(d.1))
+                    .collect(),
+                None => self.present().iter().map(|d| base(d.1)).collect(),
+            };
+            v.extend(self.opened_extra.borrow().iter().cloned());
+            Ok(v)
+        }
+        fn remount_rw(&self, mount: &str) -> Result<(), String> {
+            self.log(format!("remount-rw {mount}"));
+            *self.mounted.borrow_mut() = Some("rw".into());
+            Ok(())
         }
         fn read_witness(&self, _mount: &str, _fsid: &str) -> Copy {
             assert!(
@@ -3619,7 +3704,7 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.starts_with("mount-dev")
                 && c.contains("degraded")
-                && !c.contains(" ro,")),
+                && !(c.contains(" ro,") || c.contains(",ro,"))),
             "no read-write mount: {calls:?}"
         );
         assert!(
@@ -3850,6 +3935,41 @@ mod tests {
     }
 
     #[test]
+    fn both_present_accept_never_goes_read_write_when_the_kernel_opened_the_other_member_too() {
+        // udev registered X again between the forget and the mount: the
+        // kernel opened both. Keeping Y (the lower generation) must not be
+        // undone by a read-write mount of the higher-generation tree.
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 2, 1);
+        host.opened_extra.borrow_mut().push("sdb1".into());
+        let (r, _) = diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL12")]);
+        let why = r.unwrap_err();
+        assert!(why.contains("sdb1") && why.contains("opened"), "{why}");
+        let calls = host.calls();
+        assert!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("mount-dev") && c.contains("/dev/sdc1 /mnt/p"))
+                .all(|c| c.contains(" ro,") || c.contains(",ro,")),
+            "the kept member is mounted read-only first: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("remount-rw")),
+            "never remounted read-write: {calls:?}"
+        );
+        assert!(!calls.contains(&"write witness".to_string()));
+        assert_eq!(case.primary(), Copy::Absent, "no record written");
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("scan /dev/sdb1"),
+            "unmounted while still read-only, the other registered again: {calls:?}"
+        );
+        assert!(calls.iter().any(|c| c == "umount /mnt/p"), "{calls:?}");
+        assert_eq!(*host.mounted.borrow(), None, "nothing left mounted");
+    }
+
+    #[test]
     fn after_a_both_present_accept_a_wiped_drive_left_attached_is_refused_not_mounted_degraded() {
         let case = Case::new();
         let host = diverged_host();
@@ -3868,6 +3988,24 @@ mod tests {
         // Pulled from the enclosure: the kept drive runs degraded.
         let out = case.run(&only_y()).0;
         assert!(matches!(out, Ok(Outcome::Degraded { .. })), "{out:?}");
+    }
+
+    #[test]
+    fn opened_devices_are_the_names_under_the_filesystems_devices_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join(FS).join("devices");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sdc1"), "").unwrap();
+        assert_eq!(
+            opened_devices_under(root.path(), &FS.to_ascii_uppercase()),
+            Ok(vec!["sdc1".to_string()])
+        );
+        std::fs::write(dir.join("sdb1"), "").unwrap();
+        assert_eq!(
+            opened_devices_under(root.path(), FS),
+            Ok(vec!["sdb1".to_string(), "sdc1".to_string()])
+        );
+        assert!(opened_devices_under(root.path(), "no-such-fs").is_err());
     }
 
     #[test]

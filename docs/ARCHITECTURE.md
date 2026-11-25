@@ -279,7 +279,7 @@ Every member present, superblock generations differing, no primary record
 (bd su1b.21): `diverged_now` (each member's own view read alone), then the
 operator types the label AND the serial of the member to keep (terminal only; the
 helper refuses and names the CLI); the other member is forgotten by exact path,
-the kept one mounted degraded by its own path (never `UUID=`), `rejected=` holds the
+the kept one mounted read-only by its own path (never `UUID=`), `/sys/fs/btrfs/<fsid>/devices/` required to list only it, then remounted read-write, `rejected=` holds the
 other. Same steps after the mount as above.
 
 A rejected member is refused for every job, alone or beside the others: each
