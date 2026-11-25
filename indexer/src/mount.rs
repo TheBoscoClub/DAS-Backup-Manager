@@ -5930,7 +5930,10 @@ mod tests {
         let err = host
             .verify(&targets, &["primary-22tb"], &Recorder::default(), &runner)
             .unwrap_err();
-        assert!(err.contains("a different filesystem is mounted here"), "{err}");
+        assert!(
+            err.contains("a different filesystem is mounted here"),
+            "{err}"
+        );
     }
 
     /// bd su1b.16: the guarded mount counts as the first of one target.
@@ -5973,9 +5976,7 @@ mod tests {
         runner: &ScriptedRunner,
         f: impl FnOnce(&SystemMembers<'_>) -> R,
     ) -> R {
-        host.with_probes(runner, |probes| {
-            f(&SystemMembers { runner, probes })
-        })
+        host.with_probes(runner, |probes| f(&SystemMembers { runner, probes }))
     }
 
     /// bd su1b.16: the production host's answers, from a scripted runner.
@@ -5983,14 +5984,20 @@ mod tests {
     fn the_system_host_reads_members_from_blkid_and_says_what_failed() {
         use raid_guard::MemberHost;
         let host = Host::default();
-        let listed = ScriptedRunner::with_rules(&[("blkid", Reply::Out(0, " /dev/a1\n\n/dev/b1 \n".into()))]);
+        let listed = ScriptedRunner::with_rules(&[(
+            "blkid",
+            Reply::Out(0, " /dev/a1\n\n/dev/b1 \n".into()),
+        )]);
         assert_eq!(
             system_members(&host, &listed, |m| m.members("fs")),
             Ok(vec!["/dev/a1".to_string(), "/dev/b1".to_string()])
         );
         // blkid's "nothing matched" is no member, not an error.
         let none = ScriptedRunner::with_rules(&[("blkid", Reply::exit(2))]);
-        assert_eq!(system_members(&host, &none, |m| m.members("fs")), Ok(Vec::new()));
+        assert_eq!(
+            system_members(&host, &none, |m| m.members("fs")),
+            Ok(Vec::new())
+        );
         let broken = ScriptedRunner::with_rules(&[(
             "blkid",
             Reply::Exit {
@@ -6042,11 +6049,7 @@ mod tests {
             assert!(now >= before && now <= before + 5, "{now} vs {before}");
         });
         assert_eq!(*runner.pauses.lock().unwrap(), vec![Duration::from_secs(7)]);
-        assert!(
-            runner
-                .calls()
-                .contains(&status_call(&["umount", "/mnt/x"]))
-        );
+        assert!(runner.calls().contains(&status_call(&["umount", "/mnt/x"])));
         // A mount that will not come down is an error.
         let stuck = ScriptedRunner::with_rules(&[("umount", Reply::exit(32))]);
         let err = system_members(&host, &stuck, |m| m.umount("/mnt/x")).unwrap_err();

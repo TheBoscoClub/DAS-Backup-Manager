@@ -2255,25 +2255,26 @@ fn hold_for_cli(
 /// first). The mount is left for the script, which unmounts it.
 fn cmd_mount_target(label: &str, config: &Path, read_only: bool) -> i32 {
     let lock = CliLock::production();
-    let (line, code) = mount_target_outcome(
-        label,
-        config,
-        read_only,
-        &lock,
-        &|cfg, target, intent, held| {
-            mount::mount_guarded_target(cfg, target, intent, &CliProgress, held)
-        },
-    );
+    let (line, code) =
+        mount_target_outcome(label, config, read_only, &lock, &|cfg, target, held| {
+            mount::mount_guarded_target(
+                cfg,
+                target,
+                buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
+                &CliProgress,
+                held,
+            )
+        });
     println!("{line}");
     code
 }
 
 /// The guarded mount `mount-target` asks for: the configuration to mount
-/// with, the target, the intent and the proof of the maintenance lock.
+/// with, the target and the proof of the maintenance lock (the job's intent
+/// is the caller's: `raid_guard::Job::for_mount_target`).
 type GuardedMounter<'a> = dyn Fn(
         &Config,
         &buttered_dasd::config::Target,
-        buttered_dasd::raid_guard::Intent,
         &maintenance::MaintenanceHeld,
     ) -> Result<buttered_dasd::raid_guard::Outcome, buttered_dasd::raid_guard::Failure>
     + 'a;
@@ -2289,8 +2290,7 @@ fn mount_target_outcome(
     lock: &CliLock,
     mounter: &GuardedMounter<'_>,
 ) -> (String, i32) {
-    let cannot_run =
-        |why: String| (format!("RAID GUARD: CANNOT-RUN  ({why})"), 2);
+    let cannot_run = |why: String| (format!("RAID GUARD: CANNOT-RUN  ({why})"), 2);
     let cfg = match Config::load(config) {
         Ok(c) => c,
         Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
@@ -2335,12 +2335,7 @@ fn mount_target_outcome(
     // (no record, no witness) under `ro` (bd DAS-Backup-Manager-su1b.30).
     let mut mount_cfg = cfg.clone();
     mount_cfg.das.mount_opts = mount_target_opts(&cfg.das.mount_opts, read_only);
-    let result = mounter(
-        &mount_cfg,
-        target,
-        buttered_dasd::raid_guard::Job::for_mount_target(read_only).intent(),
-        &held,
-    );
+    let result = mounter(&mount_cfg, target, &held);
     buttered_dasd::raid_guard::cli_line(&result)
 }
 
@@ -4286,7 +4281,6 @@ mod tests {
     fn refuse_to_mount(
         _: &Config,
         _: &buttered_dasd::config::Target,
-        _: buttered_dasd::raid_guard::Intent,
         _: &maintenance::MaintenanceHeld,
     ) -> Result<buttered_dasd::raid_guard::Outcome, buttered_dasd::raid_guard::Failure> {
         panic!("the mount ran although the command could not start");
@@ -4369,10 +4363,10 @@ mod tests {
 
     /// Past the checks the guard's own result decides the line and the exit
     /// status (0 mounted, 1 not mounted, 3 refused), and the mount is asked
-    /// for with the job's intent and the options `--read-only` leaves.
+    /// for with the options `--read-only` leaves.
     #[test]
-    fn mount_target_exit_status_is_the_guards_and_the_mount_gets_the_jobs_intent() {
-        use buttered_dasd::raid_guard::{Failure, Intent, Outcome};
+    fn mount_target_exit_status_is_the_guards_and_the_mount_gets_the_read_only_options() {
+        use buttered_dasd::raid_guard::{Failure, Outcome};
         use std::cell::RefCell;
         let dir = tempfile::tempdir().unwrap();
         let mount = dir.path().join("target");
@@ -4380,16 +4374,14 @@ mod tests {
         let cfg = mount_target_config(dir.path(), &mount.to_string_lossy());
         let (_held, lock) = handed_down_lock(dir.path());
 
-        let seen: RefCell<Vec<(Intent, String, bool)>> = RefCell::new(Vec::new());
+        let seen: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
         let answer: RefCell<Option<Result<Outcome, Failure>>> = RefCell::new(None);
-        let mounter = |c: &Config,
-                       _: &buttered_dasd::config::Target,
-                       i: Intent,
-                       h: &maintenance::MaintenanceHeld| {
-            seen.borrow_mut()
-                .push((i, c.das.mount_opts.clone(), h.is_delegated()));
-            answer.borrow_mut().take().unwrap()
-        };
+        let mounter =
+            |c: &Config, _: &buttered_dasd::config::Target, h: &maintenance::MaintenanceHeld| {
+                seen.borrow_mut()
+                    .push((c.das.mount_opts.clone(), h.is_delegated()));
+                answer.borrow_mut().take().unwrap()
+            };
         let run = |read_only: bool, result: Result<Outcome, Failure>| {
             *answer.borrow_mut() = Some(result);
             mount_target_outcome("pair", &cfg, read_only, &lock, &mounter)
@@ -4422,9 +4414,9 @@ mod tests {
         assert_eq!(
             *seen.borrow(),
             vec![
-                (Intent::Write, "nodev,rw,noatime".to_string(), true),
-                (Intent::Write, "nodev,rw,noatime".to_string(), true),
-                (Intent::ReadOnly, "nodev,noatime,ro".to_string(), true),
+                ("nodev,rw,noatime".to_string(), true),
+                ("nodev,rw,noatime".to_string(), true),
+                ("nodev,noatime,ro".to_string(), true),
             ]
         );
     }
