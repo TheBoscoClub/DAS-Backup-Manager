@@ -5869,6 +5869,14 @@ mod tests {
                 assert_eq!(r.state, State::Degraded);
                 assert_eq!(r.rejoined, None);
                 assert_eq!((r.since, r.last), (500, 500));
+                assert_eq!(
+                    r.members,
+                    vec![PeriodMember {
+                        devid: 1,
+                        dev_uuid: DX.into(),
+                        generation: 50
+                    }]
+                );
                 assert_eq!(r.rejected, settled.rejected);
             }
             other => panic!("{other:?}"),
