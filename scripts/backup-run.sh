@@ -1312,6 +1312,45 @@ clear_maintenance_holder() {
     fi
 }
 
+# read_holder_record <lock file>: how the record in a lock file reads, for the
+# scripts that name a lock's holder. Sets HOLDER_LINE (its first line, without
+# control characters, at most 200 characters, trimmed) and HOLDER_STATE:
+#   unreadable  the file cannot be read          empty    nothing recorded
+#   nopid       no `<who> pid <digits>` shape    gone     that pid no longer runs
+#   running     that pid runs
+# A faithful copy sits in scripts/backup-run.sh and scripts/backup-verify.sh
+# (installed scripts source nothing: each is self-contained where it runs);
+# tests/test_maintenance_lock.sh fails if the two differ (bd
+# DAS-Backup-Manager-2kb1.18). The words each script shows for a state stay in
+# its own wrapper. The reading is the indexer's maintenance::holder_of.
+read_holder_record() {
+    local lock="$1" line="" pid
+    HOLDER_LINE="" HOLDER_STATE=""
+    if [[ ! -r "$lock" ]]; then
+        HOLDER_STATE=unreadable
+        return 0
+    fi
+    IFS= read -r line <"$lock" || true # a last line without a newline still fills $line
+    line="${line//[[:cntrl:]]/}"
+    line="${line:0:200}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    HOLDER_LINE="$line"
+    if [[ -z "$line" ]]; then
+        HOLDER_STATE=empty
+        return 0
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
+        HOLDER_STATE=nopid
+    elif [[ -d "/proc/$pid" ]]; then
+        HOLDER_STATE=running
+    else
+        HOLDER_STATE=gone
+    fi
+    return 0
+}
+
 # Who holds the maintenance lock, as its holder recorded itself — the reading
 # `holder_of` in indexer/src/maintenance.rs gives, with the same four answers
 # (tests/test_maintenance_lock.sh pins them as that file's tests do): nothing
@@ -1320,26 +1359,13 @@ clear_maintenance_holder() {
 # line only, without control characters, at most 200 characters. Display
 # only: a file that cannot be read reads as nothing recorded.
 maintenance_holder() {
-    local line="" pid
-    if [[ -r "$MAINTENANCE_LOCKFILE" ]]; then
-        IFS= read -r line <"$MAINTENANCE_LOCKFILE" || true
-    fi
-    line="${line//[[:cntrl:]]/}"
-    line="${line:0:200}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    if [[ -z "$line" ]]; then
-        echo "an unknown holder"
-        return
-    fi
-    pid="${line##* pid }"
-    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
-        echo "an unknown holder (last recorded: $line)"
-    elif [[ -d "/proc/$pid" ]]; then
-        echo "$line"
-    else
-        echo "an unknown holder (the last recorded holder, $line, is no longer running)"
-    fi
+    read_holder_record "$MAINTENANCE_LOCKFILE"
+    case "$HOLDER_STATE" in
+        unreadable | empty) echo "an unknown holder" ;;
+        nopid) echo "an unknown holder (last recorded: $HOLDER_LINE)" ;;
+        running) echo "$HOLDER_LINE" ;;
+        *) echo "an unknown holder (the last recorded holder, $HOLDER_LINE, is no longer running)" ;;
+    esac
 }
 
 # The whole disk a block device sits on: /dev/nvme0n1p2 -> /dev/nvme0n1,

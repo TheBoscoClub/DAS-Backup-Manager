@@ -48,7 +48,7 @@ check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$
 has() { if [[ "$2" == *"$3"* ]]; then echo "ok   $1"; else echo "FAIL $1: '$2' lacks '$3'"; fails=$((fails + 1)); fi; }
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenance_holder maintenance_holder record_op monotonic_secs any_op_is completed_exit_status; do
+for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenance_holder read_holder_record maintenance_holder record_op monotonic_secs any_op_is completed_exit_status; do
     body="$(extract "$RUN" "$fn")"
     if [[ -n "$body" ]]; then
         eval "$body"
