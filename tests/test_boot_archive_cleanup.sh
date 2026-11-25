@@ -103,6 +103,9 @@ ROOT_LINE='    if [[ $EUID -ne 0 ]]; then'
 n="$(grep -cxF -- "$ROOT_LINE" "$SRC")"
 [[ "$n" == 1 ]] || harness_broken "expected exactly one line '$ROOT_LINE' in $SRC, found $n"
 sed -e 's|^    if \[\[ \$EUID -ne 0 \]\]; then$|    if [[ ${DAS_TEST_EUID:?} -ne 0 ]]; then|' "$SRC" >"$COPY"
+# diff is diffutils: base-devel carries it only transitively, and a bare image
+# lacks it (bd DAS-Backup-Manager-xq80); say so rather than miscount.
+type -P diff >/dev/null || harness_broken "diff not found: install diffutils"
 changed="$(diff "$SRC" "$COPY" | grep -c '^>')"
 [[ "$changed" == 1 ]] || harness_broken "the copy differs from $SRC in $changed lines, not 1"
 
