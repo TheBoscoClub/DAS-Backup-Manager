@@ -59,8 +59,8 @@ install -Dm644 %{_vpath_builddir}/completions/btrdasd.fish %{buildroot}%{_datadi
 # never `disable --now`). --force never removes the database; config.toml is
 # kept. A failure never blocks the removal.
 if [ "$1" -eq 0 ] && command -v btrdasd >/dev/null 2>&1 && [ -e /etc/das-backup/.manifest ]; then
-    btrdasd setup --uninstall --force || {
-        echo "das-backup-manager: 'btrdasd setup --uninstall --force' failed (exit 75 = a backup or scrub holds its lock)." >&2
+    btrdasd setup --uninstall --force --keep-config || {
+        echo "das-backup-manager: 'btrdasd setup --uninstall --force --keep-config' failed (exit 75 = a backup or scrub holds its lock)." >&2
         echo "das-backup-manager: units and timers under /etc/systemd/system may remain; remove them by hand (see docs/INSTALL.md, Uninstall)." >&2
     }
 fi

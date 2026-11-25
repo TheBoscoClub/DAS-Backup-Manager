@@ -27,6 +27,11 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with_all = ["uninstall_all", "check"])]
     pub uninstall: bool,
 
+    /// With --uninstall: leave config.toml (and its directory) in place; a
+    /// package's removal hook asks for this, as removal is not a purge
+    #[arg(long, requires = "uninstall", conflicts_with_all = ["uninstall_all", "check", "modify", "upgrade"])]
+    pub keep_config: bool,
+
     /// Remove ALL files: generated configs, binaries, D-Bus, polkit, icons, man page, completions
     #[arg(long, conflicts_with = "check")]
     pub uninstall_all: bool,
@@ -96,9 +101,10 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `--uninstall` or `--uninstall-all` under setup's locks, told whether to
-/// remove the database too.
+/// remove the database too and whether to keep `config.toml` (`--uninstall`
+/// only; `--uninstall-all` ignores it, clap never lets both be given).
 type Uninstaller<'a> =
-    &'a dyn Fn(bool, &installer::SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
+    &'a dyn Fn(bool, bool, &installer::SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
 
 /// `--upgrade`: the lock site, the config path, then `say` and `warn`.
 type UpgradeMode<'a> = &'a dyn Fn(
@@ -197,13 +203,13 @@ fn dispatch(
         Action::Uninstall => {
             let remove_db = remove_db_decision(args.force, host.ask_remove_db)?;
             installer::under_setup_locks(&host.site, "btrdasd setup --uninstall", |held| {
-                (host.uninstall)(remove_db, held).map(Ok)
+                (host.uninstall)(remove_db, args.keep_config, held).map(Ok)
             })?
         }
         Action::UninstallAll => {
             let remove_db = remove_db_decision(args.force, host.ask_remove_db)?;
             installer::under_setup_locks(&host.site, "btrdasd setup --uninstall-all", |held| {
-                (host.uninstall_all)(remove_db, held).map(Ok)
+                (host.uninstall_all)(remove_db, false, held).map(Ok)
             })?
         }
         Action::ForceInstall => {
@@ -453,6 +459,7 @@ mod tests {
             modify: false,
             upgrade: false,
             uninstall: false,
+            keep_config: false,
             uninstall_all: false,
             check: false,
             force: false,
@@ -462,6 +469,7 @@ mod tests {
                 "modify" => a.modify = true,
                 "upgrade" => a.upgrade = true,
                 "uninstall" => a.uninstall = true,
+                "keep_config" => a.keep_config = true,
                 "uninstall_all" => a.uninstall_all = true,
                 "check" => a.check = true,
                 "force" => a.force = true,
@@ -536,8 +544,19 @@ mod tests {
             &["--check", "--force"],
             &["--force"],
             &["--modify"],
+            &["--uninstall", "--keep-config", "--force"],
         ] {
             assert!(parse(flags).is_ok(), "{flags:?} refused");
+        }
+        // --keep-config belongs to --uninstall alone: a flag accepted and
+        // dropped is a defect (bd DAS-Backup-Manager-pz6).
+        for flags in [
+            &["--keep-config"][..],
+            &["--keep-config", "--uninstall-all"],
+            &["--keep-config", "--uninstall", "--uninstall-all"],
+            &["--keep-config", "--upgrade"],
+        ] {
+            assert!(parse(flags).is_err(), "{flags:?} accepted");
         }
     }
 
@@ -641,7 +660,7 @@ mod tests {
     fn never_install(_: &config::Config, _: &installer::SetupLocks) -> Result<(), BoxError> {
         panic!("nothing may be installed")
     }
-    fn never_uninstall(_: bool, _: &installer::SetupLocks) -> Result<(), BoxError> {
+    fn never_uninstall(_: bool, _: bool, _: &installer::SetupLocks) -> Result<(), BoxError> {
         panic!("nothing may be removed")
     }
     fn never_upgrade(

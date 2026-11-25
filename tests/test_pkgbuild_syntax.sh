@@ -50,7 +50,7 @@ bash -n "$tmp" >/dev/null 2>&1 && rc=0 || rc=$?
 check "the old defect fails to parse" "$([[ $rc -ne 0 ]] && echo refused || echo parsed)" "refused"
 
 # Removal hooks (bd DAS-Backup-Manager-hzxr): each format's removal runs
-# `btrdasd setup --uninstall --force`, only on removal, and never fails it.
+# `btrdasd setup --uninstall --force --keep-config`, only on removal, and never fails it.
 # The copy under test has the manifest path pointed at a file of ours, and
 # btrdasd is a recording stub on a clean PATH.
 INSTALL_HOOK="$REPO/packaging/arch/das-backup-manager.install"
@@ -81,13 +81,14 @@ runhook() { # <stub exit> <command...>: the hook's exit and what the stub saw
     env -i PATH="$work/bin:/usr/bin:/bin" STUB_RC="$1" "${@:2}" >/dev/null 2>&1 && rc=0 || rc=$?
     echo "rc=$rc calls=$(tr '\n' '|' <"$work/calls")"
 }
-want="rc=0 calls=setup --uninstall --force|"
+want="rc=0 calls=setup --uninstall --force --keep-config|"
 none="rc=0 calls="
 check "arch pre_remove runs the uninstall" "$(runhook 0 bash -c "source '$work/arch.sh'; pre_remove")" "$want"
 check "arch pre_remove survives a failing uninstall" "$(runhook 75 bash -c "source '$work/arch.sh'; pre_remove")" "$want"
 check "debian prerm remove runs the uninstall" "$(runhook 0 sh "$work/prerm.sh" remove)" "$want"
 check "debian prerm survives a failing uninstall" "$(runhook 75 sh "$work/prerm.sh" remove)" "$want"
 check "debian prerm upgrade leaves units alone" "$(runhook 0 sh "$work/prerm.sh" upgrade)" "$none"
+check "debian prerm deconfigure leaves units alone" "$(runhook 0 sh "$work/prerm.sh" deconfigure)" "$none"
 check "rpm preun 0 (removal) runs the uninstall" "$(runhook 0 sh "$work/preun.sh" 0)" "$want"
 check "rpm preun 1 (upgrade) leaves units alone" "$(runhook 0 sh "$work/preun.sh" 1)" "$none"
 check "rpm preun survives a failing uninstall" "$(runhook 75 sh "$work/preun.sh" 0)" "$want"
