@@ -2347,8 +2347,10 @@ subject_status() {
 # A target already mounted when mount_targets looks: no job of this project
 # holds it (this run holds the maintenance lock), so an earlier job failed
 # to give it back (bd DAS-Backup-Manager-jgm, operator 2026-11-09). Shown to
-# be the target, it is unmounted — the plain unmount with its retries, then
-# one `umount -f` — and mount_targets mounts it afresh with this run's
+# be the target, it is unmounted — the plain unmount with its retries; still
+# busy, its holders cleared by `btrdasd backup clear-target --leftover` (the
+# stop policy, bd su1b.12) and, when that stopped something, the plain tries
+# again; then one `umount -f` — and mount_targets mounts it afresh with this run's
 # options. What is not the target, or will not come down, aborts the run
 # (3: a target's state, met again by the next start) before btrbk.
 # Never `umount -l`: it takes the path out of the mount table while the
@@ -2371,8 +2373,12 @@ FOREIGN_TARGET_MOUNTS=()
 # way; this script unmounts it. Every line it prints goes to the log; the
 # last one is `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. Sets
 # CLEAR_DETAIL. Returns 0 cleared, 3 refused; anything else aborts the run
-# (exit 3): a target that cannot be looked at is not used.
+# (exit 3): a target that cannot be looked at is not used. A clearing that
+# stopped processes ("stopped what held it: SIGTERM to pid …") is kept in
+# CLEAR_NOTES, and mount_targets turns the target's row WARN naming them: a
+# run that killed something never reads ALL OPERATIONS SUCCESSFUL.
 CLEAR_DETAIL=""
+declare -gA CLEAR_NOTES=()
 clear_target() { # clear_target <label> [--leftover]
     local label="$1" flag="${2:-}" out last rc l line status
     local -a extra=()
@@ -2397,6 +2403,9 @@ clear_target() { # clear_target <label> [--leftover]
     case "$rc:$status" in
     0:OK)
         log_info "  $label: $CLEAR_DETAIL"
+        if [[ "$CLEAR_DETAIL" == *"stopped what held it"* ]]; then
+            CLEAR_NOTES[$label]="${CLEAR_NOTES[$label]:+${CLEAR_NOTES[$label]}; }$CLEAR_DETAIL"
+        fi
         return 0
         ;;
     3:REFUSED) return 3 ;;
@@ -2437,7 +2446,7 @@ take_down_leftover() {
         abort_reason "a leftover mount" "$why"
         exit 3
     fi
-    if [[ "$CLEAR_DETAIL" == *"signal(s) sent"* ]]; then
+    if [[ "$CLEAR_DETAIL" == *"stopped what held it"* ]]; then
         umount_with_retry "$mnt" && return 0
     fi
     log_warn "  $label: retrying with umount -f"
@@ -2473,7 +2482,9 @@ take_down_leftover() {
 # whose filesystem another program holds somewhere else is said, before this
 # run mounts it (bd DAS-Backup-Manager-804; the Rust path:
 # mount::ensure_targets_mounted_with). The run goes on: the mount guard still
-# verifies what is at the target's own path.
+# verifies what is at the target's own path. A RAID-1 target's other mounts
+# are cleared by clear_target before this is asked (bd su1b.12), so for one
+# it says something only if a mount came back meanwhile.
 warn_mounted_elsewhere() {
     local label="$1" spec="$2" mnt="$3" others rc=0
     others="$(findmnt -rn -o TARGET -S "$spec")" || rc=$?
@@ -2772,6 +2783,15 @@ mount_targets() {
         else
             log_warn "  Could not mount $label at $mnt — the run will refuse to invoke btrbk (verify_targets_before_btrbk)"
         fi
+    done
+    # The processes a clearing stopped, in the target's row (bd su1b.12):
+    # WARN, never downgrading a FAIL.
+    local noted before
+    for noted in "${!CLEAR_NOTES[@]}"; do
+        before="${OP_STATUS[target_${noted}_detail]:-}"
+        record_op "target_${noted}" \
+            "$([[ "${OP_STATUS[target_${noted}]:-}" == FAIL ]] && echo FAIL || echo WARN)" \
+            "${before:+$before; }before the mount: ${CLEAR_NOTES[$noted]}"
     done
 }
 

@@ -127,7 +127,12 @@ pub fn mounts_of(entries: &[MountEntry], member_paths: &[String]) -> Vec<MountEn
     }
     let mut out: Vec<MountEntry> = entries
         .iter()
-        .filter(|e| e.fstype == "btrfs" && names.contains(&e.source))
+        .filter(|e| {
+            e.fstype == "btrfs"
+                && (names.contains(&e.source)
+                    || fs::canonicalize(&e.source)
+                        .is_ok_and(|c| names.contains(&*c.to_string_lossy())))
+        })
         .cloned()
         .collect();
     out.sort_by(|a, b| {
@@ -200,7 +205,15 @@ pub fn origin(mount_point: &str, unit_show: Option<&str>) -> Origin {
     let Some(unit) = get("Id") else {
         return Origin::Other;
     };
-    match (get("FragmentPath"), get("SourcePath")) {
+    // A mount nothing declared still has a unit, synthesized from the mount
+    // table: `SourcePath=/proc/self/mountinfo`, no fragment (read on a host,
+    // 2026-11-25). Only a file or a generator source is a declaration.
+    let source = get("SourcePath").filter(|s| *s != "/proc/self/mountinfo");
+    match (get("FragmentPath"), source) {
+        (Some(f), Some(s)) if f.starts_with("/run/systemd/generator") => Origin::Unit {
+            unit: unit.to_string(),
+            from: format!("generated from {s}"),
+        },
         (Some(f), _) => Origin::Unit {
             unit: unit.to_string(),
             from: f.to_string(),
@@ -467,7 +480,19 @@ pub fn scan_holders(site: &ProcSite, mounts: &[MountEntry]) -> Result<Vec<Holder
                 &mut mode,
             ),
         }
-        if let Ok(maps) = fs::read_to_string(dir.join("maps")) {
+        let maps = match fs::read_to_string(dir.join("maps")) {
+            Ok(m) => m,
+            Err(e) if is_gone(&e) => continue,
+            Err(e) => {
+                note(
+                    Mode::Writer,
+                    format!("its mappings cannot be read ({e})"),
+                    &mut mode,
+                );
+                String::new()
+            }
+        };
+        {
             for line in maps.lines() {
                 let f: Vec<&str> = line.splitn(6, char::is_whitespace).collect();
                 if f.len() < 6 {
@@ -540,7 +565,7 @@ pub enum Sig {
 }
 
 impl Sig {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Sig::Term => "SIGTERM",
             Sig::Kill => "SIGKILL",
@@ -758,6 +783,37 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
         }
         return Err(refuse(done.lines, why));
     }
+    // A holder that appeared during the grace gets SIGTERM and one grace of
+    // its own before anything is killed.
+    let newcomers: Vec<Holder> = left
+        .iter()
+        .filter(|h| {
+            !done.signalled.iter().any(|(pid, _, _)| *pid == h.pid)
+                || !holders
+                    .iter()
+                    .any(|o| o.pid == h.pid && o.start_time == h.start_time)
+        })
+        .cloned()
+        .collect();
+    let left = if newcomers.is_empty() {
+        left
+    } else {
+        for h in &newcomers {
+            done.lines.push(format!("new holder: {h}"));
+        }
+        signal_all(&newcomers, Sig::Term, &mut done);
+        let again = wait(TERM_GRACE, &done)?;
+        if let Some(why) = check(&again) {
+            for h in &again {
+                done.lines.push(format!("still a holder: {h}"));
+            }
+            return Err(refuse(done.lines, why));
+        }
+        again
+    };
+    if left.is_empty() {
+        return Ok(done);
+    }
     signal_all(&left, Sig::Kill, &mut done);
     let left = wait(KILL_WAIT, &done)?;
     if left.is_empty() {
@@ -921,8 +977,19 @@ mod tests {
                 from: "generated from /etc/fstab".into()
             }
         );
-        let synthesized = "Id=mnt-x.mount\nLoadState=loaded\nFragmentPath=\nSourcePath=\n";
+        // What systemd shows for a mount nothing declared (read on a host,
+        // 2026-11-25): a unit synthesized from the mount table.
+        let synthesized =
+            "Id=mnt-x.mount\nLoadState=loaded\nFragmentPath=\nSourcePath=/proc/self/mountinfo\n";
         assert_eq!(origin("/mnt/x", Some(synthesized)), Origin::Other);
+        let fstab = "Id=mnt-x.mount\nLoadState=loaded\nFragmentPath=/run/systemd/generator/mnt-x.mount\nSourcePath=/etc/fstab\n";
+        assert_eq!(
+            origin("/mnt/x", Some(fstab)),
+            Origin::Unit {
+                unit: "mnt-x.mount".into(),
+                from: "generated from /etc/fstab".into()
+            }
+        );
         assert_eq!(origin("/mnt/x", None), Origin::Other);
         assert_eq!(origin("/run/mediax/y", None), Origin::Other);
     }
@@ -1208,6 +1275,35 @@ mod tests {
         assert!(r.why.contains("writing"), "{}", r.why);
     }
 
+    /// A reader that appears during the grace gets SIGTERM and a grace of
+    /// its own before SIGKILL.
+    #[test]
+    fn a_holder_that_appears_during_the_grace_gets_sigterm_before_sigkill() {
+        let p = FakeProc::new();
+        reader(&p, 300);
+        struct Arrives<'a>(&'a FakeProc, RefCell<Vec<(i32, Sig)>>);
+        impl Signaller for Arrives<'_> {
+            fn signal(&self, pid: i32, _s: u64, sig: Sig) -> Result<(), String> {
+                self.1.borrow_mut().push((pid, sig));
+                if pid == 300 {
+                    self.0.remove(300);
+                    reader(self.0, 302);
+                }
+                if (pid, sig) == (302, Sig::Kill) {
+                    self.0.remove(302);
+                }
+                Ok(())
+            }
+        }
+        let f = Arrives(&p, RefCell::new(Vec::new()));
+        let site = p.site();
+        clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap();
+        assert_eq!(
+            *f.1.borrow(),
+            vec![(300, Sig::Term), (302, Sig::Term), (302, Sig::Kill)]
+        );
+    }
+
     #[test]
     fn a_holder_that_survives_sigkill_refuses() {
         let p = FakeProc::new();
@@ -1238,6 +1334,49 @@ mod tests {
         let site = p.site();
         let done = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap();
         assert!(done.lines.is_empty() && f.sent.borrow().is_empty());
+    }
+
+    /// The real `/proc`, read only: this test process's own files, one open
+    /// for reading and one for writing, are found with the right modes by
+    /// their mount id. Nothing is signalled.
+    #[test]
+    fn this_process_is_found_holding_its_own_files_in_the_real_proc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (r, w) = (dir.path().join("r"), dir.path().join("w"));
+        fs::write(&r, "x").unwrap();
+        let _ro = fs::File::open(&r).unwrap();
+        let _rw = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&w)
+            .unwrap();
+        let text = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap();
+        let path = path.to_string_lossy();
+        let mount = parse_mountinfo(&text)
+            .into_iter()
+            .filter(|m| under(&path, &m.mount_point))
+            .max_by_key(|m| m.mount_point.len())
+            .unwrap();
+        let me = std::process::id() as i32;
+        let hs = scan_holders(&ProcSite::host(), std::slice::from_ref(&mount)).unwrap();
+        let h = hs
+            .iter()
+            .find(|h| h.pid == me)
+            .unwrap_or_else(|| panic!("pid {me} not among the holders of {}", mount.mount_point));
+        assert_eq!(h.mode, Mode::Writer, "{h}");
+        let r = r.to_string_lossy();
+        let w = w.to_string_lossy();
+        assert!(
+            h.uses.iter().any(|u| u.ends_with(&format!("{r} (read)"))),
+            "{h}"
+        );
+        assert!(
+            h.uses.iter().any(|u| u.ends_with(&format!("{w} (WRITE)"))),
+            "{h}"
+        );
     }
 
     #[test]

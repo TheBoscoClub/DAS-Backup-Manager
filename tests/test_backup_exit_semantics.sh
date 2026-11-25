@@ -2140,7 +2140,7 @@ fresh
 leftover_primary
 knob umount_busy_until_cleared "$PRIMARY_MNT"
 knob clear_releases 1
-knob clear_leftover_line 'CLEAR TARGET: OK  (1 signal(s) sent; nothing holds it now (stub))'
+knob clear_leftover_line 'CLEAR TARGET: OK  (stopped what held it: SIGTERM to pid 300 (dolphin); nothing holds it now (stub))'
 run_backup
 check "leftover, busy, holders stopped: exit status" "$RC" "0"
 show_tail 0
@@ -2150,6 +2150,15 @@ check "leftover, busy, holders stopped: no umount -f" "$(grep -c -- "^-f " "$STA
 check "leftover, busy, holders stopped: its holder lines in the log" \
     "$(grep -c "primary-22tb: .*holder: pid 300 \[reading\] (stub, leftover=yes)" "$STATE/out")" "1"
 check "leftover, busy, holders stopped: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
+check "leftover, busy, holders stopped: the kill is in the report, the row WARN" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (.*before the mount: stopped what held it: SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
+
+fresh
+knob clear_line 'CLEAR TARGET: OK  (another program'"'"'s mount was unmounted, stopped what held it: SIGTERM to pid 300 (dolphin); the kernel has it mounted nowhere (stub))'
+run_backup
+expect_completed "another program's mount cleared, a reader stopped" 0 "COMPLETED WITH WARNINGS" "success"
+check "another program's mount cleared: the kill is named in the target's row" \
+    "$(grep -c '^  Target primary-22tb  *WARN  (all 2 members present (stub); before the mount: .*SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
 
 fresh
 leftover_primary

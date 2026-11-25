@@ -179,6 +179,10 @@ const HOST_PROBES: MountProbes<'static> = MountProbes {
     missing_devids: &raid_guard::missing_devids,
 };
 
+/// The words that name the processes a clearing stopped, in the job's log
+/// and in `CLEAR TARGET: OK` (which `backup-run.sh` reads, bd su1b.12).
+pub const STOPPED: &str = "stopped what held it";
+
 /// What clearing a target's other mounts and their holders reads and does
 /// (bd DAS-Backup-Manager-su1b.12): the mount table, the process table, the
 /// signals, and the kernel's list of mounted btrfs filesystems. Production
@@ -770,8 +774,11 @@ fn exit_why(what: &str, status: ExitStatus) -> String {
 }
 
 /// Take down a mount an earlier job left behind (bd DAS-Backup-Manager-jgm,
-/// operator 2026-11-09): the plain unmount with its retries, then one
-/// `umount -f`. `Err` says why both failed; the caller then refuses to run.
+/// operator 2026-11-09): the plain unmount with its retries; still busy and
+/// `clear` given, what holds it gets the stop policy (bd
+/// DAS-Backup-Manager-su1b.12: a writer refuses here, never forced) and, when
+/// that stopped something, the plain tries again; then one `umount -f`.
+/// `Err` says why it stayed; the caller then refuses to run.
 ///
 /// Never `umount -l`: a lazy unmount takes the path out of the mount table
 /// while the filesystem stays live and its device held, which is the state
@@ -808,8 +815,15 @@ fn take_down_leftover_with(
                     .filter(|m| m.mount_point == mount_point)
                     .collect();
                 match clear_logged(site, runner, who, &at, progress) {
-                    Ok(0) => {}
-                    Ok(_) => {
+                    Ok(sent) if sent.is_empty() => {}
+                    Ok(sent) => {
+                        progress.on_log(
+                            crate::progress::LogLevel::Warning,
+                            &format!(
+                                "Target '{who}': {mount_point}: {STOPPED}: {}",
+                                sent.join(", ")
+                            ),
+                        );
                         match umount_retrying(runner, mount_point, |msg| {
                             progress.on_log(crate::progress::LogLevel::Warning, msg);
                         }) {
@@ -910,9 +924,12 @@ fn clear_target_with(
             .filter(|m| m.mount_point == target.mount)
             .collect();
         return match clear_logged(site, runner, &target.label, &at, progress) {
-            Ok(0) => ClearTarget::Cleared(format!("nothing holds {}", target.mount)),
-            Ok(n) => ClearTarget::Cleared(format!(
-                "{n} signal(s) sent; nothing holds {} now",
+            Ok(sent) if sent.is_empty() => {
+                ClearTarget::Cleared(format!("nothing holds {}", target.mount))
+            }
+            Ok(sent) => ClearTarget::Cleared(format!(
+                "{STOPPED}: {}; nothing holds {} now",
+                sent.join(", "),
                 target.mount
             )),
             Err(why) => ClearTarget::Refused(why),
@@ -927,12 +944,17 @@ fn clear_target_with(
         Err(e) => return ClearTarget::CannotRun(e),
     };
     match clear_mounted_elsewhere(runner, site, target, fsid, &members, progress) {
-        Ok(false) => ClearTarget::Cleared("not mounted anywhere else".into()),
-        Ok(true) => ClearTarget::Cleared(
-            "another program's mount was cleared and unmounted; the kernel has it mounted \
-             nowhere"
+        Ok(None) => ClearTarget::Cleared("not mounted anywhere else".into()),
+        Ok(Some(sent)) if sent.is_empty() => ClearTarget::Cleared(
+            "another program's mount, held by nothing, was unmounted; the kernel has it \
+             mounted nowhere"
                 .into(),
         ),
+        Ok(Some(sent)) => ClearTarget::Cleared(format!(
+            "another program's mount was unmounted, {STOPPED}: {}; the kernel has it mounted \
+             nowhere",
+            sent.join(", ")
+        )),
         Err(why) => ClearTarget::Refused(why),
     }
 }
@@ -974,14 +996,15 @@ fn origin_of(runner: &dyn CommandRunner, mount_point: &str) -> crate::holders::O
 
 /// The stop policy over every process using `mounts`
 /// ([`crate::holders::clear_holders`]), each holder and each signal said as a
-/// warning. `Ok` the number of signals sent; `Err` why it refused.
+/// warning. `Ok` the signals sent (`SIGTERM to pid 300 (dolphin)`, for the
+/// report); `Err` why it refused.
 fn clear_logged(
     site: &ClearSite<'_>,
     runner: &dyn CommandRunner,
     who: &str,
     mounts: &[crate::holders::MountEntry],
     progress: &dyn ProgressCallback,
-) -> Result<usize, String> {
+) -> Result<Vec<String>, String> {
     let sleep = |d: Duration| runner.pause(d);
     let env = crate::holders::ClearEnv {
         site: &site.proc,
@@ -1000,7 +1023,11 @@ fn clear_logged(
     match crate::holders::clear_holders(&env, mounts) {
         Ok(done) => {
             say(&done.lines);
-            Ok(done.signalled.len())
+            Ok(done
+                .signalled
+                .iter()
+                .map(|(pid, sig, cmd)| format!("{} to pid {pid} ({cmd})", sig.name()))
+                .collect())
         }
         Err(r) => {
             say(&r.lines);
@@ -1017,8 +1044,9 @@ fn clear_logged(
 /// kernel asked whether it still has the filesystem mounted at all. Never a
 /// bind of another program's mount: its devinfo cannot be trusted (a scan
 /// clears a never-opened member's missing flag) and its options are not the
-/// configured ones. `Ok(false)`: mounted nowhere else; `Ok(true)`: cleared;
-/// `Err`: why it was not, the target then NOT available.
+/// configured ones. `Ok(None)`: mounted nowhere else; `Ok(Some(signals))`:
+/// cleared, with the signals sent; `Err`: why it was not, the target then NOT
+/// available.
 fn clear_mounted_elsewhere(
     runner: &dyn CommandRunner,
     site: &ClearSite<'_>,
@@ -1026,7 +1054,7 @@ fn clear_mounted_elsewhere(
     fsid: &str,
     members: &[String],
     progress: &dyn ProgressCallback,
-) -> Result<bool, String> {
+) -> Result<Option<Vec<String>>, String> {
     use crate::holders::{mounts_of, parse_mountinfo, stacked_under};
     let warn = |m: String| {
         progress.on_log(
@@ -1043,7 +1071,7 @@ fn clear_mounted_elsewhere(
     let all = parse_mountinfo(&(site.mountinfo)()?);
     let ours = elsewhere(&all);
     if ours.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     for m in &ours {
         warn(format!(
@@ -1068,20 +1096,20 @@ fn clear_mounted_elsewhere(
                 .join(", ")
         ));
     }
-    clear_logged(site, runner, &target.label, &ours, progress)?;
+    let mut sent = clear_logged(site, runner, &target.label, &ours, progress)?;
     for m in &ours {
         let mut why = String::new();
         let mut down = false;
         for attempt in 1..=UMOUNT_ATTEMPTS {
             if attempt > 1 {
                 runner.pause(UMOUNT_RETRY_PAUSE);
-                clear_logged(
+                sent.extend(clear_logged(
                     site,
                     runner,
                     &target.label,
                     std::slice::from_ref(m),
                     progress,
-                )?;
+                )?);
             }
             why = match runner.status(Command::new("umount").arg(&m.mount_point)) {
                 Ok(s) if s.success() => {
@@ -1122,7 +1150,10 @@ fn clear_mounted_elsewhere(
             sys.display()
         ));
     }
-    Ok(true)
+    if !sent.is_empty() {
+        warn(format!("{STOPPED}: {}", sent.join(", ")));
+    }
+    Ok(Some(sent))
 }
 
 /// Whether what is mounted at `target.mount` is the target: its filesystem
@@ -1639,16 +1670,41 @@ fn ensure_targets_mounted_with(
         // by the operator's stop policy and the target mounted through the
         // guard below; what cannot be cleared leaves it NOT available. Under
         // a handed-down lock nothing changes: the parent owns the mounts.
-        let clears = raid_guard::is_guarded(target) && !held.is_delegated();
-        if clears {
+        //
+        // Under a handed-down hold such a mount is not cleared either, and
+        // still never bound: the target is NOT available (the parent may
+        // have skipped it for a writer that holds it).
+        let guarded = raid_guard::is_guarded(target);
+        if guarded {
             let fsid = target.mount_uuid.as_deref().unwrap_or_default();
             let host = SystemMembers {
                 runner: &*guard.runner,
                 probes,
             };
-            let cleared = raid_guard::MemberHost::members(&host, fsid).and_then(|members| {
-                clear_mounted_elsewhere(&*guard.runner, clear, target, fsid, &members, progress)
-            });
+            let members = raid_guard::MemberHost::members(&host, fsid);
+            let cleared = if held.is_delegated() {
+                members.and_then(|members| {
+                    let all = crate::holders::parse_mountinfo(&(clear.mountinfo)()?);
+                    let elsewhere: Vec<String> = crate::holders::mounts_of(&all, &members)
+                        .into_iter()
+                        .filter(|m| m.mount_point != target.mount)
+                        .map(|m| m.mount_point)
+                        .collect();
+                    if elsewhere.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err(format!(
+                            "its filesystem is mounted by another program at {} — never bound, \
+                             and not cleared under a handed-down maintenance lock",
+                            elsewhere.join(", ")
+                        ))
+                    }
+                })
+            } else {
+                members.and_then(|members| {
+                    clear_mounted_elsewhere(&*guard.runner, clear, target, fsid, &members, progress)
+                })
+            };
             if let Err(why) = cleared {
                 progress.on_log(
                     crate::progress::LogLevel::Warning,
@@ -1664,7 +1720,7 @@ fn ensure_targets_mounted_with(
         // Already mounted elsewhere (e.g. udisks2 at /run/media/) — bind-mount
         // at the configured path so btrbk can find the target where it expects it.
         if let Some(actual) =
-            (probes.find_mount_for_device)(&target.serial, &target.role).filter(|_| !clears)
+            (probes.find_mount_for_device)(&target.serial, &target.role).filter(|_| !guarded)
         {
             // Create configured mount point directory if needed
             let created = !mount_path.exists();
@@ -3894,6 +3950,42 @@ mod tests {
             "{:?}",
             progress.logs()
         );
+    }
+
+    /// Under a handed-down hold nothing is cleared (the parent owns the run's
+    /// mounts), and another program's mount of a RAID-1 target is still
+    /// never bound: NOT available (bd su1b.12 review: the script's skip
+    /// leaves a writer's mount up for a delegated child to find).
+    #[test]
+    fn a_delegated_job_never_binds_another_programs_mount_of_a_raid1_target() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let progress = Recorder::default();
+
+        let result = host.mount_targets_held(
+            &config,
+            &progress,
+            &runner,
+            &MaintenanceHeld::delegated_for_test(),
+        );
+
+        assert!(
+            matches!(result, Err(MountError::NoDrivesFound)),
+            "{:?}",
+            result.err()
+        );
+        assert!(!binds(&runner), "bound as found: {:?}", runner.calls());
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" || c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(logged(&progress, "NOT available"), "{:?}", progress.logs());
     }
 
     /// A busy leftover at the target's own path: after the plain tries, its
