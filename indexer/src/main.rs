@@ -2493,7 +2493,7 @@ fn cmd_raid_check(label: &str, config: &Path) -> i32 {
 /// differing generations, the serial of the member to keep, bd su1b.21) is
 /// read from a terminal; anything else accepts nothing.
 fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::IsTerminal;
     // SAFETY: geteuid(2) takes nothing and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("Error: btrdasd raid accept must be run as root");
@@ -2543,23 +2543,13 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
     // The terminal: shows `text` (when any), asks `prompt`, returns the line
     // typed. Never a `--yes`, never a non-terminal answer.
     let terminal = |text: &str, prompt: &str| -> Result<String, String> {
-        if !text.is_empty() {
-            println!("{text}");
-        }
-        if !std::io::stdin().is_terminal() {
-            return Err(
-                "standard input is not a terminal: run it at a terminal and type the answers (there is no --yes)"
-                    .into(),
-            );
-        }
-        print!("{prompt}");
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| format!("cannot read the answer: {e}"))?;
-        Ok(line)
+        terminal_answer(
+            text,
+            prompt,
+            std::io::stdin().is_terminal(),
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        )
     };
     let mut confirm = |explanation: &str| {
         terminal(
@@ -2568,7 +2558,7 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
         )
     };
     let mut ask = |text: &str, prompt: &str| terminal(text, prompt);
-    match mount::raid_accept(
+    let result = mount::raid_accept(
         &cfg,
         label,
         db,
@@ -2579,34 +2569,74 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
         &CliProgress,
         &singleton,
         &held,
-    ) {
+    );
+    let (code, out, err) = raid_accept_outcome(label, &result);
+    for line in err {
+        eprintln!("{line}");
+    }
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    code
+}
+
+/// Shows `text` (when any) and asks `prompt` on `out`, reads one line from
+/// `input`. `Err` when `is_terminal` is false: an answer is never taken
+/// from a pipe (there is no `--yes`).
+fn terminal_answer(
+    text: &str,
+    prompt: &str,
+    is_terminal: bool,
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<String, String> {
+    if !text.is_empty() {
+        writeln!(out, "{text}").map_err(|e| e.to_string())?;
+    }
+    if !is_terminal {
+        return Err(
+            "standard input is not a terminal: run it at a terminal and type the answers (there is no --yes)"
+                .into(),
+        );
+    }
+    write!(out, "{prompt}").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read the answer: {e}"))?;
+    Ok(line)
+}
+
+/// What `btrdasd raid accept` prints and exits with once the accept ran:
+/// (exit code, stdout, stderr lines). 0 with the `Accepted:` line (and each
+/// warning on stderr); 1 with `Error: <why>`.
+fn raid_accept_outcome(
+    label: &str,
+    result: &Result<mount::RaidAccepted, String>,
+) -> (i32, String, Vec<String>) {
+    match result {
         Ok(done) => {
-            for w in &done.warnings {
-                eprintln!("WARNING: {w}");
-            }
-            println!(
-                "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed from the filesystem.",
-                done.accepted
-                    .after
-                    .members
-                    .iter()
-                    .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                done.accepted
-                    .after
-                    .rejected
-                    .iter()
+            let list = |ms: &[buttered_dasd::raid_guard::PeriodMember]| {
+                ms.iter()
                     .map(|m| format!("devid {} {}", m.devid, m.dev_uuid))
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
-            0
+            };
+            (
+                0,
+                format!(
+                    "Accepted: target '{label}' now runs on {}; {} refused until wiped or removed from the filesystem.",
+                    list(&done.accepted.after.members),
+                    list(&done.accepted.after.rejected)
+                ),
+                done.warnings
+                    .iter()
+                    .map(|w| format!("WARNING: {w}"))
+                    .collect(),
+            )
         }
-        Err(why) => {
-            eprintln!("Error: {why}");
-            1
-        }
+        Err(why) => (1, String::new(), vec![format!("Error: {why}")]),
     }
 }
 
@@ -4308,6 +4338,71 @@ mod tests {
     /// (`DAS_SCRUB_STATE` / `DAS_BTRFS_STATUS_DIR`) — `cargo test` runs test
     /// functions in parallel by default within one binary.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn accepted_fixture(warnings: &[&str]) -> mount::RaidAccepted {
+        use buttered_dasd::raid_guard::{Accepted, PeriodMember, Record, State};
+        let pm = |devid, u: &str| PeriodMember {
+            devid,
+            dev_uuid: u.into(),
+            generation: 9,
+        };
+        let rec = |members, rejected| Record {
+            fsid: "fs".into(),
+            state: State::Settled,
+            members,
+            since: 1,
+            last: 2,
+            rejoined: None,
+            rejected,
+        };
+        mount::RaidAccepted {
+            accepted: Accepted {
+                before: rec(vec![pm(1, "aa")], vec![]),
+                after: rec(vec![pm(1, "aa")], vec![pm(2, "bb"), pm(3, "cc")]),
+                explanation: String::new(),
+                diverged: false,
+            },
+            warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn raid_accept_success_exits_0_naming_kept_and_refused() {
+        // bd su1b.33
+        let (code, out, err) = raid_accept_outcome("t1", &Ok(accepted_fixture(&["no journal"])));
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "Accepted: target 't1' now runs on devid 1 aa; devid 2 bb, devid 3 cc refused until wiped or removed from the filesystem."
+        );
+        assert_eq!(err, vec!["WARNING: no journal".to_string()]);
+    }
+
+    #[test]
+    fn raid_accept_failure_exits_1_with_the_reason_and_no_stdout() {
+        let (code, out, err) = raid_accept_outcome("t1", &Err("split brain gone".into()));
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_eq!(err, vec!["Error: split brain gone".to_string()]);
+    }
+
+    #[test]
+    fn terminal_answer_reads_only_from_a_terminal() {
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"t1\nrest\n".to_vec());
+        assert_eq!(
+            terminal_answer("why", "label: ", true, &mut input, &mut out).as_deref(),
+            Ok("t1\n")
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "why\nlabel: ");
+        // Not a terminal: refused, the pipe is never read, no prompt shown.
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(b"t1\n".to_vec());
+        let r = terminal_answer("", "label: ", false, &mut input, &mut out);
+        assert!(r.unwrap_err().contains("not a terminal"));
+        assert_eq!(input.position(), 0);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn mount_target_read_only_mounts_ro() {

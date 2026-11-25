@@ -3624,6 +3624,22 @@ mod tests {
     }
 
     #[test]
+    fn ro_degraded_opts_drops_the_four_kinds_and_ends_ro_degraded() {
+        // bd su1b.33: rw, ro, degraded and every rescue=* go; ordinary
+        // options (rescue-like names included) stay, in order.
+        assert_eq!(
+            ro_degraded_opts("rw,noatime,degraded,rescue=all,ro,compress=zstd:3,rescue=ibadroots"),
+            "noatime,compress=zstd:3,ro,degraded"
+        );
+        assert_eq!(ro_degraded_opts(""), "ro,degraded");
+        assert_eq!(ro_degraded_opts("rescue=all"), "ro,degraded");
+        assert_eq!(
+            ro_degraded_opts(" nodev , rescuefoo,degradedx,nosuid"),
+            "nodev,rescuefoo,degradedx,nosuid,ro,degraded"
+        );
+    }
+
+    #[test]
     fn a_member_on_a_drive_whose_serial_is_not_configured_is_refused_for_every_intent() {
         for intent in [Intent::Write, Intent::ReadOnly] {
             let case = Case::new();

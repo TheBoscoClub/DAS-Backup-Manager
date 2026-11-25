@@ -3636,6 +3636,74 @@ mod tests {
         (config, host, part, mnt)
     }
 
+    /// bd su1b.33: `SystemMembers::remount_rw` asks for exactly
+    /// `mount -o remount,rw <mount>` and reports the command's failure.
+    #[test]
+    fn remount_rw_runs_the_remount_and_propagates_failure() {
+        use raid_guard::MemberHost;
+        let probes = HOST_PROBES;
+        let ok = ScriptedRunner::succeeding();
+        let host = SystemMembers {
+            runner: ok.as_ref(),
+            probes: &probes,
+        };
+        assert_eq!(host.remount_rw("/mnt/t"), Ok(()));
+        assert_eq!(
+            argvs(&ok, "mount"),
+            vec![vec!["mount", "-o", "remount,rw", "/mnt/t"]]
+        );
+        let bad = ScriptedRunner::with_rules(&[(
+            "remount,rw",
+            Reply::Exit {
+                code: 32,
+                stdout: "",
+                stderr: "wrong fs type",
+            },
+        )]);
+        let host = SystemMembers {
+            runner: bad.as_ref(),
+            probes: &probes,
+        };
+        let e = host.remount_rw("/mnt/t").unwrap_err();
+        assert!(e.contains("mount -o remount,rw") && e.contains("32"), "{e}");
+        assert!(e.contains("wrong fs type"), "{e}");
+    }
+
+    /// bd su1b.33: the opened devices are read from the kernel's sysfs for
+    /// this filesystem; one the kernel does not know is an error, never a
+    /// made-up list. Reads `/sys/fs/btrfs` only, a UUID no host has.
+    #[test]
+    fn opened_devices_of_an_unknown_filesystem_is_an_error() {
+        use raid_guard::MemberHost;
+        let probes = HOST_PROBES;
+        let runner = ScriptedRunner::succeeding();
+        let host = SystemMembers {
+            runner: runner.as_ref(),
+            probes: &probes,
+        };
+        assert!(
+            host.opened_devices("00000000-0000-4000-8000-0000000033ff")
+                .is_err()
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    /// bd su1b.33: the preview refuses a label no target carries, before
+    /// touching anything.
+    #[test]
+    fn raid_accept_preview_of_an_unknown_label_is_an_error() {
+        let config = config_with(Vec::new(), Vec::new());
+        let e = raid_accept_preview(
+            &config,
+            "nope",
+            Path::new("/nonexistent/das-33.db"),
+            &Recorder::default(),
+            &MaintenanceHeld::assumed(),
+        )
+        .unwrap_err();
+        assert_eq!(e, "no [[target]] labelled 'nope'");
+    }
+
     fn guard_holding(runner: &Arc<ScriptedRunner>, mounts: &[&str]) -> MountGuard {
         let mut guard = MountGuard::new(runner.clone());
         guard
