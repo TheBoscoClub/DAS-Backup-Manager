@@ -1,9 +1,21 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.23.0
-# Date: 2026-11-22
+# Version: 4.24.0
+# Date: 2026-11-25
 #
 # Features:
+#   - What holds a target is cleared by one stop policy (v4.24.0, bd
+#     DAS-Backup-Manager-su1b.12, operator 2026-11-23): a RAID-1 target's
+#     filesystem another program mounted elsewhere (udisks, a .mount unit, a
+#     hand mount) is never used as found — `btrdasd backup clear-target`
+#     (fd 8) names every mount and every process using it, never signals one
+#     holding a file open for writing (the target is then NOT available, a
+#     FAIL row naming it), stops readers (SIGTERM, 10 s, SIGKILL) and
+#     unmounts each, before guarded_mount; a busy leftover at a target's path
+#     gets the same (`--leftover`) after its five plain tries, then the plain
+#     tries again, then umount -f. raid_missing_devids also counts
+#     /sys/fs/btrfs/<fsid>/devices/: fewer opened devices than devids not
+#     missing is unreadable (a scan clears a never-opened member's flag).
 #   - A RAID-1 member that drops during the run is recorded, and an owed
 #     scrub starts by itself (v4.23.0, bd DAS-Backup-Manager-su1b.14): before
 #     unmount_all() unmounts a target the guard mounted (not one it mounted
@@ -2347,6 +2359,57 @@ subject_status() {
 # this run mounted anything there: never unmounted by this run.
 FOREIGN_TARGET_MOUNTS=()
 
+# clear_target <label> [--leftover]: `btrdasd backup clear-target`, handed
+# this run's maintenance lock on fd 8 — the one implementation of the stop
+# policy the Rust jobs use (bd DAS-Backup-Manager-su1b.12, operator
+# 2026-11-23). Without --leftover: a RAID-1 target's filesystem mounted
+# anywhere but its own path (udisks, a .mount unit, a hand mount) — every
+# such mount and every process using it said, a process holding a file there
+# open for writing never signalled (REFUSED), readers SIGTERM, 10 s, then
+# SIGKILL, then each mount unmounted. With --leftover: the busy mount an
+# earlier job left at the target's own path, its holders cleared the same
+# way; this script unmounts it. Every line it prints goes to the log; the
+# last one is `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. Sets
+# CLEAR_DETAIL. Returns 0 cleared, 3 refused; anything else aborts the run
+# (exit 3): a target that cannot be looked at is not used.
+CLEAR_DETAIL=""
+clear_target() { # clear_target <label> [--leftover]
+    local label="$1" flag="${2:-}" out last rc l line status
+    local -a extra=()
+    [[ -n "$flag" ]] && extra=("$flag")
+    out="$(DAS_MAINTENANCE_LOCK_FD=8 "$BTRDASD_BIN" backup clear-target --label "$label" \
+        "${extra[@]}" --config "$DAS_CONFIG" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    last="${out##*$'\n'}"
+    if [[ "$last" == status=* ]]; then
+        rc="${last#status=}"
+    else
+        rc="uncaptured"
+    fi
+    while IFS= read -r l; do
+        [[ -n "$l" && "$l" != "CLEAR TARGET: "* && "$l" != status=* ]] || continue
+        log_warn "  $label: ${l#"${l%%[![:space:]]*}"}"
+    done <<<"$out"
+    line="$(grep -m1 '^CLEAR TARGET: ' <<<"$out" || true)"
+    status="${line#CLEAR TARGET: }"
+    status="${status%%  (*}"
+    CLEAR_DETAIL="${line#*  (}"
+    CLEAR_DETAIL="${CLEAR_DETAIL%)}"
+    case "$rc:$status" in
+    0:OK)
+        log_info "  $label: $CLEAR_DETAIL"
+        return 0
+        ;;
+    3:REFUSED) return 3 ;;
+    *)
+        local why="$label: the clearing of its other mounts could not run (exit $rc): ${line:-no CLEAR TARGET line}"
+        log_error "ABORTING: $why"
+        record_op "target_${label}" "FAIL" "$why"
+        abort_reason "a RAID-1 target's mount" "$why"
+        exit 3
+        ;;
+    esac
+}
+
 take_down_leftover() {
     local label="$1"
     local mnt="${TARGET_MOUNTS[$label]}" err
@@ -2361,6 +2424,22 @@ take_down_leftover() {
     fi
     log_warn "  $label: $mnt was left mounted by an earlier job — unmounting it, to mount it afresh for this run"
     umount_with_retry "$mnt" && return 0
+    # Still busy: what holds it gets the stop policy (bd su1b.12); a writer
+    # refuses, never forced; when something was stopped, the plain tries
+    # again.
+    log_warn "  $label: $mnt is still busy — looking for what holds it"
+    local crc=0
+    clear_target "$label" --leftover || crc=$?
+    if ((crc == 3)); then
+        local why="$label: $mnt was left mounted by an earlier job and is busy: $CLEAR_DETAIL"
+        log_error "ABORTING: $why"
+        record_op "mount_targets" "FAIL" "$why"
+        abort_reason "a leftover mount" "$why"
+        exit 3
+    fi
+    if [[ "$CLEAR_DETAIL" == *"signal(s) sent"* ]]; then
+        umount_with_retry "$mnt" && return 0
+    fi
     log_warn "  $label: retrying with umount -f"
     # The status inside the capture, as in umount_with_retry: a umount -f that
     # could not be run is not one that succeeded (bd DAS-Backup-Manager-tzwf).
@@ -2638,6 +2717,20 @@ mount_targets() {
         # A RAID-1 target: the guarded mount, never `degraded` as configured
         # and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
         if is_guarded_target "$label"; then
+            # Another program's mount of it is never used as found (bd
+            # su1b.12): cleared by the stop policy and unmounted first; what
+            # will not clear leaves the target NOT available this run, a FAIL
+            # row naming why, its bare mount point removed (the bare-mountpoint
+            # guard then sees an unavailable target, as for an absent drive).
+            local crc=0
+            clear_target "$label" || crc=$?
+            if ((crc == 3)); then
+                log_error "  $label: another program's mount of it cannot be cleared: $CLEAR_DETAIL — this target is NOT available this run"
+                record_op "target_${label}" "FAIL" "not mounted: another program's mount of it cannot be cleared: $CLEAR_DETAIL"
+                TARGET_AVAILABLE[$label]=false
+                rmdir -- "$mnt" 2>/dev/null || log_warn "  $label: $mnt could not be removed (the bare-mountpoint guard decides)"
+                continue
+            fi
             warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
             guarded_mount "$label"
             continue
@@ -4536,7 +4629,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.23.0
+  backup-run.sh v4.24.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
