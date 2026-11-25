@@ -3272,6 +3272,14 @@ Overall:
     }
 
     #[test]
+    fn the_host_wrapper_reads_the_host_tables_and_never_guesses() {
+        // bd su1b.33: a partition no kernel table knows is an Err, so the
+        // wrapper cannot be a constant Ok. Read-only: /sys and /run/udev.
+        let configured = vec!["SERIAL11".to_string()];
+        assert!(member_drive_serial("/dev/btrdasd-no-such-33", &configured).is_err());
+    }
+
+    #[test]
     fn a_serial_that_cannot_be_read_is_an_error_never_a_guess() {
         // No udev record for the disk.
         let d = serial_tree(None);
