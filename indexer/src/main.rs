@@ -2361,8 +2361,9 @@ fn cmd_raid_check(label: &str, config: &Path) -> i32 {
 
 /// `btrdasd raid accept <label>` (bd DAS-Backup-Manager-su1b.11): root only,
 /// under the backup singleton and the maintenance lock, both taken without
-/// waiting (held: exit 75). The label is read from a terminal; anything else
-/// accepts nothing.
+/// waiting (held: exit 75). The label (and, with every member present and
+/// differing generations, the serial of the member to keep, bd su1b.21) is
+/// read from a terminal; anything else accepts nothing.
 fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
     use std::io::{BufRead, IsTerminal, Write};
     // SAFETY: geteuid(2) takes nothing and cannot fail.
@@ -2411,15 +2412,19 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
             return 1;
         }
     };
-    let mut confirm = |explanation: &str| -> Result<String, String> {
-        println!("{explanation}");
+    // The terminal: shows `text` (when any), asks `prompt`, returns the line
+    // typed. Never a `--yes`, never a non-terminal answer.
+    let terminal = |text: &str, prompt: &str| -> Result<String, String> {
+        if !text.is_empty() {
+            println!("{text}");
+        }
         if !std::io::stdin().is_terminal() {
             return Err(
-                "standard input is not a terminal: run it at a terminal and type the label (there is no --yes)"
+                "standard input is not a terminal: run it at a terminal and type the answers (there is no --yes)"
                     .into(),
             );
         }
-        print!("To accept, type the target label exactly ({label}): ");
+        print!("{prompt}");
         std::io::stdout().flush().map_err(|e| e.to_string())?;
         let mut line = String::new();
         std::io::stdin()
@@ -2428,11 +2433,21 @@ fn cmd_raid_accept(label: &str, config: &Path, db: &Path) -> i32 {
             .map_err(|e| format!("cannot read the answer: {e}"))?;
         Ok(line)
     };
+    let mut confirm = |explanation: &str| {
+        terminal(
+            explanation,
+            &format!("To accept, type the target label exactly ({label}): "),
+        )
+    };
+    let mut ask = |text: &str, prompt: &str| terminal(text, prompt);
     match mount::raid_accept(
         &cfg,
         label,
         db,
-        &mut confirm,
+        buttered_dasd::raid_guard::Terminal {
+            confirm: &mut confirm,
+            ask: Some(&mut ask),
+        },
         &CliProgress,
         &singleton,
         &held,

@@ -1054,10 +1054,12 @@ pub trait MemberHost {
     /// Whether a drive with this serial is attached.
     fn serial_attached(&self, serial: &str) -> bool;
     /// The serial of the drive the member partition `path` sits on
-    /// (partition, parent disk, serial: the inverse of `serial_attached`'s
-    /// lookup). An `Err` says why it could not be read; it is never a
-    /// default (bd DAS-Backup-Manager-su1b.27).
-    fn member_serial(&self, path: &str) -> Result<String, String>;
+    /// (partition, parent disk, serial). A drive that is one of the
+    /// `configured` serials' drives (the lookup `serial_attached` makes) is
+    /// named by that serial; any other by what the kernel's tables say. An
+    /// `Err` says why it could not be read; it is never a default (bd
+    /// DAS-Backup-Manager-su1b.27).
+    fn member_serial(&self, path: &str, configured: &[String]) -> Result<String, String>;
     /// `mount -t btrfs [-o opts] UUID=<fsid> <mount>`.
     fn mount(&self, opts: &str, fsid: &str, mount: &str) -> Result<(), String>;
     fn umount(&self, mount: &str) -> Result<(), String>;
@@ -1388,7 +1390,7 @@ fn survey(
         // The drive's serial, read before anything is registered: a member
         // is a filesystem UUID AND a configured serial (bd su1b.27).
         let (member, serial_error) = match member {
-            Ok(mut m) => match host.member_serial(&path) {
+            Ok(mut m) => match host.member_serial(&path, plan.serials) {
                 Ok(s) => {
                     m.serial = Some(s);
                     (Ok(m), None)
@@ -1868,8 +1870,9 @@ fn diverged_without_record(plan: &Plan<'_>, members: &[Member]) -> Option<String
         "the members' superblock generations differ ({}) and no RAID record explains it \
          ({} is absent): one of them may lack writes the other holds, or be a drive 'btrdasd \
          raid accept' gave up — not mounting it read-write (each member's own record named no \
-         rejection). Restore the NEWEST copy of the record from a backup, or, if one drive is \
-         dead, pull it and run 'btrdasd raid accept {}'",
+         rejection). Restore the NEWEST copy of the record from a backup; or, with every drive \
+         present, run 'sudo btrdasd raid accept {}' at a terminal and choose the member to \
+         keep; or, if one drive is dead, pull it and run the same command",
         members
             .iter()
             .map(|m| format!(
@@ -2314,6 +2317,11 @@ pub struct Accepted {
     pub after: Record,
     /// What was shown before the label was typed.
     pub explanation: String,
+    /// Every member was present and their generations differed, no record
+    /// existed: the operator named the member to keep
+    /// ([`accept_diverged`], bd DAS-Backup-Manager-su1b.21). `before` then
+    /// holds no real period: its times are the accept time.
+    pub diverged: bool,
 }
 
 /// Look at the target as the guard would, once, without waiting and without
@@ -2616,14 +2624,66 @@ pub fn accept(
             "not accepted, nothing changed: the drive to accept is no longer present".into(),
         );
     }
+    commit_accept(host, plan, found, explanation, &[])
+}
+
+/// The writing half of an accept, after every check: the record for the
+/// members in `found.present`, the present member mounted degraded and
+/// read-write, the kernel's view checked, both copies written, unmounted.
+/// `set_aside` are present members that must not be assembled with it (the
+/// diverged case: both drives are attached): each is forgotten by its exact
+/// path and the kept member is mounted by its own path, never by UUID.
+fn commit_accept(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    found: SplitBrainNow,
+    explanation: String,
+    set_aside: &[Member],
+) -> Result<Accepted, String> {
     let after = accepted_record(&found, host.now());
     let primary_path = primary_path(plan.record_dir, plan.fsid);
-    host.mount(
-        &with_degraded(&without_degraded(plan.mount_opts)),
-        plan.fsid,
-        plan.mount,
-    )
-    .map_err(|e| format!("not accepted, nothing changed: the degraded mount failed ({e})"))?;
+    let degraded_opts = with_degraded(&without_degraded(plan.mount_opts));
+    if set_aside.is_empty() {
+        host.mount(&degraded_opts, plan.fsid, plan.mount)
+    } else {
+        let kept = &found.present[0];
+        let mut forgotten = Vec::new();
+        let mut result = Ok(());
+        for m in set_aside {
+            match host.forget(&m.path) {
+                Ok(()) => forgotten.push(m.path.clone()),
+                Err(e) => {
+                    result = Err(format!("{} cannot be set aside ({e})", m.path));
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            result = host.mount_device(&degraded_opts, &kept.path, plan.mount);
+        }
+        if result.is_err() {
+            // Back as found: the guard refuses this pair on every mount
+            // until it is accepted.
+            for path in &forgotten {
+                let _ = host.scan(path);
+            }
+        }
+        result
+    }
+    .map_err(|e| {
+        if set_aside.is_empty() {
+            format!("not accepted, nothing changed: the degraded mount failed ({e})")
+        } else {
+            // The other member was forgotten and registered again by path;
+            // udev may have registered it in between, so only the records
+            // are certain to be unchanged.
+            format!(
+                "not accepted, no record written: the degraded mount of the kept member failed \
+                 ({e}); the other member was set aside and registered again — check \
+                 'btrdasd doctor' before the next job"
+            )
+        }
+    })?;
     let take_down = |why: String| match host.umount(plan.mount) {
         Ok(()) => why,
         Err(u) => format!("{why}; and {} will not unmount: {u}", plan.mount),
@@ -2668,11 +2728,16 @@ pub fn accept(
         (Ok(()), Ok(())) => {}
         (Err(e), u) => {
             return Err(format!(
-                "the record is written, but the witness is not ({e}){}; run 'btrdasd raid \
-                 accept' again to finish",
+                "the record is written, but the witness is not ({e}){}; {}",
                 u.err()
                     .map(|u| format!("; and {} will not unmount: {u}", plan.mount))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if set_aside.is_empty() {
+                    "run 'btrdasd raid accept' again to finish"
+                } else {
+                    "the other drive is refused from now on; look at 'btrdasd doctor' before \
+                     the next job"
+                }
             ));
         }
         (Ok(()), Err(u)) => {
@@ -2686,7 +2751,359 @@ pub fn accept(
         before: found.period,
         after,
         explanation,
+        diverged: !set_aside.is_empty(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// `btrdasd raid accept` when every member is present (bd su1b.21)
+// ---------------------------------------------------------------------------
+
+/// What `raid accept` found when every member is present, their superblock
+/// generations differ and no RAID record exists: the guard refuses every job
+/// that writes the target, and no member is dead, so the operator names the
+/// one to keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergedNow {
+    /// Every member, by its own superblock and drive serial.
+    pub members: Vec<Member>,
+    /// What each member's own filesystem view holds of the RAID record, read
+    /// with that member alone through the read-only probe; parallel to
+    /// `members`.
+    pub views: Vec<Copy>,
+    pub expected: u64,
+}
+
+/// Look once, as the guard would: `Ok(Some)` only when every member is
+/// present, their generations differ and no primary record exists.
+/// `Ok(None)` is any other state (the other `accept` handles it, or there is
+/// nothing to accept). `Err` is a refusal that applies: a member bound to no
+/// configured drive, a member any copy rejects (never accepted back), or a
+/// member's own view that cannot be read. Each member's own view is read
+/// alone ([`member_witnesses`]: refused while the filesystem is mounted
+/// anywhere, the others forgotten by exact path and registered again).
+pub fn diverged_now(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    progress: &dyn ProgressCallback,
+) -> Result<Option<DivergedNow>, String> {
+    if read_copy(&primary_path(plan.record_dir, plan.fsid), plan.fsid) != Copy::Absent {
+        return Ok(None);
+    }
+    let s = survey(host, plan, &BTreeSet::new(), progress);
+    if let Some(f) = unbound_refusal(&s) {
+        return Err(f.why().to_string());
+    }
+    if !s.all_present() || !generations_differ(&s.members) {
+        return Ok(None);
+    }
+    let views = member_witnesses(host, plan, &s.members).map_err(|why| {
+        format!("{why} — each member's own view must be read before one is chosen; nothing changed")
+    })?;
+    let rejected: BTreeSet<String> = views
+        .iter()
+        .filter_map(|c| match c {
+            Copy::Read(r) => Some(r.rejected.iter().map(|m| m.dev_uuid.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let found: Vec<&Member> = s
+        .members
+        .iter()
+        .filter(|m| rejected.contains(&m.dev_uuid))
+        .collect();
+    if !found.is_empty() {
+        return Err(rejected_why(&found));
+    }
+    Ok(Some(DivergedNow {
+        members: s.members,
+        views,
+        expected: s.expected,
+    }))
+}
+
+/// What the operator is shown before the two answers: every member by drive
+/// serial, devid, device UUID, path and superblock generation (the higher is
+/// not automatically right), and what its own view holds.
+pub fn diverged_explanation(label: &str, fsid: &str, found: &DivergedNow) -> String {
+    let mut text = format!(
+        "Target '{label}' (filesystem {fsid}) is refused: every member is present, their \
+         superblock generations differ and no RAID record explains it. One of them lacks \
+         writes the other holds.\n\nMembers ({} of {}):\n",
+        found.members.len(),
+        found.expected
+    );
+    for (m, view) in found.members.iter().zip(&found.views) {
+        text.push_str(&format!(
+            "  {}, devid {} {} at {}, superblock generation {}\n    its own view: {}\n",
+            serial_text(m),
+            m.devid,
+            m.dev_uuid,
+            m.path,
+            m.generation,
+            match view {
+                Copy::Read(r) => format!(
+                    "a RAID record, state {}, since {} last {}",
+                    r.state.as_str(),
+                    when(r.since),
+                    when(r.last)
+                ),
+                Copy::Absent => "no RAID record on it (nothing more is known of its data)".into(),
+                Copy::Bad(e) => format!("an unreadable RAID record ({e})"),
+            }
+        ));
+    }
+    text.push_str(
+        "\nThe higher generation is NOT automatically the one to keep: a drive can hold a \
+         newer superblock and still lack writes the other took while it was away. Decide from \
+         what you know of each drive.\n\
+         \n\
+         Keeping one makes it the filesystem's history from now on. What only the other holds \
+         is given up, and the other is REFUSED from then on, alone or beside the kept one, \
+         until it is wiped (wipefs) or removed from the filesystem (btrfs device remove, \
+         btrfs replace). Take it out of the enclosure now: a wiped drive left attached \
+         makes the guard refuse the target too (every configured drive is attached while a \
+         member is missing), so the kept drive runs degraded only while the other is \
+         absent; to put it back, mount the kept drive degraded by hand and 'btrfs replace' \
+         onto it. The kept drive is mounted degraded to write the record, and every later \
+         job runs on it degraded, one copy of every write, until a second drive is added \
+         (btrfs replace) and scrubbed.\n",
+    );
+    text
+}
+
+/// Both-present `raid accept` (bd su1b.21), under the caller's locks. `ask`
+/// is handed `(text to show, prompt line)` and returns what was typed; an
+/// `Err` (no terminal) accepts nothing. The operator types the target label
+/// exactly AND the serial of the member to keep; nothing is written unless
+/// both match. Then the members are looked at again (the same set, the same
+/// serials and generations, the filesystem mounted nowhere), the other
+/// member forgotten by its exact path, the kept member mounted degraded
+/// read-write by its own path, the kernel's view checked, the primary and
+/// witness records written (the kept member as the history, the other
+/// rejected, as any accept does), and unmounted.
+pub fn accept_diverged(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    ask: &mut AskFn<'_>,
+    progress: &dyn ProgressCallback,
+) -> Result<Accepted, String> {
+    let Some(found) = diverged_now(host, plan, progress)? else {
+        return Err(
+            "not applicable: the members are not all present with differing superblock \
+             generations and no record"
+                .into(),
+        );
+    };
+    let serials: Vec<&str> = found
+        .members
+        .iter()
+        .filter_map(|m| m.serial.as_deref())
+        .collect();
+    if serials.len() != found.members.len() {
+        return Err(format!(
+            "not accepted, nothing changed: a member's drive serial cannot be read ({}) — the \
+             member to keep is named by its serial",
+            member_list(&found.members)
+        ));
+    }
+    let explanation = diverged_explanation(plan.label, plan.fsid, &found);
+    let strip = |s: String| s.trim_end_matches(['\n', '\r']).to_string();
+    let typed = strip(
+        ask(
+            &explanation,
+            &format!(
+                "To accept, type the target label exactly ({}): ",
+                plan.label
+            ),
+        )
+        .map_err(|e| format!("not accepted: {e}"))?,
+    );
+    if typed != plan.label {
+        return Err(format!(
+            "not accepted: '{typed}' is not the target label '{}' — nothing changed",
+            plan.label
+        ));
+    }
+    let keep_typed = strip(
+        ask(
+            "",
+            &format!(
+                "Type the serial of the member to KEEP ({}): ",
+                serials.join(" or ")
+            ),
+        )
+        .map_err(|e| format!("not accepted: {e}"))?,
+    );
+    let Some(kept) = found
+        .members
+        .iter()
+        .find(|m| m.serial.as_deref().is_some_and(|s| s == keep_typed.trim()))
+    else {
+        return Err(format!(
+            "not accepted: '{keep_typed}' is not the serial of a member ({}) — nothing changed",
+            serials.join(", ")
+        ));
+    };
+    let other: Vec<Member> = found
+        .members
+        .iter()
+        .filter(|m| m.dev_uuid != kept.dev_uuid)
+        .cloned()
+        .collect();
+    // Look again: the same members, the same drives, the same generations,
+    // and the filesystem mounted nowhere, or nothing is written.
+    let again = look_again(host, plan)?;
+    let key = |ms: &[Member]| {
+        let mut v: Vec<(String, String, Option<String>, u64)> = ms
+            .iter()
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    m.dev_uuid.clone(),
+                    m.serial.clone(),
+                    m.generation,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    if key(&again) != key(&found.members) {
+        return Err(format!(
+            "not accepted, nothing changed: the members changed while the answers were typed \
+             (now {}) — run 'btrdasd raid accept {}' again",
+            member_list(&again),
+            plan.label
+        ));
+    }
+    match host.fsid_mounted(plan.fsid) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(format!(
+                "not accepted, nothing changed: filesystem {} is mounted elsewhere",
+                plan.fsid
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "not accepted, nothing changed: whether {} is mounted elsewhere cannot be read \
+                 ({e})",
+                plan.fsid
+            ));
+        }
+    }
+    let now = host.now();
+    let given_up: Vec<PeriodMember> = other
+        .iter()
+        .map(|m| PeriodMember {
+            devid: m.devid,
+            dev_uuid: m.dev_uuid.clone(),
+            generation: m.generation,
+        })
+        .collect();
+    let split = SplitBrainNow {
+        present: vec![kept.clone()],
+        period: Record {
+            fsid: plan.fsid.to_ascii_lowercase(),
+            state: State::Degraded,
+            members: given_up,
+            since: now,
+            last: now,
+            rejoined: None,
+            rejected: Vec::new(),
+        },
+        absent_serials: other.iter().filter_map(|m| m.serial.clone()).collect(),
+        expected: found.expected,
+        resumed: false,
+    };
+    commit_accept(host, plan, split, explanation, &other)
+}
+
+/// The members as listed and read right now, without registering anything:
+/// every listed path must be readable, each with its drive serial.
+fn look_again(host: &dyn MemberHost, plan: &Plan<'_>) -> Result<Vec<Member>, String> {
+    host.members(plan.fsid)
+        .map_err(|e| format!("not accepted, nothing changed: cannot list the members ({e})"))?
+        .iter()
+        .map(|path| {
+            let mut m = host
+                .read_super(path)
+                .and_then(|t| parse_super(path, &t, plan.fsid))
+                .map_err(|e| {
+                    format!(
+                        "not accepted, nothing changed: {path} is listed with this filesystem \
+                         and its superblock cannot be read ({e})"
+                    )
+                })?;
+            m.serial = host.member_serial(path, plan.serials).ok();
+            Ok(m)
+        })
+        .collect()
+}
+
+/// The terminal, for [`accept_any`]: `(text to show, prompt line)` in, what
+/// was typed out; an `Err` (no terminal) accepts nothing.
+pub type AskFn<'a> = dyn FnMut(&str, &str) -> Result<String, String> + 'a;
+
+/// What an accept may ask of the operator: the label (one-drive case), and,
+/// when present, the member picker for the both-present case. The helper
+/// has `ask: None`.
+pub struct Terminal<'a> {
+    pub confirm: &'a mut dyn FnMut(&str) -> Result<String, String>,
+    pub ask: Option<&'a mut AskFn<'a>>,
+}
+
+/// `raid accept` as the command line and the helper run it: the both-present
+/// case when it applies, else [`accept`]. `ask` is the terminal: `None` (the
+/// GUI's helper has no picker) refuses the both-present case, telling the
+/// operator to use the command line, and writes nothing.
+pub fn accept_any(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    runs_between: &dyn Fn(i64, i64) -> Result<Option<u64>, String>,
+    confirm: &mut dyn FnMut(&str) -> Result<String, String>,
+    ask: Option<&mut AskFn<'_>>,
+    progress: &dyn ProgressCallback,
+) -> Result<Accepted, String> {
+    if diverged_now(host, plan, progress)?.is_some() {
+        return match ask {
+            Some(ask) => accept_diverged(host, plan, ask, progress),
+            None => Err(diverged_needs_the_terminal(plan.label)),
+        };
+    }
+    accept(host, plan, runs_between, confirm, progress)
+}
+
+fn diverged_needs_the_terminal(label: &str) -> String {
+    format!(
+        "every member of target '{label}' is present and their superblock generations differ \
+         with no RAID record: choosing the member to keep needs the command line, at a \
+         terminal — run 'sudo btrdasd raid accept {label}' (the GUI offers no picker). Nothing \
+         changed"
+    )
+}
+
+/// What the helper's preview shows: [`accept_explanation`] for the one-drive
+/// split brain, and, for the both-present case, the instruction to use the
+/// command line.
+pub fn preview(
+    host: &dyn MemberHost,
+    plan: &Plan<'_>,
+    runs_between: &dyn Fn(i64, i64) -> Result<Option<u64>, String>,
+    progress: &dyn ProgressCallback,
+) -> Result<String, String> {
+    if diverged_now(host, plan, progress)?.is_some() {
+        return Err(diverged_needs_the_terminal(plan.label));
+    }
+    let found = split_brain_now(host, plan, progress)?;
+    Ok(accept_explanation(
+        plan.label,
+        plan.fsid,
+        &found,
+        &runs_between(found.period.since, found.period.last),
+    ))
 }
 
 /// A read-only job's mount of a split-brain member: [`stale_read_opts`],
@@ -2894,7 +3311,7 @@ mod tests {
             self.present().iter().any(|d| d.0 == serial)
                 || self.extra_attached.borrow().contains(&serial)
         }
-        fn member_serial(&self, path: &str) -> Result<String, String> {
+        fn member_serial(&self, path: &str, _configured: &[String]) -> Result<String, String> {
             if self.serial_unreadable.borrow().contains(path) {
                 return Err(format!("{path}: no udev serial (fake)"));
             }
@@ -3156,6 +3573,324 @@ mod tests {
         let (r, shown) = accept_with(&case, &only_y(), Ok("primary"));
         r.unwrap();
         assert!(shown[0].contains("serial SERIAL12"), "{}", shown[0]);
+    }
+
+    // --- bd DAS-Backup-Manager-su1b.21: `raid accept` when every member is
+    // present, their generations differ and no record exists ----------------
+
+    fn diverged_host() -> FakeHost {
+        FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL12", "/dev/sdc1", 2, DY, 52, 0),
+        ])
+    }
+
+    /// The kernel's view once only `kept` is assembled.
+    fn kernel_sees_only(host: &FakeHost, kept: u64, other: u64) {
+        *host.devinfo.borrow_mut() = Some(Ok(vec![(kept, false), (other, true)]));
+    }
+
+    /// Run the both-present accept with these typed answers; returns what was
+    /// asked (text, prompt) too.
+    fn diverged_accept(
+        case: &Case,
+        host: &FakeHost,
+        answers: &[Result<&str, &str>],
+    ) -> (Result<Accepted, String>, Vec<(String, String)>) {
+        let mut asked = Vec::new();
+        let mut i = 0;
+        let mut ask = |text: &str, prompt: &str| {
+            asked.push((text.to_string(), prompt.to_string()));
+            let a = answers[i.min(answers.len() - 1)];
+            i += 1;
+            a.map(str::to_string).map_err(str::to_string)
+        };
+        let r = accept_diverged(host, &plan_for(case), &mut ask, &TestProgress::default());
+        (r, asked)
+    }
+
+    fn wrote_nothing(case: &Case, host: &FakeHost) {
+        assert_eq!(case.primary(), Copy::Absent, "no record written");
+        let calls = host.calls();
+        assert!(
+            !calls.iter().any(|c| c == "write witness"),
+            "no witness written: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("mount-dev")
+                && c.contains("degraded")
+                && !c.contains(" ro,")),
+            "no read-write mount: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("mount ")),
+            "no mount by UUID: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn both_present_accept_keeps_the_typed_serial_and_rejects_the_other() {
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 2, 1);
+        let (r, asked) = diverged_accept(&case, &host, &[Ok("primary\n"), Ok("SERIAL12\n")]);
+        let done = r.unwrap();
+        assert!(done.diverged);
+        assert_eq!(
+            done.after.members,
+            vec![PeriodMember {
+                devid: 2,
+                dev_uuid: DY.into(),
+                generation: 52
+            }]
+        );
+        assert_eq!(
+            done.after.rejected,
+            vec![PeriodMember {
+                devid: 1,
+                dev_uuid: DX.into(),
+                generation: 60
+            }],
+            "the other member is rejected, though its generation is the newer"
+        );
+        assert_eq!(case.primary(), Copy::Read(done.after.clone()));
+        // The listing: serial, devid, dev_uuid, generation of BOTH members.
+        let shown = &asked[0].0;
+        for needle in [
+            "SERIAL11",
+            "SERIAL12",
+            DX,
+            DY,
+            "generation 60",
+            "generation 52",
+            "NOT automatically",
+        ] {
+            assert!(shown.contains(needle), "{needle} missing: {shown}");
+        }
+        assert!(asked[0].1.contains("label"), "{asked:?}");
+        assert!(asked[1].1.contains("SERIAL11 or SERIAL12"), "{asked:?}");
+        // The kept member alone, by its own path; the other set aside first.
+        let calls = host.calls();
+        let forget = calls.iter().position(|c| c == "forget /dev/sdb1").unwrap();
+        let mount = calls
+            .iter()
+            .position(|c| {
+                c.starts_with("mount-dev")
+                    && c.contains("degraded")
+                    && c.contains("/dev/sdc1 /mnt/p")
+            })
+            .unwrap();
+        assert!(forget < mount, "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("mount ")),
+            "never mounted by UUID, which would assemble both: {calls:?}"
+        );
+        assert!(calls.contains(&"write witness".to_string()));
+        // From then on the other drive is refused for every job.
+        let again = diverged_host();
+        let why = refusal(case.run(&again).0);
+        assert!(why.contains(DX) && why.contains("given up"), "{why}");
+    }
+
+    #[test]
+    fn both_present_accept_can_keep_the_member_with_the_older_superblock_or_the_newer() {
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 1, 2);
+        let done = diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL11")])
+            .0
+            .unwrap();
+        assert_eq!(done.after.members[0].dev_uuid, DX);
+        assert_eq!(done.after.rejected[0].dev_uuid, DY);
+    }
+
+    #[test]
+    fn both_present_accept_writes_nothing_unless_the_label_and_a_members_serial_are_typed() {
+        for answers in [
+            vec![Ok("wrong"), Ok("SERIAL12")],
+            vec![Ok("primary"), Ok("SERIAL99")],
+            vec![Ok("primary"), Ok("")],
+            vec![Ok("primary"), Ok("5eed00a2")],
+            vec![Err("standard input is not a terminal")],
+            vec![Ok("primary"), Err("cannot read the answer")],
+        ] {
+            let case = Case::new();
+            let host = diverged_host();
+            kernel_sees_only(&host, 2, 1);
+            let (r, _) = diverged_accept(&case, &host, &answers);
+            assert!(r.unwrap_err().contains("not accepted"), "{answers:?}");
+            wrote_nothing(&case, &host);
+        }
+    }
+
+    #[test]
+    fn both_present_accept_refuses_when_a_member_changes_while_the_answers_are_typed() {
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 2, 1);
+        let mut n = 0;
+        let mut ask = |_: &str, _: &str| {
+            n += 1;
+            if n == 2 {
+                // Between the answers the kept drive's serial stops reading.
+                host.serial_unreadable
+                    .borrow_mut()
+                    .insert("/dev/sdc1".into());
+            }
+            Ok(if n == 1 { "primary" } else { "SERIAL12" }.to_string())
+        };
+        let r = accept_diverged(&host, &plan_for(&case), &mut ask, &TestProgress::default());
+        assert!(r.unwrap_err().contains("changed while"), "refused");
+        wrote_nothing(&case, &host);
+    }
+
+    #[test]
+    fn both_present_accept_refuses_while_the_filesystem_is_mounted_elsewhere() {
+        let case = Case::new();
+        let host = diverged_host();
+        host.mounted_elsewhere.set(true);
+        let (r, asked) = diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL12")]);
+        let why = r.unwrap_err();
+        assert!(why.contains("mounted elsewhere"), "{why}");
+        assert!(asked.is_empty(), "nothing asked: {asked:?}");
+        wrote_nothing(&case, &host);
+    }
+
+    #[test]
+    fn both_present_accept_never_accepts_a_member_back_that_a_copy_rejects() {
+        let case = Case::new();
+        let host = diverged_host();
+        // X's own view says an earlier accept gave Y up.
+        host.witness.borrow_mut().insert(
+            DX.into(),
+            Copy::Read(Record {
+                rejected: vec![PeriodMember {
+                    devid: 2,
+                    dev_uuid: DY.into(),
+                    generation: 52,
+                }],
+                ..accepted()
+            }),
+        );
+        let (r, asked) = diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL12")]);
+        assert!(r.unwrap_err().contains("given up"), "refused");
+        assert!(asked.is_empty());
+        wrote_nothing(&case, &host);
+    }
+
+    #[test]
+    fn the_both_present_case_is_only_when_generations_differ_and_no_record_exists() {
+        let progress = TestProgress::default();
+        // Equal generations: the guard mounts it normally.
+        let case = Case::new();
+        assert_eq!(diverged_now(&both(), &plan_for(&case), &progress), Ok(None));
+        // A record exists: the guard decides by it.
+        let case = Case::new();
+        put_primary(&case, &accepted());
+        assert_eq!(
+            diverged_now(&diverged_host(), &plan_for(&case), &progress),
+            Ok(None)
+        );
+        // One member only: the other accept.
+        let case = Case::new();
+        assert_eq!(
+            diverged_now(&only_x(), &plan_for(&case), &progress),
+            Ok(None)
+        );
+        // The case itself.
+        let case = Case::new();
+        let found = diverged_now(&diverged_host(), &plan_for(&case), &progress)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.members.len(), 2);
+        assert_eq!(found.views, vec![Copy::Absent, Copy::Absent]);
+    }
+
+    #[test]
+    fn the_helper_has_no_member_picker_and_says_to_use_the_command_line() {
+        let case = Case::new();
+        let host = diverged_host();
+        let mut confirm = |_: &str| Ok("primary".to_string());
+        let runs = |_: i64, _: i64| Ok(None);
+        let r = accept_any(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            None,
+            &TestProgress::default(),
+        );
+        let why = r.unwrap_err();
+        assert!(
+            why.contains("btrdasd raid accept primary") && why.contains("terminal"),
+            "{why}"
+        );
+        wrote_nothing(&case, &host);
+        let p = preview(&host, &plan_for(&case), &runs, &TestProgress::default());
+        assert!(p.unwrap_err().contains("command line"));
+    }
+
+    #[test]
+    fn the_one_drive_accept_is_still_what_accept_any_runs_when_a_member_is_absent() {
+        let (case, _period) = split_brain_case();
+        let host = only_y();
+        let mut confirm = |_: &str| Ok("primary".to_string());
+        let runs = |_: i64, _: i64| Ok(Some(3));
+        let mut ask = |_: &str, _: &str| -> Result<String, String> { panic!("no picker here") };
+        let done = accept_any(
+            &host,
+            &plan_for(&case),
+            &runs,
+            &mut confirm,
+            Some(&mut ask),
+            &TestProgress::default(),
+        )
+        .unwrap();
+        assert!(!done.diverged);
+    }
+
+    #[test]
+    fn after_a_both_present_accept_a_wiped_drive_left_attached_is_refused_not_mounted_degraded() {
+        let case = Case::new();
+        let host = diverged_host();
+        kernel_sees_only(&host, 2, 1);
+        diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL12")])
+            .0
+            .unwrap();
+        // X was wiped and left in the bay: its drive is attached, no
+        // partition carries the filesystem. Every configured drive is
+        // attached with a member missing: refused, never degraded.
+        let after = only_y();
+        after.extra_attached.borrow_mut().push("SERIAL11");
+        let why = refusal(case.run(&after).0);
+        assert!(why.contains("every configured drive"), "{why}");
+        assert!(after.calls().iter().all(|c| !c.starts_with("mount")));
+        // Pulled from the enclosure: the kept drive runs degraded.
+        let out = case.run(&only_y()).0;
+        assert!(matches!(out, Ok(Outcome::Degraded { .. })), "{out:?}");
+    }
+
+    #[test]
+    fn the_refusal_for_diverged_members_names_the_both_present_accept() {
+        let case = Case::new();
+        let why = refusal(case.run(&diverged_host()).0);
+        assert!(
+            why.contains("sudo btrdasd raid accept primary") && why.contains("choose the member"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_member_on_an_unconfigured_drive_blocks_the_both_present_accept_too() {
+        let case = Case::new();
+        let host = FakeHost::new(vec![
+            ("SERIAL11", "/dev/sdb1", 1, DX, 60, 0),
+            ("SERIAL99", "/dev/sdc1", 2, DY, 52, 0),
+        ]);
+        let (r, asked) = diverged_accept(&case, &host, &[Ok("primary"), Ok("SERIAL11")]);
+        assert!(r.unwrap_err().contains("SERIAL99"));
+        assert!(asked.is_empty());
+        wrote_nothing(&case, &host);
     }
 
     #[test]

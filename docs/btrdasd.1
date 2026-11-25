@@ -1041,7 +1041,8 @@ its members are found by filesystem UUID
 each registered by its own path
 .RB ( "btrfs device scan" " <path>;"
 never an unscoped scan) and identified by its own superblock and by the
-serial of the drive it sits on (partition, parent disk, udev
+serial of the drive it sits on (partition, parent disk; a configured serial
+whose by\-id drive is that disk names it, any other drive is named by udev
 .BR ID_SERIAL_SHORT ):
 every member line the guard prints names that serial; a partition carrying
 the filesystem on a drive whose serial is not among the target's configured
@@ -3164,6 +3165,32 @@ finishes it. The GUI's Health dashboard (Drives tab) offers the same action thro
 helper, which asks polkit
 .RB ( org.dasbackup.raid.accept ,
 authenticated every time) and compares the typed label itself.
+.PP
+When every member is present, their superblock generations differ and no RAID
+record exists (bd DAS\-Backup\-Manager\-su1b.21), the guard refuses every job
+that writes the target and no drive is dead; this command then lists each
+member (drive serial, devid, device UUID, path, superblock generation, and what
+its own view of the filesystem holds of the RAID record, read with that member
+alone through a read\-only probe) and says that the newer generation is not
+automatically the one to keep. Type the target's label exactly, then the
+.B serial
+of the member to keep. Nothing is written unless both match, the members are
+unchanged when looked at again, and the filesystem is mounted nowhere. The
+other member is set aside by its exact path, the kept one mounted degraded by
+its own path, and the record written as above: the kept member is the history,
+the other is
+.BR rejected ,
+refused by every job until it is wiped
+.RB ( wipefs )
+or removed from the filesystem; take it out of the enclosure, because a wiped
+drive left attached makes the guard refuse the target as well (every configured
+drive attached while a member is missing), and to reuse it mount the kept drive
+degraded by hand and
+.BR "btrfs replace" .
+The history row's period columns hold the
+accept time (there is no degraded period). The GUI has no member picker: its
+Accept action refuses this case and tells you to run this command at a
+terminal.
 .PP
 Takes the backup singleton and the maintenance lock without waiting; either
 held exits 75, nothing changed. Exit status 0 accepted, 1 refused or not

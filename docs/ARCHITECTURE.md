@@ -275,6 +275,13 @@ write primary → mount <mount_opts>,degraded rw → write witness → unmount
 logger -t btrdasd; raid_accepted row (schema 9)
 ```
 
+Every member present, superblock generations differing, no primary record
+(bd su1b.21): `diverged_now` (each member's own view read alone), then the
+operator types the label AND the serial of the member to keep (terminal only; the
+helper refuses and names the CLI); the other member is forgotten by exact path,
+the kept one mounted degraded by its own path (never `UUID=`), `rejected=` holds the
+other. Same steps after the mount as above.
+
 A rejected member is refused for every job, alone or beside the others: each
 superblock is read before its device is scanned, a rejected one is never
 scanned (primary copy); a rejection only the witness carries takes the normal

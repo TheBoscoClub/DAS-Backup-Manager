@@ -2200,7 +2200,12 @@ impl HelperInterface {
                 &config,
                 &label,
                 Path::new(&db_path),
-                &mut confirm,
+                // No member picker in the GUI: a both-present split is
+                // refused here, naming the command line (bd su1b.21).
+                buttered_dasd::raid_guard::Terminal {
+                    confirm: &mut confirm,
+                    ask: None,
+                },
                 &buttered_dasd::progress::NullProgress,
                 &singleton,
                 &held,
