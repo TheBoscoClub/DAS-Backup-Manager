@@ -368,7 +368,12 @@ pub(crate) fn mount_id_of(path: &Path) -> io::Result<Option<u64>> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((buf.stx_mask & libc::STATX_MNT_ID != 0).then_some(buf.stx_mnt_id))
+    Ok(reported_mnt_id(buf.stx_mask, buf.stx_mnt_id))
+}
+
+/// The mount id statx returned, when its mask says the kernel filled it in.
+fn reported_mnt_id(mask: u32, id: u64) -> Option<u64> {
+    (mask & libc::STATX_MNT_ID != 0).then_some(id)
 }
 
 /// What a link in `/proc/<pid>` names, without a " (deleted)" suffix.
@@ -650,48 +655,55 @@ impl Signaller for SystemSignaller {
                 "refused: a test build never signals a real process (pid {pid})"
             ));
         }
-        if pid <= 1 {
-            return Err(format!("refused: never a signal to pid {pid}"));
-        }
-        // SAFETY: plain syscalls on integer arguments; the fd is closed below.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(format!("pidfd_open({pid}): {}", io::Error::last_os_error()));
-        }
-        let fd = fd as libc::c_int;
-        let result = if start_time(Path::new("/proc"), pid) != Some(expected) {
-            Err(format!(
-                "pid {pid} is no longer the process that was checked"
-            ))
-        } else {
-            let signo = match sig {
-                Sig::Term => libc::SIGTERM,
-                Sig::Kill => libc::SIGKILL,
-            };
-            // SAFETY: as above; a null siginfo is allowed.
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd,
-                    signo,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(format!(
-                    "pidfd_send_signal({pid}, {}): {}",
-                    sig.name(),
-                    io::Error::last_os_error()
-                ))
-            }
-        };
-        // SAFETY: fd is ours.
-        unsafe { libc::close(fd) };
-        result
+        signal_process(Path::new("/proc"), pid, expected, sig)
     }
+}
+
+/// The signalling itself, with the `/proc` its start-time check reads given:
+/// [`SystemSignaller`] minus the test-build refusal, so the tests can drive
+/// it against processes they spawned themselves.
+fn signal_process(proc_root: &Path, pid: i32, expected: u64, sig: Sig) -> Result<(), String> {
+    if pid <= 1 {
+        return Err(format!("refused: never a signal to pid {pid}"));
+    }
+    // SAFETY: plain syscalls on integer arguments; the fd is closed below.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(format!("pidfd_open({pid}): {}", io::Error::last_os_error()));
+    }
+    let fd = fd as libc::c_int;
+    let result = if start_time(proc_root, pid) != Some(expected) {
+        Err(format!(
+            "pid {pid} is no longer the process that was checked"
+        ))
+    } else {
+        let signo = match sig {
+            Sig::Term => libc::SIGTERM,
+            Sig::Kill => libc::SIGKILL,
+        };
+        // SAFETY: as above; a null siginfo is allowed.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                signo,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "pidfd_send_signal({pid}, {}): {}",
+                sig.name(),
+                io::Error::last_os_error()
+            ))
+        }
+    };
+    // SAFETY: fd is ours.
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// What [`clear_holders`] did: one line per holder seen and per signal sent,
@@ -1637,5 +1649,536 @@ mod tests {
             .signal(std::process::id() as i32 + 1_000_000, 0, Sig::Term)
             .unwrap_err();
         assert!(e.contains("test build"), "{e}");
+    }
+
+    // -----------------------------------------------------------------------
+    // bd DAS-Backup-Manager-su1b.34: the survivors of the CI mutation run.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mountinfo_octal_escapes_decode_to_their_bytes_and_only_whole_ones() {
+        assert_eq!(unescape("a\\040b"), "a b");
+        assert_eq!(unescape("\\040"), " ");
+        assert_eq!(unescape("\\134"), "\\");
+        assert_eq!(unescape("x\\011y\\012z"), "x\ty\nz");
+        assert_eq!(unescape("\\0409"), " 9");
+        // A tail too short for three digits, and a non-octal one, stay as
+        // written (never an out-of-range read).
+        assert_eq!(unescape("a\\04"), "a\\04");
+        assert_eq!(unescape("\\04"), "\\04");
+        assert_eq!(unescape("a\\0x9"), "a\\0x9");
+        // Digits that do not follow a backslash are never decoded.
+        assert_eq!(unescape("ab123456"), "ab123456");
+    }
+
+    #[test]
+    fn a_malformed_mountinfo_line_is_skipped_and_a_spaced_option_list_is_not() {
+        let text = "\
+77 30 0:52 / /mnt rw - btrfs /dev/sdx1 rw,subvolid=5\n\
+77 30 0:52 / /mnt - btrfs /dev/sdx1 rw\n\
+78 30 0:52 / /mnt rw - btrfs /dev/sdx1\n\
+xx 30 0:52 / /mnt rw - btrfs /dev/sdx1 rw\n\
+79 30 0:52 / /mnt rw btrfs /dev/sdx1 rw\n\
+80 30 0:52 / /mnt2 rw - btrfs /dev/sdx1 rw,a b\n";
+        let got = parse_mountinfo(text);
+        let ids: Vec<u64> = got.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![77, 80], "{got:?}");
+        assert_eq!(got[1].super_options, "rw,a b");
+    }
+
+    #[test]
+    fn modes_and_holders_are_shown_in_full() {
+        assert_eq!(Mode::CwdOnly.to_string(), "working directory only");
+        assert_eq!(Mode::Reader.to_string(), "reading");
+        assert_eq!(Mode::Writer.to_string(), "WRITING");
+        let mk = |user: Option<&str>, uid: Option<u32>, cmd: &str| Holder {
+            pid: 7,
+            start_time: 1,
+            uid,
+            user: user.map(str::to_string),
+            unit: Some("app.scope".into()),
+            cmdline: cmd.into(),
+            mode: Mode::Reader,
+            kernel_thread: false,
+            uses: vec!["fd 3 /x (read)".into(), "cwd /x".into()],
+        };
+        let line = |u, i, c| mk(u, i, c).to_string();
+        assert_eq!(
+            line(Some("bosco"), Some(1000), "dolphin"),
+            "pid 7 [reading] user bosco (uid 1000), unit app.scope: dolphin — fd 3 /x (read); cwd /x"
+        );
+        assert!(
+            line(None, Some(1000), "dolphin").contains("user uid 1000, unit"),
+            "{}",
+            line(None, Some(1000), "dolphin")
+        );
+        assert!(line(None, None, "d").contains("user uid unknown, unit"));
+        assert!(line(Some("x"), None, "d").contains("user uid unknown, unit"));
+        assert!(line(None, None, "").contains(": (no command line) — "));
+        let mut h = mk(None, None, "d");
+        h.unit = None;
+        assert!(h.to_string().contains("unit none:"), "{h}");
+    }
+
+    /// A `/proc/<pid>/stat` with `rest` after the command name.
+    fn stat_root(pid: i32, rest: &str) -> tempfile::TempDir {
+        let t = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(t.path().join(pid.to_string())).unwrap();
+        fs::write(
+            t.path().join(pid.to_string()).join("stat"),
+            format!("{pid} (a) b) {rest}\n"),
+        )
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn a_stat_needs_exactly_twenty_fields_after_the_name_and_no_fewer() {
+        // state ppid, then 4 zeros, flags (field 6), then zeros to field 19.
+        let twenty = "S 41 0 0 0 0 4194304 0 0 0 0 0 0 0 0 0 0 0 0 777";
+        assert_eq!(twenty.split_whitespace().count(), 20);
+        let t = stat_root(5, twenty);
+        assert_eq!(read_stat(t.path(), 5).unwrap(), ('S', 41, 4_194_304, 777));
+        let nineteen = "S 41 0 0 0 0 4194304 0 0 0 0 0 0 0 0 0 0 0 777";
+        assert_eq!(nineteen.split_whitespace().count(), 19);
+        let t = stat_root(5, nineteen);
+        let e = read_stat(t.path(), 5).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        // No closing parenthesis at all.
+        let t = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(t.path().join("5")).unwrap();
+        fs::write(t.path().join("5/stat"), "5 a S 1\n").unwrap();
+        assert!(read_stat(t.path(), 5).is_err());
+    }
+
+    #[test]
+    fn start_time_is_none_for_a_zombie_a_dead_one_and_a_missing_one() {
+        let p = FakeProc::new();
+        for (pid, state) in [(10, 'S'), (11, 'Z'), (12, 'X'), (13, 'R')] {
+            p.add(Proc {
+                pid,
+                state,
+                start: 4242,
+                ..Default::default()
+            });
+        }
+        let root = p.site().proc_root;
+        assert_eq!(start_time(&root, 10), Some(4242));
+        assert_eq!(start_time(&root, 13), Some(4242));
+        assert_eq!(start_time(&root, 11), None, "zombie");
+        assert_eq!(start_time(&root, 12), None, "dead");
+        assert_eq!(start_time(&root, 99), None, "missing");
+    }
+
+    #[test]
+    fn a_lineage_stops_at_pid_1_and_never_holds_pid_0() {
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 1,
+            ppid: 0,
+            ..Default::default()
+        });
+        p.add(Proc {
+            pid: 899,
+            ppid: 1,
+            ..Default::default()
+        });
+        p.add(Proc {
+            pid: 900,
+            ppid: 899,
+            ..Default::default()
+        });
+        let root = p.site().proc_root;
+        assert_eq!(lineage(&root, 900), BTreeSet::from([1, 899, 900]));
+        // A pid with no stat is itself and nothing more.
+        assert_eq!(lineage(&root, 555), BTreeSet::from([555]));
+    }
+
+    #[test]
+    fn the_mount_id_is_only_taken_when_the_kernel_says_it_filled_it_in() {
+        assert_eq!(reported_mnt_id(libc::STATX_MNT_ID, 5), Some(5));
+        assert_eq!(
+            reported_mnt_id(libc::STATX_MNT_ID | libc::STATX_BASIC_STATS, 5),
+            Some(5)
+        );
+        assert_eq!(reported_mnt_id(0, 5), None);
+        assert_eq!(reported_mnt_id(libc::STATX_BASIC_STATS, 5), None);
+    }
+
+    #[test]
+    fn only_a_vanished_file_or_process_is_gone() {
+        assert!(is_gone(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(is_gone(&io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(!is_gone(&io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_gone(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!is_gone(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!is_gone(&io::Error::other("x")));
+    }
+
+    #[test]
+    fn a_user_is_looked_up_by_uid_and_a_short_passwd_line_is_no_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pw = dir.path().join("passwd");
+        fs::write(
+            &pw,
+            "root:x:0:0::/root:/bin/sh\nshort:x\nbob:x:1001:1001::/h:/bin/sh\nbad:x:nan:1\n",
+        )
+        .unwrap();
+        assert_eq!(user_name(&pw, 1001).as_deref(), Some("bob"));
+        assert_eq!(user_name(&pw, 0).as_deref(), Some("root"));
+        assert_eq!(user_name(&pw, 5), None);
+        assert_eq!(user_name(&dir.path().join("absent"), 0), None);
+    }
+
+    #[test]
+    fn the_unit_is_the_deepest_named_cgroup_component_else_the_whole_path() {
+        let u = |c: &str| unit_of(c);
+        assert_eq!(
+            u("0::/user.slice/user-1000.slice/session-2.scope\n").as_deref(),
+            Some("session-2.scope")
+        );
+        // The deepest component with a unit suffix, not the deepest.
+        assert_eq!(
+            u("0::/system.slice/foo.service/sub\n").as_deref(),
+            Some("foo.service")
+        );
+        // A slice alone is not a unit: the path is shown whole.
+        assert_eq!(u("0::/system.slice\n").as_deref(), Some("/system.slice"));
+        assert_eq!(
+            u("0::/a.slice/b.slice\n").as_deref(),
+            Some("/a.slice/b.slice")
+        );
+        // cgroup v1 lines.
+        assert_eq!(
+            u("12:name=systemd:/x/foo.service\n1:cpu:/\n").as_deref(),
+            Some("foo.service")
+        );
+        // Nothing to show.
+        assert_eq!(u("0::\n"), None);
+        assert_eq!(u(""), None);
+    }
+
+    #[test]
+    fn a_unit_with_its_own_file_is_shown_by_that_file_not_as_generated() {
+        let both = "Id=mnt-x.mount\nLoadState=loaded\nFragmentPath=/etc/systemd/system/mnt-x.mount\nSourcePath=/etc/fstab\n";
+        assert_eq!(
+            origin("/mnt/x", Some(both)),
+            Origin::Unit {
+                unit: "mnt-x.mount".into(),
+                from: "/etc/systemd/system/mnt-x.mount".into()
+            }
+        );
+        assert_eq!(
+            origin("/mnt/x", Some("Id=mnt-x.mount\nLoadState=not-found\n")),
+            Origin::Other
+        );
+        assert_eq!(Origin::Other.to_string(), "a hand mount or another program");
+    }
+
+    // --- scan_holders: what is read, what is left out ----------------------
+
+    fn scanned(p: &FakeProc, mounts: &[MountEntry]) -> Vec<(i32, Mode)> {
+        scan_holders(&p.site(), mounts)
+            .unwrap()
+            .iter()
+            .map(|h| (h.pid, h.mode))
+            .collect()
+    }
+
+    fn mount_at(id: u64, point: &str) -> MountEntry {
+        MountEntry {
+            id,
+            root: "/".into(),
+            mount_point: point.into(),
+            options: "rw".into(),
+            fstype: "btrfs".into(),
+            source: "/dev/sdx1".into(),
+            super_options: String::new(),
+        }
+    }
+
+    /// Gives a directory its permissions back when it goes out of scope, so
+    /// the temporary tree can be removed.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn unreadable(path: PathBuf) -> Restore {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        Restore(path)
+    }
+
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid(2) takes nothing and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn a_process_whose_open_files_or_maps_vanish_is_left_out() {
+        let p = FakeProc::new();
+        for pid in [700, 701] {
+            p.add(Proc {
+                pid,
+                ..Default::default()
+            });
+        }
+        let root = p.site().proc_root;
+        fs::remove_dir_all(root.join("700/fd")).unwrap();
+        fs::remove_file(root.join("701/maps")).unwrap();
+        assert_eq!(scanned(&p, &das_mount()), vec![]);
+    }
+
+    /// What cannot be read is never assumed harmless: a writer, listed. (A
+    /// directory's mode does not stop root, so this runs unprivileged only.)
+    #[test]
+    fn a_process_whose_open_files_or_maps_cannot_be_read_is_a_writer() {
+        if running_as_root() {
+            return;
+        }
+        let p = FakeProc::new();
+        for pid in [702, 703] {
+            p.add(Proc {
+                pid,
+                ..Default::default()
+            });
+        }
+        let root = p.site().proc_root;
+        let _a = unreadable(root.join("702/fd"));
+        let _b = unreadable(root.join("703/maps"));
+        let hs = scan_holders(&p.site(), &das_mount()).unwrap();
+        let got: Vec<(i32, Mode)> = hs.iter().map(|h| (h.pid, h.mode)).collect();
+        assert_eq!(got, vec![(702, Mode::Writer), (703, Mode::Writer)]);
+        assert!(
+            hs[0].uses[0].contains("open files cannot be read"),
+            "{:?}",
+            hs[0]
+        );
+        assert!(
+            hs[1].uses[0].contains("mappings cannot be read"),
+            "{:?}",
+            hs[1]
+        );
+    }
+
+    /// A working directory that is gone is not a holder; one whose mount
+    /// cannot be told, under the mount's path, is a writer.
+    #[test]
+    fn a_vanished_working_directory_is_no_holder_and_an_unreadable_one_is_a_writer() {
+        let p = FakeProc::new();
+        // The link names a directory that no longer exists.
+        p.add(Proc {
+            pid: 710,
+            cwd: "/run/media/user/das/deleted-dir",
+            ..Default::default()
+        });
+        // The link loops: statx fails with ELOOP, which is not "gone".
+        let real = tempfile::TempDir::new().unwrap();
+        let dir = fs::canonicalize(real.path()).unwrap();
+        let looping = dir.join("loop");
+        symlink(&looping, &looping).unwrap();
+        let looping: &'static str =
+            Box::leak(looping.to_string_lossy().into_owned().into_boxed_str());
+        p.add(Proc {
+            pid: 711,
+            cwd: looping,
+            ..Default::default()
+        });
+        let mut mounts = das_mount();
+        mounts.push(mount_at(4242, &dir.to_string_lossy()));
+        let hs = scan_holders(&p.site(), &mounts).unwrap();
+        let got: Vec<(i32, Mode)> = hs.iter().map(|h| (h.pid, h.mode)).collect();
+        assert_eq!(got, vec![(711, Mode::Writer)], "{hs:?}");
+        assert!(
+            hs[0].uses[0].contains("its mount cannot be told"),
+            "{:?}",
+            hs[0]
+        );
+    }
+
+    #[test]
+    fn mappings_are_classified_by_their_permissions_and_only_under_the_mount() {
+        let map = |perms: &str, path: &str| format!("7f00-7f10 {perms} 00000000 00:34 12 {path}\n");
+        let p = FakeProc::new();
+        let on = "/run/media/user/das/lib.so";
+        let cases = [
+            (610, map("r-xp", on)),
+            (611, map("rw-p", on)),
+            (612, map("r--s", on)),
+            (613, map("rw-s", on)),
+            // Nothing there: an anonymous mapping (five fields), the heap,
+            // and a file elsewhere.
+            (
+                614,
+                format!(
+                    "7f00-7f10 rw-p 00000000 00:00 0\n55d0-55e0 rw-p 00000000 00:00 0      [heap]\n{}",
+                    map("r-xp", "/usr/lib/libc.so.6")
+                ),
+            ),
+        ];
+        for (pid, maps) in &cases {
+            p.add(Proc {
+                pid: *pid,
+                maps: Box::leak(maps.clone().into_boxed_str()),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            scanned(&p, &das_mount()),
+            vec![
+                (610, Mode::Reader),
+                (611, Mode::Reader),
+                (612, Mode::Reader),
+                (613, Mode::Writer),
+            ]
+        );
+    }
+
+    /// btrfs maintenance is recognised by the first word of its command line
+    /// as well as by its name.
+    #[test]
+    fn a_btrfs_command_line_alone_makes_a_holder_a_writer() {
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 620,
+            cmd: "/usr/bin/btrfs balance start /run/media/user/das",
+            comm: "x",
+            fds: vec![(3, "/run/media/user/das", "0200000", Some(77))],
+            ..Default::default()
+        });
+        p.add(Proc {
+            pid: 621,
+            cmd: "/usr/bin/btrfs-helper run",
+            comm: "x",
+            fds: vec![(3, "/run/media/user/das", "0200000", Some(77))],
+            ..Default::default()
+        });
+        assert_eq!(
+            scanned(&p, &das_mount()),
+            vec![(620, Mode::Writer), (621, Mode::Reader)]
+        );
+    }
+
+    /// A pid reused by another process during the grace is a new holder: it
+    /// gets SIGTERM and a grace of its own, never an immediate SIGKILL.
+    #[test]
+    fn a_reused_pid_during_the_grace_gets_sigterm_not_sigkill() {
+        let p = FakeProc::new();
+        reader(&p, 300);
+        struct Reuses<'a>(&'a FakeProc, RefCell<Vec<(i32, Sig)>>);
+        impl Signaller for Reuses<'_> {
+            fn signal(&self, pid: i32, _s: u64, sig: Sig) -> Result<(), String> {
+                let first = self.1.borrow().is_empty();
+                self.1.borrow_mut().push((pid, sig));
+                self.0.remove(pid);
+                if first {
+                    // Another process takes the pid, a reader too.
+                    self.0.add(Proc {
+                        pid,
+                        start: 555,
+                        cmd: "other",
+                        fds: vec![(3, "/run/media/user/das/b", "0100000", Some(77))],
+                        ..Default::default()
+                    });
+                }
+                Ok(())
+            }
+        }
+        let f = Reuses(&p, RefCell::new(Vec::new()));
+        let site = p.site();
+        clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap();
+        assert_eq!(
+            *f.1.borrow(),
+            vec![(300, Sig::Term), (300, Sig::Term)],
+            "the reused pid went straight to SIGKILL"
+        );
+    }
+
+    // --- the host signaller, on processes this test spawned ----------------
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_sleeper() -> Child {
+        Child(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn exited(c: &mut Child) -> Option<std::process::ExitStatus> {
+        for _ in 0..100 {
+            if let Some(s) = c.0.try_wait().unwrap() {
+                return Some(s);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    fn real_start(pid: i32) -> u64 {
+        start_time(Path::new("/proc"), pid).expect("a live child")
+    }
+
+    #[test]
+    fn signal_process_ends_a_child_it_was_given_with_the_signal_asked_for() {
+        use std::os::unix::process::ExitStatusExt;
+        for (sig, signo) in [(Sig::Term, libc::SIGTERM), (Sig::Kill, libc::SIGKILL)] {
+            let mut c = spawn_sleeper();
+            let pid = c.0.id() as i32;
+            let start = real_start(pid);
+            assert_eq!(signal_process(Path::new("/proc"), pid, start, sig), Ok(()));
+            let status = exited(&mut c).expect("the child ended");
+            assert_eq!(status.signal(), Some(signo), "{sig:?}: {status:?}");
+        }
+    }
+
+    #[test]
+    fn signal_process_refuses_a_pid_whose_start_time_is_not_the_one_checked() {
+        let mut c = spawn_sleeper();
+        let pid = c.0.id() as i32;
+        let start = real_start(pid);
+        let e = signal_process(Path::new("/proc"), pid, start + 1, Sig::Kill).unwrap_err();
+        assert!(e.contains("no longer the process"), "{e}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(c.0.try_wait().unwrap().is_none(), "the child was signalled");
+    }
+
+    #[test]
+    fn signal_process_reports_a_pid_that_is_gone() {
+        let mut c = spawn_sleeper();
+        let pid = c.0.id() as i32;
+        let start = real_start(pid);
+        c.0.kill().unwrap();
+        c.0.wait().unwrap();
+        let e = signal_process(Path::new("/proc"), pid, start, Sig::Term).unwrap_err();
+        assert!(e.starts_with(&format!("pidfd_open({pid}): ")), "{e}");
+    }
+
+    /// Never a signal to PID 1, to 0 (a process group) or to a negative pid
+    /// (a group, or every process): refused before any syscall. The start
+    /// time given matches nothing, so even a check that failed to refuse
+    /// would not signal.
+    #[test]
+    fn signal_process_never_signals_pid_1_or_less() {
+        for pid in [1, 0, -1, -4242] {
+            let e = signal_process(Path::new("/proc"), pid, u64::MAX, Sig::Kill).unwrap_err();
+            assert_eq!(e, format!("refused: never a signal to pid {pid}"));
+        }
     }
 }
