@@ -2620,12 +2620,13 @@ fn scrub_one_target(
                 // for many hours, so anchoring on the pass would accept a record
                 // written half a day before this target was even touched.
                 let activity = record.last_activity_start();
-                if activity == 0 {
+                let freshness = record_freshness(activity, scrub_started);
+                if freshness == Freshness::NoStart {
                     result.errors.push(format!(
                     "scrub status record for {fsuuid} has no start timestamp — cannot confirm it \
                      belongs to this run"
                 ));
-                } else if activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+                } else if freshness == Freshness::Stale {
                     result.errors.push(format!(
                         "scrub status record for {fsuuid} is stale (last start/resume {activity} \
                      predates this filesystem's scrub start {scrub_started}) — no result was \
@@ -2664,12 +2665,7 @@ fn scrub_one_target(
     // was present again, pays it: both record copies go, while the
     // filesystem is still mounted (the witness is on it). Corrected errors
     // are expected here — they are the stale copies being repaired.
-    if guarded.is_some()
-        && result.errors.is_empty()
-        && result.interrupted_by.is_none()
-        && result.outcome == Some(ScrubOutcome::Finished)
-        && result.counters.uncorrectable_errors == 0
-    {
+    if pays_owed_scrub(guarded.is_some(), &result) {
         match crate::raid_guard::clear_after_scrub(
             &crate::raid_guard::record_dir(),
             &mount_point,
@@ -2711,6 +2707,40 @@ fn scrub_one_target(
     result
 }
 
+/// Whether a filesystem's result pays the scrub a RAID-1 target owes after a
+/// degraded period: a guarded target, scrubbed to the end, nothing errored,
+/// interrupted or uncorrectable.
+fn pays_owed_scrub(guarded: bool, result: &ScrubFsResult) -> bool {
+    guarded
+        && result.errors.is_empty()
+        && result.interrupted_by.is_none()
+        && result.outcome == Some(ScrubOutcome::Finished)
+        && result.counters.uncorrectable_errors == 0
+}
+
+/// Whether a btrfs status record belongs to this filesystem's run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freshness {
+    /// The record holds no start timestamp.
+    NoStart,
+    /// Its last start or resume predates this filesystem's scrub start by
+    /// more than [`RECORD_FRESHNESS_SLACK_SECS`].
+    Stale,
+    Fresh,
+}
+
+/// The record's `last_activity_start` against this filesystem's scrub start
+/// (not the pass's: a pass runs for hours).
+fn record_freshness(activity: i64, scrub_started: i64) -> Freshness {
+    if activity == 0 {
+        Freshness::NoStart
+    } else if activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+        Freshness::Stale
+    } else {
+        Freshness::Fresh
+    }
+}
+
 /// Take an interrupted filesystem's figures from its btrfs status record
 /// (bd DAS-Backup-Manager-su1b.22).
 ///
@@ -2727,7 +2757,7 @@ fn take_interrupted_figures(
 ) {
     let Ok(record) = record else { return };
     let activity = record.last_activity_start();
-    if activity == 0 || activity < scrub_started - RECORD_FRESHNESS_SLACK_SECS {
+    if record_freshness(activity, scrub_started) != Freshness::Fresh {
         return;
     }
     result.counters = record.counters();
@@ -7317,6 +7347,92 @@ mod interrupted_pass_tests {
             "5eed0016-0000-4000-8000-000000000016",
         )
         .unwrap()
+    }
+
+    /// bd 3gzs.11: the freshness anchor at each edge. A record whose last
+    /// start is 120 s before the filesystem's scrub start still counts; one
+    /// second earlier does not; none at all is its own answer.
+    #[test]
+    fn a_status_record_is_fresh_from_the_slack_before_the_filesystems_start() {
+        let started = 1_000_000;
+        assert_eq!(record_freshness(0, started), Freshness::NoStart);
+        assert_eq!(record_freshness(1, started), Freshness::Stale);
+        assert_eq!(
+            record_freshness(started - RECORD_FRESHNESS_SLACK_SECS - 1, started),
+            Freshness::Stale
+        );
+        assert_eq!(
+            record_freshness(started - RECORD_FRESHNESS_SLACK_SECS, started),
+            Freshness::Fresh
+        );
+        assert_eq!(record_freshness(started, started), Freshness::Fresh);
+        assert_eq!(record_freshness(started + 5_000, started), Freshness::Fresh);
+    }
+
+    /// bd su1b.16: only a guarded target scrubbed to the end, with nothing
+    /// errored, interrupted or uncorrectable, pays the owed scrub.
+    #[test]
+    fn only_a_clean_finished_scrub_of_a_guarded_target_pays_the_owed_scrub() {
+        let clean = || {
+            let mut r = ScrubFsResult::new("pair");
+            r.outcome = Some(ScrubOutcome::Finished);
+            r
+        };
+        assert!(pays_owed_scrub(true, &clean()));
+        assert!(!pays_owed_scrub(false, &clean()), "not a guarded target");
+        let mut errored = clean();
+        errored.errors.push("x".into());
+        assert!(!pays_owed_scrub(true, &errored));
+        let mut interrupted = clean();
+        interrupted.interrupted_by = Some(libc::SIGTERM);
+        assert!(!pays_owed_scrub(true, &interrupted));
+        let mut aborted = clean();
+        aborted.outcome = Some(ScrubOutcome::Aborted);
+        assert!(!pays_owed_scrub(true, &aborted));
+        let mut no_record = clean();
+        no_record.outcome = None;
+        assert!(!pays_owed_scrub(true, &no_record));
+        let mut damaged = clean();
+        damaged.counters.uncorrectable_errors = 1;
+        assert!(!pays_owed_scrub(true, &damaged));
+        // Corrected errors are the stale copies being repaired: still pays.
+        let mut repaired = clean();
+        repaired.counters.corrected_errors = 9;
+        assert!(pays_owed_scrub(true, &repaired));
+    }
+
+    #[test]
+    fn a_failure_is_described_by_its_errors_or_else_its_outcome() {
+        let mut r = ScrubFsResult::new("pair");
+        assert_eq!(describe_failure(&r), "no scrub status record produced");
+        r.outcome = Some(ScrubOutcome::Aborted);
+        r.counters.csum_errors = 3;
+        let figures = r.counters_summary();
+        assert_eq!(
+            describe_failure(&r),
+            format!("scrub aborted (did not complete); {figures}")
+        );
+        r.outcome = Some(ScrubOutcome::Canceled);
+        assert_eq!(describe_failure(&r), format!("scrub canceled; {figures}"));
+        r.outcome = Some(ScrubOutcome::Finished);
+        assert_eq!(describe_failure(&r), format!("errors found: {figures}"));
+        r.errors = vec!["one".into(), "two".into()];
+        assert_eq!(describe_failure(&r), "one; two");
+    }
+
+    /// bd su1b.22 / 3gzs.11: the duration of an attempt is filed, and the
+    /// unknown-figures flag reaches the state file only when it is set.
+    #[test]
+    fn the_state_file_keeps_the_attempts_duration_and_its_unknown_flag() {
+        let mut r = interrupted_result();
+        r.duration_secs = 42;
+        let a = filed(&r);
+        assert_eq!(a.duration_secs, 42);
+        assert!(a.counters_unknown);
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"counters_unknown\":true"), "{json}");
+        assert!(is_false(&false));
+        assert!(!is_false(&true));
     }
 
     fn interrupted_result() -> ScrubFsResult {
