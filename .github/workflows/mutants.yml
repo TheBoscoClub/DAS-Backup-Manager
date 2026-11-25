@@ -86,6 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install toolchain
@@ -168,7 +169,10 @@ jobs:
             if [ "$SHARD" = 0 ]; then LISTED=$ALL; else LISTED=0; fi
           else
             SHARD_ARGS="--shard $SHARD/$SHARDS --sharding round-robin"
-            LISTED=$(cargo mutants --list --in-diff mutants.diff $SHARD_ARGS | wc -l)
+            # SHARD_ARGS is a fixed, space-separated flag list: split it into an
+            # array so each flag is one quoted argument.
+            read -ra SHARD_WORDS <<< "$SHARD_ARGS"
+            LISTED=$(cargo mutants --list --in-diff mutants.diff "${SHARD_WORDS[@]}" | wc -l)
           fi
           echo "listed=$LISTED" >> "$GITHUB_OUTPUT"
           echo "shard_args=$SHARD_ARGS" >> "$GITHUB_OUTPUT"
@@ -279,6 +283,8 @@ jobs:
       SHARDS: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
