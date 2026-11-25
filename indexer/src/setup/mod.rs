@@ -106,6 +106,11 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn std::error::Error>> {
 type Uninstaller<'a> =
     &'a dyn Fn(bool, bool, &installer::SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
 
+/// `--uninstall-all`, told whether to remove the database too (it keeps no
+/// config: `--keep-config` is refused beside it).
+type UninstallAll<'a> =
+    &'a dyn Fn(bool, &installer::SetupLocks) -> Result<(), Box<dyn std::error::Error>>;
+
 /// `--upgrade`: the lock site, the config path, then `say` and `warn`.
 type UpgradeMode<'a> = &'a dyn Fn(
     &installer::SetupLockSite,
@@ -126,7 +131,7 @@ struct SetupHost<'a> {
     /// `--uninstall`, told whether to remove the database too.
     uninstall: Uninstaller<'a>,
     /// `--uninstall-all`, likewise.
-    uninstall_all: Uninstaller<'a>,
+    uninstall_all: UninstallAll<'a>,
     /// `--upgrade`, which takes the locks itself.
     upgrade: UpgradeMode<'a>,
     /// The interactive wizard, given the config to pre-fill.
@@ -209,7 +214,7 @@ fn dispatch(
         Action::UninstallAll => {
             let remove_db = remove_db_decision(args.force, host.ask_remove_db)?;
             installer::under_setup_locks(&host.site, "btrdasd setup --uninstall-all", |held| {
-                (host.uninstall_all)(remove_db, false, held).map(Ok)
+                (host.uninstall_all)(remove_db, held).map(Ok)
             })?
         }
         Action::ForceInstall => {
@@ -663,6 +668,9 @@ mod tests {
     fn never_uninstall(_: bool, _: bool, _: &installer::SetupLocks) -> Result<(), BoxError> {
         panic!("nothing may be removed")
     }
+    fn never_uninstall_all(_: bool, _: &installer::SetupLocks) -> Result<(), BoxError> {
+        panic!("nothing may be removed")
+    }
     fn never_upgrade(
         _: &installer::SetupLockSite,
         _: &Path,
@@ -692,7 +700,7 @@ mod tests {
             check: &never_check,
             install: &never_install,
             uninstall: &never_uninstall,
-            uninstall_all: &never_uninstall,
+            uninstall_all: &never_uninstall_all,
             upgrade: &never_upgrade,
             wizard: &never_wizard,
             ask_remove_db: &never_ask,

@@ -2297,7 +2297,6 @@ fn under_root(root: &Path, absolute: &str) -> PathBuf {
 /// mounting when it is stopped.
 pub fn uninstall_all(
     remove_db: bool,
-    _keep_config: bool,
     _held: &SetupLocks,
 ) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_all_with(
@@ -7075,7 +7074,7 @@ auth = "starttls""#,
                 )
             };
         let uninstall_all =
-            |remove_db: bool, _: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
+            |remove_db: bool, _: &SetupLocks| -> Result<(), Box<dyn std::error::Error>> {
                 step(&format!("uninstall-all remove_db={remove_db}"));
                 uninstall_all_with(base, &config_path, &manifest_path, remove_db, &|a| {
                     systemctl.run(a)
