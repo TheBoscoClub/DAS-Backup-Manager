@@ -224,7 +224,7 @@ with `--read-only` (`Job::VerifyMount`, bd su1b.23), which also adds `ro` to
 `[das].mount_opts`, so the guard writes no record or witness and the look
 writes nothing (bd su1b.30). Single-device targets are
 mounted as before. Every
-caller names its job (`raid_guard::Job::<job>.intent()`, never inferred):
+caller names its job (`raid_guard::Job::<job>`, its intent and whether it may stop readers both from that table, never inferred):
 `ReadOnly` only for a job that persists nothing derived from the target's
 contents (restore file, restore snapshot, browse, the doctor's report,
 `backup-verify.sh`'s read-only look);
@@ -959,7 +959,7 @@ This requires a passphrase on every database open (the indexer and `btrdasd-help
 | `fsutil` | `src/fsutil.rs` | ~1260 | Atomic file replacement and the `CommandRunner` seam for host commands |
 | `forget` | `src/forget.rs` | ~460 | Snapshot selection and deletion for `forget` / `purge`, with a live-series guard |
 | `health` | `src/health.rs` | ~2250 | Drive health (SMART), mountpoint checks, serial→device resolution, scrub health, recovery OS lines |
-| `holders` | `src/holders.rs` | ~1250 | Who holds a target's filesystem (bd su1b.12): its mounts by member device from mountinfo, each mount's origin (udisks, a `.mount` unit, a hand mount), every process using one (fds by `mnt_id` with their open modes, mappings, cwd, root), and the operator's stop policy: writers never signalled (refused), readers SIGTERM then SIGKILL, start time re-read before each signal, a pidfd-based signaller that refuses in test builds |
+| `holders` | `src/holders.rs` | ~1250 | Who holds a target's filesystem (bd su1b.12): its mounts by member device from mountinfo, each mount's origin (udisks, a `.mount` unit, a hand mount), every process using one (fds by `mnt_id` with their open modes, mappings, cwd, root), and the operator's stop policy: writers never signalled (refused), readers SIGTERM then SIGKILL only for a job that writes under the target (`Job::stops_readers`; any other job refuses, naming them), start time re-read before each signal, a pidfd-based signaller that refuses in test builds |
 | `indexer` | `src/indexer.rs` | ~610 | Snapshot discovery, span logic, walk orchestration |
 | `maintenance` | `src/maintenance.rs` | ~1500 | The DAS maintenance lock: `MaintenanceHeld`, the proof every target mount requires; holder records; the wait of `walk`, `restore` and the GUI's index and restore jobs (`--no-wait`, cancel) |
 | `mount` | `src/mount.rs` | ~6000 | Source and target mounting by `mount_uuid` or serial, RAII `MountGuard`, unmount retry, `verify_write_targets()` (with the RAID-1 kernel-view check), the read-only mount of a mirror's own ESP by `esp_partuuid` (`read_recovery_esp`), and the host side of the RAID-1 guard (`SystemMembers`, `mount_guarded_target`) |

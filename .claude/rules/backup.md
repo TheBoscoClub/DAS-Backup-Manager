@@ -241,6 +241,9 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
   btrfs maintenance on it (`exclusive_operation` not `none`, a running scrub, a `btrfs`/`btrbk` process) → a
   writer: refused. A cwd/root/exe counts by its mount id (statx), never its path. A dry run (`--report-only`,
   `ensure_targets_mounted_dry_run`) → says "would stop"/"would unmount", touches nothing; such a target is not mounted.
+  Only a job that writes under the target stops readers (operator 2026-11-25; `raid_guard::Job::stops_readers`:
+  backup, send, boot-archive, forget/purge, scrub, `backup-run.sh`); every other job (doctor, walk, index, reindex,
+  reconcile, restore, browse, recovery-OS record, raid accept) → signals nothing, any holder refuses it, named.
 
 **Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
 deadlock-free; release order is irrelevant.

@@ -181,6 +181,29 @@ impl Job {
             | Job::RaidAccept => Intent::Write,
         }
     }
+
+    /// Whether this job may stop a process that only reads the target
+    /// (the stop policy, `holders::clear_holders`): only a job that writes
+    /// under the target — a backup, its send, boot-archive, forget/purge,
+    /// the scrub (operator 2026-11-25, bd su1b.12). Every other job reads
+    /// the target and refuses it while anything holds it, naming the
+    /// holders: killing a forgotten shell is not worth a verify or a walk.
+    pub const fn stops_readers(self) -> bool {
+        match self {
+            Job::Backup | Job::BootArchive | Job::Forget | Job::Scrub | Job::MountTarget => true,
+            Job::VerifyMount
+            | Job::Walk
+            | Job::IndexWalk
+            | Job::Reindex
+            | Job::Reconcile
+            | Job::RecoveryOsRecord
+            | Job::RestoreFiles
+            | Job::RestoreSnapshot
+            | Job::Browse
+            | Job::Doctor
+            | Job::RaidAccept => false,
+        }
+    }
 }
 /// The first line of every record copy.
 const FORMAT_LINE: &str = "format=das-backup-raid-record 1";
@@ -4332,6 +4355,24 @@ mod tests {
         assert!(!host.calls().iter().any(|c| c == "write witness"));
     }
 
+    /// Only a job that writes under the target may stop a reader of it
+    /// (operator 2026-11-25, bd su1b.12); every job that reads it, even one
+    /// that writes the index from it, may not.
+    #[test]
+    fn only_jobs_that_write_under_the_target_stop_its_readers() {
+        let stopping: Vec<Job> = Job::ALL.into_iter().filter(|j| j.stops_readers()).collect();
+        assert_eq!(
+            stopping,
+            [
+                Job::Backup,
+                Job::BootArchive,
+                Job::Forget,
+                Job::Scrub,
+                Job::MountTarget
+            ]
+        );
+    }
+
     /// Only jobs that persist nothing derived from the target's contents may
     /// read a split-brain member: every job that writes the index, a record
     /// or a state file from what it reads is refused it.
@@ -4365,10 +4406,11 @@ mod tests {
         }
     }
 
-    /// Every caller names its job: each `ensure_targets_mounted(` and
-    /// `mount_guarded_target(` call in the sources passes
-    /// `Job::<job>.intent()`, never a bare `Intent`, so the table above is the
-    /// whole classification.
+    /// Every caller names its job: each `ensure_targets_mounted(` call in
+    /// the sources passes `Job::<job>` (its intent and whether it may stop
+    /// readers both come from the table above), each `mount_guarded_target(`
+    /// call `Job::<job>.intent()`, never a bare `Intent`, so the table above
+    /// is the whole classification.
     #[test]
     fn every_target_mount_names_its_job() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -4396,8 +4438,13 @@ mod tests {
                     }
                     let end = text[at..].find(';').map_or(text.len(), |e| at + e);
                     let args = &text[at..end];
+                    let named = if name == "mount_guarded_target(" {
+                        args.contains("Job::") && args.contains(".intent()")
+                    } else {
+                        args.contains("Job::") && !args.contains(".intent()")
+                    };
                     assert!(
-                        args.contains("Job::") && args.contains(".intent()"),
+                        named,
                         "{}: a target mount that does not name its job: {args}",
                         p.display()
                     );

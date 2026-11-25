@@ -257,6 +257,10 @@ struct ClearSite<'a> {
     /// A dry run: holders and mounts are said ("would stop", "would
     /// unmount"), nothing is signalled or unmounted (bd su1b.12 review).
     report_only: bool,
+    /// The job may stop readers: only one that writes under the target
+    /// (operator 2026-11-25, [`raid_guard::Job::stops_readers`]). `false` →
+    /// any holder refuses the target, named.
+    stop_readers: bool,
     /// `/sys/fs/btrfs`: `<fsid>` is there exactly while the filesystem is
     /// mounted in some mount namespace (proven on a VM, kernel 7.3: absent
     /// when only registered by a scan or after its last unmount; present
@@ -270,9 +274,10 @@ fn read_self_mountinfo() -> Result<String, String> {
         .map_err(|e| format!("/proc/self/mountinfo: {e}"))
 }
 
-fn host_clear_site(report_only: bool) -> ClearSite<'static> {
+fn host_clear_site(report_only: bool, stop_readers: bool) -> ClearSite<'static> {
     ClearSite {
         report_only,
+        stop_readers,
         mountinfo: &read_self_mountinfo,
         proc: crate::holders::ProcSite::host(),
         signaller: &crate::holders::SystemSignaller,
@@ -996,7 +1001,7 @@ pub fn clear_target(
     clear_target_with(
         &SystemRunner,
         &HOST_PROBES,
-        &host_clear_site(report_only),
+        &host_clear_site(report_only, true),
         target,
         leftover,
         progress,
@@ -1088,7 +1093,7 @@ pub fn take_down_leftover(
         &SystemRunner,
         mount_point,
         progress,
-        Some((&host_clear_site(false), mount_point, None)),
+        Some((&host_clear_site(false, true), mount_point, None)),
     )
     .map(drop)
 }
@@ -1190,6 +1195,7 @@ fn clear_logged(
         signaller: site.signaller,
         sleep: &sleep,
         report_only: site.report_only,
+        stop_readers: site.stop_readers,
     };
     let say = |lines: &[String]| {
         for l in lines {
@@ -1729,11 +1735,11 @@ fn remove_created_mount_point(owner: &str, mount_point: &str, progress: &dyn Pro
 /// (bd DAS-Backup-Manager-frb). Release the guard before the lock.
 pub fn ensure_targets_mounted(
     config: &Config,
-    intent: raid_guard::Intent,
+    job: raid_guard::Job,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_on(config, intent, progress, held, false)
+    ensure_targets_mounted_on(config, job, progress, held, false)
 }
 
 /// [`ensure_targets_mounted`] for a dry run (bd DAS-Backup-Manager-su1b.12
@@ -1742,23 +1748,23 @@ pub fn ensure_targets_mounted(
 /// program's unmounted; such a target is NOT available for the dry run.
 pub fn ensure_targets_mounted_dry_run(
     config: &Config,
-    intent: raid_guard::Intent,
+    job: raid_guard::Job,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
 ) -> Result<MountGuard, MountError> {
-    ensure_targets_mounted_on(config, intent, progress, held, true)
+    ensure_targets_mounted_on(config, job, progress, held, true)
 }
 
 fn ensure_targets_mounted_on(
     config: &Config,
-    intent: raid_guard::Intent,
+    job: raid_guard::Job,
     progress: &dyn ProgressCallback,
     held: &MaintenanceHeld,
     report_only: bool,
 ) -> Result<MountGuard, MountError> {
     ensure_targets_mounted_with(
         config,
-        intent,
+        job.intent(),
         progress,
         held,
         &HOST_PROBES,
@@ -1766,7 +1772,7 @@ fn ensure_targets_mounted_on(
         RaidSite {
             record_dir: &raid_guard::record_dir(),
             missing: std::rc::Rc::new(raid_guard::missing_devids),
-            clear: &host_clear_site(report_only),
+            clear: &host_clear_site(report_only, job.stops_readers()),
         },
     )
 }
@@ -3317,6 +3323,9 @@ mod tests {
         exclusive: Vec<(String, String)>,
         /// Clear as a dry run does.
         report_only: bool,
+        /// Clear for a job that writes nothing under the target: it may
+        /// not stop readers (operator 2026-11-25).
+        read_only_job: bool,
     }
 
     /// The described host's signals: recorded, and the process ends unless
@@ -3370,6 +3379,7 @@ mod tests {
                 signaller: &signals,
                 self_pid: 900,
                 report_only: self.report_only,
+                stop_readers: !self.read_only_job,
                 sysfs_btrfs: sysfs.path().to_path_buf(),
             })
         }
@@ -4266,6 +4276,96 @@ mod tests {
             "{:?}",
             progress.logs()
         );
+    }
+
+    /// A job that writes nothing under the target (verify, walk, restore,
+    /// browse, doctor) never stops the other program's reader: the target is
+    /// refused, the reader named, nothing signalled or unmounted (operator
+    /// 2026-11-25, bd su1b.12).
+    #[test]
+    fn a_read_only_job_refuses_another_programs_mount_with_a_reader_and_stops_nothing() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        host.read_only_job = true;
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        let calls = runner.calls();
+        assert!(
+            !calls.iter().any(|c| c.argv[0] == "umount"
+                || (c.argv[0] == "mount" && c.argv.iter().any(|a| a == &mnt))),
+            "{calls:?}"
+        );
+        assert!(
+            logged(&progress, "never stops a process") && logged(&progress, "pid 300"),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
+    /// The same for a busy leftover at the target's own path: a read-only
+    /// job tries the plain unmounts, then refuses naming the holder, never a
+    /// signal and never `umount -f`.
+    #[test]
+    fn a_read_only_job_never_stops_a_busy_leftovers_reader() {
+        let scratch = Scratch::new();
+        let (mut config, mut host, _part, mnt) = attached_primary(&scratch);
+        config.targets[0].mount_uuid = Some("u-p".into());
+        scratch.mkdir("mnt/p");
+        host.mountpoints = vec![PathBuf::from(&mnt)];
+        scratch.mkdir("mnt/p/sub");
+        let real_id = crate::holders::testproc::FakeProc::real_mount_id(Path::new(&mnt));
+        host.mountinfo = vec![format!(
+            "{real_id} 22 0:52 / {mnt} rw - btrfs /dev/sdb1 rw,subvolid=5"
+        )];
+        let proc = crate::holders::testproc::FakeProc::new();
+        proc.add(crate::holders::testproc::Proc {
+            pid: 310,
+            cmd: "bash",
+            cwd: Box::leak(format!("{mnt}/sub").into_boxed_str()),
+            ..Default::default()
+        });
+        host.proc = Some(Arc::new(proc));
+        host.read_only_job = true;
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "UUID",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "u-p\n",
+                    stderr: "",
+                },
+            ),
+            ("umount", Reply::exit(32)),
+        ]);
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        let err = format!("{:?}", result.as_ref().map(|g| g.count()));
+        assert!(
+            matches!(&result, Err(MountError::LeftoverMounted { detail, .. })
+                if detail.contains("never stops a process") && detail.contains("pid 310 (bash)")),
+            "{err}"
+        );
+        assert!(host.signals().is_empty(), "{:?}", host.signals());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv.iter().any(|a| a == "-f")),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(logged(&progress, "pid 310"), "{:?}", progress.logs());
     }
 
     /// What the clearing stopped is kept for the job's report, naming each
@@ -7686,7 +7786,7 @@ mod tests {
         let progress = NullProgress;
         let result = ensure_targets_mounted(
             &config,
-            raid_guard::Job::Backup.intent(),
+            raid_guard::Job::Backup,
             &progress,
             &MaintenanceHeld::assumed(),
         );
@@ -8379,6 +8479,7 @@ mod tests {
             signaller: &signals,
             self_pid: 1,
             report_only: false,
+            stop_readers: true,
             sysfs_btrfs: sysfs.to_path_buf(),
         };
         let got = maintenance_on(runner.as_ref(), &site, fsid, "/mnt/t");

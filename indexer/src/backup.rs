@@ -4504,14 +4504,9 @@ impl BackupJobHost for SystemBackupHost {
         } else {
             mount::ensure_targets_mounted
         };
-        mount(
-            config,
-            crate::raid_guard::Job::Backup.intent(),
-            progress,
-            held,
-        )
-        .map(|guard| Box::new(guard) as Box<dyn Release>)
-        .map_err(|e| e.to_string())
+        mount(config, crate::raid_guard::Job::Backup, progress, held)
+            .map(|guard| Box::new(guard) as Box<dyn Release>)
+            .map_err(|e| e.to_string())
     }
 
     fn run(
@@ -4890,7 +4885,7 @@ impl RecordHost for SystemRecordHost {
     ) -> Result<Box<dyn Release>, String> {
         mount::ensure_targets_mounted(
             &mounted_read_only(drives),
-            crate::raid_guard::Job::RecoveryOsRecord.intent(),
+            crate::raid_guard::Job::RecoveryOsRecord,
             progress,
             held,
         )

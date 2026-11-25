@@ -95,7 +95,7 @@ struct Cli {
 /// nothing.
 type DeletionMounter = fn(
     &Config,
-    buttered_dasd::raid_guard::Intent,
+    buttered_dasd::raid_guard::Job,
     &dyn buttered_dasd::progress::ProgressCallback,
     &buttered_dasd::maintenance::MaintenanceHeld,
 ) -> Result<mount::MountGuard, mount::MountError>;
@@ -144,7 +144,7 @@ where
     let progress = CliProgress;
     let mut guard = deletion_mounter(dry_run)(
         &cfg,
-        buttered_dasd::raid_guard::Job::Forget.intent(),
+        buttered_dasd::raid_guard::Job::Forget,
         &progress,
         locks.maintenance(),
     )?;
@@ -2681,12 +2681,8 @@ fn cmd_walk(
     let Some(held) = hold_for_cli("btrdasd walk", run)? else {
         return Ok(Ran::Deferred);
     };
-    let mut guard = mount::ensure_targets_mounted(
-        &cfg,
-        buttered_dasd::raid_guard::Job::Walk.intent(),
-        progress,
-        &held,
-    )?;
+    let mut guard =
+        mount::ensure_targets_mounted(&cfg, buttered_dasd::raid_guard::Job::Walk, progress, &held)?;
     let database = Database::open(db)?;
     // A mount point is not an identity: the root must be the configured
     // filesystem's top level before anything is read from or pruned under it.
@@ -2805,7 +2801,7 @@ fn cmd_restore_file(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Job::RestoreFiles.intent(),
+        buttered_dasd::raid_guard::Job::RestoreFiles,
         progress,
         &held,
     )?;
@@ -2843,7 +2839,7 @@ fn cmd_restore_snapshot(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Job::RestoreSnapshot.intent(),
+        buttered_dasd::raid_guard::Job::RestoreSnapshot,
         progress,
         &held,
     )?;
@@ -2879,7 +2875,7 @@ fn cmd_restore_browse(
     };
     let mut guard = mount::ensure_targets_mounted(
         &cfg,
-        buttered_dasd::raid_guard::Job::Browse.intent(),
+        buttered_dasd::raid_guard::Job::Browse,
         progress,
         &held,
     )?;
@@ -3021,7 +3017,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(
                 &cfg,
-                buttered_dasd::raid_guard::Job::Reindex.intent(),
+                buttered_dasd::raid_guard::Job::Reindex,
                 &progress,
                 locks.maintenance(),
             )?;
@@ -3129,7 +3125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let progress = CliProgress;
             let mut guard = mount::ensure_targets_mounted(
                 &cfg,
-                buttered_dasd::raid_guard::Job::Reconcile.intent(),
+                buttered_dasd::raid_guard::Job::Reconcile,
                 &progress,
                 locks.maintenance(),
             )?;
@@ -3529,7 +3525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // classifies it, not 1 ("could not start").
                 let mut guard = match mount::ensure_targets_mounted(
                     &cfg,
-                    buttered_dasd::raid_guard::Job::BootArchive.intent(),
+                    buttered_dasd::raid_guard::Job::BootArchive,
                     &progress,
                     locks.maintenance(),
                 ) {

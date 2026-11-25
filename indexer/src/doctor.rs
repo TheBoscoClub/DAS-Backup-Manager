@@ -946,19 +946,16 @@ fn perform_delivery_check(
         "Checking that every target holds a recent snapshot of each pair",
         1,
     );
-    let mut guard = match mount::ensure_targets_mounted(
-        config,
-        crate::raid_guard::Job::Doctor.intent(),
-        progress,
-        held,
-    ) {
-        Ok(guard) => guard,
-        Err(e) => {
-            (report.targets_failed, report.targets_absent) =
-                unmounted_targets(config, &e.to_string(), &mount::target_attached);
-            return;
-        }
-    };
+    let mut guard =
+        match mount::ensure_targets_mounted(config, crate::raid_guard::Job::Doctor, progress, held)
+        {
+            Ok(guard) => guard,
+            Err(e) => {
+                (report.targets_failed, report.targets_absent) =
+                    unmounted_targets(config, &e.to_string(), &mount::target_attached);
+                return;
+            }
+        };
     let check = delivery_check(
         config,
         local_today(),

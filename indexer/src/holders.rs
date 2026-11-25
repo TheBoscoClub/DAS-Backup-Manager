@@ -16,6 +16,9 @@
 //!   holders named;
 //! - PID 1, this process, its ancestors and kernel threads are never
 //!   signalled: one of them holding it refuses;
+//! - a job that writes nothing under the target (verify, walk, index,
+//!   restore, browse, doctor: `raid_guard::Job::stops_readers`) never
+//!   signals anything: any holder refuses it, named (operator 2026-11-25);
 //! - otherwise every holder gets SIGTERM, [`TERM_GRACE`] to go, then SIGKILL
 //!   and [`KILL_WAIT`]; each signal is named in the returned lines;
 //! - before each signal the pid's start time is read again, and a pid whose
@@ -738,6 +741,10 @@ pub struct ClearEnv<'a> {
     /// A dry run (bd su1b.12 review): every holder classified and said
     /// ("would stop: …"), the same refusals, and no signal at all.
     pub report_only: bool,
+    /// Whether this job may stop readers at all (operator 2026-11-25): only
+    /// a job that writes under the target does. `false` → any holder
+    /// refuses, named, and nothing is signalled.
+    pub stop_readers: bool,
 }
 
 /// A holder no signal may reach: why, or `None`.
@@ -810,6 +817,30 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
     };
     if let Some(why) = check(&holders) {
         return Err(refuse(done.lines, why));
+    }
+    if !env.stop_readers {
+        let named: Vec<String> = holders
+            .iter()
+            .map(|h| {
+                format!(
+                    "pid {} ({})",
+                    h.pid,
+                    if h.cmdline.is_empty() {
+                        "?"
+                    } else {
+                        &h.cmdline
+                    }
+                )
+            })
+            .collect();
+        return Err(refuse(
+            done.lines,
+            format!(
+                "it is in use by {} — this job writes nothing to the target and never stops \
+                 a process; close it, then run again",
+                named.join(", ")
+            ),
+        ));
     }
     if env.report_only {
         done.would_stop = holders.iter().map(|h| format!("would stop: {h}")).collect();
@@ -1279,6 +1310,38 @@ mod tests {
             signaller: s,
             sleep: sleeps,
             report_only: false,
+            stop_readers: true,
+        }
+    }
+
+    /// A job that writes nothing under the target (verify, walk, restore,
+    /// browse, doctor) never stops a reader: the reader refuses it, named
+    /// (operator 2026-11-25), in a dry run too.
+    #[test]
+    fn a_job_that_may_not_stop_readers_refuses_naming_them_and_signals_nothing() {
+        let p = FakeProc::new();
+        reader(&p, 300);
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![(300, Sig::Term)],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        for report_only in [false, true] {
+            let mut e = env(&site, &f, &|_| {});
+            e.stop_readers = false;
+            e.report_only = report_only;
+            let r = clear_holders(&e, &das_mount()).unwrap_err();
+            assert!(
+                f.sent.borrow().is_empty(),
+                "nothing signalled: {:?}",
+                f.sent
+            );
+            assert!(
+                r.why.contains("pid 300") && r.why.contains("never stops"),
+                "{}",
+                r.why
+            );
         }
     }
 
