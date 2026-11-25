@@ -660,7 +660,7 @@ GUARD_OPTIONAL_NOTE="" # ...and what its guard did not show, said once
 HISTORY_MODE=""       # provision or undo; else the session's RUN_MODE
 P_ALSO=()             # provision: the @.archive.* names also set aside
 INSTALL_USER=""       # provision: the new OS's account, [recovery_os].install_user (load_targets)
-INSTALL_TIMEZONE=""   # provision: the new OS's time zone, [recovery_os].timezone; empty = the installer's UTC (load_targets)
+INSTALL_TIMEZONE=""   # provision: the new OS's time zone, [recovery_os].timezone; dump-env always gives it: the configured zone, else the host's own, else UTC (load_targets)
 REPO_LEVEL=""         # unattended repo-level step: [recovery_os].repo_level (load_targets)
 P_DOCS=()             # provision: the installation's own documents, $LOCAL_DOCS_DIR/*.md
 LOCAL_DOCS_DIR=""     # provision: where they are, [recovery_os].local_docs_dir as dump-env resolved it (load_targets)
@@ -1113,7 +1113,7 @@ load_targets() {
         { [[ ! "$INSTALL_USER" =~ ^[abcdefghijklmnopqrstuvwxyz_][abcdefghijklmnopqrstuvwxyz0123456789_-]{0,31}$ ]] || [[ "$INSTALL_USER" == root ]]; }; then
         refuse "[recovery_os].install_user in $DAS_CONFIG is not a user name (a lower-case letter or _, then up to 31 of a-z 0-9 _ -; not root)"
     fi
-    # The new OS's time zone: config.toml only, no built-in zone; unset means
+    # The new OS's time zone: dump-env resolves it (config.toml, else the host's own, else UTC); no built-in zone. Absent only from an older btrdasd; then
     # the installer's UTC. Checked here by shape as Config::validate checks it
     # (one unquoted word in the step script); the installer checks the zone
     # file in the new OS (bd cnjc).
@@ -6823,7 +6823,7 @@ prov_env_lines() {
         # A user name (load_targets checked it), so one unquoted word.
         printf 'export DAS_INSTALL_USER=%s\n' "$INSTALL_USER"
         # A zone name (load_targets checked its shape), so one unquoted word;
-        # left out when unset, so the installer's own UTC applies.
+        # left out only when dump-env gave none, so the installer's own UTC applies.
         [[ -z "$INSTALL_TIMEZONE" ]] || printf 'export DAS_INSTALL_TIMEZONE=%s\n' "$INSTALL_TIMEZONE"
         if ((${#P_DOCS[@]} > 0)); then
             printf 'export DAS_INSTALL_LOCAL_DOCS=%s/docs\n' "$PAYLOAD_MNT"

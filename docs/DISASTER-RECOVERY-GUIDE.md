@@ -1662,7 +1662,7 @@ The usage lines, verbatim from `recovery-os-vm.sh`:
 - **Both inputs are pinned by sha256**: the ISO must match `DAS_RECOVERY_VM_ISO_SHA256`, and the package file must match `--package-sha256`.
 - **A non-empty `--authorized-keys` file**: the drive's `sshd` is on, key-only.
 - **`[recovery_os].install_user` in `config.toml`**: the account the new OS gets (sudo, autologin, the only `sshd` user). There is no default; unset, `provision` refuses before it touches a drive.
-- **`[recovery_os].timezone` in `config.toml`** (optional): the new OS's time zone, an IANA name such as `Europe/Berlin`. Unset, the new OS is on UTC (journal and report times then read UTC, not your local time); a name that is not a zone file in the new OS refuses `configure` before it writes anything.
+- **`[recovery_os].timezone` in `config.toml`** (optional): the new OS's time zone, an IANA name such as `Europe/Berlin`. Unset, the new OS gets this host's own zone (where `/etc/localtime` points), else UTC; a name that is not a zone file in the new OS refuses `configure` before it writes anything.
 - **`libisoburn` on the host** (`xorriso`): the installer and the package travel to the VM on a payload cdrom the driver builds.
 - **The drive was seeded**: partition 2 holds at least one received backup. An empty disk is one to seed first, not one to rebuild, and the installer refuses it. A partition 2 whose filesystem UUID is not the target's `mount_uuid` is refused before the first rename.
 - Backup, scrub and doctor units inactive; the maintenance lock and the drive's claim are taken as for a session.
