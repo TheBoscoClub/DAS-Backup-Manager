@@ -5133,6 +5133,11 @@ mod tests {
         }
     }
 
+    /// How long a test waits for a thread it spawned to reach a lock: long,
+    /// because CI's runner also runs the mutation shards; 5 s timed out there
+    /// once with the code unchanged (CI run on b0ee3395, 2026-11-25).
+    const THREAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn wait_for(limit: std::time::Duration, what: &str, f: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + limit;
         while !f() {
@@ -5169,7 +5174,7 @@ mod tests {
                 BackupLockAttempt::AlreadyRunning => panic!("nothing else runs"),
             }
         });
-        wait_for(std::time::Duration::from_secs(5), "the claim", || {
+        wait_for(THREAD_WAIT, "the claim", || {
             crate::maintenance::claim_is_held(&site.path).unwrap()
         });
         assert_eq!(
@@ -5222,7 +5227,7 @@ mod tests {
         let backup = std::thread::spawn(move || {
             acquire_claiming_locks_at(&s2, &m2, &c2, "btrdasd-helper BackupRun job", &*p2).is_err()
         });
-        wait_for(std::time::Duration::from_secs(5), "the claim", || {
+        wait_for(THREAD_WAIT, "the claim", || {
             crate::maintenance::claim_is_held(&site.path).unwrap()
         });
         progress.cancel.as_ref().unwrap().cancel();
@@ -5331,7 +5336,7 @@ mod tests {
                 BackupLockAttempt::Acquired(_)
             )
         });
-        wait_for(std::time::Duration::from_secs(5), "the waiter", || {
+        wait_for(THREAD_WAIT, "the waiter", || {
             scrub::FileLock::try_acquire(&singleton).unwrap().is_none()
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
