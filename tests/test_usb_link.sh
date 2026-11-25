@@ -31,6 +31,19 @@ body="$(sed -n '/^log_throughput() {/,/^}/p' "$SCRIPT")"
 grep -qF '/sys/bus/usb/devices/*/' <<<"$body" || { echo "FAIL: log_throughput no longer reads /sys/bus/usb/devices"; exit 1; }
 eval "${body//\/sys\/bus\/usb\/devices\//$WORK\/usb\/}"
 
+# run_sent_nothing is the real one, from the script: log_throughput calls it,
+# and a missing one was "command not found" noise on stderr. A run whose btrbk
+# log was never read is "not measured", so the throughput line is made as before.
+sbody="$(sed -n '/^run_sent_nothing() {/,/^}/p' "$SCRIPT")"
+[[ -n "$sbody" ]] || { echo "FAIL: run_sent_nothing not found in backup-run.sh"; exit 1; }
+eval "$sbody"
+BTRBK_RUN_LOG_OK=false BTRBK_RUN_SENT=""
+# A call to a function that does not exist fails the suite, not only the stderr.
+command_not_found_handle() {
+    echo "$1" >>"$WORK/not-found"
+    echo "bash: $1: command not found" >&2
+    return 127
+}
 log_info() { echo "INFO: $*" >>"$WORK/log"; }
 log_warn() { echo "WARN: $*" >>"$WORK/log"; }
 record_op() { echo "$*" >>"$WORK/ops"; }
@@ -130,6 +143,7 @@ rm -r "${WORK:?}/usb/4-1"
 # shellcheck disable=SC2016 # matched as written
 has "the report has a USB link row" "$(cat "$SCRIPT")" 'USB link              ${OP_STATUS[usb_link]:-N/A}'
 
+check "no command the suite ran was missing" "$(cat "$WORK/not-found" 2>/dev/null || true)" ""
 echo
 if ((FAILS > 0)); then printf '%d check(s) FAILED\n' "$FAILS"; exit 1; fi
 echo "USB-LINK SUITE GREEN"

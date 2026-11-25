@@ -504,7 +504,16 @@ if(BUILD_TESTING)
         if(NOT shell_suites)
             message(FATAL_ERROR "REQUIRE_ALL_SHELL_CASES is on and no shell suite was found to apply it to")
         endif()
-        set_tests_properties(${shell_suites} PROPERTIES FAIL_REGULAR_EXPRESSION "NOT RUN")
+        # Every NOT RUN fails when the indexer is built (ctest then gives the
+        # replays and the mail suite their btrdasd). Without it those suites
+        # cannot run their real-binary cases by design, so only the locale
+        # cases CI generates the locale for are required (bd DAS-Backup-Manager-xq80).
+        if(BUILD_INDEXER)
+            set(not_run_regex "NOT RUN")
+        else()
+            set(not_run_regex "NOT RUN: the en_US")
+        endif()
+        set_tests_properties(${shell_suites} PROPERTIES FAIL_REGULAR_EXPRESSION "${not_run_regex}")
     endif()
 endif()
 

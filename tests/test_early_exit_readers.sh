@@ -1,7 +1,6 @@
 #!/bin/bash
-# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329
+# shellcheck disable=SC2016,SC2034,SC2329
 # SC2016: the lines extract() looks for are literal text, single-quoted so.
-# SC2030, SC2031: every LC_ALL set here is meant to stay in its subshell.
 # SC2034, SC2329: the globals and stub functions each case defines are read
 #   and called by the function it sourced, which shellcheck cannot see.
 # A reader that quits early after a pipe, under `set -o pipefail`
@@ -305,6 +304,7 @@ run_boot_subvols() { # run_boot_subvols <listing file> [tmp-full]: "<result>|<de
         # A locale of the caller's choosing (BOOT_LOCALE), as a unit inherits
         # the host's: under en_US.UTF-8 bash's regex [0-9] matches more.
         if [[ -n "${BOOT_LOCALE:-}" ]]; then
+            # shellcheck disable=SC2030
             export LC_ALL="$BOOT_LOCALE"
         fi
         if [[ -n "${BOOT_NO_MOUNTPOINT:-}" ]]; then
@@ -1368,6 +1368,7 @@ NONASCII_FULLWIDTH='ID 302 gen 9 top level 5 path nvme/root-.２０２６１０�
 # non-ASCII digit there, or these checks could not fail.
 not_run=""
 probe_digit='٢'
+# shellcheck disable=SC2030,SC2031
 if (export LC_ALL=en_US.UTF-8; [[ $probe_digit =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for name in NONASCII_ARABIC NONASCII_FULLWIDTH; do
         printf '%s\n' "${!name}" >"$WORK/$name.txt"
@@ -1400,6 +1401,7 @@ run_sector_attr() { # run_sector_attr <value> [locale]: "<status>|<what it print
         source "$WORK/report_sector_attr.sh"
         RED='<red>' GREEN='<green>' YELLOW='<yellow>' NC='<end>'
         if [[ -n "${2:-}" ]]; then
+            # shellcheck disable=SC2030,SC2031
             export LC_ALL="$2"
         fi
         rc=0
@@ -1418,6 +1420,7 @@ check "sector attribute 12x: unparsable, nonzero" "$(run_sector_attr 12x)" \
 
 ARABIC_THREE=$'\xd9\xa3'
 SUPERSCRIPT_TWO=$'\xc2\xb2'
+# shellcheck disable=SC2031
 if (export LC_ALL=en_US.UTF-8; [[ $ARABIC_THREE =~ [0-9] ]]) 2>/dev/null; then # locale-range-ok: the probe
     for digit in "$ARABIC_THREE" "$SUPERSCRIPT_TWO" "1$ARABIC_THREE"; do
         check "en_US.UTF-8, sector attribute '$digit': unparsable, not a count" \
@@ -1461,31 +1464,67 @@ range_lint() { # range_lint <files>: file:line: text, for each offender
     local f
     for f in "$@"; do
         LC_ALL=C awk '
-            function ranged(s) { return s ~ /\[[^]]*[0-9A-Za-z]-[0-9A-Za-z][^]]*\]/ }
-            FNR == NR {
-                if ($0 ~ /^[ \t]*#/) next
-                s = $0
-                while (match(s, /=~[ \t]*\$\{?[A-Za-z_][A-Za-z0-9_]*/)) { # locale-range-ok: awk, not a bash match
-                    name = substr(s, RSTART, RLENGTH)
-                    sub(/^=~[ \t]*\$\{?/, "", name)
-                    used[name] = 1
-                    s = substr(s, RSTART + RLENGTH)
+            # A range is X-Y inside one bracket expression: the ends may be
+            # punctuation or a space ([ -~]), not only a letter or digit.
+            function ranged(s) { return s ~ /\[[^]]*[^][-]-[^]][^]]*\]/ }
+            # The text of a logical line from column `from` of line i (`join`: a value, not a match): a value
+            # that ends in a backslash, or opens a quote it does not close, goes on to the
+            # next line (at most eight more), so a pattern assigned across two
+            # lines is read whole.
+            function logical(i, from, join,    cur, j, t, q1, q2) {
+                cur = substr(L[i], from)
+                j = i
+                while (join && j < n && j - i < 8) {
+                    t = cur
+                    if (t ~ /\\$/) {
+                        sub(/\\$/, "", cur)
+                    } else {
+                        # Only a value that OPENS with a quote and never closes it.
+                        q1 = (t ~ /^\047/) ? gsub(/\047/, "&", t) : 0
+                        q2 = (t ~ /^"/) ? gsub(/"/, "&", t) : 0
+                        if (q1 % 2 == 0 && q2 % 2 == 0) break
+                    }
+                    j++
+                    cur = cur " " L[j]
                 }
-                next
+                return cur
             }
+            { L[FNR] = $0; n = FNR }
             /^[ \t]*#/ { next }
-            /locale-range-ok/ { next }
             {
-                bad = 0
-                if (match($0, /=~|_RE=|[ \t]re=/) && ranged(substr($0, RSTART))) bad = 1
-                for (n in used) {
-                    if (!bad && match($0, "(^|[ \t;])" n "\\+?=")) {
-                        rest = substr($0, RSTART + RLENGTH)
-                        if (rest !~ /^\(/ && ranged(rest)) bad = 1
+                # Every unquoted $name a =~ reads as (part of) its pattern, so
+                # also text before it (^$p$) and each name of an alternation
+                # ($a|$b); a quoted one is matched literally and cannot widen.
+                s = $0
+                while (match(s, /=~/)) { # locale-range-ok: awk, not a bash match
+                    s = substr(s, RSTART + RLENGTH)
+                    t = s
+                    sub(/[ \t]&&.*|[ \t]\|\|.*|[ \t];.*|[ \t]\]\].*/, "", t)
+                    gsub(/"[^"]*"/, "", t)
+                    gsub(/\047[^\047]*\047/, "", t)
+                    while (match(t, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+                        name = substr(t, RSTART, RLENGTH)
+                        sub(/^\$\{?/, "", name)
+                        used[name] = 1
+                        t = substr(t, RSTART + RLENGTH)
                     }
                 }
-                if (bad) print FILENAME ":" FNR ": " $0
-            }' "$f" "$f"
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    if (L[i] ~ /^[ \t]*#/ || L[i] ~ /locale-range-ok/) continue
+                    bad = 0
+                    if (match(L[i], /=~/) && ranged(logical(i, RSTART, 0))) bad = 1
+                    if (!bad && match(L[i], /_RE=|[ \t]re=/) && ranged(logical(i, RSTART + RLENGTH, 1))) bad = 1
+                    for (nm in used) {
+                        if (!bad && match(L[i], "(^|[ \t;])" nm "\\+?=")) {
+                            rest = logical(i, RSTART + RLENGTH, 1)
+                            if (rest !~ /^\(/ && ranged(rest)) bad = 1
+                        }
+                    }
+                    if (bad) print FILENAME ":" i ": " L[i]
+                }
+            }' "$f"
     done
 }
 # The lint must be able to say no. A planted range in a regex match is found,
@@ -1522,6 +1561,23 @@ range_lint() { # range_lint <files>: file:line: text, for each offender
 } >"$WORK/lint-ok.sh"
 check "the range lint finds a planted digit range, letter range and hex range in a variable, and four more in variables a =~ reads" "$(range_lint "$WORK/lint-bad.sh" | wc -l)" "7"
 check "the range lint passes [[:digit:]], a subscript, a comment, a marked probe, an array literal, a glob and a literal match" "$(range_lint "$WORK/lint-ok.sh" | wc -l)" "0"
+# The shapes the lint once missed (bd DAS-Backup-Manager-k1nr), one fixture
+# each: found in the first four, passed in the last.
+lint_shape() { # lint_shape <lines...>: how many offenders the lint finds in them
+    printf '%s\n' "$@" >"$WORK/lint-shape.sh"
+    range_lint "$WORK/lint-shape.sh" | wc -l
+}
+check "the range lint finds a range in a variable with text before it in a =~" \
+    "$(lint_shape 'pre="^[0-9]+"' '[[ $p =~ ^$pre$ ]]')" "1" # locale-range-ok: lint fixture
+check "the range lint finds a range in the second variable of an alternation" \
+    "$(lint_shape 'first="abc"' 'second="[0-9]"' '[[ $r =~ $first|$second ]]')" "1" # locale-range-ok: lint fixture
+check "the range lint finds a range that starts on punctuation" \
+    "$(lint_shape '[[ $x =~ ^[ -~]+$ ]]')" "1" # locale-range-ok: lint fixture
+# shellcheck disable=SC1003
+check "the range lint finds a pattern assigned across two lines (value on the next line, and a quote left open)" \
+    "$(lint_shape 'split=\' "  '^[0-9]+\$'" '[[ $s =~ $split ]]' "open='^a" '[0-9]$' "'" '[[ $s =~ $open ]]')" "2" # locale-range-ok: lint fixture
+check "the range lint passes a clean variable inside a pattern, a trailing hyphen, a quoted use and a test after the pattern" \
+    "$(lint_shape 'safe="[[:digit:]]"' '[[ $v =~ ^$safe$ ]]' 'sep="[+-]"' '[[ $v =~ $sep && -f x ]]' 'lit="[a-z]"' '[[ $v =~ "$lit"$ ]]')" "0" # locale-range-ok: lint fixture
 shell_sources=("$ROOT"/scripts/*.sh "$ROOT"/.github/scripts/*.sh "$ROOT"/packaging/appimage/*.sh "$ROOT"/tests/*.sh)
 [[ -e "${shell_sources[0]}" && -e "${shell_sources[${#shell_sources[@]} - 1]}" ]] || harness_broken "a source glob matched nothing"
 left="$(range_lint "${shell_sources[@]}" | sed "s|^$ROOT/||")"

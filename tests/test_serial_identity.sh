@@ -156,6 +156,27 @@ check "smartctl could not open the drive: empty" "$(verify_read_drive_serial "$W
 smart sdv 4 "$ATA"
 check "a SMART finding in the exit status still reads it" "$(verify_read_drive_serial "$WORK/dev/sdv")" SER1
 
+# The three scripts each carry parse_drive_serial (installed scripts source
+# nothing); the rule is one rule only while the copies are one text (bd
+# DAS-Backup-Manager-2kb1.18).
+WIPE="$ROOT/scripts/das-wipe-all-drives-and-partition-from-scratch.sh"
+same_body() { # same_body <function> <file>...: yes, no, or missing
+    local fn="$1" f first="" cur
+    shift
+    for f in "$@"; do
+        cur="$(extract "$f" "$fn")"
+        [[ -n "$cur" ]] || { echo missing; return; }
+        [[ -n "$first" ]] || first="$cur"
+        [[ "$cur" == "$first" ]] || { echo no; return; }
+    done
+    echo yes
+}
+check "parse_drive_serial is the same text in backup-run.sh, backup-verify.sh and the partition script" \
+    "$(same_body parse_drive_serial "$RUN" "$VERIFY" "$WIPE")" yes
+sed 's/^        DRIVE_SERIAL_PROBLEM="no serial in smartctl.s output"$/        DRIVE_SERIAL_PROBLEM="no serial"/' "$WIPE" >"$WORK/wipe-changed.sh"
+check "the same-text check says no for a copy that differs" \
+    "$(same_body parse_drive_serial "$RUN" "$VERIFY" "$WORK/wipe-changed.sh")" no
+
 if [[ $fails -eq 0 ]]; then
     echo "SERIAL IDENTITY SUITE GREEN"
 else

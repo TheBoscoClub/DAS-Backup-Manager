@@ -449,6 +449,45 @@ check_smart_health() {
     fi
 }
 
+# read_holder_record <lock file>: how the record in a lock file reads, for the
+# scripts that name a lock's holder. Sets HOLDER_LINE (its first line, without
+# control characters, at most 200 characters, trimmed) and HOLDER_STATE:
+#   unreadable  the file cannot be read          empty    nothing recorded
+#   nopid       no `<who> pid <digits>` shape    gone     that pid no longer runs
+#   running     that pid runs
+# A faithful copy sits in scripts/backup-run.sh and scripts/backup-verify.sh
+# (installed scripts source nothing: each is self-contained where it runs);
+# tests/test_maintenance_lock.sh fails if the two differ (bd
+# DAS-Backup-Manager-2kb1.18). The words each script shows for a state stay in
+# its own wrapper. The reading is the indexer's maintenance::holder_of.
+read_holder_record() {
+    local lock="$1" line="" pid
+    HOLDER_LINE="" HOLDER_STATE=""
+    if [[ ! -r "$lock" ]]; then
+        HOLDER_STATE=unreadable
+        return 0
+    fi
+    IFS= read -r line <"$lock" || true # a last line without a newline still fills $line
+    line="${line//[[:cntrl:]]/}"
+    line="${line:0:200}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    HOLDER_LINE="$line"
+    if [[ -z "$line" ]]; then
+        HOLDER_STATE=empty
+        return 0
+    fi
+    pid="${line##* pid }"
+    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
+        HOLDER_STATE=nopid
+    elif [[ -d "/proc/$pid" ]]; then
+        HOLDER_STATE=running
+    else
+        HOLDER_STATE=gone
+    fi
+    return 0
+}
+
 # Who holds the lock, as the holder recorded itself in the lock file: its first
 # line, `<who> pid <pid>`. Said plainly when there is nothing to name: an empty
 # or unreadable record, a record without a pid (shown as the last one recorded),
@@ -457,28 +496,15 @@ check_smart_health() {
 # backup-run.sh's maintenance_holder() and the indexer's maintenance::holder_of,
 # in the words of a line that is only displayed (bd DAS-Backup-Manager-3wc).
 maintenance_lock_holder() {
-    local lock="$1" line="" pid
-    if [[ ! -r "$lock" ]]; then
-        echo "an unknown holder (its record in $lock cannot be read)"
-        return
-    fi
-    IFS= read -r line <"$lock" || true # a last line without a newline still fills $line
-    line="${line//[[:cntrl:]]/}"
-    line="${line:0:200}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    if [[ -z "$line" ]]; then
-        echo "an unknown holder (its record in $lock is empty)"
-        return
-    fi
-    pid="${line##* pid }"
-    if [[ "$line" != *" pid "* || ! "$pid" =~ ^[[:digit:]]+$ ]]; then
-        echo "an unknown holder (last recorded: $line)"
-    elif [[ -d "/proc/$pid" ]]; then
-        echo "$line"
-    else
-        echo "an unknown holder (the last recorded holder, $line, is no longer running)"
-    fi
+    local lock="$1"
+    read_holder_record "$lock"
+    case "$HOLDER_STATE" in
+        unreadable) echo "an unknown holder (its record in $lock cannot be read)" ;;
+        empty) echo "an unknown holder (its record in $lock is empty)" ;;
+        nopid) echo "an unknown holder (last recorded: $HOLDER_LINE)" ;;
+        running) echo "$HOLDER_LINE" ;;
+        *) echo "an unknown holder (the last recorded holder, $HOLDER_LINE, is no longer running)" ;;
+    esac
 }
 
 # Take the DAS maintenance lock without waiting, on fd 8 (held until this

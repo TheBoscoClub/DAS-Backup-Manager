@@ -22,6 +22,7 @@ done
 # writes $LOCKFILE (/run/das-backup.lock). Never reached from a test.
 # shellcheck disable=SC2329
 clear_singleton_holder() { :; }
+start_owed_scrub() { :; }
 
 # shellcheck disable=SC2329  # called by the eval-extracted functions
 log_info() { :; }; log_warn() { echo "WARN: $*" >>"$WORK/log"; }; log_error() { echo "ERROR: $*" >>"$WORK/log"; }

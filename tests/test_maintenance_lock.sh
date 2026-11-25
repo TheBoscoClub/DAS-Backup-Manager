@@ -50,17 +50,44 @@ cleanup_test() {
 trap cleanup_test EXIT
 
 extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
-for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenance_holder clear_maintenance_holder maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup monotonic_secs; do
+for fn in acquire_maintenance_lock acquire_claim release_claim record_maintenance_holder clear_maintenance_holder read_holder_record maintenance_holder run_indexer record_op abort_exit_status note_abort cleanup monotonic_secs; do
     body="$(extract "$RUN" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-run.sh"; exit 1; }
     eval "$body"
 done
-for fn in maintenance_lock_holder take_maintenance_lock clear_maintenance_record mount_primary_guarded check_btrbk_status; do
+for fn in read_holder_record maintenance_lock_holder take_maintenance_lock clear_maintenance_record mount_primary_guarded check_btrbk_status; do
     body="$(extract "$VERIFY" "$fn")"
     [[ -n "$body" ]] || { echo "FAIL: $fn not found in backup-verify.sh"; exit 1; }
     eval "$body"
 done
 
+# The rest of backup-run.sh that the extracted cleanup() reaches is not under
+# test here: stubs, so a missing function is no "command not found" noise, and
+# a command_not_found_handle that fails the suite should one appear again
+# (bd DAS-Backup-Manager-2kb1.18).
+clear_singleton_holder() { :; }
+start_owed_scrub() { :; }
+command_not_found_handle() {
+    echo "$1" >>"$WORK/not-found"
+    echo "bash: $1: command not found" >&2
+    return 127
+}
+
+# same_body <function> <file>...: "yes" when the function's text is byte for
+# byte the same in every file (installed scripts source nothing, so a function
+# two of them share is a copy and this keeps the copies one; bd
+# DAS-Backup-Manager-2kb1.18), else "no", or "missing" when a file lacks it.
+same_body() {
+    local fn="$1" f first="" cur
+    shift
+    for f in "$@"; do
+        cur="$(sed -n "/^$fn() {/,/^}/p" "$f")"
+        [[ -n "$cur" ]] || { echo missing; return; }
+        [[ -n "$first" ]] || first="$cur"
+        [[ "$cur" == "$first" ]] || { echo no; return; }
+    done
+    echo yes
+}
 LOCK="$WORK/das-maintenance.lock"
 MAINTENANCE_LOCKFILE="$LOCK"
 CLAIM_LOCKFILE="$WORK/das-maintenance-claim.lock" # the claim a waiting backup holds (su1b.2)
@@ -75,6 +102,14 @@ mountpoint() { true; }
 
 fails=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
+# The check must be able to say no: a copy with one line changed differs.
+# shellcheck disable=SC2016 # the sed text is literal
+sed 's/^    local lock="\$1" line="" pid$/    local lock="$1" line="" pid x/' "$RUN" >"$WORK/run-changed.sh"
+check "read_holder_record is the same text in backup-run.sh and backup-verify.sh" \
+    "$(same_body read_holder_record "$RUN" "$VERIFY")" yes
+check "the same-text check says no for a copy that differs" \
+    "$(same_body read_holder_record "$RUN" "$WORK/run-changed.sh")" no
+
 record() { head -n 1 "$LOCK" 2>/dev/null || true; }
 free() { if flock -n "$LOCK" true; then echo free; else echo held; fi; }
 wait_for_file() { local n=0; until [[ -e "$1" ]]; do command sleep 0.05; n=$((n + 1)); ((n < 200)) || return 1; done; }
@@ -453,6 +488,7 @@ STUB
         "$(grep -c '^ERROR: Failed to mount primary-x .*(exit 139): no RAID GUARD line' "$WORK/log")" "1"
 fi
 
+check "no command the suite ran was missing" "$(cat "$WORK/not-found" 2>/dev/null || true)" ""
 if [[ $fails -eq 0 ]]; then
     [[ -z "$not_run" ]] || echo "NOT RUN: $not_run"
     echo "MAINTENANCE LOCK SUITE GREEN"
