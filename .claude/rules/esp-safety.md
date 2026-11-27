@@ -28,7 +28,9 @@ discovery loop, cross-check label against mount, and refuse any device not on th
 ### The one ESP mount this project makes
 
 The recovery-OS reading mounts a mirror target's own ESP **read-only** (bd `sp78.20`), only by that target's
-`esp_partuuid`, only when the drive itself lists that PARTUUID, never over or beside another mount of it:
+`esp_partuuid`, only when the drive itself lists that PARTUUID, only as the partition the drive's own listing pairs with it by
+device number (`MAJ:MIN`; a by-partuuid link to, or a mount of, another partition with that PARTUUID → not read, nothing touched),
+never over or beside another mount of it:
 `mount::read_recovery_esp`. No other code path mounts an ESP; never add one that finds it any other way.
 This project's own ESP mount, left mounted, is released only at its own directory, only when `findmnt -S PARTUUID=<esp_partuuid>` shows
 it there: `MountGuard::release_esps` (bd `s5jv.2`), `backup-run.sh` `unmount_all` (bd `s5jv.1`).
