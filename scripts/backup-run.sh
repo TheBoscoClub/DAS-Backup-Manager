@@ -1,9 +1,14 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.26.0
+# Version: 4.27.0
 # Date: 2026-11-27
 #
 # Features:
+#   - The operations table's name column fits its longest name (v4.27.0, bd
+#     DAS-Backup-Manager-3gzs.14): a real label (`Target ` and 20 or more
+#     characters) overflowed the fixed 21-character column and pushed its
+#     status out of line in the emailed report; the column is now the longest
+#     name in the table, never under 21. Row text is otherwise as it was.
 #   - The emailed report reads at a glance (v4.26.0, bd
 #     DAS-Backup-Manager-3gzs.12): the header time carries its zone; a
 #     `── NEEDS ATTENTION ──` block after the header lists every operation that
@@ -4705,8 +4710,8 @@ generate_report() {
 
     # The operations table, one row per operation, each remembered (name,
     # status, detail) for the attention and RESULT blocks. The rows are the
-    # old ones byte for byte (a name longer than the 21-character column
-    # overflows it, as it always did: the suites match these rows). The target
+    # old ones except for the padding: the name column is as wide as the
+    # longest name in the table, never under 21 (bd 3gzs.14). The target
     # rows come after the fixed ones, one
     # per target detection looked at (record_op "target_<label>"): a drive
     # that is gone is a row naming it, never just a row that is not there (bd
@@ -4763,9 +4768,13 @@ generate_report() {
     for i in "${!extra_name[@]}"; do
         ((${#extra_name[i]} <= width)) || width=${#extra_name[i]}
     done
+    local ops_width=21
+    for i in "${!row_name[@]}"; do
+        ((${#row_name[i]} <= ops_width)) || ops_width=${#row_name[i]}
+    done
     local ops_rows="" n_fail=0 n_warn=0 attention=""
     for i in "${!row_name[@]}"; do
-        ops_rows+="$(printf '  %-21s %s  (%s)' "${row_name[i]}" "${row_status[i]}" "${row_detail[i]}")"$'\n'
+        ops_rows+="$(printf '  %-*s %s  (%s)' "$ops_width" "${row_name[i]}" "${row_status[i]}" "${row_detail[i]}")"$'\n'
         case "${row_status[i]}" in
         FAIL) n_fail=$((n_fail + 1)) ;;
         WARN) n_warn=$((n_warn + 1)) ;;
@@ -4827,7 +4836,7 @@ RESULT
   $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
 
 ===============================================================
-  backup-run.sh v4.26.0
+  backup-run.sh v4.27.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

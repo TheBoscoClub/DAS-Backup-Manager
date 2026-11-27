@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The nightly report's operations table fits its longest name** (`backup-run.sh` 4.27.0, bd `DAS-Backup-Manager-3gzs.14`): the name column was a fixed 21 characters, so a real label (`Target ` and a 20-character label or more) pushed its status out of line in the emailed report
+  - The column is as wide as the longest name in the table, never under 21, as `report.rs` `align_name_column` does for the Rust report; the text of every row is unchanged, only the padding between name and status
+  - The shell suites match a row's content with flexible padding (`  *`, or the padding squeezed before an exact comparison), and `tests/test_target_presence.sh` gains the long-label case (every status in the long name's column)
+
 - **What clearing another program's mount says is aligned rows, a kind word first** (bd `DAS-Backup-Manager-3gzs.14`): the lines above `CLEAR TARGET:` and `CLEAR DRIVE:` — and the same lines the Rust jobs log, so the GUI log, the journal and `recovery-os-vm.sh`'s `host_mounts` history carry them — were sentences of 150+ characters; now one row per fact, scanned down the first column
   - `mount` (source, filesystem and rw/ro, mount point, who made it, `-> another program's mount, not this job's`), `options` (mount options, filesystem options, root), `holder` (pid, command, reader/writer/cwd only and what it uses, user and unit, `-> to be stopped` / `would stop` / `not signalled` with the reason), `signal` (`SIGTERM pid 4122 (dolphin, user bosco, unit app-dolphin.scope)`, or `not sent` and why), `action` (`unmounted …`, `would unmount …`, `stopped what held it: …`); pid, command and mount columns are padded to the block's widest
   - The `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)` and `CLEAR DRIVE: …` status lines, the emailed report's `Target <label>` rows and `host_mounts` as an array of strings (one per line) are unchanged; no fact of the old lines is dropped (a holder's `would stop:` is now `-> would stop` on its row)

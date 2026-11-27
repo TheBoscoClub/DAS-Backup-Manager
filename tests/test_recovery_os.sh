@@ -101,7 +101,7 @@ check "current: run status SUCCESS" "$(run_status)" "SUCCESS"
 check "current: subject SUCCESS" "$(subject_status)" "SUCCESS"
 report="$(generate_report)"
 check "current: ALL OPERATIONS SUCCESSFUL" "$(grep -c '^  Status: ALL OPERATIONS SUCCESSFUL$' <<<"$report")" "1"
-check "current: operation row" "$(grep -c '^  Recovery OS           OK  (' <<<"$report")" "1"
+check "current: operation row" "$(grep -c '^  Recovery OS  *OK  (' <<<"$report")" "1"
 check "current: section in the report" "$(grep -c '^RECOVERY OS$' <<<"$report")" "1"
 check "no double blank line" "$(grep -c -Pzo '\n\n\n' <<<"$report" || true)" "0"
 
@@ -142,7 +142,7 @@ report="$(generate_report)"
 check "stale: status says warnings" "$(grep -c '^  Status: COMPLETED WITH WARNINGS$' <<<"$report")" "1"
 check "stale: not ALL OPERATIONS SUCCESSFUL" "$(grep -c 'ALL OPERATIONS SUCCESSFUL' <<<"$report" || true)" "0"
 check "stale: not FAILURES DETECTED" "$(grep -c 'FAILURES DETECTED' <<<"$report" || true)" "0"
-check "stale: row shows WARN" "$(grep -c '^  Recovery OS           WARN  (stale' <<<"$report")" "1"
+check "stale: row shows WARN" "$(grep -c '^  Recovery OS  *WARN  (stale' <<<"$report")" "1"
 check "stale: the run is still recorded as SUCCESS" "$(run_status)" "SUCCESS"
 check "stale: the subject says so" "$(subject_status)" "SUCCESS WITH WARNINGS"
 # A failure elsewhere outranks a warning.
@@ -165,7 +165,7 @@ check "boot warning: logged once, as a warning" "$(grep -c '^WARN: ' "$WORK/log"
 check "boot warning: the log line names btrbk" "$(grep -c '^WARN: btrbk may run when a recovery OS boots' "$WORK/log")" "1"
 report="$(generate_report)"
 check "boot warning: status says warnings" "$(grep -c '^  Status: COMPLETED WITH WARNINGS$' <<<"$report")" "1"
-check "boot warning: row shows WARN" "$(grep -c '^  Recovery OS           WARN  (btrbk may run at boot' <<<"$report")" "1"
+check "boot warning: row shows WARN" "$(grep -c '^  Recovery OS  *WARN  (btrbk may run at boot' <<<"$report")" "1"
 
 # --- a boot problem: an fstab entry naming a partition the drive lacks ------
 # (bd DAS-Backup-Manager-ac82) — its own words, not "btrbk" and not "stale".

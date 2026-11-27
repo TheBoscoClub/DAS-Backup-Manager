@@ -501,13 +501,13 @@ OP_STATUS=([subvol_sync]=OK [subvol_expire]=OK)
 SUBVOL_SYNC_REPORT=$'SUBVOLUME SYNC\n  Adopted: @new'
 SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
-check "report lists the sync operation" "$(grep -c '^  Subvolume sync        OK' <<<"$report")" "1"
-check "report lists the expiry operation" "$(grep -c '^  Retired expiry        OK' <<<"$report")" "1"
+check "report lists the sync operation" "$(grep -c '^  Subvolume sync  *OK' <<<"$report")" "1"
+check "report lists the expiry operation" "$(grep -c '^  Retired expiry  *OK' <<<"$report")" "1"
 check "report lists coverage after the sync, N/A when not run" \
-    "$(grep -A1 '^  Subvolume sync ' <<<"$report" | sed -n 2p)" "  Subvolume coverage    N/A  (n/a)"
+    "$(grep -A1 '^  Subvolume sync ' <<<"$report" | sed -n 2p | sed -E 's/ {2,}(OK|WARN|FAIL|N\/A)  \(/ \1  (/')" "  Subvolume coverage N/A  (n/a)"
 OP_STATUS[subvol_coverage]=WARN; OP_STATUS[subvol_coverage_detail]="1 subvolume/target pair no longer backed up"
 check "report shows the coverage row" \
-    "$(generate_report | grep -c '^  Subvolume coverage    WARN  (1 subvolume/target pair no longer backed up)$')" "1"
+    "$(generate_report | grep -c '^  Subvolume coverage  *WARN  (1 subvolume/target pair no longer backed up)$')" "1"
 unset 'OP_STATUS[subvol_coverage]' 'OP_STATUS[subvol_coverage_detail]'
 check "sync section is printed" "$(grep -c '^SUBVOLUME SYNC$' <<<"$report")" "1"
 check "empty expire report prints no header" "$(grep -c 'RETIRED SUBVOLUMES' <<<"$report" || true)" "0"
@@ -523,7 +523,7 @@ check "no double blank line with both sections" "$(grep -c -Pzo '\n\n\n' <<<"$re
 SUBVOL_SYNC_REPORT=""; SUBVOL_EXPIRE_REPORT=""
 report="$(generate_report)"
 check "no sections: one blank line before THROUGHPUT" \
-    "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | tr '\n' '|')" "  Recovery OS           N/A  (n/a)||"
+    "$(grep -B2 '^THROUGHPUT$' <<<"$report" | sed -n '1,2p' | sed -E 's/ {2,}(OK|WARN|FAIL|N\/A)  \(/ \1  (/' | tr '\n' '|')" "  Recovery OS N/A  (n/a)||"
 # The footer's version is the header's: one bump, both places.
 version="$(sed -n 's/^# Version: //p' "$SCRIPT")"
 check "the header names a version" "$([[ "$version" =~ ^[[:digit:]]+(\.[[:digit:]]+)+$ ]] && echo yes)" "yes"
