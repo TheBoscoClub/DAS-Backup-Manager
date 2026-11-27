@@ -1771,7 +1771,8 @@ fn program_from_text(text: String, role: Role) -> Program {
 }
 
 /// What a `#!` line (the text after `#!`) has the kernel run: its
-/// interpreter, or past `env` (`/usr/bin/env`, `/bin/env`) and its
+/// interpreter, or past `env` (the interpreter `hashbang_of`'s `is_env`
+/// says is env: [`named_env`], or [`Findings::is_env`]) and its
 /// `-i`/`-0`/`-v` options and assignments, the program env runs — a bare
 /// name env finds in the `PATH`.
 #[derive(Debug, PartialEq, Eq)]
@@ -1793,13 +1794,37 @@ fn next_word(s: &str) -> (&str, &str) {
     s.split_at(s.find(char::is_whitespace).unwrap_or(s.len()))
 }
 
-/// What the `#!` line `line` (the text after `#!`) runs ([`Hashbang`]).
-fn hashbang_of(line: &str) -> Hashbang<'_> {
+/// Whether the program `word` names is env by its name: the last component
+/// of its path, however the directories before it are spelt
+/// (`/usr/sbin/env`, `/usr/bin//env`), as [`run_from`] tells a wrapper.
+fn named_env(word: &str) -> bool {
+    word.rsplit('/').next() == Some("env")
+}
+
+/// Whether a command line env `-S` splits holds what env reads its own way
+/// and sh does not: a backslash (`\_` is a blank, `\c` ends the line) or a
+/// `$` (env expands `${NAME}` from its environment). Such a line is not
+/// read (bd DAS-Backup-Manager-eg4j.25).
+fn env_split_unread(line: &str) -> bool {
+    line.contains(['\\', '$'])
+}
+
+/// Why the command line `what` names ([`env_split_unread`]) is not read.
+fn env_split_why(what: &str) -> String {
+    format!(
+        "it gives {what}, an env -S command line with an escape or a variable env reads \
+         itself, not read here"
+    )
+}
+
+/// What the `#!` line `line` (the text after `#!`) runs ([`Hashbang`]),
+/// its interpreter env when `is_env` says so.
+fn hashbang_of(line: &str, is_env: impl Fn(&str) -> bool) -> Hashbang<'_> {
     let (word, mut rest) = next_word(line);
     if word.is_empty() {
         return Hashbang::None;
     }
-    if !matches!(word, "/usr/bin/env" | "/bin/env") {
+    if !is_env(word) {
         return Hashbang::Program { word, env: false };
     }
     let env = word;
@@ -1850,7 +1875,7 @@ fn hashbang_of(line: &str) -> Hashbang<'_> {
 fn runs_sh(text: &str) -> bool {
     let line = text.lines().next().unwrap_or_default();
     let line = line.strip_prefix("#!").unwrap_or(line);
-    let program = match hashbang_of(line) {
+    let program = match hashbang_of(line, named_env) {
         Hashbang::Program { word, .. } => word.to_string(),
         Hashbang::Split { env, line } => {
             let words = shell_words(&format!("{env} {line}"));
@@ -2534,6 +2559,31 @@ fn words(line: &str) -> Vec<String> {
     split(line, false)
 }
 
+/// An `Exec…=` line with each backslash systemd keeps doubled, so that
+/// [`words`] keeps it too: systemd ignores an escape it does not know
+/// (`\_`, `\$`), leaving the backslash in the word, where env `-S` reads it
+/// its own way (bd DAS-Backup-Manager-eg4j.25). The escapes it knows — C's,
+/// `\s`, `\x`, `\u`, `\U`, octal, a blank, `\;` — are left to [`words`].
+fn systemd_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '\\' {
+            continue;
+        }
+        match chars.peek() {
+            Some(&n) if "abfnrtv\\\"'sxuU01234567;".contains(n) || n.is_whitespace() => {
+                out.push(n);
+                chars.next();
+            }
+            Some(_) => out.push('\\'),
+            None => {}
+        }
+    }
+    out
+}
+
 /// [`words`] as sh reads a line: a command substitution in double quotes
 /// (`"$(cmd)"`, `` "`cmd`" ``) runs as an unquoted one does, so its words
 /// are split out of the quotes, which go on after it. systemd's quotes are
@@ -2592,6 +2642,18 @@ fn split(line: &str, shell: bool) -> Vec<String> {
                 .flatten();
         match quote {
             Some(q) if c == q => quote = None,
+            // sh keeps a backslash in single quotes, and in double quotes one
+            // before anything but `$`, `` ` ``, `"`, `\` or a newline: what
+            // the program is given (env -S reads its own; bd
+            // DAS-Backup-Manager-eg4j.25). systemd's quotes unescape.
+            Some('\'') if shell && c == '\\' => word.push(c),
+            Some('"')
+                if shell
+                    && c == '\\'
+                    && !matches!(chars.peek(), Some('$' | '`' | '"' | '\\' | '\n')) =>
+            {
+                word.push(c);
+            }
             Some(_) if c == '\\' => word.extend(chars.next()),
             Some(_) => word.push(c),
             None => match c {
@@ -3076,6 +3138,9 @@ enum Launch {
         path: Option<String>,
     },
     Inline(String),
+    /// A command line passed on whole that is not read: what it runs may be
+    /// btrbk (`env -S` with an escape or a variable, [`env_split_unread`]).
+    Unread(String),
     /// A word `owner` is given, which it may run.
     Argument {
         owner: String,
@@ -3383,16 +3448,35 @@ fn wrapper_operand(
     let mut options = true;
     let mut path = None;
     let mut rest = words.iter().enumerate().skip(from);
+    // A command line an option passes: env's `-S` one holding what env reads
+    // its own way ([`env_split_unread`]) is not read.
+    let inline = |line: &str| {
+        if wrapper.name == "env" && env_split_unread(line) {
+            Launch::Unread(format!("env -S {line}"))
+        } else {
+            Launch::Inline(line.to_string())
+        }
+    };
     while let Some((j, w)) = rest.next() {
         if options && wrapper.command.contains(&w.as_str()) {
-            found.extend(words.get(j + 1).map(|line| Launch::Inline(line.clone())));
+            found.extend(words.get(j + 1).map(|line| inline(line)));
             return (Inner::Neither, operand);
         }
         if let Some((flag, line)) = w.split_once('=')
             && options
             && wrapper.command.contains(&flag)
         {
-            found.push(Launch::Inline(line.to_string()));
+            found.push(inline(line));
+            return (Inner::Neither, operand);
+        }
+        // A short one with its value joined on (`-Sline`).
+        if options
+            && !w.starts_with("--")
+            && let Some(flag) = w.get(..2)
+            && w.len() > 2
+            && wrapper.command.contains(&flag)
+        {
+            found.push(inline(&w[2..]));
             return (Inner::Neither, operand);
         }
         if options && w == "--" {
@@ -4175,7 +4259,7 @@ impl Findings<'_> {
         exec: &SearchPath,
         env: &SearchPath,
     ) -> Runs {
-        let mut raw_words = words(raw);
+        let mut raw_words = words(&systemd_escapes(raw));
         let grammar = if raw_words.first().is_some_and(|w| w == "|") {
             // The rest is a shell's, which reads its own quotes.
             raw_words = shell_words(raw);
@@ -4236,6 +4320,13 @@ impl Findings<'_> {
             let (word, how) = match launch {
                 Launch::Inline(line) => {
                     runs.extend(self.inline(at, path, &line));
+                    continue;
+                }
+                Launch::Unread(line) => {
+                    self.unknown(
+                        format!("{} may run btrbk: {}", at.who, env_split_why(&line)),
+                        None,
+                    );
                     continue;
                 }
                 Launch::Path(raw) => {
@@ -4410,6 +4501,20 @@ impl Findings<'_> {
     /// ([`Findings::read_sh`]); another interpreter's code
     /// ([`Findings::read_code`]); or what could not be told.
     fn read(&mut self, at: At, path: &mut SearchPath, resolved: &str, how: &Use) -> Runs {
+        // A link to env under another name runs what env is given, as a
+        // command line's `env` does ([`launches`]; bd DAS-Backup-Manager-eg4j.25).
+        if how.role == Role::Program
+            && !named_env(resolved)
+            && let Some(env) = self.env_at(resolved)
+        {
+            let grammar = if how.shell {
+                Grammar::Shell
+            } else {
+                Grammar::Systemd
+            };
+            let words: Vec<String> = std::iter::once(env).chain(how.args.clone()).collect();
+            return self.words_run(at, path, &words, grammar);
+        }
         match program_at(self.root, self.mounts, self.probe, resolved, how.role) {
             Program::Btrbk => vec![(at.script.map(String::from), btrbk_config(&how.args))],
             // A program's `#!` line, not a shell's or an interpreter's
@@ -4500,24 +4605,28 @@ impl Findings<'_> {
             shell: false,
             args: Vec::new(),
         };
-        let found = hashbang_of(line);
+        let interpreter = next_word(line).0;
         // The kernel opens the interpreter as named: a relative one from the
         // directory it is run in.
-        if let Hashbang::Program { word, env: false } = found
-            && !word.starts_with('/')
-        {
+        if !interpreter.is_empty() && !interpreter.starts_with('/') {
             self.unknown(
                 format!(
-                    "{} may run btrbk through {script}: its #! interpreter {word} is a relative \
-                     path, from a directory only that OS knows",
+                    "{} may run btrbk through {script}: its #! interpreter {interpreter} is a \
+                     relative path, from a directory only that OS knows",
                     at.who
                 ),
                 None,
             );
             return Vec::new();
         }
+        // env however it is spelt or linked to (bd DAS-Backup-Manager-eg4j.25);
+        // the file named is read as a program all the same.
+        let via_env = !interpreter.is_empty() && self.is_env(interpreter);
+        let found = hashbang_of(line, |_| via_env);
         if at.depth >= MAX_SCRIPT_DEPTH {
+            let planted = via_env && !self.only_binaries(at, path, interpreter, false, &how);
             let what = match found {
+                _ if planted => interpreter,
                 Hashbang::None => return Vec::new(),
                 Hashbang::Program { word, env } => {
                     if self.only_binaries(at, path, word, env, &how) {
@@ -4543,9 +4652,26 @@ impl Findings<'_> {
             script: Some(script),
             ..at
         };
-        match found {
+        // (A split line's env is read with that line.)
+        let mut runs = if via_env && !matches!(found, Hashbang::Split { .. }) {
+            self.program(inside, path, interpreter, &how)
+        } else {
+            Vec::new()
+        };
+        runs.extend(match found {
             Hashbang::None => Vec::new(),
             Hashbang::Program { word, .. } => self.program(inside, path, word, &how),
+            Hashbang::Split { line, .. } if env_split_unread(line) => {
+                let why = env_split_why(&format!("env -S {line}"));
+                self.unknown(
+                    format!(
+                        "{} may run btrbk through {script}: its #! line {why}",
+                        at.who
+                    ),
+                    None,
+                );
+                Vec::new()
+            }
             Hashbang::Split { env, line } => self.inline(inside, path, &format!("{env} {line}")),
             Hashbang::Unread(option) => {
                 self.unknown(
@@ -4558,6 +4684,27 @@ impl Findings<'_> {
                 );
                 Vec::new()
             }
+        });
+        runs
+    }
+
+    /// Whether the program at `word` is env ([`hashbang_of`]): by its name
+    /// ([`named_env`]), or an absolute path that leads, through the links on
+    /// it in the image, to a file named env — `/usr/sbin/env` through
+    /// `/usr/sbin` → `bin`, a link `/usr/local/bin/e` → `/usr/bin/env`.
+    fn is_env(&self, word: &str) -> bool {
+        named_env(word) || self.env_at(word).is_some()
+    }
+
+    /// Where the absolute path `word` leads when that is a file named env
+    /// ([`Findings::is_env`]).
+    fn env_at(&self, word: &str) -> Option<String> {
+        if !word.starts_with('/') {
+            return None;
+        }
+        match locate(self.root, word.trim_matches('/'), self.probe) {
+            Located::File(at, _) if named_env(&at) => Some(format!("/{}", at.trim_matches('/'))),
+            _ => None,
         }
     }
 
@@ -6764,6 +6911,7 @@ mod tests {
                         if literal { " literal" } else { "" }
                     )),
                     Launch::Inline(line) => Some(format!("[{line}]")),
+                    Launch::Unread(line) => Some(format!("<{line}>")),
                     Launch::Argument { .. } | Launch::Path(_) => None,
                 })
                 .collect()
@@ -6838,6 +6986,14 @@ mod tests {
                 vec!["env Program", "[btrbk run]"],
             ),
             ("env --split-string=x", Shell, vec!["env Program", "[x]"]),
+            ("env -Sx", Systemd, vec!["env Program literal", "[x]"]),
+            (
+                "env -S 'a\\\\_b'",
+                Systemd,
+                vec!["env Program literal", "<env -S a\\_b>"],
+            ),
+            ("env -S '${X}'", Shell, vec!["env Program", "<env -S ${X}>"]),
+            ("flock -c '${X}'", Shell, vec!["flock Program", "[${X}]"]),
             (
                 "nice -n 19 ionice -c 3 /opt/b.sh",
                 Shell,
@@ -10798,6 +10954,81 @@ mod tests {
     }
 
     #[test]
+    fn eg4j25_env_s_escapes_variables_and_other_spellings_of_env_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        binary(root, "usr/bin/env");
+        program_file(root, "usr/local/bin/evil", "#!/bin/sh\nexec btrbk run\n");
+        link(root, "usr/local/bin/e", "/usr/bin/env");
+        let base = "ExecStart=/usr/local/bin/job";
+        let with_env = "ExecStart=/usr/local/bin/job\n\
+                        Environment=EVIL=/usr/local/bin/evil CMD=/usr/local/bin/evil";
+        let will = &[BootVerdict::Will][..];
+        let will_or_may = &[BootVerdict::Will, BootVerdict::May][..];
+        // (the unit's lines, the job's #! line or none, the verdicts wanted)
+        let mut read_wrong = Vec::new();
+        for (exec, job, wanted) in [
+            // env -S's own escapes: `\_` is a blank, `\c` ends the string.
+            (base, Some("#!/usr/bin/env -S evil\\_x"), will_or_may),
+            (base, Some("#!/usr/bin/env -S evil\\c"), will_or_may),
+            ("ExecStart=/usr/bin/env -S evil\\_x", None, will_or_may),
+            // env -S expands ${VAR} from the environment it is given.
+            (with_env, Some("#!/usr/bin/env -S ${EVIL}"), will_or_may),
+            (
+                with_env,
+                Some("#!/usr/bin/env -S sh -c ${CMD}"),
+                will_or_may,
+            ),
+            // env under another spelling, or a link to it.
+            (base, Some("#!/usr/sbin/env -S evil"), will),
+            (base, Some("#!/usr/bin//env -S evil"), will),
+            (base, Some("#!/usr/local/bin/e evil"), will),
+            (base, Some("#!/usr/local/bin/e -S evil"), will),
+            ("ExecStart=/usr/local/bin/e evil", None, will),
+            ("ExecStart=/usr/bin/env -Sevil", None, will),
+            // Through a script: sh keeps a backslash in quotes for env.
+            (base, Some("#!/bin/sh\nenv -S 'evil\\_x'"), will_or_may),
+            (base, Some("#!/bin/sh\nenv -S \"evil\\_x\""), will_or_may),
+        ] {
+            nightly_runs(root, exec);
+            if let Some(text) = job {
+                program_file(root, "usr/local/bin/job", &format!("{text}\n"));
+            }
+            let got = verdict_of(root).0;
+            if !wanted.contains(&got) {
+                read_wrong.push(format!("{exec} / {job:?}: {got:?}"));
+            }
+        }
+        assert!(read_wrong.is_empty(), "read wrong: {read_wrong:#?}");
+        // The converse: env running stock programs runs no btrbk, however
+        // it is spelt.
+        for b in ["python3", "perl"] {
+            binary(root, &format!("usr/bin/{b}"));
+        }
+        for (exec, job) in [
+            (base, Some("#!/usr/bin/env python3\nprint(1)")),
+            (base, Some("#!/usr/bin/env -S perl -w\nprint 1;")),
+            (base, Some("#!/usr/sbin/env python3\nprint(1)")),
+            (base, Some("#!/usr/bin//env -S perl -w\nprint 1;")),
+            (base, Some("#!/usr/local/bin/e python3\nprint(1)")),
+            ("ExecStart=/usr/bin/env FOO=1 /usr/bin/true", None),
+            ("ExecStart=/usr/local/bin/e FOO=1 /usr/bin/true", None),
+            ("ExecStart=/usr/bin/env -S/usr/bin/true", None),
+        ] {
+            nightly_runs(root, exec);
+            if let Some(text) = job {
+                program_file(root, "usr/local/bin/job", &format!("{text}\n"));
+            }
+            assert_eq!(
+                verdict_of(root),
+                (BootVerdict::No, vec![]),
+                "{exec} / {job:?}"
+            );
+        }
+    }
+
+    #[test]
     fn another_interpreter_s_script_is_not_read_as_sh() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -11656,7 +11887,10 @@ mod tests {
                 .into_iter()
                 .filter_map(|l| match l {
                     Launch::Program { word, .. } => Some(word),
-                    Launch::Inline(_) | Launch::Argument { .. } | Launch::Path(_) => None,
+                    Launch::Inline(_)
+                    | Launch::Unread(_)
+                    | Launch::Argument { .. }
+                    | Launch::Path(_) => None,
                 })
                 .collect()
         };
@@ -11681,7 +11915,10 @@ mod tests {
                 .into_iter()
                 .filter_map(|l| match l {
                     Launch::Inline(line) => Some(line),
-                    Launch::Program { .. } | Launch::Argument { .. } | Launch::Path(_) => None,
+                    Launch::Program { .. }
+                    | Launch::Unread(_)
+                    | Launch::Argument { .. }
+                    | Launch::Path(_) => None,
                 })
                 .collect()
         };
@@ -11808,7 +12045,10 @@ mod tests {
                 .into_iter()
                 .filter_map(|l| match l {
                     Launch::Program { word, .. } => Some(word),
-                    Launch::Inline(_) | Launch::Argument { .. } | Launch::Path(_) => None,
+                    Launch::Inline(_)
+                    | Launch::Unread(_)
+                    | Launch::Argument { .. }
+                    | Launch::Path(_) => None,
                 })
                 .collect()
         };
