@@ -121,8 +121,27 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
 /// member's path is tried, as given and canonicalized. Deepest mount point
 /// first: the order they come down in.
 pub fn mounts_of(entries: &[MountEntry], member_paths: &[String]) -> Vec<MountEntry> {
+    mounts_matching(entries, member_paths, |e| e.fstype == "btrfs")
+}
+
+/// The mounts of any filesystem whose source is one of these partitions
+/// (bd DAS-Backup-Manager-eg4j.19): the recovery drive's vfat ESP that
+/// udisks mounted is as much its mount as a btrfs one. Each path is tried as
+/// given and canonicalized (a `/dev/disk/by-partuuid/…` link names the same
+/// partition mountinfo shows as `/dev/sdX1`). Same order as [`mounts_of`]:
+/// deepest mount point first. [`mounts_of`] itself stays btrfs only, for the
+/// RAID-1 guard.
+pub fn mounts_of_partitions(entries: &[MountEntry], partitions: &[String]) -> Vec<MountEntry> {
+    mounts_matching(entries, partitions, |_| true)
+}
+
+fn mounts_matching(
+    entries: &[MountEntry],
+    paths: &[String],
+    kind: impl Fn(&MountEntry) -> bool,
+) -> Vec<MountEntry> {
     let mut names: BTreeSet<String> = BTreeSet::new();
-    for p in member_paths {
+    for p in paths {
         names.insert(p.clone());
         if let Ok(c) = fs::canonicalize(p) {
             names.insert(c.to_string_lossy().into_owned());
@@ -131,7 +150,7 @@ pub fn mounts_of(entries: &[MountEntry], member_paths: &[String]) -> Vec<MountEn
     let mut out: Vec<MountEntry> = entries
         .iter()
         .filter(|e| {
-            e.fstype == "btrfs"
+            kind(e)
                 && (names.contains(&e.source)
                     || fs::canonicalize(&e.source)
                         .is_ok_and(|c| names.contains(&*c.to_string_lossy())))
@@ -1145,6 +1164,50 @@ mod tests {
         let stacked = stacked_under(&all, &ours);
         assert_eq!(stacked.len(), 1);
         assert_eq!(stacked[0].mount_point, "/run/media/user/das/inner");
+    }
+
+    #[test]
+    fn mounts_of_partitions_matches_vfat_and_btrfs_by_partition() {
+        let text = "\
+22 1 0:21 / / rw - btrfs /dev/nvme0n1p2 rw\n\
+50 30 0:60 / /run/media/user/ESP rw - vfat /dev/sdx1 rw,fmask=0022\n\
+51 30 0:61 / /mnt/b rw - btrfs /dev/sdx2 rw,subvolid=5\n\
+52 50 0:62 / /run/media/user/ESP/inner rw - vfat /dev/sdx1 rw\n";
+        let all = parse_mountinfo(text);
+        let got = mounts_of_partitions(&all, &["/dev/sdx1".into(), "/dev/sdx2".into()]);
+        let points: Vec<&str> = got.iter().map(|m| m.mount_point.as_str()).collect();
+        // Any filesystem type; deepest mount point first.
+        assert_eq!(
+            points,
+            vec!["/run/media/user/ESP/inner", "/run/media/user/ESP", "/mnt/b"]
+        );
+        // `mounts_of` stays btrfs only, for the RAID-1 guard.
+        let btrfs = mounts_of(&all, &["/dev/sdx1".into(), "/dev/sdx2".into()]);
+        assert_eq!(btrfs.len(), 1);
+        assert_eq!(btrfs[0].mount_point, "/mnt/b");
+    }
+
+    #[test]
+    fn mounts_of_partitions_ignores_other_partitions() {
+        let all = parse_mountinfo(
+            "50 30 0:60 / /run/media/user/ESP rw - vfat /dev/sdy1 rw\n\
+51 30 0:61 / /mnt/b rw - vfat /dev/sdx10 rw\n",
+        );
+        assert!(mounts_of_partitions(&all, &["/dev/sdx1".into()]).is_empty());
+        assert!(mounts_of_partitions(&all, &[]).is_empty());
+    }
+
+    #[test]
+    fn mounts_of_partitions_follows_a_symlinked_partition_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("sdx1");
+        std::fs::write(&real, b"").unwrap();
+        let link = dir.path().join("by-partuuid-x");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_s = real.to_string_lossy().into_owned();
+        let all = parse_mountinfo(&format!("50 30 0:60 / /mnt/e rw - vfat {real_s} rw\n"));
+        let got = mounts_of_partitions(&all, &[link.to_string_lossy().into_owned()]);
+        assert_eq!(got.len(), 1);
     }
 
     #[test]

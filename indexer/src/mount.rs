@@ -1300,27 +1300,73 @@ fn clear_mounted_elsewhere(
     }
     maintenance_on(runner, site, Some(fsid), &ours[0].mount_point)?;
     if site.report_only {
-        let mut would: Vec<String> = ours
-            .iter()
-            .map(|m| {
-                format!(
-                    "would unmount {} ({})",
-                    m.mount_point,
-                    origin_of(runner, &m.mount_point)
-                )
-            })
-            .collect();
-        clear_logged(site, runner, &target.label, &ours, progress)?;
-        let env_lines = crate::holders::scan_holders(&site.proc, &ours)
-            .map_err(|e| format!("who uses it cannot be read ({e})"))?;
-        would.extend(env_lines.iter().map(|h| format!("would stop: {h}")));
-        for w in would.iter().filter(|w| w.starts_with("would unmount")) {
-            warn(format!("dry run: {w}"));
-        }
-        return Ok(Some(would));
+        return would_clear(runner, site, &target.label, &ours, progress).map(Some);
     }
     let mut sent = clear_logged(site, runner, &target.label, &ours, progress)?;
-    for m in &ours {
+    unmount_each(runner, site, &target.label, &ours, progress, &mut sent)?;
+    let left = elsewhere(&parse_mountinfo(&(site.mountinfo)()?));
+    if !left.is_empty() {
+        return Err(format!(
+            "still mounted at {} after it was unmounted",
+            left.iter()
+                .map(|m| m.mount_point.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if sys.exists() {
+        return Err(hidden());
+    }
+    if !sent.is_empty() {
+        warn(format!("{STOPPED}: {}", sent.join(", ")));
+    }
+    Ok(Some(sent))
+}
+
+/// A dry run's account of clearing `ours`: each "would unmount", each "would
+/// stop" holder; a holder the policy refuses is the `Err`, as in a real run.
+fn would_clear(
+    runner: &dyn CommandRunner,
+    site: &ClearSite<'_>,
+    who: &str,
+    ours: &[crate::holders::MountEntry],
+    progress: &dyn ProgressCallback,
+) -> Result<Vec<String>, String> {
+    let mut would: Vec<String> = ours
+        .iter()
+        .map(|m| {
+            format!(
+                "would unmount {} ({})",
+                m.mount_point,
+                origin_of(runner, &m.mount_point)
+            )
+        })
+        .collect();
+    clear_logged(site, runner, who, ours, progress)?;
+    let env_lines = crate::holders::scan_holders(&site.proc, ours)
+        .map_err(|e| format!("who uses it cannot be read ({e})"))?;
+    would.extend(env_lines.iter().map(|h| format!("would stop: {h}")));
+    for w in would.iter().filter(|w| w.starts_with("would unmount")) {
+        progress.on_log(
+            crate::progress::LogLevel::Warning,
+            &format!("Target '{who}': dry run: {w}"),
+        );
+    }
+    Ok(would)
+}
+
+/// Unmount each of `ours` (already deepest first): up to [`UMOUNT_ATTEMPTS`]
+/// tries, the holders looked for again between them (what that stops is
+/// added to `sent`). `Err` names the mount that would not come down.
+fn unmount_each(
+    runner: &dyn CommandRunner,
+    site: &ClearSite<'_>,
+    who: &str,
+    ours: &[crate::holders::MountEntry],
+    progress: &dyn ProgressCallback,
+    sent: &mut Vec<String>,
+) -> Result<(), String> {
+    for m in ours {
         let mut why = String::new();
         let mut down = false;
         for attempt in 1..=UMOUNT_ATTEMPTS {
@@ -1329,7 +1375,7 @@ fn clear_mounted_elsewhere(
                 sent.extend(clear_logged(
                     site,
                     runner,
-                    &target.label,
+                    who,
                     std::slice::from_ref(m),
                     progress,
                 )?);
@@ -1349,12 +1395,95 @@ fn clear_mounted_elsewhere(
                 m.mount_point
             ));
         }
+        progress.on_log(
+            crate::progress::LogLevel::Warning,
+            &format!(
+                "Target '{who}': unmounted {} (another program's mount)",
+                m.mount_point
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Every mount of `partitions` (any filesystem), by the operator's stop
+/// policy (bd DAS-Backup-Manager-eg4j.19): each said (point, origin, options),
+/// its holders cleared, each unmounted deepest first, then the mount table
+/// read again. `btrfs_fsid`: the filesystem UUID of a btrfs on the drive —
+/// maintenance on a btrfs mount refuses, and `/sys/fs/btrfs/<fsid>` must be
+/// gone afterwards (or must never have been there with nothing visibly
+/// mounted). `Ok(None)`: mounted nowhere; `Ok(Some(signals))`: cleared (a
+/// dry run: the "would …" lines); `Err`: refused, why.
+#[cfg_attr(not(test), expect(dead_code, reason = "first caller: the next commit"))]
+fn clear_partitions_with(
+    runner: &dyn CommandRunner,
+    site: &ClearSite<'_>,
+    who: &str,
+    partitions: &[String],
+    btrfs_fsid: Option<&str>,
+    progress: &dyn ProgressCallback,
+) -> Result<Option<Vec<String>>, String> {
+    use crate::holders::{mounts_of_partitions, parse_mountinfo, stacked_under};
+    let warn = |m: String| {
+        progress.on_log(
+            crate::progress::LogLevel::Warning,
+            &format!("Target '{who}': {m}"),
+        )
+    };
+    let sys = btrfs_fsid.map(|f| site.sysfs_btrfs.join(f.to_ascii_lowercase()));
+    let hidden = |sys: &Path| {
+        format!(
+            "every mount of it this host shows is gone, yet the kernel still has it mounted \
+             ({} exists): another mount namespace or a lazy unmount held open keeps it",
+            sys.display()
+        )
+    };
+    let all = parse_mountinfo(&(site.mountinfo)()?);
+    let ours = mounts_of_partitions(&all, partitions);
+    if ours.is_empty() {
+        if let Some(sys) = sys.as_deref().filter(|s| s.exists()) {
+            return Err(hidden(sys));
+        }
+        return Ok(None);
+    }
+    for m in &ours {
         warn(format!(
-            "unmounted {} (another program's mount)",
-            m.mount_point
+            "{} is mounted at {} by {} ({} {}, root {}, options {}, filesystem options {}) — \
+             not this job's mount",
+            m.source,
+            m.mount_point,
+            origin_of(runner, &m.mount_point),
+            m.fstype,
+            if m.options.split(',').any(|o| o == "ro") {
+                "ro"
+            } else {
+                "rw"
+            },
+            m.root,
+            m.options,
+            m.super_options
         ));
     }
-    let left = elsewhere(&parse_mountinfo(&(site.mountinfo)()?));
+    let stacked = stacked_under(&all, &ours);
+    if !stacked.is_empty() {
+        return Err(format!(
+            "another filesystem is mounted inside it ({}) — not this job's to take down",
+            stacked
+                .iter()
+                .map(|m| format!("{} at {}", m.source, m.mount_point))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let (Some(fsid), Some(b)) = (btrfs_fsid, ours.iter().find(|m| m.fstype == "btrfs")) {
+        maintenance_on(runner, site, Some(fsid), &b.mount_point)?;
+    }
+    if site.report_only {
+        return would_clear(runner, site, who, &ours, progress).map(Some);
+    }
+    let mut sent = clear_logged(site, runner, who, &ours, progress)?;
+    unmount_each(runner, site, who, &ours, progress, &mut sent)?;
+    let left = mounts_of_partitions(&parse_mountinfo(&(site.mountinfo)()?), partitions);
     if !left.is_empty() {
         return Err(format!(
             "still mounted at {} after it was unmounted",
@@ -1364,8 +1493,8 @@ fn clear_mounted_elsewhere(
                 .join(", ")
         ));
     }
-    if sys.exists() {
-        return Err(hidden());
+    if let Some(sys) = sys.as_deref().filter(|s| s.exists()) {
+        return Err(hidden(sys));
     }
     if !sent.is_empty() {
         warn(format!("{STOPPED}: {}", sent.join(", ")));
@@ -4227,6 +4356,238 @@ mod tests {
 
     fn logged(progress: &Recorder, fragment: &str) -> bool {
         progress.logs().iter().any(|(_, m)| m.contains(fragment))
+    }
+
+    // --- bd DAS-Backup-Manager-eg4j.19: partition-keyed clearing ----------
+
+    const ESP_AT: &str = "/run/media/u/RECOV-ESP-1";
+
+    /// A recovery drive's partition `/dev/sdx1` (a vfat ESP, mount id 50)
+    /// mounted by udisks, with `holder` (if any) using it.
+    fn esp_mounted_by_udisks(holder: Option<crate::holders::testproc::Proc<'_>>) -> Host {
+        let proc = crate::holders::testproc::FakeProc::new();
+        if let Some(h) = holder {
+            proc.add(h);
+        }
+        Host {
+            mountinfo: vec![
+                "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+                format!("50 22 0:60 / {ESP_AT} rw,nosuid - vfat /dev/sdx1 rw,fmask=0022"),
+            ],
+            proc: Some(Arc::new(proc)),
+            ..Host::default()
+        }
+    }
+
+    fn esp_user(pid: i32, flags: &'static str) -> crate::holders::testproc::Proc<'static> {
+        crate::holders::testproc::Proc {
+            pid,
+            cmd: "kate",
+            fds: vec![(3, "/run/media/u/RECOV-ESP-1/x", flags, Some(50))],
+            ..Default::default()
+        }
+    }
+
+    fn clear_parts(
+        host: &Host,
+        runner: &Arc<ScriptedRunner>,
+        fsid: Option<&str>,
+        progress: &Recorder,
+    ) -> Result<Option<Vec<String>>, String> {
+        host.with_clear(runner, |c| {
+            clear_partitions_with(
+                &**runner,
+                c,
+                "recovery",
+                &["/dev/sdx1".to_string()],
+                fsid,
+                progress,
+            )
+        })
+    }
+
+    fn umounts(runner: &ScriptedRunner) -> Vec<String> {
+        runner
+            .calls()
+            .iter()
+            .filter(|c| c.argv[0] == "umount")
+            .map(|c| c.argv[1].clone())
+            .collect()
+    }
+
+    #[test]
+    fn clear_partitions_idle_vfat_mount_is_unmounted() {
+        let host = esp_mounted_by_udisks(None);
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let got = clear_parts(&host, &runner, None, &progress);
+
+        assert_eq!(got, Ok(Some(Vec::new())));
+        assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
+        assert!(host.signals().is_empty());
+        assert!(
+            logged(&progress, &format!("mounted at {ESP_AT} by udisks")),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
+    #[test]
+    fn clear_partitions_mounted_nowhere_is_none_and_touches_nothing() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo.truncate(1);
+        let runner = ScriptedRunner::succeeding();
+
+        assert_eq!(
+            clear_parts(&host, &runner, None, &Recorder::default()),
+            Ok(None)
+        );
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn clear_partitions_reader_is_stopped_when_job_writes() {
+        let host = esp_mounted_by_udisks(Some(esp_user(300, "0100000")));
+        let runner = ScriptedRunner::succeeding();
+
+        let got = clear_parts(&host, &runner, None, &Recorder::default()).unwrap();
+
+        assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
+        let sent = got.expect("cleared");
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("SIGTERM to pid 300 (kate"), "{sent:?}");
+        assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
+    }
+
+    #[test]
+    fn clear_partitions_reader_refuses_read_only_job() {
+        let mut host = esp_mounted_by_udisks(Some(esp_user(300, "0100000")));
+        host.read_only_job = true;
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(
+            err.contains("never stops a process") && err.contains("pid 300"),
+            "{err}"
+        );
+        assert!(host.signals().is_empty());
+        assert!(umounts(&runner).is_empty());
+    }
+
+    #[test]
+    fn clear_partitions_writer_refuses_and_signals_nothing() {
+        let host = esp_mounted_by_udisks(Some(esp_user(301, "0100002")));
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("pid 301") && err.contains("writing"), "{err}");
+        assert!(host.signals().is_empty());
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// Review 1: a vfat ESP mounted at two places comes down deepest first.
+    #[test]
+    fn clear_partitions_two_mounts_come_down_deepest_first() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo
+            .push("51 22 0:60 / /mnt/e rw - vfat /dev/sdx1 rw".into());
+        let runner = ScriptedRunner::succeeding();
+
+        let got = clear_parts(&host, &runner, None, &Recorder::default());
+
+        assert_eq!(got, Ok(Some(Vec::new())));
+        assert_eq!(
+            umounts(&runner),
+            vec![ESP_AT.to_string(), "/mnt/e".to_string()]
+        );
+    }
+
+    /// Review 2: another filesystem mounted under the partition's mount is
+    /// not this job's to take down.
+    #[test]
+    fn clear_partitions_stacked_mount_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo.push(format!(
+            "60 50 0:70 / {ESP_AT}/inner rw - ext4 /dev/sdz1 rw"
+        ));
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("mounted inside it"), "{err}");
+        assert!(umounts(&runner).is_empty());
+        assert!(host.signals().is_empty());
+    }
+
+    #[test]
+    fn clear_partitions_report_only_unmounts_nothing() {
+        let mut host = esp_mounted_by_udisks(Some(esp_user(300, "0100000")));
+        host.report_only = true;
+        let runner = ScriptedRunner::succeeding();
+
+        let would = clear_parts(&host, &runner, None, &Recorder::default())
+            .unwrap()
+            .expect("would clear");
+
+        assert!(
+            would
+                .iter()
+                .any(|w| w.starts_with(&format!("would unmount {ESP_AT}"))),
+            "{would:?}"
+        );
+        assert!(would.iter().any(|w| w.contains("pid 300")), "{would:?}");
+        assert!(umounts(&runner).is_empty());
+        assert!(host.signals().is_empty());
+    }
+
+    /// An ESP-only mount never asks btrfs anything, even when the target has
+    /// a btrfs filesystem UUID.
+    #[test]
+    fn clear_partitions_vfat_mount_with_a_fsid_never_asks_btrfs() {
+        let host = esp_mounted_by_udisks(None);
+        let runner = ScriptedRunner::succeeding();
+
+        let got = clear_parts(&host, &runner, Some("u-r"), &Recorder::default());
+
+        assert_eq!(got, Ok(Some(Vec::new())));
+        assert!(
+            !runner.calls().iter().any(|c| c.argv[0] == "btrfs"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// A btrfs mount of the partition with maintenance running is refused,
+    /// as `clear_mounted_elsewhere` does.
+    #[test]
+    fn clear_partitions_btrfs_balance_running_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] = "50 22 0:60 / /run/media/u/b rw - btrfs /dev/sdx1 rw,subvolid=5".into();
+        host.exclusive = vec![("u-r".into(), "balance\n".into())];
+        host.in_sysfs = vec!["u-r".into()];
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, Some("u-r"), &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("balance"), "{err}");
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// The kernel has the target's btrfs mounted where this host cannot see:
+    /// the answer is a refusal, not "mounted nowhere".
+    #[test]
+    fn clear_partitions_btrfs_mounted_only_out_of_sight_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo.truncate(1);
+        host.in_sysfs = vec!["u-r".into()];
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, Some("u-r"), &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("another mount namespace"), "{err}");
     }
 
     /// The other program's mount is never bound: its reader is stopped, it
