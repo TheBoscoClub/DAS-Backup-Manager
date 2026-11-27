@@ -135,8 +135,8 @@ fn apply_udev_rules(config: &Config) {
     for args in steps {
         if let Err(e) = run_udevadm(args) {
             eprintln!(
-                "Warning: {e} — the udisks-ignore rule is installed but not yet \
-                 applied to attached drives; it takes effect on the next boot"
+                "Warning: {e} — the udisks-ignore and recovery-ESP name rules are installed \
+                 but not yet applied to attached drives; they take effect on the next boot"
             );
             return;
         }
@@ -600,6 +600,88 @@ pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<
                 "Target {} not attached — udisks visibility could not be checked",
                 t.label
             ))),
+        }
+    }
+    lines
+}
+
+/// The lines `setup --check` prints about the RECOVERY partition name on each
+/// configured recovery ESP, read from udev's database (bd
+/// `DAS-Backup-Manager-eg4j.18`). An ESP without that name can be mounted
+/// read-write as root by fwupd. An ESP not attached is a valid state (an absent
+/// recovery drive), never a failure; a database that could not be read is
+/// reported as not checked, never as fine.
+pub fn recovery_esp_name_report(
+    export_db: &Result<String, String>,
+    config: &Config,
+) -> Vec<CheckLine> {
+    let mut lines = Vec::new();
+    for target in &config.targets {
+        let Some(raw) = target.esp_partuuid.as_deref() else {
+            continue;
+        };
+        if !buttered_dasd::config::is_partuuid(raw) {
+            lines.push(CheckLine::warn(format!(
+                "Target {}: esp_partuuid {raw:?} is not a PARTUUID — no RECOVERY name rule \
+                 was written for it, so fwupd may mount that ESP",
+                target.label
+            )));
+            continue;
+        }
+        let wanted = raw.to_ascii_lowercase();
+        let db = match export_db {
+            Ok(db) => db,
+            Err(e) => {
+                lines.push(CheckLine::warn(format!(
+                    "Target {} ESP RECOVERY name NOT checked: {e}",
+                    target.label
+                )));
+                continue;
+            }
+        };
+        let mut named = Vec::new();
+        let mut unnamed = Vec::new();
+        for record in db.split("\n\n") {
+            let prop = |key: &str| {
+                record
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("E: "))
+                    .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            };
+            if prop("SUBSYSTEM") != Some("block")
+                || !prop("ID_PART_ENTRY_UUID").is_some_and(|u| u.eq_ignore_ascii_case(&wanted))
+            {
+                continue;
+            }
+            let dev = prop("DEVNAME").unwrap_or("(unnamed device)").to_string();
+            if prop("ID_PART_ENTRY_NAME") == Some("RECOVERY") {
+                named.push(dev);
+            } else {
+                unnamed.push(dev);
+            }
+        }
+        if !unnamed.is_empty() {
+            lines.push(CheckLine::fail(format!(
+                "Target {} ESP {} is not named RECOVERY in udev — fwupd may mount it read-write",
+                target.label,
+                unnamed.join(", ")
+            )));
+            lines.push(CheckLine::more(
+                "  Fix with: sudo btrdasd setup --upgrade, or: sudo udevadm trigger \
+                 --action=change --subsystem-match=block \
+                 --property-match=ID_PART_ENTRY_UUID=<its PARTUUID>",
+            ));
+        } else if !named.is_empty() {
+            lines.push(CheckLine::ok(format!(
+                "Target {} ESP named RECOVERY in udev, so fwupd skips it ({})",
+                target.label,
+                named.join(", ")
+            )));
+        } else {
+            lines.push(CheckLine::ok(format!(
+                "Target {} ESP not attached — its RECOVERY name could not be checked",
+                target.label
+            )));
         }
     }
     lines
@@ -2389,6 +2471,10 @@ fn check_sections(
         "I/O scheduler, drives",
         io_scheduler_live_report(&export_db, probes.active_scheduler, &config),
     );
+    section(
+        "Recovery ESP names",
+        recovery_esp_name_report(&export_db, &config),
+    );
     section("udisks visibility", udisks_report(export_db, &config));
 
     let mut lines = Vec::new();
@@ -2813,6 +2899,93 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    const ESP_A: &str = "5eed0025-0000-4000-8000-000000000025";
+    const ESP_B: &str = "5eed0023-0000-4000-8000-000000000023";
+
+    /// A partition record as `udevadm info --export-db` prints it.
+    fn esp_record(devname: &str, partuuid: &str, name: &str) -> String {
+        format!(
+            "P: /devices/x/block/{devname}\nN: {devname}\nE: DEVNAME=/dev/{devname}\n\
+             E: SUBSYSTEM=block\nE: DEVTYPE=partition\nE: ID_FS_TYPE=vfat\n\
+             E: ID_PART_ENTRY_UUID={partuuid}\nE: ID_PART_ENTRY_NAME={name}\n\n"
+        )
+    }
+
+    fn esp_config(partuuids: &[Option<&str>]) -> Config {
+        let mut config = Config::default();
+        for (i, pu) in partuuids.iter().enumerate() {
+            let mut t = exposure_target(&format!("rec-{i}"), &["SERIAL04"], None);
+            t.role = TargetRole::Mirror;
+            t.esp_partuuid = pu.map(str::to_string);
+            config.targets.push(t);
+        }
+        config
+    }
+
+    fn status_texts(lines: &[CheckLine]) -> Vec<(Option<LineStatus>, String)> {
+        lines.iter().map(|l| (l.status, l.text.clone())).collect()
+    }
+
+    #[test]
+    fn recovery_esp_name_report_fails_an_attached_esp_without_the_name() {
+        let db = esp_record("sdj1", ESP_A, "EFI system partition");
+        let lines = recovery_esp_name_report(&Ok(db), &esp_config(&[Some(ESP_A)]));
+        let got = status_texts(&lines);
+        assert_eq!(got[0].0, Some(LineStatus::Fail));
+        assert!(
+            got[0].1.contains("rec-0") && got[0].1.contains("fwupd may mount"),
+            "{got:?}"
+        );
+        assert!(got[0].1.contains("/dev/sdj1"), "{got:?}");
+        assert_eq!(got[1].0, None);
+        assert!(
+            got[1].1.contains("setup --upgrade")
+                && got[1].1.contains("udevadm trigger --action=change")
+        );
+    }
+
+    #[test]
+    fn recovery_esp_name_report_passes_an_esp_named_recovery() {
+        let db = esp_record("sdj1", ESP_A, "RECOVERY");
+        let lines = recovery_esp_name_report(&Ok(db), &esp_config(&[Some(ESP_A)]));
+        let got = status_texts(&lines);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, Some(LineStatus::Ok));
+        assert!(got[0].1.contains("rec-0") && got[0].1.contains("RECOVERY"));
+    }
+
+    #[test]
+    fn recovery_esp_name_report_does_not_fail_an_unattached_esp() {
+        let db = esp_record("sdj1", ESP_B, "EFI system partition");
+        let lines = recovery_esp_name_report(&Ok(db), &esp_config(&[Some(ESP_A), None]));
+        let got = status_texts(&lines);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_ne!(got[0].0, Some(LineStatus::Fail));
+        assert!(got[0].1.contains("not attached"), "{got:?}");
+    }
+
+    #[test]
+    fn recovery_esp_name_report_matches_the_partuuid_case_insensitively() {
+        let db = esp_record("sdj1", &ESP_A.to_uppercase(), "RECOVERY");
+        let lines = recovery_esp_name_report(&Ok(db), &esp_config(&[Some(ESP_A)]));
+        assert_eq!(lines[0].status, Some(LineStatus::Ok));
+    }
+
+    #[test]
+    fn recovery_esp_name_report_flags_an_invalid_partuuid_and_an_unreadable_database() {
+        let lines = recovery_esp_name_report(&Ok(String::new()), &esp_config(&[Some("bad\"")]));
+        assert_eq!(lines[0].status, Some(LineStatus::Warn));
+        assert!(lines[0].text.contains("not a PARTUUID"));
+        let lines = recovery_esp_name_report(
+            &Err("udevadm exited with 1".into()),
+            &esp_config(&[Some(ESP_A)]),
+        );
+        assert_eq!(lines[0].status, Some(LineStatus::Warn));
+        assert!(lines[0].text.contains("NOT checked"));
+        // Nothing configured, nothing said.
+        assert!(recovery_esp_name_report(&Err("x".into()), &esp_config(&[None])).is_empty());
     }
 
     #[test]

@@ -287,7 +287,7 @@ sudo btrfs device stats {{primary_mount}}
 
 A backup that starts while you have it mounted uses your mount and unmounts it when it finishes; unmount it yourself when you are done.
 
-The backup targets are hidden from udisks by the generated rule `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, so no desktop session mounts them and nothing should appear under `/run/media`. If one does, the rule is not applying: unmount it and run `sudo btrdasd setup --check`.
+The backup targets are hidden from udisks by the generated rule `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, so no desktop session mounts them and nothing should appear under `/run/media`. The same file names each recovery drive's ESP `RECOVERY` in udev, which makes fwupd skip it. If a target does appear, the rule is not applying: unmount it and run `sudo btrdasd setup --check`.
 
 #### Step 3: Verify SMART on the surviving leg
 

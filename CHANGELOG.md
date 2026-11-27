@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The generated udev rule names each configured recovery ESP `RECOVERY`, so fwupd never mounts it** (bd `DAS-Backup-Manager-eg4j.18`): on 2026-11-26 fwupd, started after a reboot, enumerated every ESP by partition type and mounted both recovery-drive ESPs read-write as root through udisks — one stayed mounted and refused the next recovery-OS update
+  - `btrdasd setup` adds one line per target `esp_partuuid` to `99-das-backup-udisks-ignore.rules`, setting `ID_PART_ENTRY_NAME=RECOVERY` on that partition; fwupd skips an ESP whose name is on udisks' recovery list (`fu_volume_check_is_recovery`). Only a udev property changes — the on-disk partition table is untouched; the existing `UDISKS_IGNORE` lines are unchanged
+  - The PARTUUID is checked with `config::is_partuuid` before it reaches the rule (an invalid one is skipped with a comment), and matched by PARTUUID alone, never by partition type
+  - `btrdasd setup --check` gains a "Recovery ESP names" section: FAIL for an attached ESP that does not read `RECOVERY` back from udev (fix: `setup --upgrade`), OK for one that does, OK-with-reason for one not attached, WARN for an invalid PARTUUID or an unreadable database
+
 - **`btrdasd scrub pause` and `btrdasd scrub resume`** (bd `DAS-Backup-Manager-su1b.15`): on 2026-11-22 a pass had to be paused by hand for an install and a reboot — a held claim, then `systemctl stop`, which left the unit failed and the pass `interrupted` (FAIL)
   - `pause` writes `/run/das-scrub-pause` (0600, requester and time) only while a pass runs, then claims the maintenance lock as a backup does: the pass yields as for a backup (scrub stopped resumably, `canceled:0 finished:0`; unmounted), files the filesystem `paused`, and ends 0 — `das-scrub.service` ends inactive, not failed
   - The command waits up to 240 s (`PAUSE_ANSWER_SECS`) and kills nothing: no pass running → nothing written, exit 0; the pass finished first → the request taken away, exit 0; no answer → exit 1 naming the holder, the request left so the pass pauses at its next look
