@@ -178,6 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`btrdasd setup --check`'s RESULT status comes from each check, not from words in its lines** (bd `DAS-Backup-Manager-3gzs.13`): `render_check` guessed OK, WARN or FAIL from status words in a topic's lines, so a failing check worded without them read OK; each check now returns its lines with the status it decided (`CheckLine`), a continuation line takes the status of the line above, and the word heuristic is gone — the printed text is unchanged
+
 - **Removing the package retires what `btrdasd setup` installed, keeping the configuration** (bd `DAS-Backup-Manager-hzxr`): no package format had a removal hook, so `pacman -R`, `apt remove` or `dnf remove` left the generated units, their links and the enabled timers behind, firing at a script that was gone
   - Arch `pre_remove`, Debian `prerm` (on `remove` only, never `deconfigure` or an upgrade) and rpm `%preun` (final erase only) run `btrdasd setup --uninstall --force --keep-config` when a setup manifest exists; a hook that fails never blocks the removal and says what to run by hand
   - New `setup --uninstall --keep-config` keeps `/etc/das-backup/config.toml` (plain `--uninstall` removes it, as before — `docs/INSTALL.md` said otherwise and is corrected); the backup database and the targets' snapshots are never touched by either

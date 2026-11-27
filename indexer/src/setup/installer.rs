@@ -254,30 +254,43 @@ fn read_installed_io_rule(path: &Path) -> Result<Option<String>, String> {
 pub fn io_scheduler_rule_report(
     installed: Result<Option<String>, String>,
     config: &Config,
-) -> Vec<String> {
+) -> Vec<CheckLine> {
     let path = crate::setup::templates::UDEV_IO_SCHEDULER_RULES;
-    let fix = "  Fix with: sudo btrdasd setup --upgrade".to_string();
+    let fix = || CheckLine::more("  Fix with: sudo btrdasd setup --upgrade");
     let installed = match installed {
         Ok(text) => text,
-        Err(e) => return vec![format!("I/O scheduler rule NOT checked: {e}")],
+        Err(e) => {
+            return vec![CheckLine::warn(format!(
+                "I/O scheduler rule NOT checked: {e}"
+            ))];
+        }
     };
     let expected = crate::setup::templates::render_udev_io_scheduler(config);
     match (expected, installed) {
         (None, None) => {
-            vec!["I/O scheduler not pinned by udev ([das].io_scheduler is empty)".to_string()]
+            vec![CheckLine::ok(
+                "I/O scheduler not pinned by udev ([das].io_scheduler is empty)",
+            )]
         }
         (None, Some(_)) => vec![
-            format!("I/O scheduler rule {path} is STALE — [das].io_scheduler is empty"),
-            fix,
+            CheckLine::fail(format!(
+                "I/O scheduler rule {path} is STALE — [das].io_scheduler is empty"
+            )),
+            fix(),
         ],
-        (Some(_), None) => vec![format!("I/O scheduler rule {path} MISSING"), fix],
-        (Some(want), Some(have)) if want == have => vec![format!(
+        (Some(_), None) => vec![
+            CheckLine::fail(format!("I/O scheduler rule {path} MISSING")),
+            fix(),
+        ],
+        (Some(want), Some(have)) if want == have => vec![CheckLine::ok(format!(
             "I/O scheduler rule current ({} pinned on the target drives at every add/change)",
             config.das.io_scheduler
-        )],
+        ))],
         (Some(_), Some(_)) => vec![
-            format!("I/O scheduler rule {path} is STALE — it differs from what setup would write"),
-            fix,
+            CheckLine::fail(format!(
+                "I/O scheduler rule {path} is STALE — it differs from what setup would write"
+            )),
+            fix(),
         ],
     }
 }
@@ -329,14 +342,18 @@ pub fn io_scheduler_live_report(
     export_db: &Result<String, String>,
     active: &dyn Fn(&str) -> Result<String, String>,
     config: &Config,
-) -> Vec<String> {
+) -> Vec<CheckLine> {
     let want = config.das.io_scheduler.as_str();
     if want.is_empty() {
         return Vec::new();
     }
     let db = match export_db {
         Ok(db) => db,
-        Err(e) => return vec![format!("I/O scheduler of the drives NOT checked: {e}")],
+        Err(e) => {
+            return vec![CheckLine::warn(format!(
+                "I/O scheduler of the drives NOT checked: {e}"
+            ))];
+        }
     };
     let serials: Vec<String> = config
         .targets
@@ -368,25 +385,31 @@ pub fn io_scheduler_live_report(
         found = true;
         match active(devpath) {
             Ok(text) => match active_scheduler(&text) {
-                Some(now) if now == want => lines.push(format!("Drive {devname} runs {now}")),
+                Some(now) if now == want => {
+                    lines.push(CheckLine::ok(format!("Drive {devname} runs {now}")))
+                }
                 Some(now) => {
                     off = true;
-                    lines.push(format!("Drive {devname} runs {now}, not {want}"));
+                    lines.push(CheckLine::fail(format!(
+                        "Drive {devname} runs {now}, not {want}"
+                    )));
                 }
-                None => lines.push(format!(
+                None => lines.push(CheckLine::warn(format!(
                     "Drive {devname} scheduler NOT read: no active one listed"
-                )),
+                ))),
             },
-            Err(e) => lines.push(format!("Drive {devname} scheduler NOT read: {e}")),
+            Err(e) => lines.push(CheckLine::warn(format!(
+                "Drive {devname} scheduler NOT read: {e}"
+            ))),
         }
     }
     if !found {
-        lines.push(
-            "No target drive attached — their I/O scheduler could not be checked".to_string(),
-        );
+        lines.push(CheckLine::warn(
+            "No target drive attached — their I/O scheduler could not be checked",
+        ));
     }
     if off {
-        lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+        lines.push(CheckLine::more("  Fix with: sudo btrdasd setup --upgrade"));
     }
     lines
 }
@@ -424,18 +447,18 @@ fn btrfs_uuids_for_serials(export_db: &str, serials: &[String]) -> Vec<String> {
 /// mount point, not which filesystem is mounted there. Where udev knows the
 /// target's filesystem, the line to add is printed; `setup` never writes it
 /// into an existing config by itself.
-pub fn mount_uuid_report(export_db: &Result<String, String>, config: &Config) -> Vec<String> {
+pub fn mount_uuid_report(export_db: &Result<String, String>, config: &Config) -> Vec<CheckLine> {
     let mut lines = Vec::new();
     for target in config
         .targets
         .iter()
         .filter(|t| t.mount_uuid.as_deref().is_none_or(str::is_empty))
     {
-        lines.push(format!(
+        lines.push(CheckLine::warn(format!(
             "Target {} has no mount_uuid — found by drive serial only, and verified only \
              as a mount point, not as its filesystem",
             target.label
-        ));
+        )));
         let serials = target.effective_serials();
         let hint = match export_db {
             Err(e) => format!("  Its filesystem UUID could not be looked up: {e}"),
@@ -454,7 +477,7 @@ pub fn mount_uuid_report(export_db: &Result<String, String>, config: &Config) ->
                 ),
             },
         };
-        lines.push(hint);
+        lines.push(CheckLine::more(hint));
     }
     lines
 }
@@ -485,13 +508,13 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
 /// so a unit that is not `loaded` is reported as such before any value is
 /// compared. A probe that failed or printed no such property is reported,
 /// never read as "fine".
-fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
+fn scrub_priority_report(shown: Result<String, String>) -> Vec<CheckLine> {
     let shown = match shown {
         Ok(s) => s,
         Err(e) => {
-            return vec![format!(
+            return vec![CheckLine::warn(format!(
                 "das-scrub.service priority could not be read back: {e}"
-            )];
+            ))];
         }
     };
     let value = |key: &str| {
@@ -511,8 +534,11 @@ fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
             "  Install das-scrub.service: sudo btrdasd setup --upgrade (between runs)"
         };
         return vec![
-            format!("das-scrub.service is not loaded (LoadState={})", show(load)),
-            hint.to_string(),
+            CheckLine::fail(format!(
+                "das-scrub.service is not loaded (LoadState={})",
+                show(load)
+            )),
+            CheckLine::more(hint),
         ];
     }
     let nice = value("Nice");
@@ -522,53 +548,58 @@ fn scrub_priority_report(shown: Result<String, String>) -> Vec<String> {
     // its name on others; both mean best-effort.
     let class_ok = matches!(class, Some(c) if c == SCRUB_IO_CLASS || c == "2");
     if nice == Some(SCRUB_NICE) && class_ok && level == Some(SCRUB_IO_LEVEL) {
-        return vec![format!(
+        return vec![CheckLine::ok(format!(
             "das-scrub.service runs at nice {SCRUB_NICE}, {SCRUB_IO_CLASS} I/O level {SCRUB_IO_LEVEL}"
-        )];
+        ))];
     }
     vec![
-        format!(
+        CheckLine::fail(format!(
             "das-scrub.service priority DIFFERS from what setup writes: Nice={} IOSchedulingClass={} \
              IOSchedulingPriority={} (expected Nice={SCRUB_NICE} IOSchedulingClass={SCRUB_IO_CLASS} \
              IOSchedulingPriority={SCRUB_IO_LEVEL})",
             show(nice),
             show(class),
             show(level)
+        )),
+        CheckLine::more(
+            "  A stale unit: sudo btrdasd setup --upgrade (between runs). A drop-in: \
+             systemctl cat das-scrub.service",
         ),
-        "  A stale unit: sudo btrdasd setup --upgrade (between runs). A drop-in: \
-         systemctl cat das-scrub.service"
-            .to_string(),
     ]
 }
 
 /// The lines `setup --check` prints about udisks visibility, given the result
 /// of reading udev's database. A database that could not be read is reported
 /// as not checked — it must never read as "nothing exposed".
-pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<String> {
+pub fn udisks_report(export_db: Result<String, String>, config: &Config) -> Vec<CheckLine> {
     let db = match export_db {
         Ok(db) => db,
-        Err(e) => return vec![format!("udisks visibility NOT checked: {e}")],
+        Err(e) => {
+            return vec![CheckLine::warn(format!(
+                "udisks visibility NOT checked: {e}"
+            ))];
+        }
     };
     let mut lines = Vec::new();
     for t in udisks_exposure(&db, config) {
         match t.verdict() {
-            ExposureVerdict::Hidden => lines.push(format!(
+            ExposureVerdict::Hidden => lines.push(CheckLine::ok(format!(
                 "Target {} hidden from udisks ({})",
                 t.label,
                 t.hidden.join(", ")
-            )),
+            ))),
             ExposureVerdict::Exposed => {
-                lines.push(format!(
+                lines.push(CheckLine::fail(format!(
                     "Target {} EXPOSED to udisks — a desktop login can automount {}",
                     t.label,
                     t.exposed.join(", ")
-                ));
-                lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+                )));
+                lines.push(CheckLine::more("  Fix with: sudo btrdasd setup --upgrade"));
             }
-            ExposureVerdict::NotAttached => lines.push(format!(
+            ExposureVerdict::NotAttached => lines.push(CheckLine::warn(format!(
                 "Target {} not attached — udisks visibility could not be checked",
                 t.label
-            )),
+            ))),
         }
     }
     lines
@@ -2090,16 +2121,48 @@ struct CheckProbes<'a> {
     dependencies: &'a dyn Fn(bool) -> Vec<crate::setup::detect::DepStatus>,
 }
 
+/// One line of the `setup --check` report. The check that makes the line
+/// decides its status (bd DAS-Backup-Manager-3gzs.13); nothing reads it back
+/// out of the wording. A continuation line has none: it belongs to the line
+/// above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckLine {
+    status: Option<LineStatus>,
+    text: String,
+}
+
+impl CheckLine {
+    fn new(status: Option<LineStatus>, text: impl Into<String>) -> Self {
+        Self {
+            status,
+            text: text.into(),
+        }
+    }
+    fn ok(text: impl Into<String>) -> Self {
+        Self::new(Some(LineStatus::Ok), text)
+    }
+    fn warn(text: impl Into<String>) -> Self {
+        Self::new(Some(LineStatus::Warn), text)
+    }
+    fn fail(text: impl Into<String>) -> Self {
+        Self::new(Some(LineStatus::Fail), text)
+    }
+    /// A line that belongs to the one above it, and takes its status.
+    fn more(text: impl Into<String>) -> Self {
+        Self::new(None, text)
+    }
+}
+
 /// One topic of the `setup --check` report: what was looked at and the
 /// lines it printed (their wording is the report functions' own).
 struct CheckSection {
     name: &'static str,
-    lines: Vec<String>,
+    lines: Vec<CheckLine>,
 }
 
 /// How a `setup --check` line reads: fine, to look at, or broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LineStatus {
+pub enum LineStatus {
     Ok,
     Warn,
     Fail,
@@ -2115,48 +2178,6 @@ impl LineStatus {
     }
 }
 
-/// The status of a report line, from the words the report functions put in
-/// the lines that need a reader: `None` for a continuation (indented) line,
-/// which belongs to the line above it. A line none of these words is in reads
-/// `OK`; `check_status_words_cover_every_report_function` pins each bad
-/// line the report functions can produce.
-fn line_status(line: &str) -> Option<LineStatus> {
-    if line.starts_with(' ') {
-        return None;
-    }
-    const FAIL: [&str; 10] = [
-        "Config error",
-        "Config not found",
-        "UNREACHABLE",
-        " MISSING",
-        "STALE",
-        "EXPOSED",
-        "DIFFERS",
-        "is not loaded",
-        "generated files missing",
-        "(required, not found)",
-    ];
-    const WARN: [&str; 9] = [
-        "NOT checked",
-        "NOT read",
-        "could not",
-        "Config warning",
-        "has no mount_uuid",
-        "(optional, not found)",
-        "No manifest found",
-        "No target drive attached",
-        "not attached",
-    ];
-    let drive_off = line.starts_with("Drive ") && line.contains(", not ");
-    Some(if drive_off || FAIL.iter().any(|w| line.contains(w)) {
-        LineStatus::Fail
-    } else if WARN.iter().any(|w| line.contains(w)) {
-        LineStatus::Warn
-    } else {
-        LineStatus::Ok
-    })
-}
-
 /// A report line with the indented lines that belong to it, and its status.
 type LineGroup = (LineStatus, Vec<String>);
 
@@ -2170,10 +2191,10 @@ fn render_check(sections: &[CheckSection]) -> Vec<String> {
     let groups = |sec: &CheckSection| -> Vec<LineGroup> {
         let mut g: Vec<LineGroup> = Vec::new();
         for line in &sec.lines {
-            match (line_status(line), g.last_mut()) {
-                (Some(st), _) => g.push((st, vec![line.clone()])),
-                (None, Some(last)) => last.1.push(line.clone()),
-                (None, None) => g.push((LineStatus::Ok, vec![line.clone()])),
+            match (line.status, g.last_mut()) {
+                (Some(st), _) => g.push((st, vec![line.text.clone()])),
+                (None, Some(last)) => last.1.push(line.text.clone()),
+                (None, None) => g.push((LineStatus::Ok, vec![line.text.clone()])),
             }
         }
         g
@@ -2258,34 +2279,37 @@ fn check_sections(
     probes: &CheckProbes,
 ) -> Result<Vec<CheckSection>, Box<dyn std::error::Error>> {
     let mut sections: Vec<CheckSection> = Vec::new();
-    let mut section = |name: &'static str, lines: Vec<String>| {
+    let mut section = |name: &'static str, lines: Vec<CheckLine>| {
         sections.push(CheckSection { name, lines });
     };
     if !config_path.exists() {
         section(
             "Config",
             vec![
-                format!("Config not found at {}", config_path.display()),
-                "  Run: sudo btrdasd setup".to_string(),
+                CheckLine::fail(format!("Config not found at {}", config_path.display())),
+                CheckLine::more("  Run: sudo btrdasd setup"),
             ],
         );
         return Ok(sections);
     }
-    let mut lines = vec![format!("Config found: {}", config_path.display())];
+    let mut lines = vec![CheckLine::ok(format!(
+        "Config found: {}",
+        config_path.display()
+    ))];
 
     let text = std::fs::read_to_string(config_path)?;
     let config = Config::from_toml(&text)?;
     let errors = config.validate();
     if errors.is_empty() {
-        lines.push("Config is valid".to_string());
+        lines.push(CheckLine::ok("Config is valid"));
     } else {
         for err in &errors {
-            lines.push(format!("Config error: {}", err));
+            lines.push(CheckLine::fail(format!("Config error: {}", err)));
         }
     }
     // A key nothing reads (a typo the save keeps): warned, never an error.
     for w in buttered_dasd::config::unknown_key_warnings(&text)? {
-        lines.push(format!("Config warning: {w}"));
+        lines.push(CheckLine::warn(format!("Config warning: {w}")));
     }
     section("Config", lines);
 
@@ -2295,17 +2319,20 @@ fn check_sections(
         let mut lines = Vec::new();
         let relay = format!("{}:{}", config.email.smtp_host, config.email.smtp_port);
         if (probes.relay_up)(&config) {
-            lines.push(format!("Mail relay reachable at {relay}"));
+            lines.push(CheckLine::ok(format!("Mail relay reachable at {relay}")));
         } else {
-            lines.push(format!("Mail relay UNREACHABLE at {relay}"));
+            lines.push(CheckLine::fail(format!(
+                "Mail relay UNREACHABLE at {relay}"
+            )));
             if config.email.smtp_port == 1025 {
-                lines.push(
-                    "  Port 1025 is Protonmail Bridge, which this version no longer uses."
-                        .to_string(),
-                );
-                lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+                lines.push(CheckLine::more(
+                    "  Port 1025 is Protonmail Bridge, which this version no longer uses.",
+                ));
+                lines.push(CheckLine::more("  Fix with: sudo btrdasd setup --upgrade"));
             } else {
-                lines.push("  Reports will be saved to disk but not delivered.".to_string());
+                lines.push(CheckLine::more(
+                    "  Reports will be saved to disk but not delivered.",
+                ));
             }
         }
         section("Mail relay", lines);
@@ -2320,20 +2347,25 @@ fn check_sections(
             .filter(|line| !Path::new(line.trim()).exists())
             .collect();
         if missing.is_empty() {
-            lines.push(format!("All {} generated files present", total));
+            lines.push(CheckLine::ok(format!(
+                "All {} generated files present",
+                total
+            )));
         } else {
-            lines.push(format!(
+            lines.push(CheckLine::fail(format!(
                 "{} of {} generated files missing:",
                 missing.len(),
                 total
-            ));
+            )));
             for m in &missing {
-                lines.push(format!("    {}", m));
+                lines.push(CheckLine::more(format!("    {}", m)));
             }
-            lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
+            lines.push(CheckLine::more("  Fix with: sudo btrdasd setup --upgrade"));
         }
     } else {
-        lines.push("No manifest found. Files may be from a manual install.".to_string());
+        lines.push(CheckLine::warn(
+            "No manifest found. Files may be from a manual install.",
+        ));
     }
     section("Generated files", lines);
 
@@ -2362,11 +2394,17 @@ fn check_sections(
     let mut lines = Vec::new();
     for dep in &(probes.dependencies)(config.email.enabled) {
         if let Some(path) = &dep.path {
-            lines.push(format!("{} ({})", dep.name, path));
+            lines.push(CheckLine::ok(format!("{} ({})", dep.name, path)));
         } else if dep.required {
-            lines.push(format!("{} (required, not found)", dep.name));
+            lines.push(CheckLine::fail(format!(
+                "{} (required, not found)",
+                dep.name
+            )));
         } else {
-            lines.push(format!("{} (optional, not found)", dep.name));
+            lines.push(CheckLine::warn(format!(
+                "{} (optional, not found)",
+                dep.name
+            )));
         }
     }
     section("Dependencies", lines);
@@ -2753,9 +2791,17 @@ mod tests {
         assert!(err.contains("could not be run"), "{err}");
     }
 
+    /// The printed text of report lines, without their status.
+    fn texts(lines: &[CheckLine]) -> Vec<String> {
+        lines.iter().map(|l| l.text.clone()).collect()
+    }
+
     #[test]
     fn udisks_report_says_hidden_exposed_or_absent_per_target() {
-        let lines = udisks_report(Ok(export_db(false, true)), &exposure_config());
+        let lines = texts(&udisks_report(
+            Ok(export_db(false, true)),
+            &exposure_config(),
+        ));
         assert_eq!(
             lines,
             vec![
@@ -2775,7 +2821,7 @@ mod tests {
         config
             .targets
             .push(exposure_target("blank", &["SERIAL04"], Some("")));
-        let lines = mount_uuid_report(&Ok(export_db(true, true)), &config);
+        let lines = texts(&mount_uuid_report(&Ok(export_db(true, true)), &config));
         assert_eq!(
             lines,
             vec![
@@ -2811,14 +2857,17 @@ mod tests {
         config
             .targets
             .push(exposure_target("mixed", &["SERIAL04", "SERIAL11"], None));
-        let lines = mount_uuid_report(&Ok(export_db(true, true)), &config);
+        let lines = texts(&mount_uuid_report(&Ok(export_db(true, true)), &config));
         assert_eq!(
             lines[1],
             "  Its drives carry more than one BTRFS filesystem \
              (5eed0008-0000-4000-8000-000000000008, 5eed0016-0000-4000-8000-000000000016) — \
              set mount_uuid by hand"
         );
-        let lines = mount_uuid_report(&Err("udevadm exited with 1".into()), &config);
+        let lines = texts(&mount_uuid_report(
+            &Err("udevadm exited with 1".into()),
+            &config,
+        ));
         assert_eq!(
             lines[1],
             "  Its filesystem UUID could not be looked up: udevadm exited with 1"
@@ -2852,7 +2901,8 @@ mod tests {
     fn io_scheduler_rule_report_says_current_stale_or_missing() {
         let config = scheduler_config();
         let rule = crate::setup::templates::render_udev_io_scheduler(&config).unwrap();
-        let said = |r: Result<Option<String>, String>, c: &Config| io_scheduler_rule_report(r, c);
+        let said =
+            |r: Result<Option<String>, String>, c: &Config| texts(&io_scheduler_rule_report(r, c));
 
         let current = said(Ok(Some(rule.clone())), &config);
         assert_eq!(current.len(), 1, "{current:?}");
@@ -2879,10 +2929,13 @@ mod tests {
     fn io_scheduler_rule_report_with_no_scheduler_wants_no_rule() {
         let mut config = scheduler_config();
         config.das.io_scheduler = String::new();
-        let none = io_scheduler_rule_report(Ok(None), &config);
+        let none = texts(&io_scheduler_rule_report(Ok(None), &config));
         assert_eq!(none.len(), 1, "{none:?}");
         assert!(none[0].contains("not pinned"), "{none:?}");
-        let left = io_scheduler_rule_report(Ok(Some("old rule\n".into())), &config);
+        let left = texts(&io_scheduler_rule_report(
+            Ok(Some("old rule\n".into())),
+            &config,
+        ));
         assert!(left[0].contains("STALE"), "{left:?}");
         assert!(left[1].contains("setup --upgrade"), "{left:?}");
     }
@@ -2923,7 +2976,7 @@ mod tests {
             "/devices/x/block/sdj" => Ok("mq-deadline kyber [bfq] none\n".to_string()),
             other => panic!("read a device that is not a target's: {other}"),
         };
-        let lines = io_scheduler_live_report(&Ok(disk_db()), &read, &config);
+        let lines = texts(&io_scheduler_live_report(&Ok(disk_db()), &read, &config));
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], "Drive /dev/sdi runs mq-deadline");
         assert!(
@@ -2937,14 +2990,21 @@ mod tests {
     fn io_scheduler_live_report_never_reads_a_failure_as_a_match() {
         let config = scheduler_config();
         let unread = |_: &str| Err("no such file".to_string());
-        let lines = io_scheduler_live_report(&Ok(disk_db()), &unread, &config);
+        let lines = texts(&io_scheduler_live_report(&Ok(disk_db()), &unread, &config));
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines.iter().all(|l| l.contains("NOT read")), "{lines:?}");
-        let db_down =
-            io_scheduler_live_report(&Err("udevadm exited with 1".into()), &unread, &config);
+        let db_down = texts(&io_scheduler_live_report(
+            &Err("udevadm exited with 1".into()),
+            &unread,
+            &config,
+        ));
         assert_eq!(db_down.len(), 1);
         assert!(db_down[0].contains("NOT checked: udevadm exited with 1"));
-        let none = io_scheduler_live_report(&Ok(String::new()), &unread, &config);
+        let none = texts(&io_scheduler_live_report(
+            &Ok(String::new()),
+            &unread,
+            &config,
+        ));
         assert!(none[0].contains("No target drive attached"), "{none:?}");
         let mut off = scheduler_config();
         off.das.io_scheduler = String::new();
@@ -3041,7 +3101,10 @@ mod tests {
 
     #[test]
     fn udisks_report_never_reads_an_unreadable_database_as_nothing_exposed() {
-        let lines = udisks_report(Err("udevadm exited with 1".to_string()), &exposure_config());
+        let lines = texts(&udisks_report(
+            Err("udevadm exited with 1".to_string()),
+            &exposure_config(),
+        ));
         assert_eq!(
             lines,
             vec!["udisks visibility NOT checked: udevadm exited with 1".to_string()]
@@ -6440,6 +6503,7 @@ auth = "starttls""#,
             .unwrap()
             .into_iter()
             .flat_map(|sec| sec.lines)
+            .map(|l| l.text)
             .collect()
     }
 
@@ -6731,7 +6795,10 @@ auth = "starttls""#,
             check_sections(&config_path, &manifest_path, &probes).unwrap()
         };
         let all = sections(false);
-        let flat: Vec<String> = all.iter().flat_map(|s| s.lines.clone()).collect();
+        let flat: Vec<String> = all
+            .iter()
+            .flat_map(|s| s.lines.iter().map(|l| l.text.clone()))
+            .collect();
         let text = render_check(&all);
         assert_eq!(text[0], "━━ btrdasd setup --check ━━", "{text:#?}");
         // The deciding block, before any routine topic.
@@ -6796,50 +6863,55 @@ auth = "starttls""#,
         );
     }
 
-    /// The status words: every line a report function prints that needs a
-    /// reader reads WARN or FAIL, and a routine line OK; a continuation line
-    /// has no status of its own.
+    /// The status each report function gives its lines is its own decision,
+    /// with a continuation line carrying none.
     #[test]
-    fn check_status_words_cover_every_report_function() {
-        let fail = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Fail), "{l}");
-        let warn = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Warn), "{l}");
-        let ok = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Ok), "{l}");
-        // scrub_priority_report
-        fail(&scrub_priority_report(Ok("LoadState=not-found\n".into()))[0]);
-        fail(&scrub_priority_report(Ok("LoadState=loaded\nNice=19\n".into()))[0]);
-        warn(&scrub_priority_report(Err("x".into()))[0]);
-        ok(&scrub_priority_report(Ok(HEALTHY_SCRUB_SHOW.into()))[0]);
-        // udisks_report
-        let cfg = exposure_config();
-        let lines = udisks_report(Ok(export_db(false, true)), &cfg);
-        fail(&lines[0]); // EXPOSED
-        assert_eq!(line_status(&lines[1]), None); // "  Fix with"
-        ok(&lines[2]); // hidden
-        warn(&lines[3]); // not attached
-        warn(&udisks_report(Err("e".into()), &cfg)[0]);
-        // mount_uuid_report, the rule and the live scheduler
+    fn check_lines_carry_the_status_their_check_decided() {
+        use LineStatus::{Fail, Ok as Good, Warn};
+        let st = |l: &[CheckLine]| l.iter().map(|c| c.status).collect::<Vec<_>>();
+        assert_eq!(
+            st(&scrub_priority_report(Ok("LoadState=not-found\n".into()))),
+            [Some(Fail), None]
+        );
+        assert_eq!(st(&scrub_priority_report(Err("x".into()))), [Some(Warn)]);
+        assert_eq!(
+            st(&scrub_priority_report(Ok(HEALTHY_SCRUB_SHOW.into()))),
+            [Some(Good)]
+        );
+        assert_eq!(
+            st(&udisks_report(
+                Ok(export_db(false, true)),
+                &exposure_config()
+            )),
+            [Some(Fail), None, Some(Good), Some(Warn)]
+        );
         let mut c = Config::default();
         c.das.io_scheduler = "mq-deadline".into();
-        warn(&io_scheduler_rule_report(Err("e".into()), &c)[0]);
-        fail(&io_scheduler_rule_report(Ok(None), &c)[0]);
-        fail(&io_scheduler_rule_report(Ok(Some("old".into())), &c)[0]);
-        warn(&io_scheduler_live_report(&Err("e".into()), &|_| Err("x".into()), &c)[0]);
-        warn(&io_scheduler_live_report(&Ok(String::new()), &|_| Err("x".into()), &c)[0]);
-        c.das.io_scheduler.clear();
-        ok(&io_scheduler_rule_report(Ok(None), &c)[0]);
-        // Drive off its scheduler (the line io_scheduler_live_report builds).
-        fail("Drive sda runs bfq, not mq-deadline");
-        ok("Drive sda runs mq-deadline");
-        // The check's own lines.
-        fail("Config error: no targets");
-        warn("Config warning: x is not a key");
-        ok("Config is valid");
-        fail("1 of 9 generated files missing:");
-        ok("All 9 generated files present");
-        warn("No manifest found. Files may be from a manual install.");
-        warn("mbuffer (optional, not found)");
-        fail("smartctl (required, not found)");
-        ok("btrbk (/usr/bin/btrbk)");
+        assert_eq!(
+            st(&io_scheduler_rule_report(Ok(None), &c)),
+            [Some(Fail), None]
+        );
+        assert_eq!(
+            st(&io_scheduler_rule_report(Err("e".into()), &c)),
+            [Some(Warn)]
+        );
+    }
+
+    /// The RESULT status comes from the check that made the line, not from
+    /// words in it: a failing line worded with none of today's words still
+    /// reads FAIL (bd DAS-Backup-Manager-3gzs.13).
+    #[test]
+    fn check_result_status_is_not_inferred_from_words() {
+        let sec = CheckSection {
+            name: "Disks",
+            lines: vec![CheckLine::fail("Disk sda is gone")],
+        };
+        let text = render_check(&[sec]);
+        assert!(
+            text.iter()
+                .any(|l| l.starts_with("  Disks") && l.contains("FAIL")),
+            "{text:#?}"
+        );
     }
 
     #[test]
