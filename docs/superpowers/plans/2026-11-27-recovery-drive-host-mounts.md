@@ -108,14 +108,28 @@ Each has its test in the owning task.
   "dry run: … nothing was stopped or unmounted" (never continue beside a mount); 3 → refuse
   `drive in use on this host -- <detail>`; 2 or other → refuse `cannot clear the drive's host mounts: <detail>`;
   0 but still mounted (Review 4's reverse) → refuse `still mounted after clearing: …`.
-- Both call sites must run after `take_lock` holds `LOCK_FD`; move the call if either runs before it (verify by reading).
+- **Lock order (read 2026-11-27):** `cmd_session` runs `check_not_mounted` *before* `take_lock` and before
+  `HISTORY_ARMED=true`; `cmd_provision` runs `provision_preflight` (which holds the call) before its `take_lock`, and its
+  `--dry-run` exits before taking the lock. So: split `check_not_mounted` into the existing early listing (kept
+  where it is, now only logging the mounts it found, never refusing) and a new `clear_host_mounts` run straight
+  after `take_lock` (and, in `cmd_session`, after `HISTORY_ARMED=true` for a real run, so a refusal reaches the
+  history with its `host_mounts`). A drive session of a two-drive run inherits the lock through
+  `DAS_RECOVERY_VM_LOCK_FD`; its `take_lock` adopts it first, so the same placement holds. `refuse` exits 1 and the
+  existing exit path releases the lock — confirm by reading, do not change it.
+- **Dry runs:** a session dry run takes the lock → `clear-drive --report-only`, then refuse as above. A provision
+  dry run holds no lock → no `clear-drive`; it prints the mount listing and `a real run clears these by the stop
+  policy (writers refuse)`, and its dry-run result stands.
 - `write_history`: a `host_mounts` field — the list of cleared/refused mount lines (array of strings), `[]` when none.
+- **What the GUI shows:** the helper runs sessions through `run_script_merged` (stdout and stderr on one pipe, order
+  kept). Every line of the block goes out with `$LOG_PREFIX` through `log`/`warn`, so it lands whole and in order;
+  a helper test asserts the block's lines arrive in order in the relayed text (`indexer/src/bin/btrdasd-helper.rs` tests).
 
 - [ ] VM-suite cases first (stub `btrdasd` on the suite's PATH as the suite already does; never a self-calling stub):
   `session_idle_host_mount_is_cleared_and_session_continues`, `session_writer_host_mount_refuses_with_block`,
   `session_clear_drive_cannot_run_refuses`, `session_mount_gone_before_clear_continues` (Review 4),
   `session_dry_run_with_host_mount_unmounts_nothing`, `provision_preflight_clears_host_mount`,
-  `history_line_carries_host_mounts`.
+  `history_line_carries_host_mounts`, `refused_session_history_carries_host_mounts`,
+  `pair_run_drive_session_clears_under_inherited_lock`, `provision_dry_run_lists_mounts_without_clearing`.
 - [ ] Run the suite alone (`systemd-run --user --scope --quiet -p TasksMax=600 bash tests/test_recovery_os_vm.sh`, ~5 min, output to a file) → new cases fail; implement; run → pass.
   Commit `feat(recovery-os-vm): a host mount of the drive is cleared by the stop policy, not just refused (bd DAS-Backup-Manager-eg4j.19)`.
 
@@ -149,10 +163,20 @@ serial, else a single-device lookup). RAID-1-only parts (guarded mount, missing-
   a holder, unmount an idle one), then its normal mount; the bind fallback stays only for a target with no `mount_uuid`.
 - Script: `clear_target` runs for every target with a uuid before mounting; the dry-run and exit-3 handling (WARN /
   FAIL row, NOT available, `rmdir`) as the RAID-1 branch does today; then the existing single-device mount.
+- Scrub (`indexer/src/scrub.rs` `ensure_mounted`, sweep by mount site 2026-11-27): its non-guarded branch mounts
+  `UUID=` beside another program's mount; it clears first as a writing job (scrub repairs), through the same
+  Task 1 / `clear_mounted_elsewhere` code; refused → that filesystem is not scrubbed, named, as a guarded refusal is.
+- Delegated hold (`held.is_delegated()` branches in `ensure_targets_mounted_with` and `scrub::ensure_mounted`):
+  another program's mount of a single-drive target is not cleared under a handed-down hold and never bound — NOT
+  available, as the RAID-1 branch does today (the parent owns the mounts).
+- Read-only users of `ensure_targets_mounted` (doctor, walk, restore, `recovery-os record`) get the read-only
+  behaviour for single-drive targets: idle mount unmounted, holder → that target refused, named.
 
 - [ ] Tests first: Rust `single_drive_target_mounted_elsewhere_is_cleared_then_mounted`,
   `single_drive_target_writer_elsewhere_not_available`, `single_drive_target_never_bind_mounted_when_uuid_configured`,
-  `target_without_uuid_still_bind_mounts`; shell (the backup-run suite that covers `clear_target`):
+  `target_without_uuid_still_bind_mounts`, `scrub_single_drive_mounted_elsewhere_cleared_then_scrubbed`,
+  `scrub_single_drive_writer_elsewhere_not_scrubbed`, `delegated_hold_single_drive_elsewhere_not_available`,
+  `doctor_single_drive_reader_elsewhere_refused_nothing_signalled`; shell (the backup-run suite that covers `clear_target`):
   `mirror_target_mounted_elsewhere_cleared_then_mounted`, `mirror_target_clear_refused_fail_row_not_available`.
 - [ ] Run → fail; implement; run → pass. Commit `feat(backup): a single-drive target mounted by another program is cleared by the stop policy, never written through (bd DAS-Backup-Manager-eg4j.19)`.
 
@@ -166,3 +190,9 @@ down another program's idle mount of a target's own ESP, found only by `esp_part
 - [ ] Update every hit; `markdownlint`, `codespell` on changed docs.
 - [ ] Full suites once: `~/.claude/bin/bounded-test -- cargo test --features dbus` (all), `ctest --test-dir build`, VM suite alone. Every result line read.
 - [ ] Commit `docs: another program's mount of a recovery drive (bd DAS-Backup-Manager-eg4j.19)`.
+
+### Task 7: Install and reproduce for the operator's GUI test (native, live host)
+
+- [ ] Busy check from `backup.md` (no das-backup/das-scrub unit active, the singleton free); `cmake --build build`, `cmake --install build`, `sudo btrdasd setup --upgrade`; `cmp` the installed binaries and script against the build.
+- [ ] Reproduce, with the operator's OK first (a hand mount of a recovery ESP): `udisksctl mount -b /dev/disk/by-partuuid/<B's esp_partuuid> -o ro` as root, the way fwupd's mount came through udisks (a `systemctl restart fwupd` is not expected to leave one: yesterday's leftover came from a transient busy unmount). `findmnt -S PARTUUID=<…>` shows it.
+- [ ] Tell the operator it is installed and the condition is in place; his GUI run is the acceptance test. Record the result in bd `eg4j.19`.
