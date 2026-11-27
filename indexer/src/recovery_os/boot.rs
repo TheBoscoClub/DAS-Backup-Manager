@@ -11683,4 +11683,32 @@ mod tests {
         link(root, "etc/x", "/run");
         assert_eq!(verdict_of(root).0, BootVerdict::May);
     }
+
+    #[test]
+    fn a_machine_or_boot_id_where_a_run_dir_may_begin_leaves_everything_to_that_os() {
+        // Text before the id that a run directory's path starts with: the id's name on disk
+        // may be a link into /run, and the glob it is read as never matches /run/job.
+        let make = "#!/bin/sh\\nbtrbk snapshot\\n";
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut wrong = Vec::new();
+        for (extra, at) in [
+            (
+                format!("f+ /var/%m/a/job 0755 root root - {make}"),
+                format!("var/{id}/a"),
+            ),
+            (
+                format!("f+ /r%b/a/job 0755 root root - {make}"),
+                format!("r{id}/a"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            declared_job_and(root, &extra);
+            link(root, &at, "/run");
+            if verdict_of(root).0 != BootVerdict::May {
+                wrong.push(extra);
+            }
+        }
+        assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
 }

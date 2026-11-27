@@ -2574,7 +2574,11 @@ is
 the home directory: its value may hold a slash and lead anywhere), but the
 machine and boot ids
 .BR %m " and " %b ,
-one name each, read as a glob. Paths under
+one name each, read as a glob where the path cannot begin
+.I /run
+or
+.IR /var/run .
+Paths under
 .I /sys
 and
 .I /proc/sys

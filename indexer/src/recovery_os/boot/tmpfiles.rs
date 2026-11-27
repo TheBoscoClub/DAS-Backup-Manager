@@ -39,7 +39,8 @@
 //!   `/sys` and `/proc/sys` are exempt; any other declares nothing. Nor may a
 //!   path outside `/run` hold a `%` specifier ([`specifiers_stay_where_written`]):
 //!   `%t` is `/run`, so `/etc%t/job` is `/etc/run/job`; only the machine and
-//!   boot ids `%m` and `%b`, one name each, are read, as a glob.
+//!   boot ids `%m` and `%b`, one name each, are read, as a glob, and only where
+//!   the path cannot begin a run directory (`/var/%m/…` declares nothing).
 //!
 //! `/var/run` and `/var/lock` are read as `/run` and `/run/lock` (Arch's
 //! `filesystem` links them there).
@@ -333,6 +334,11 @@ fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
             });
             continue;
         };
+        if specifier_outside_run(fields[1].as_str()) {
+            // `/var/%m/a/job` may begin like /run, and the id's name on disk may be a link
+            // there: the glob it is read as never matches what it reaches.
+            return Err(format!("{line}: a specifier where /run may begin"));
+        }
         if base == 'L' {
             // A link under /run is written through by `w` and `C`.
             return Err(format!("{line}: a link under /run"));
@@ -358,13 +364,7 @@ const ONE_NAME_SPECIFIERS: [char; 2] = ['m', 'b'];
 /// (`%t` is `/run`, `%h` `/root`, `%S` `/var/lib`, `%%`, one this does not know)
 /// may stand for names that lead anywhere, `/run` included.
 fn specifiers_stay_where_written(path: &str) -> bool {
-    let Some((before, _)) = path.split_once('%') else {
-        return true;
-    };
-    if ["/run/", "/var/run/", "/var/lock/"]
-        .iter()
-        .any(|dir| before.starts_with(dir))
-    {
+    if !specifier_outside_run(path) {
         return true;
     }
     let mut chars = path.chars();
@@ -378,6 +378,17 @@ fn specifiers_stay_where_written(path: &str) -> bool {
         }
     }
     true
+}
+
+/// Whether `path`, as written, has a `%` specifier and is not under `/run`
+/// (`/var/run`, `/var/lock`) before its first one: what it stands for is
+/// read only as a name outside `/run`, never as one that may lead into it.
+fn specifier_outside_run(path: &str) -> bool {
+    path.split_once('%').is_some_and(|(before, _)| {
+        !["/run/", "/var/run/", "/var/lock/"]
+            .iter()
+            .any(|dir| before.starts_with(dir))
+    })
 }
 
 /// `path` with each specifier (`%b`, `%H`...) made a glob's `*`: whatever it
