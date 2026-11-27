@@ -1,9 +1,12 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.27.1
+# Version: 4.27.2
 # Date: 2026-11-27
 #
 # Features:
+#   - A dry run's recovery-OS check passes `--report-only` (v4.27.2, bd
+#     DAS-Backup-Manager-eg4j.19): another program's mount of a drive's ESP is
+#     said, never taken down, and that ESP is not read.
 #   - clear_target reads only the LAST line `btrdasd backup clear-target`
 #     printed as its status (v4.27.1, bd DAS-Backup-Manager-3gzs.14): a file
 #     name on the target holding a newline and `CLEAR TARGET: OK` is text, never
@@ -2306,6 +2309,10 @@ check_recovery_os() {
     local args=(recovery-os status --config "$DAS_CONFIG")
     if [[ "$mode" != "dryrun" ]]; then
         args+=(--state-file "$DAS_RECOVERY_OS_STATE")
+    else
+        # A dry run takes down no other program's mount of a drive's ESP:
+        # it says so, and that ESP is not read (bd eg4j.19 review N2).
+        args+=(--report-only)
     fi
 
     log_info "Checking the recovery OSes..."
@@ -4853,7 +4860,7 @@ RESULT
   $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
 
 ===============================================================
-  backup-run.sh v4.27.1
+  backup-run.sh v4.27.2
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

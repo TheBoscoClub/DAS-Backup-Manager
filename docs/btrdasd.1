@@ -3001,12 +3001,24 @@ and a backup started from the GUI do the same in process, by the same rule
 .IR PATH ]
 .RB [ \-\-state\-file
 .IR PATH ]
+.RB [ \-\-report\-only ]
 .RB [ \-\-json ]
 .TP
 .BI \-\-config " PATH"
 Path to config.toml.
 Default:
 .IR /etc/das\-backup/config.toml .
+.TP
+.B \-\-report\-only
+A dry run:
+.B backup\-run.sh \-\-dryrun
+passes it. Another program's mount of a drive's ESP is said
+.RB ( "would unmount" ,
+.BR "would stop" ),
+never taken down, nothing is signalled, and that ESP is not read (its
+.B ESP
+row reads
+.BR "not checked" ).
 .TP
 .BI \-\-state\-file " PATH"
 Record what was read from each drive in

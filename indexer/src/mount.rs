@@ -3367,15 +3367,20 @@ pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
 /// read, the user named, nothing signalled ([`ESP_HELD`]). Mounted at its own
 /// directory, an earlier reading left it, and it is taken down as a target an
 /// earlier job left is (bd jgm).
+///
+/// `report_only` (a dry run, review N2): another program's mount is said
+/// ("would unmount", "would stop"), never taken down, and the ESP is then
+/// not read.
 pub fn read_recovery_esp<T>(
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
+    report_only: bool,
     read: &dyn Fn(&Path) -> Result<T, String>,
 ) -> EspReading<T> {
     read_recovery_esp_with(
         &SystemRunner,
         Path::new(ESP_MOUNT_ROOT),
-        &host_clear_site(false, false),
+        &host_clear_site(report_only, false),
         Path::new("/dev/disk/by-partuuid"),
         target,
         drive_ids,
@@ -3517,6 +3522,16 @@ fn mount_read_unmount<T>(
                             "{spec} is mounted at {there}, but no mount of this drive's partition \
                              ({}:{}) is — another partition carries the same PARTUUID; not read",
                             drive_dev.0, drive_dev.1
+                        ));
+                    }
+                    // A dry run (review N2): what a real reading would do
+                    // is said, nothing is taken down, and the ESP is never
+                    // read beside another program's mount.
+                    Some(would) if clear.report_only => {
+                        return Err(format!(
+                            "{spec} is mounted at {there}: a dry run takes nothing down ({}) — \
+                             not read",
+                            would.join("; ")
                         ));
                     }
                     Some(_) => {}
@@ -9763,6 +9778,59 @@ mod tests {
         assert!(!read_ran);
         assert!(host.signals().is_empty());
         assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+    }
+
+    /// Review N2 (bd eg4j.19): a dry run (`recovery-os status --report-only`)
+    /// says what it would unmount, unmounts nothing, and does not read the
+    /// ESP beside another program's mount.
+    #[test]
+    fn a_dry_run_reading_says_it_would_unmount_and_reads_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pdir = scratch.path().join("by-partuuid");
+        let mut host = esp_mounted_by_udisks(None);
+        host.read_only_job = true;
+        host.report_only = true;
+        host.block_devs.push((
+            pdir.join(ESP_PU).to_str().unwrap().to_string(),
+            "8:17".to_string(),
+        ));
+        let [_, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{ESP_AT}\n")),
+                    stderr: "",
+                },
+            ),
+            q,
+            verified(),
+        ]);
+        let seen = Mutex::new(false);
+        let read = |_: &Path| {
+            *seen.lock().unwrap() = true;
+            Ok(vec!["found".to_string()])
+        };
+        let r = host.with_clear(&runner, |c| {
+            read_recovery_esp_with(
+                &*runner,
+                scratch.path(),
+                c,
+                &pdir,
+                &esp_target(Some(ESP_PU)),
+                &esp_drive_ids(),
+                &read,
+            )
+        });
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains(&format!("would unmount {ESP_AT}")) && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!*seen.lock().unwrap());
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+        assert!(host.signals().is_empty());
     }
 
     #[test]

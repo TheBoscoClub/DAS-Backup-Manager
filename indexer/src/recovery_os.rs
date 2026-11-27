@@ -1266,6 +1266,17 @@ pub fn check_esp(
     target: &crate::config::Target,
     ids: Result<&BTreeSet<String>, &str>,
 ) -> Option<Result<esp::Findings, String>> {
+    check_esp_with(target, ids, false)
+}
+
+/// [`check_esp`] for a dry run when `report_only` (`recovery-os status
+/// --report-only`, review N2): another program's mount of the ESP is said,
+/// never taken down, and the ESP then not read.
+pub fn check_esp_with(
+    target: &crate::config::Target,
+    ids: Result<&BTreeSet<String>, &str>,
+    report_only: bool,
+) -> Option<Result<esp::Findings, String>> {
     Some(match ids {
         // Unlisted partitions cannot show the key names this drive's ESP.
         Err(why) if target.esp_partuuid.is_some() => {
@@ -1275,6 +1286,7 @@ pub fn check_esp(
         Ok(ids) => esp_findings(crate::mount::read_recovery_esp(
             target,
             ids,
+            report_only,
             &esp::read_loader,
         )),
     })
