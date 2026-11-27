@@ -1184,14 +1184,16 @@ never interrupted: refused. A working directory, root or executable counts
 by the mount it is on, never by its path. With
 .BR \-\-report\-only ,
 for a dry run, it says what it would stop
-.RB ( "would stop:" )
-and unmount
-.RB ( "would unmount" )
+.RB ( "\-> would stop"
+on the holder's row) and unmount
+.RB ( "action   would unmount" )
 and does neither; exit 0 when it would clear, 3 when it would refuse. A filesystem still
 mounted when every visible mount is gone
 .RI ( /sys/fs/btrfs/<fsid>
 present: another mount namespace, or a lazy unmount held open) is refused.
-It prints one line per mount, holder and signal, then
+It prints aligned rows, a kind word first
+.RB ( mount ", " options ", " holder ", " signal ", " action "):"
+a mount and its options, a holder with what it does there and what is done about it, a signal sent, a mount taken down; then
 .BI "CLEAR TARGET: " STATUS "  (" detail ) \fR,
 .I STATUS
 one of

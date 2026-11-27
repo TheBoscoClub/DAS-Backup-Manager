@@ -1731,8 +1731,8 @@ host_mount() {
     echo "$1" >"$S/cleardrive.rc"
     if [[ "${3:-}" == unmount ]]; then : >"$S/cleardrive.unmount"; fi
 }
-CLEARED_OUT=$'Target \'system-recovery-A-2tb\': /dev/sdj1 is mounted at /run/media/root/RECOV-ESP-1 by udisks (vfat rw)\nCLEAR DRIVE: OK  (another program\'s mount of /dev/sdj, held by nothing, was unmounted)\n'
-WRITER_OUT=$'Target \'system-recovery-A-2tb\': pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled\nCLEAR DRIVE: REFUSED  (pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled)\n'
+CLEARED_OUT=$'  [WARN]  Target \'system-recovery-A-2tb\': mount    /dev/sdj1  vfat rw  /run/media/root/RECOV-ESP-1  by udisks (a desktop session\'s automount)  -> another program\'s mount, not this job\'s\n  [WARN]  Target \'system-recovery-A-2tb\': options  mount rw,nosuid  filesystem rw  root /\nCLEAR DRIVE: OK  (another program\'s mount of /dev/sdj, held by nothing, was unmounted)\n'
+WRITER_OUT=$'  [WARN]  Target \'system-recovery-A-2tb\': holder   pid 4121  kate  writer (EFI/loader/loader.conf)  user u (uid 1000), unit none  -> not signalled\nCLEAR DRIVE: REFUSED  (pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled)\n'
 
 fixture
 host_mount 0 "$CLEARED_OUT" unmount
@@ -1740,13 +1740,14 @@ run_driver session A
 check "idle host mount: the session goes on to the end" "$RC" "0"
 has "idle host mount: the block is headed" "$OUT" "DRIVE MOUNTED ON HOST"
 has "idle host mount: the mount is shown" "$OUT" "sdj1 on /run/media/root/RECOV-ESP-1"
-has "idle host mount: clear-drive's own lines are shown" "$OUT" "is mounted at /run/media/root/RECOV-ESP-1 by udisks"
+has "idle host mount: clear-drive's own lines are shown" "$OUT" "mount    /dev/sdj1  vfat rw  /run/media/root/RECOV-ESP-1  by udisks"
 has "idle host mount: continues" "$OUT" "drive clear -- continuing"
 has "idle host mount: asked by label" "$(file "$S/cleardrive.calls")" "recovery-os clear-drive --label system-recovery-A-2tb fd="
 lacks "idle host mount: a real run is not report-only" "$(file "$S/cleardrive.calls")" "--report-only"
 check "idle host mount: asked once, under the held lock" "$(file "$S/cleardrive.lock")" "held"
 check "idle host mount: before the disk is claimed" "$(file "$S/cleardrive.holder")" "before-holder"
-check "idle host mount: history carries the lines" "$(jq -r '.host_mounts | length' "$H")" "2"
+check "idle host mount: history carries the lines" "$(jq -r '.host_mounts | length' "$H")" "3"
+has "idle host mount: history keeps a row's aligned columns" "$(jq -r '.host_mounts[0]' "$H")" "mount    /dev/sdj1  vfat rw  /run/media/root/RECOV-ESP-1"
 has "idle host mount: history carries the result line" "$(jq -r '.host_mounts[-1]' "$H")" "CLEAR DRIVE: OK"
 check "idle host mount: lock free at the end" "$(lock_state)" "free"
 
@@ -1759,7 +1760,7 @@ fixture
 host_mount 3 "$WRITER_OUT"
 run_driver session A
 check "host mount with a writer: refused" "$RC" "1"
-has "host mount with a writer: the holder is named" "$OUT" "pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled"
+has "host mount with a writer: the holder is named" "$OUT" "holder   pid 4121  kate  writer (EFI/loader/loader.conf)"
 has "host mount with a writer: refusal says the drive is in use" "$OUT" "REFUSED: drive in use on this host -- pid 4121 kate"
 check "host mount with a writer: the drive was never claimed" "$(file "$S/holder.calls")" ""
 check "host mount with a writer: lock free" "$(lock_state)" "free"

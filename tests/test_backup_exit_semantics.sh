@@ -313,7 +313,7 @@ case "$1 ${2:-}" in
         printf '%s\n' "$(knob "${pfx}clear_report_line" 'CLEAR TARGET: OK  (not mounted anywhere else)')"
         exit "$(knob "${pfx}clear_report_rc" 0)"
     fi
-    echo "  [WARN]  Target '$label': holder: pid 300 [reading] (stub, leftover=$leftover)" >&2
+    echo "  [WARN]  Target '$label': holder   pid 300  dolphin  reader (stub, leftover=$leftover)  user u, unit none  -> to be stopped" >&2
     if [[ "$leftover" == yes ]]; then
         [[ -f "$S/knobs/clear_releases" ]] && : >"$S/cleared"
         printf '%s\n' "$(knob "${pfx}clear_leftover_line" 'CLEAR TARGET: OK  (nothing holds it (stub))')"
@@ -2169,7 +2169,7 @@ check "leftover, busy, holders stopped: clear-target --leftover, on fd 8" \
     "$(grep -c '^primary-22tb fd=8 leftover=yes$' "$STATE/calls/clear_target")" "1"
 check "leftover, busy, holders stopped: no umount -f" "$(grep -c -- "^-f " "$STATE/calls/umount")" "0"
 check "leftover, busy, holders stopped: its holder lines in the log" \
-    "$(grep -c "primary-22tb: .*holder: pid 300 \[reading\] (stub, leftover=yes)" "$STATE/out")" "1"
+    "$(grep -c "primary-22tb: .*holder   pid 300  dolphin  reader (stub, leftover=yes)  user u, unit none  -> to be stopped" "$STATE/out")" "1"
 check "leftover, busy, holders stopped: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
 check "leftover, busy, holders stopped: the kill is in the report, the row WARN" \
     "$(grep -c '^  Target primary-22tb  *WARN  (.*before the mount: stopped what held it: SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
