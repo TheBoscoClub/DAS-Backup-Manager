@@ -2985,6 +2985,9 @@ mod tests {
         write(&root, "usr/local/bin/tool", "\x7fELF\x02\x01\x01\0");
         std::os::unix::fs::symlink("backup.sh", root.join("usr/local/bin/tool.sh")).unwrap();
         write(&root, "usr/bin/wrap.sh", "#!/bin/sh\ntrue\n");
+        // The shell the scripts' `#!` lines name: its first bytes are read
+        // (bd DAS-Backup-Manager-eg4j.24).
+        write(&root, "usr/bin/sh", "\x7fELF\x02\x01\x01\0");
         std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
         enable(&root, VENDOR, "sockets.target.wants", "snap.socket");
         write(
@@ -3038,6 +3041,7 @@ mod tests {
             "etc/systemd/system/backup.service",
             "usr/local/bin/backup.sh",
             "usr/local/bin/tool",
+            "usr/bin/sh",
             "usr/bin/wrap.sh",
             "usr/lib/systemd/system/sockets.target.wants",
             "usr/lib/systemd/system/snap.socket",
