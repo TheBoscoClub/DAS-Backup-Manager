@@ -2566,7 +2566,15 @@ a line that writes
 .BR C )
 also when its own name is such a link, or it is under
 .IR /dev .
-Paths under
+So it is when a path elsewhere holds a specifier
+.RB ( %t
+is
+.IR /run ,
+.B %h
+the home directory: its value may hold a slash and lead anywhere), but the
+machine and boot ids
+.BR %m " and " %b ,
+one name each, read as a glob. Paths under
 .I /sys
 and
 .I /proc/sys

@@ -36,7 +36,10 @@
 //!   name a glob may stand for is looked at), or under `/proc`
 //!   (`/proc/self/root/run`) but `/proc/sys`; a line that writes (`f`, `F`,
 //!   `w`, `C`) also when its own name is such a link or it is under `/dev`.
-//!   `/sys` and `/proc/sys` are exempt; any other declares nothing.
+//!   `/sys` and `/proc/sys` are exempt; any other declares nothing. Nor may a
+//!   path outside `/run` hold a `%` specifier ([`specifiers_stay_where_written`]):
+//!   `%t` is `/run`, so `/etc%t/job` is `/etc/run/job`; only the machine and
+//!   boot ids `%m` and `%b`, one name each, are read, as a glob.
 //!
 //! `/var/run` and `/var/lock` are read as `/run` and `/run/lock` (Arch's
 //! `filesystem` links them there).
@@ -310,6 +313,11 @@ fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
             // `..` can lead into /run from anywhere.
             return Err(format!("{line}: a path with `..` in it"));
         }
+        if !specifiers_stay_where_written(path) {
+            // `/etc%t/job` is `/etc/run/job`: a value with a slash in it joins names the
+            // widened glob never looks at.
+            return Err(format!("{line}: a specifier outside /run"));
+        }
         let path = widen_specifiers(path);
         let Some(simple) = simplify(&path) else {
             continue;
@@ -338,6 +346,38 @@ fn parse(text: &str) -> Result<(Vec<Line>, Vec<Outside>), String> {
         });
     }
     Ok((found, outside))
+}
+
+/// The specifiers whose value is one name, never a slash in it: the machine and
+/// boot ids, 32 hex digits each (`machine-id(5)`, `random(4)`). Stock systemd
+/// writes them outside `/run` (`/var/log/journal/%m`, `/tmp/systemd-private-%b-*`).
+const ONE_NAME_SPECIFIERS: [char; 2] = ['m', 'b'];
+
+/// Whether every `%` specifier in `path`, as written, stays inside the name it
+/// is written in, or the path is under `/run` before its first one. Any other
+/// (`%t` is `/run`, `%h` `/root`, `%S` `/var/lib`, `%%`, one this does not know)
+/// may stand for names that lead anywhere, `/run` included.
+fn specifiers_stay_where_written(path: &str) -> bool {
+    let Some((before, _)) = path.split_once('%') else {
+        return true;
+    };
+    if ["/run/", "/var/run/", "/var/lock/"]
+        .iter()
+        .any(|dir| before.starts_with(dir))
+    {
+        return true;
+    }
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        if c == '%'
+            && !chars
+                .next()
+                .is_some_and(|s| ONE_NAME_SPECIFIERS.contains(&s))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// `path` with each specifier (`%b`, `%H`...) made a glob's `*`: whatever it

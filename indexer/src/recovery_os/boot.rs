@@ -11617,4 +11617,70 @@ mod tests {
         let (verdict, reasons) = verdict_of(root);
         assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
     }
+
+    // ---- bd DAS-Backup-Manager-3nb, fourth round: a specifier that holds a slash ----
+
+    #[test]
+    fn a_specifier_outside_the_run_dir_leaves_everything_to_that_os() {
+        // systemd-tmpfiles joins a specifier's value as text: %t is /run, %h /root, %T /tmp,
+        // so each path below is a name under a link the image's disk holds into /run.
+        let make = "#!/bin/sh\\nbtrbk snapshot\\n";
+        let mut wrong = Vec::new();
+        for (extra, at, to) in [
+            (
+                format!("f+ /etc%t/job 0755 root root - {make}"),
+                "etc/run",
+                "/run",
+            ),
+            (
+                format!("f+ /srv%h/job 0755 root root - {make}"),
+                "srv/root",
+                "/run",
+            ),
+            (
+                format!("f+ /etc%T/job 0755 root root - {make}"),
+                "etc/tmp",
+                "/run",
+            ),
+            // Text before the specifier that starts like /run: still not under it.
+            (
+                format!("f+ /r%t/a/job 0755 root root - {make}"),
+                "r/run/a",
+                "/run",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            declared_job_and(root, &extra);
+            link(root, at, to);
+            if verdict_of(root).0 != BootVerdict::May {
+                wrong.push(extra);
+            }
+        }
+        assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
+
+    #[test]
+    fn a_machine_or_boot_id_outside_the_run_dir_leaves_it_declared_unless_a_link_is_there() {
+        // %m and %b are hex ids, one name: stock systemd's journal and private-tmp lines.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        declared_job_and(
+            root,
+            "z /var/log/journal/%m/system.journal 0640\nx /tmp/systemd-private-%b-*\n\
+             x /var/lib/systemd/coredump/.#core*.%b*",
+        );
+        fs::create_dir_all(root.join("var/log/journal")).unwrap();
+        let (verdict, reasons) = verdict_of(root);
+        assert_eq!((verdict, reasons), (BootVerdict::No, vec![]));
+        // The same id at a name the image's disk holds as a link into /run.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        declared_job_and(
+            root,
+            "f+ /etc/x/%m/job 0755 root root - #!/bin/sh\\nbtrbk snapshot\\n",
+        );
+        link(root, "etc/x", "/run");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+    }
 }
