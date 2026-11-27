@@ -141,7 +141,7 @@ rm -r "${WORK:?}/usb/4-1"
 
 # The report carries the row, so a FAIL says why in the email, not only the journal.
 # shellcheck disable=SC2016 # matched as written
-has "the report has a USB link row" "$(cat "$SCRIPT")" 'USB link              ${OP_STATUS[usb_link]:-N/A}'
+has "the report has a USB link row" "$(cat "$SCRIPT")" 'add_row "USB link" "${OP_STATUS[usb_link]:-N/A}"'
 
 check "no command the suite ran was missing" "$(cat "$WORK/not-found" 2>/dev/null || true)" ""
 echo

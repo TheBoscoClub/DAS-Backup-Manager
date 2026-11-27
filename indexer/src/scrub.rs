@@ -2893,7 +2893,7 @@ fn ensure_mounted(
     };
 
     if let Some((config, target)) = guarded {
-        match crate::mount::mount_guarded_target(
+        match crate::mount::mount_guarded_target_clearing(
             config,
             target,
             crate::raid_guard::Job::Scrub.intent(),
@@ -4840,6 +4840,97 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// `── NEEDS ATTENTION ──`: each pass error and each filesystem that failed or
+/// paused, status word first, then a blank line; empty when there is none.
+fn attention_block(pass: &ScrubPass) -> String {
+    let mut problems: Vec<(&str, String)> =
+        pass.errors.iter().map(|e| ("FAILED", e.clone())).collect();
+    for result in &pass.results {
+        if let Some(p) = &result.paused {
+            problems.push((
+                "PAUSED",
+                format!(
+                    "{}: paused at the request of {} — not a failure; `btrdasd scrub resume` \
+                     resumes it",
+                    result.target_label, p.by
+                ),
+            ));
+        } else if !result.ok() {
+            problems.push((
+                "FAILED",
+                format!("{}: {}", result.target_label, describe_failure(result)),
+            ));
+        }
+    }
+    if problems.is_empty() {
+        return String::new();
+    }
+    let mut r = String::from("── NEEDS ATTENTION ──\n");
+    for (word, p) in &problems {
+        r.push_str(&format!("  {word:<8}{p}\n"));
+    }
+    r.push('\n');
+    r
+}
+
+/// `RESULT`: one row per filesystem, status first, one clause for why; empty
+/// when the pass had none (a skipped pass).
+fn result_block(pass: &ScrubPass, thin: &str) -> String {
+    if pass.results.is_empty() && pass.already_scrubbed.is_empty() {
+        return String::new();
+    }
+    let w = pass
+        .results
+        .iter()
+        .map(|x| x.target_label.as_str())
+        .chain(pass.already_scrubbed.iter().map(String::as_str))
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut r = format!("\nRESULT\n{thin}\n");
+    for result in &pass.results {
+        let class = if result.paused.is_some() {
+            "WARN"
+        } else if result.ok() {
+            "OK"
+        } else {
+            "FAIL"
+        };
+        r.push_str(&format!(
+            "  {class:<6}{:<w$} {} (outcome {}, errors {})\n",
+            result.target_label,
+            result.status_word(),
+            result.outcome.map(|o| o.as_str()).unwrap_or("<no record>"),
+            result.counters_summary()
+        ));
+    }
+    for label in &pass.already_scrubbed {
+        r.push_str(&format!(
+            "  {:<6}{label:<w$} DONE (scrubbed to the end before the pause this pass resumes)\n",
+            "OK"
+        ));
+    }
+    r
+}
+
+/// What `btrdasd scrub run` prints (the journal of `das-scrub.service`): the
+/// one line it always printed, then what needs attention and a RESULT row
+/// per filesystem. `word` is the pass's status word.
+pub fn format_scrub_run(pass: &ScrubPass, word: &str) -> String {
+    let mut out = format!(
+        "Scrub pass {word}: {} of {} filesystems clean\n",
+        pass.clean_count(),
+        pass.results.len()
+    );
+    let attention = attention_block(pass);
+    if !attention.is_empty() {
+        out.push('\n');
+        out.push_str(&attention);
+    }
+    out.push_str(&result_block(pass, &"-".repeat(70)));
+    out
+}
+
 /// Render the email body for a pass.
 ///
 /// The word `FAILURE` appears in the header when anything failed — the shared
@@ -4859,9 +4950,15 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
         "FAILURES DETECTED"
     };
 
+    // The pass's start, local time with its zone (spec 2026-11-27 rule 6).
+    let started = crate::caldate::local_stamp(pass.started_epoch)
+        .map(|t| format!(" — {t}"))
+        .unwrap_or_default();
     r.push_str(&format!(
-        "{sep}\n  DAS Scrub Report\n  Status: {overall}\n{sep}\n\n"
+        "{sep}\n  DAS Scrub Report{started}\n  Status: {overall}\n{sep}\n\n"
     ));
+
+    r.push_str(&attention_block(pass));
 
     let elapsed = (pass.finished_epoch - pass.started_epoch).max(0) as u64;
     r.push_str(&format!("PASS SUMMARY\n{thin}\n"));
@@ -4917,29 +5014,6 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
         ));
     }
 
-    let mut problems: Vec<String> = pass.errors.clone();
-    for result in &pass.results {
-        if let Some(p) = &result.paused {
-            problems.push(format!(
-                "{}: paused at the request of {} — not a failure; `btrdasd scrub resume` \
-                 resumes it",
-                result.target_label, p.by
-            ));
-        } else if !result.ok() {
-            problems.push(format!(
-                "{}: {}",
-                result.target_label,
-                describe_failure(result)
-            ));
-        }
-    }
-    if !problems.is_empty() {
-        r.push_str(&format!("\nPROBLEMS\n{thin}\n"));
-        for p in &problems {
-            r.push_str(&format!("  • {p}\n"));
-        }
-    }
-
     let yields: Vec<String> = pass
         .results
         .iter()
@@ -4966,6 +5040,8 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
         }
     }
 
+    r.push_str(&result_block(pass, &thin));
+
     r.push_str(&format!("\n{sep}\n"));
     r
 }
@@ -4977,6 +5053,18 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd DAS-Backup-Manager-eg4j.20: the engine's RAID-1 mount is the one
+    /// that clears another program's mount first (the clearing itself is
+    /// proven in `mount::tests::scrub_guarded_mount_*`); the plain guarded
+    /// mount, which clears nothing, is never called from this file.
+    #[test]
+    fn the_engine_mounts_a_raid1_target_only_through_the_clearing_mount() {
+        let src = include_str!("scrub.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(code.contains("mount_guarded_target_clearing("));
+        assert!(!code.contains("mount_guarded_target("));
+    }
 
     /// bd DAS-Backup-Manager-qab: flock works on a read-only descriptor, so a
     /// lock file anyone can open is a lock anyone can hold, keeping the
@@ -6864,8 +6952,82 @@ Total to scrub:   401.28MiB\n";
         assert!(report.contains("system-recovery-A-2tb"));
         assert!(report.contains("ABORTED"));
         assert!(report.contains("super=3"));
-        assert!(report.contains("PROBLEMS"));
+        assert!(report.contains("── NEEDS ATTENTION ──"));
         assert!(report.contains("uuid=uuid-b"));
+    }
+
+    /// bd 3gzs.12: the emailed scrub report names when the pass started (local
+    /// time and zone), sets what failed apart right after the header, and
+    /// closes with one RESULT row per filesystem; the `Status:` line and the
+    /// per-filesystem table stay.
+    #[test]
+    fn report_sets_the_failed_apart_and_closes_with_a_row_per_filesystem() {
+        let pass = pass_with(vec![
+            fs_result("primary-22tb", "uuid-a", true, 1_000_400),
+            fs_result("system-recovery-A-2tb", "uuid-b", false, 1_000_450),
+        ]);
+        let report = format_scrub_report(&pass, &Config::default());
+        let stamp = crate::caldate::local_stamp(pass.started_epoch).unwrap();
+        assert!(
+            report.contains(&format!(
+                "  DAS Scrub Report — {stamp}\n  Status: FAILURES DETECTED\n"
+            )),
+            "{report}"
+        );
+        let after_header = report.split("\n\n").nth(1).unwrap();
+        assert!(
+            after_header.starts_with("── NEEDS ATTENTION ──\n  FAILED  system-recovery-A-2tb: "),
+            "{report}"
+        );
+        assert!(!report.contains("PROBLEMS"), "{report}");
+        let result = report.split("\nRESULT\n").nth(1).expect("a RESULT block");
+        let rows: Vec<&str> = result
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .collect();
+        assert_eq!(rows.len(), 2, "{result}");
+        assert!(rows[0].starts_with("  OK    primary-22tb "), "{result}");
+        assert!(
+            rows[1].starts_with("  FAIL  system-recovery-A-2tb "),
+            "{result}"
+        );
+        assert!(rows[1].contains("ABORTED"), "{result}");
+        // Still there: the table and its detail line.
+        assert!(report.contains("PER-FILESYSTEM RESULTS"), "{report}");
+        assert!(report.contains("    uuid=uuid-b outcome="), "{report}");
+    }
+
+    /// bd 3gzs.12: `scrub run` keeps its first line and adds the attention
+    /// block and a RESULT row per filesystem after it.
+    #[test]
+    fn scrub_run_prints_its_line_then_the_attention_and_result_blocks() {
+        let pass = pass_with(vec![
+            fs_result("primary-22tb", "uuid-a", true, 1_000_400),
+            fs_result("system-recovery-A-2tb", "uuid-b", false, 1_000_450),
+        ]);
+        let out = format_scrub_run(&pass, "completed");
+        assert!(
+            out.starts_with("Scrub pass completed: 1 of 2 filesystems clean\n\n── NEEDS ATTENTION ──\n  FAILED  system-recovery-A-2tb: "),
+            "{out}"
+        );
+        let rows: Vec<&str> = out
+            .split("\nRESULT\n")
+            .nth(1)
+            .expect("a RESULT block")
+            .lines()
+            .skip(1)
+            .collect();
+        assert_eq!(rows.len(), 2, "{out}");
+        assert!(rows[0].starts_with("  OK    primary-22tb "), "{out}");
+        assert!(
+            rows[1].starts_with("  FAIL  system-recovery-A-2tb "),
+            "{out}"
+        );
+
+        let clean = pass_with(vec![fs_result("primary-22tb", "uuid-a", true, 1_000_400)]);
+        let out = format_scrub_run(&clean, "completed");
+        assert!(!out.contains("NEEDS ATTENTION"), "{out}");
     }
 
     #[test]
@@ -6875,7 +7037,7 @@ Total to scrub:   401.28MiB\n";
         let report = format_scrub_report(&pass, &config);
         assert!(report.contains("ALL SCRUBS COMPLETED CLEANLY"));
         assert!(!report.contains("FAILURE"));
-        assert!(!report.contains("PROBLEMS"));
+        assert!(!report.contains("NEEDS ATTENTION"));
     }
 
     /// bd DAS-Backup-Manager-su1b.2 (step A3): a target that yielded to a
@@ -6902,7 +7064,7 @@ Total to scrub:   401.28MiB\n";
         assert!(pass.success());
         let report = format_scrub_report(&pass, &config);
         assert!(report.contains("ALL SCRUBS COMPLETED CLEANLY"), "{report}");
-        assert!(!report.contains("PROBLEMS"), "{report}");
+        assert!(!report.contains("NEEDS ATTENTION"), "{report}");
         assert!(report.contains("YIELDS TO BACKUPS"), "{report}");
         let at = |e: i64| crate::caldate::local_datetime(e).unwrap()[..16].to_string();
         assert!(
@@ -9187,7 +9349,7 @@ mod yield_tests {
                 .any(|l| l.trim_start().starts_with("first") && l.contains("DONE")),
             "{report}"
         );
-        assert!(!report.contains("PROBLEMS"), "{report}");
+        assert!(!report.contains("NEEDS ATTENTION"), "{report}");
     }
 
     /// bd DAS-Backup-Manager-su1b.25: a target that finished before a pause

@@ -143,6 +143,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`backup-run.sh` 4.26.0: the nightly emailed report reads at a glance** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
+  - The header time carries its zone (`2026-11-27 03:19 CST`), in the full report and in the ABORTED one
+  - A `── NEEDS ATTENTION ──` block follows the header whenever an operation FAILed or WARNed: each one, status word first, with its reason, ahead of the table; an operation with no row of its own (a run history that was not recorded) is named there too
+  - A `RESULT` block closes the report with the status and the counts of operations, FAIL, WARN and OK
+  - The ABORTED report names what aborted and why in the same block; the `Status:` line, every table row and every other line are unchanged, but for the `Content indexer` row, whose name column was one space wider than the rest
+  - The operations table is built from one list of rows (`add_row`), so the table and the blocks cannot disagree
+
+- **The doctor's could-not-run email sets its reason apart** (bd `DAS-Backup-Manager-3gzs.12`): `doctor::format_could_not_run` builds the body, with the report's own header and `Status: COULD NOT RUN — FAILURE` line (the word the mailer reads), a `── NEEDS ATTENTION ──` block naming the reason status word first, and one `RESULT` row; `tests/test_report_mail.sh` expects the same body
+
+- **`btrdasd scrub run`, `scrub status` and the emailed scrub report are reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
+  - `scrub status` opens with `━━ btrdasd scrub status — <local time and zone> ━━`, sets each filesystem that failed (FAIL) or needs a look (WARN: never scrubbed, paused, yielded) in a `── NEEDS ATTENTION ──` block, keeps its table and detail lines as they were, and closes with a `RESULT` block of one row per filesystem; `--json` is unchanged
+  - `scrub run` prints the line it always printed (`Scrub pass <status>: N of M filesystems clean`), then the attention block and a `RESULT` row per filesystem
+  - The emailed scrub report names the pass's start in local time with its zone, moves what was the `PROBLEMS` section to a `── NEEDS ATTENTION ──` block right after the header (status word first: `FAILED`, `PAUSED`; the same lines), and closes with a `RESULT` block; the `Status:` line, the pass summary and the per-filesystem table stay, and the word `FAILURE` still appears only when something failed
+  - New `caldate::local_stamp` (`2026-11-27 03:19 CST`) for the time with its zone
+
+- **The operations table of a Rust-run report keeps its statuses in one column when a target name is long** (bd `DAS-Backup-Manager-3gzs.12`): the name column was a fixed 21 characters, so `Target <label>` and `RAID-1 <label>` rows overflowed it and their status stood a few columns to the right of the rest
+  - The column is as wide as the longest name in the block (21 at least); every row's text is unchanged, only the padding moves, and the `NEEDS ATTENTION` block uses the same width
+
 - **The emailed backup report from `btrdasd backup run` is reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
   - A `── NEEDS ATTENTION ──` block follows the header whenever anything failed or warned: each error as `FAILED  <error>` and each FAIL or WARN operations row, status word first, ahead of the routine rows; the `ERRORS` section at the bottom is gone (its lines live only in that block)
   - A `RESULT` block closes the report: the overall status with the counts of FAIL, WARN and OK rows and of errors
@@ -191,6 +209,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `docs/INSTALL.md` no longer says CachyOS's packages need x86-64-v3/v4 for the updater VM's CPU passthrough
 
 ### Fixed
+
+- **A scrub of a RAID-1 target another program has mounted clears that mount first, as every other path does** (bd `DAS-Backup-Manager-eg4j.20`): the scrub engine's guarded mount cleared nothing, so a pass on the RAID-1 primary mounted it beside the other program's mount
+  - The engine now goes through `mount::mount_guarded_target_clearing`, which clears as a writing job (idle mounts unmounted, readers stopped by the stop policy) before the guarded mount; a writer, or any such mount under a handed-down hold, means the filesystem is not scrubbed and the error names why, with nothing signalled or mounted
 
 - **`btrdasd setup --check`'s RESULT status comes from each check, not from words in its lines** (bd `DAS-Backup-Manager-3gzs.13`): `render_check` guessed OK, WARN or FAIL from status words in a topic's lines, so a failing check worded without them read OK; each check now returns its lines with the status it decided (`CheckLine`), a continuation line takes the status of the line above, and the word heuristic is gone — the printed text is unchanged
 

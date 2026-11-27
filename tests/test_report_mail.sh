@@ -194,7 +194,7 @@ check "the run's mailx is the stub" \
     "$(env -i PATH="$STUBS:/usr/bin:/bin" bash -c 'type -P mailx')" "$STUBS/mailx"
 
 host="$(cat /proc/sys/kernel/hostname)"
-sep="═══════════════════════════════════════════════════════════"
+sep="═══════════════════════════════════════════════════════════════"
 
 echo "== email enabled, the relay takes it"
 config true
@@ -228,7 +228,10 @@ check "the recipient" "${args[12]:-}" "ops@example.org"
 why="$(grep -m1 '^Error: ' <<<"$out")"
 why="${why#Error: }"
 check "the doctor said why it could not run" "$([[ -n "$why" ]] && echo yes || echo no)" "yes"
-want_body="$(printf '%s\n  DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n%s\n\nThe drift check could not run: %s\n' "$sep" "$sep" "$why")"
+# The report's own header and RESULT shape (doctor.rs format_could_not_run): the reason
+# apart, status word first, then one RESULT row.
+thin="───────────────────────────────────────────────────────────────"
+want_body="$(printf '%s\n  DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n%s\n── NEEDS ATTENTION ──\n  %-8s%s\n\nRESULT\n%s\n  %-22s%-7s%s\n\n%s\n' "$sep" "$sep" "FAILED" "The drift check could not run: $why" "$thin" "Drift check" "FAIL" "could not run" "$sep")"
 check "the body is the could-not-run report, on stdin" "$(cat "$REC/body" 2>/dev/null)" "$want_body"
 has "it says the report went" "$out" "Doctor failure report emailed"
 

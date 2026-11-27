@@ -1336,6 +1336,33 @@ fn format_scrub_status(views: &[ScrubTargetView], config: &Config) -> String {
     let now = now_epoch_secs();
     let thin = "-".repeat(70);
     let mut out = String::new();
+    // The job, when it was read (local time with its zone), then what needs
+    // a look, set apart from the table that follows (spec 2026-11-27).
+    out.push_str(&format!(
+        "━━ btrdasd scrub status — {} ━━\n\n",
+        buttered_dasd::caldate::local_stamp(now).unwrap_or_else(|| format!("epoch {now}"))
+    ));
+    let needs: Vec<_> = views
+        .iter()
+        .filter(|v| scrub_status_class(v.status_word()) != "OK")
+        .collect();
+    if !needs.is_empty() {
+        out.push_str("── NEEDS ATTENTION ──\n");
+        let w = views
+            .iter()
+            .map(|v| v.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        for v in needs {
+            out.push_str(&format!(
+                "  {:<8}{:<w$} {}\n",
+                scrub_status_class(v.status_word()),
+                v.label,
+                scrub_status_reason(v)
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str(&format!(
         "{:<24} {:<15} {:>6} {:>12} {:>10}\n",
         "Target", "Status", "Age", "Bytes", "Duration"
@@ -1387,7 +1414,51 @@ fn format_scrub_status(views: &[ScrubTargetView], config: &Config) -> String {
         "\nwarn_age_days={} fail_age_days={} (age is measured against last_success_epoch)\n",
         config.scrub.warn_age_days, config.scrub.fail_age_days
     ));
+    // One row per filesystem, status first, the reason in a clause.
+    out.push_str(&format!("\nRESULT\n{thin}\n"));
+    let w = views
+        .iter()
+        .map(|v| v.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    for v in views {
+        out.push_str(&format!(
+            "  {:<6}{:<w$} {}\n",
+            scrub_status_class(v.status_word()),
+            v.label,
+            scrub_status_reason(v)
+        ));
+    }
     out
+}
+
+/// How a status word reads in the attention and RESULT blocks: `OK` (clean,
+/// or a scrub running now), `WARN` (never scrubbed, paused or yielded: not a
+/// failure) or `FAIL` (anything else).
+fn scrub_status_class(word: &str) -> &'static str {
+    match word {
+        "OK" | "RUNNING" => "OK",
+        "NEVER SCRUBBED" | "PAUSED" | "YIELDED" => "WARN",
+        _ => "FAIL",
+    }
+}
+
+/// One clause for a filesystem's row: its status word and what the table's
+/// detail line says (the outcome, the error counts, or why it has none).
+fn scrub_status_reason(v: &ScrubTargetView) -> String {
+    let detail = v
+        .resolve_error
+        .as_deref()
+        .or(v.detail.as_deref())
+        .unwrap_or("");
+    format!(
+        "{} (outcome {}, errors {}{}{})",
+        v.status_word(),
+        v.outcome.as_deref().unwrap_or("<none>"),
+        v.counters_summary.as_deref().unwrap_or("-"),
+        if detail.is_empty() { "" } else { "; " },
+        detail
+    )
 }
 
 /// Render one target's status view as a single JSON object. Every string
@@ -4277,11 +4348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pass.failed_count(),
                     );
                 } else {
-                    println!(
-                        "Scrub pass {status_word}: {} of {} filesystems clean",
-                        pass.clean_count(),
-                        pass.results.len()
-                    );
+                    print!("{}", scrub::format_scrub_run(&pass, status_word));
                     if !pass.success() && exit_code == 0 {
                         // The pass ran (exit 0) despite failures — make sure a
                         // console reader isn't misled by the exit code alone.
@@ -4361,12 +4428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     eprintln!("Error: {e}");
                     if email {
-                        let failure_text = format!(
-                            "═══════════════════════════════════════════════════════════\n  \
-                             DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n\
-                             ═══════════════════════════════════════════════════════════\n\n\
-                             The drift check could not run: {e}\n"
-                        );
+                        let failure_text = doctor::format_could_not_run(&e.to_string());
                         eprintln!(
                             "{}",
                             email_doctor_report(&failure_text, &cfg, true, &report::MAILX)
@@ -5429,6 +5491,112 @@ mod tests {
         let v = build_scrub_target_view(&config, "hurt-target", Some(&state));
         let shown = format_scrub_status(&[v], &config);
         assert!(shown.contains("errors=corrected=7"), "{shown}");
+    }
+
+    /// bd 3gzs.12: `scrub status` opens with a header, sets a filesystem that
+    /// failed or needs a look apart (status word first, reason kept), keeps the
+    /// table as it was and closes with one RESULT row per filesystem.
+    #[test]
+    fn status_sets_the_failed_apart_and_closes_with_a_row_per_filesystem() {
+        let (good, bad, never) = (
+            "66666666-6666-6666-6666-666666666666",
+            "77777777-7777-7777-7777-777777777777",
+            "88888888-8888-8888-8888-888888888888",
+        );
+        let config = test_config(&[
+            ("good-target", good),
+            ("bad-target", bad),
+            ("new-target", never),
+        ]);
+        let mut state = scrub::ScrubState::default();
+        let mut put = |uuid: &str, label: &str, ok: bool| {
+            state.filesystems.insert(
+                uuid.into(),
+                scrub::FsState {
+                    target_label: label.into(),
+                    mountpoint: format!("/mnt/{label}"),
+                    last_success_epoch: ok.then_some(1_785_000_000),
+                    last_attempt: scrub::AttemptState {
+                        outcome: "finished".into(),
+                        ok,
+                        finished_epoch: 1_785_000_100,
+                        ..Default::default()
+                    },
+                },
+            );
+        };
+        put(good, "good-target", true);
+        put(bad, "bad-target", false);
+        let views: Vec<_> = ["good-target", "bad-target", "new-target"]
+            .iter()
+            .map(|l| build_scrub_target_view(&config, l, Some(&state)))
+            .collect();
+
+        let shown = format_scrub_status(&views, &config);
+
+        let first = shown.lines().next().unwrap();
+        assert!(
+            first.starts_with("━━ btrdasd scrub status — ") && first.ends_with(" ━━"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("\n── NEEDS ATTENTION ──\n  FAIL    bad-target "),
+            "{shown}"
+        );
+        assert!(shown.contains("\n  WARN    new-target "), "{shown}");
+        let attention = shown.split("── NEEDS ATTENTION ──\n").nth(1).unwrap();
+        assert!(
+            !attention
+                .split("\n\n")
+                .next()
+                .unwrap()
+                .contains("good-target"),
+            "{shown}"
+        );
+        // The table is as it was.
+        assert!(
+            shown.contains("Target                   Status             Age"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "    uuid=66666666-6666-6666-6666-666666666666 source=state outcome=finished"
+            ),
+            "{shown}"
+        );
+        // One RESULT row per filesystem, in config order.
+        let result = shown.split("\nRESULT\n").nth(1).expect("a RESULT block");
+        let rows: Vec<&str> = result.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(rows.len(), 3, "{result}");
+        assert!(rows[0].starts_with("  OK    good-target"), "{result}");
+        assert!(rows[1].starts_with("  FAIL  bad-target"), "{result}");
+        assert!(rows[2].starts_with("  WARN  new-target"), "{result}");
+    }
+
+    /// Nothing to look at: no attention block, the RESULT block still there.
+    #[test]
+    fn status_of_clean_filesystems_has_no_attention_block() {
+        let uuid = "99999999-9999-9999-9999-999999999999";
+        let config = test_config(&[("clean-target", uuid)]);
+        let mut state = scrub::ScrubState::default();
+        state.filesystems.insert(
+            uuid.into(),
+            scrub::FsState {
+                target_label: "clean-target".into(),
+                mountpoint: "/mnt/clean-target".into(),
+                last_success_epoch: Some(1_785_000_000),
+                last_attempt: scrub::AttemptState {
+                    outcome: "finished".into(),
+                    ok: true,
+                    finished_epoch: 1_785_000_100,
+                    ..Default::default()
+                },
+            },
+        );
+        let v = build_scrub_target_view(&config, "clean-target", Some(&state));
+        let shown = format_scrub_status(&[v], &config);
+        assert!(!shown.contains("NEEDS ATTENTION"), "{shown}");
+        assert!(shown.contains("\nRESULT\n"), "{shown}");
     }
 
     /// bd 3gzs.11: bytes scrubbed are shown when measured and withheld when the

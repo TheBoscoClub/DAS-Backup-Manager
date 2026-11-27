@@ -402,12 +402,14 @@ pub fn format_report_from(
         ));
     }
 
+    let name_width = align_name_column(&mut ops);
+
     // The deciding lines, apart from the routine ones (spec rule 2): each
     // error, and each row that failed or warned, status word first. The
     // rows stay in their table; the errors are listed only here.
     let flagged: Vec<(&str, String)> = ops
         .iter()
-        .filter_map(|row| row_status(row).map(|st| (st, row_without_status(row, st))))
+        .filter_map(|row| row_status(row).map(|st| (st, row_without_status(row, st, name_width))))
         .filter(|(st, _)| matches!(*st, "FAIL" | "WARN"))
         .collect();
     if !result.errors.is_empty() || !flagged.is_empty() {
@@ -542,9 +544,39 @@ fn row_status(row: &str) -> Option<&'static str> {
     })
 }
 
+/// The name column of the operations block: 21 wide, or as wide as the
+/// longest name when a `Target <label>` is longer, so every status word
+/// stands in one column. Each row's name and text stay as they were; only
+/// the padding between them moves. Returns the width.
+fn align_name_column(rows: &mut [String]) -> usize {
+    const MIN: usize = 21;
+    let split = |row: &str| -> Option<(String, String)> {
+        let st = row_status(row)?;
+        let trimmed = row.trim_start();
+        let at = trimmed.find(&format!(" {st}"))?;
+        Some((
+            trimmed[..at].trim_end().to_string(),
+            trimmed[at..].trim_start().to_string(),
+        ))
+    };
+    let width = rows
+        .iter()
+        .filter_map(|r| split(r))
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MIN);
+    for row in rows.iter_mut() {
+        if let Some((name, rest)) = split(row) {
+            *row = format!("  {name:<width$} {rest}");
+        }
+    }
+    width
+}
+
 /// An operations row as the attention block shows it: name and reason, the
 /// status word (which the block puts first) taken out.
-fn row_without_status(row: &str, status: &str) -> String {
+fn row_without_status(row: &str, status: &str, name_width: usize) -> String {
     let trimmed = row.trim_start();
     let at = trimmed.find(&format!(" {status}")).unwrap_or(trimmed.len());
     let name = trimmed[..at].trim_end();
@@ -553,7 +585,7 @@ fn row_without_status(row: &str, status: &str) -> String {
         .strip_prefix(status)
         .unwrap_or("");
     // The name column, as the table has it, so the reasons line up.
-    format!("{name:<21} {}", reason.trim())
+    format!("{name:<name_width$} {}", reason.trim())
         .trim_end()
         .to_string()
 }
@@ -1749,7 +1781,7 @@ mod tests {
         let report = format_report_from(&result, None, &data);
         assert!(
             report.contains(
-                "── NEEDS ATTENTION ──\n  WARN    USB link              (no USB device's product contains 'X')\n  WARN    Target a-very-long-target-label (before the mount: stopped 3 processes)\n\nBACKUP OPERATIONS"
+                "── NEEDS ATTENTION ──\n  WARN    USB link                        (no USB device's product contains 'X')\n  WARN    Target a-very-long-target-label (before the mount: stopped 3 processes)\n\nBACKUP OPERATIONS"
             ),
             "{report}"
         );
@@ -1761,6 +1793,52 @@ mod tests {
         data.clear_rows.clear();
         result.usb_link = crate::run_steps::UsbLinkStep::NotChecked;
         assert!(!format_report_from(&result, None, &data).contains("NEEDS ATTENTION"));
+    }
+
+    /// A name longer than the name column widens it for the whole block, so
+    /// every status word stands in one column; the rows' text is unchanged.
+    #[test]
+    fn a_long_target_name_widens_the_operations_name_column_for_every_row() {
+        let result = result_with(Some(0), Some(0), 0, &[]);
+        let data = ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+            raid_rows: vec!["  RAID-1 primary        WARN  (DEGRADED: x)".into()],
+            clear_rows: vec![
+                "  Target a-very-long-target-label WARN  (before the mount: stopped 3 processes)"
+                    .into(),
+            ],
+        };
+        let report = format_report_from(&result, None, &data);
+        let ops = report
+            .split("BACKUP OPERATIONS\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        let columns: std::collections::BTreeSet<usize> = ops
+            .lines()
+            .skip(1)
+            .map(|l| {
+                ["FAIL", "WARN", "OK", "N/A"]
+                    .iter()
+                    .filter_map(|w| l.find(&format!(" {w}")))
+                    .min()
+                    .unwrap_or_else(|| panic!("no status in {l:?}"))
+            })
+            .collect();
+        assert_eq!(columns.len(), 1, "statuses in one column: {ops}");
+        assert!(
+            ops.contains(
+                "  Target a-very-long-target-label WARN  (before the mount: stopped 3 processes)"
+            ),
+            "{ops}"
+        );
+        assert!(
+            ops.contains("  RAID-1 primary                  WARN  (DEGRADED: x)"),
+            "{ops}"
+        );
     }
 
     #[test]

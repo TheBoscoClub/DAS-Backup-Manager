@@ -1171,6 +1171,14 @@ check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
 check "clean run: the snapshot counts row" \
     "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
+# bd DAS-Backup-Manager-3gzs.12: the report's time carries its zone, a clean run
+# has no attention block, and a RESULT block closes it with the counts.
+check "clean run: the header time carries its zone" \
+    "$(grep -cE '^  DAS Backup Report — [[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2} [[:digit:]]{2}:[[:digit:]]{2} [^[:space:]]+$' "$WORK/lib/last-report.txt")" "1"
+check "clean run: no attention block" \
+    "$(grep -c '^── NEEDS ATTENTION ──$' "$WORK/lib/last-report.txt" || true)" "0"
+check "clean run: the RESULT block says the status and counts every operation" \
+    "$(grep -cE '^  ALL OPERATIONS SUCCESSFUL  \([[:digit:]]+ operations: 0 FAIL, 0 WARN, [[:digit:]]+ OK or not applicable\)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: a silent mount logs no mount warning" \
     "$(grep -c 'WARN.*mount said' "$STATE/out")" "0"
 
@@ -1341,6 +1349,10 @@ run_backup
 expect_completed "the snapshot counts unknown (no transaction log)" 3 "FAILURES DETECTED" failure
 check "counts unknown: the report names it" \
     "$(grep -c '^  Snapshot counts       FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' "$WORK/lib/last-report.txt")" "1"
+check "counts unknown: the attention block lists it, status word first, ahead of the table" \
+    "$(sed -n '/^── NEEDS ATTENTION ──$/,/^BACKUP OPERATIONS$/p' "$WORK/lib/last-report.txt" | grep -cE '^  FAIL    Snapshot counts +\(btrbk transaction log incomplete \(no startup or finished row\); counts unknown\)$')" "1"
+check "counts unknown: the RESULT block counts the FAIL" \
+    "$(grep -cE '^  FAILURES DETECTED  \([[:digit:]]+ operations: 1 FAIL, ' "$WORK/lib/last-report.txt")" "1"
 check "counts unknown: recorded unknown" "$(vector_has --counts-unknown)" "yes"
 check "counts unknown: btrbk itself succeeded" "$(grep -c 'btrbk completed' "$STATE/out")" "1"
 check "counts unknown: warned once" \
@@ -2182,7 +2194,7 @@ check "leftover held by a writer: never mounted over it" "$(calls_for mount "$PR
 check "leftover held by a writer: ABORTED" "$(mail_status 1)" "ABORTED"
 check "leftover held by a writer: what aborted" "$(body_field 1 'What aborted')" "a leftover mount"
 check "leftover held by a writer: names the writer" \
-    "$(grep -c 'held open for writing by pid 301' "$STATE/mail.1.body")" "1"
+    "$(grep -v '^  ABORTED ' "$STATE/mail.1.body" | grep -c 'held open for writing by pid 301')" "1"
 
 # ---------------------------------------------------------------------------
 echo "== a RAID-1 target another program mounted (bd DAS-Backup-Manager-su1b.12)"
@@ -2308,7 +2320,7 @@ check "a foreign filesystem at the target's path: still mounted" "$(left_mounted
 check "a foreign filesystem at the target's path: what aborted" \
     "$(body_field 1 'What aborted')" "a mount at a target's path"
 check "a foreign filesystem at the target's path: why" \
-    "$(grep -cF -- "primary-22tb: $PRIMARY_MNT has fs UUID 'a-different-filesystem', expected 'primary-uuid'" "$STATE/mail.1.body")" "1"
+    "$(grep -v '^  ABORTED ' "$STATE/mail.1.body" | grep -cF -- "primary-22tb: $PRIMARY_MNT has fs UUID 'a-different-filesystem', expected 'primary-uuid'")" "1"
 # second_source <label> <volume> <device>: a second source in the config.
 second_source() {
     sed -i 's/^DAS_SOURCE_COUNT=1$/DAS_SOURCE_COUNT=2/' "$STATE/env"
@@ -2505,7 +2517,7 @@ check "found mounted, the wrong filesystem: refused" \
 check "found mounted, the wrong filesystem: btrbk never ran" "$(ran_btrbk)" "no"
 check "found mounted, the wrong filesystem: what aborted" "$(body_field 1 'What aborted')" "source verification"
 check "found mounted, the wrong filesystem: why" \
-    "$(grep -cF -- "nvme: $SOURCE_MNT has fs UUID 'a-different-filesystem', expected 'source-uuid'" "$STATE/mail.1.body")" "1"
+    "$(grep -v '^  ABORTED ' "$STATE/mail.1.body" | grep -cF -- "nvme: $SOURCE_MNT has fs UUID 'a-different-filesystem', expected 'source-uuid'")" "1"
 check "found mounted, the wrong filesystem: not mounted over" "$(calls_for mount "$SOURCE_MNT")" "0"
 check "found mounted, the wrong filesystem: left as found" \
     "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "0 $SOURCE_MNT "
@@ -2517,7 +2529,7 @@ check "found mounted at a subvolume: exit status" "$RC" "3"
 show_tail 3
 check "found mounted at a subvolume: what aborted" "$(body_field 1 'What aborted')" "source verification"
 check "found mounted at a subvolume: why" \
-    "$(grep -cF -- "nvme: $SOURCE_MNT is mounted at subvolume '/@', expected the top-level volume '/'" "$STATE/mail.1.body")" "1"
+    "$(grep -v '^  ABORTED ' "$STATE/mail.1.body" | grep -cF -- "nvme: $SOURCE_MNT is mounted at subvolume '/@', expected the top-level volume '/'")" "1"
 check "found mounted at a subvolume: left as found" \
     "$(calls_for umount "$SOURCE_MNT") $(left_mounted)" "0 $SOURCE_MNT "
 

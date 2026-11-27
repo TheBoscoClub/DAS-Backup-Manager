@@ -4408,8 +4408,8 @@ mod tests {
 
     /// Every caller names its job: each `ensure_targets_mounted(` call in
     /// the sources passes `Job::<job>` (its intent and whether it may stop
-    /// readers both come from the table above), each `mount_guarded_target(`
-    /// call `Job::<job>.intent()`, never a bare `Intent`, so the table above
+    /// readers both come from the table above), each `mount_guarded_target(` or
+    /// `mount_guarded_target_clearing(` call `Job::<job>.intent()`, never a bare `Intent`, so the table above
     /// is the whole classification.
     #[test]
     fn every_target_mount_names_its_job() {
@@ -4425,7 +4425,11 @@ mod tests {
                 continue;
             }
             let text = fs::read_to_string(&p).unwrap();
-            for name in ["ensure_targets_mounted(", "mount_guarded_target("] {
+            for name in [
+                "ensure_targets_mounted(",
+                "mount_guarded_target(",
+                "mount_guarded_target_clearing(",
+            ] {
                 for (at, _) in text.match_indices(name) {
                     let before = &text[..at];
                     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -4438,7 +4442,7 @@ mod tests {
                     }
                     let end = text[at..].find(';').map_or(text.len(), |e| at + e);
                     let args = &text[at..end];
-                    let named = if name == "mount_guarded_target(" {
+                    let named = if name.starts_with("mount_guarded_target") {
                         args.contains("Job::") && args.contains(".intent()")
                     } else {
                         args.contains("Job::") && !args.contains(".intent()")
