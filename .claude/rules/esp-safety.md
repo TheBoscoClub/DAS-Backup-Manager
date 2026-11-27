@@ -30,7 +30,7 @@ discovery loop, cross-check label against mount, and refuse any device not on th
 The recovery-OS reading mounts a mirror target's own ESP **read-only** (bd `sp78.20`), only by that target's
 `esp_partuuid`, only when the drive itself lists that PARTUUID, never over or beside another mount of it:
 `mount::read_recovery_esp`. No other code path mounts an ESP; never add one that finds it any other way.
-One left mounted is released only at its own directory, only when `findmnt -S PARTUUID=<esp_partuuid>` shows
+This project's own ESP mount, left mounted, is released only at its own directory, only when `findmnt -S PARTUUID=<esp_partuuid>` shows
 it there: `MountGuard::release_esps` (bd `s5jv.2`), `backup-run.sh` `unmount_all` (bd `s5jv.1`).
 Another program's mount of that ESP (udisks, a `.mount` unit, a hand mount; bd `eg4j.19`) found there by `findmnt -S PARTUUID=<esp_partuuid>` only → the reading clears it as a job that writes nothing: idle → unmounted, the reading goes on; held by any process → not read, the holder named, nothing signalled (WARN row); the partition identified by its block device number, never by a mount's source text.
 The recovery-OS session and provision find the drive by its configured serial only, never an ESP by type → every mount of its partitions is cleared under the stop policy (`btrdasd recovery-os clear-drive`); a writer refuses the session.
