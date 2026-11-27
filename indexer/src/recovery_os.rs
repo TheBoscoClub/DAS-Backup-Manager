@@ -1547,7 +1547,20 @@ pub fn status_noting_until(
                             assessment.boot_problems.extend(found.problems);
                             assessment.esp_left_mounted = found.left_mounted;
                         }
-                        Some(Err(why)) => assessment.esp = Some(format!("not checked: {why}")),
+                        Some(Err(why)) => {
+                            // Another program's mount of the ESP, held by a
+                            // process: a finding, a WARNING (bd
+                            // DAS-Backup-Manager-eg4j.19); a key not
+                            // configured stays a said row.
+                            if why.contains(crate::mount::ESP_HELD) {
+                                assessment.warnings.push(
+                                    "the ESP was not read: another program holds its mount \
+                                     (see the ESP row)"
+                                        .to_string(),
+                                );
+                            }
+                            assessment.esp = Some(format!("not checked: {why}"));
+                        }
                         None => {}
                     }
                 }
@@ -4603,6 +4616,8 @@ mod tests {
         });
         let a2 = assessment(&entries);
         assert!(a2.boot_problems.is_empty());
+        // esp_not_configured_stays_info: no WARNING for it.
+        assert!(a2.warnings.is_empty(), "{:?}", a2.warnings);
         assert_eq!(exit_code(&entries), 0);
         assert!(
             format_section(&entries, &current_host())
@@ -4611,6 +4626,31 @@ mod tests {
             format_section(&entries, &current_host())
         );
         assert_eq!(classify(&entries, None).0, RecordStatus::Ok);
+        // esp_not_checked_because_held_is_warn: another program's mount of
+        // the ESP, held by a process: not read, and a WARNING.
+        let held: &'static str = Box::leak(
+            format!(
+                "PARTUUID=x is mounted at /run/media/u/E: pid 300 kate holds it — not read ({})",
+                crate::mount::ESP_HELD
+            )
+            .into_boxed_str(),
+        );
+        let entries = read(&listed, &|_, _| Some(Err(held.to_string())));
+        let a3 = assessment(&entries);
+        assert!(
+            a3.warnings
+                .iter()
+                .any(|w| w.contains("another program holds its mount")),
+            "{:?}",
+            a3.warnings
+        );
+        assert!(a3.boot_problems.is_empty());
+        assert_eq!(classify(&entries, None).0, RecordStatus::Warn);
+        assert!(
+            format_section(&entries, &current_host()).contains("pid 300 kate holds it"),
+            "{}",
+            format_section(&entries, &current_host())
+        );
         // Read and complete: said, so it is never mistaken for not asked.
         let entries = read(&listed, &|_, _| {
             Some(Ok(esp::Findings {

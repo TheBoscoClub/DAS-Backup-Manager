@@ -3175,9 +3175,13 @@ pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
 /// The configured PARTUUID is a claim, not an identity: it is mounted only
 /// when the drive itself lists it, so a mistyped or copied key — the host's
 /// `EFI` — is refused before anything is asked of the host. Never
-/// discovered (`.claude/rules/esp-safety.md`). Mounted elsewhere, it is left
-/// as it is; mounted at its own directory, an earlier reading left it, and
-/// it is taken down as a target an earlier job left is (bd jgm).
+/// discovered (`.claude/rules/esp-safety.md`). Mounted at another place by
+/// another program (udisks, a unit, by hand) it is cleared by the stop policy
+/// as a job that writes nothing clears it (bd DAS-Backup-Manager-eg4j.19): an
+/// idle mount is unmounted and the reading goes on; one something uses is not
+/// read, the user named, nothing signalled ([`ESP_HELD`]). Mounted at its own
+/// directory, an earlier reading left it, and it is taken down as a target an
+/// earlier job left is (bd jgm).
 pub fn read_recovery_esp<T>(
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
@@ -3186,11 +3190,18 @@ pub fn read_recovery_esp<T>(
     read_recovery_esp_with(
         &SystemRunner,
         Path::new(ESP_MOUNT_ROOT),
+        &host_clear_site(false, false),
+        Path::new("/dev/disk/by-partuuid"),
         target,
         drive_ids,
         read,
     )
 }
+
+/// What a "not read" ESP's text says when another program's mount of it was
+/// held by something: a finding of the reading (a WARN row), not a missing
+/// setting (bd DAS-Backup-Manager-eg4j.19).
+pub const ESP_HELD: &str = "held by another program";
 
 /// A reading of a recovery drive's ESP ([`read_recovery_esp`]): what `read`
 /// said, or why it was not asked, and — when the ESP could not be taken down
@@ -3205,20 +3216,34 @@ pub struct EspReading<T> {
 fn read_recovery_esp_with<T>(
     runner: &dyn CommandRunner,
     root: &Path,
+    clear: &ClearSite<'_>,
+    partuuid_dir: &Path,
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
     read: &dyn Fn(&Path) -> Result<T, String>,
 ) -> EspReading<T> {
     let mut left_mounted = None;
-    let read = mount_read_unmount(runner, root, target, drive_ids, read, &mut left_mounted);
+    let read = mount_read_unmount(
+        runner,
+        root,
+        clear,
+        partuuid_dir,
+        target,
+        drive_ids,
+        read,
+        &mut left_mounted,
+    );
     EspReading { read, left_mounted }
 }
 
 /// [`read_recovery_esp_with`]'s steps: `Err` when the ESP was not read;
 /// `left_mounted` is set when, read or not, it is still mounted at the end.
+#[allow(clippy::too_many_arguments)] // one reading's whole host, passed as it is
 fn mount_read_unmount<T>(
     runner: &dyn CommandRunner,
     root: &Path,
+    clear: &ClearSite<'_>,
+    partuuid_dir: &Path,
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
     read: &dyn Fn(&Path) -> Result<T, String>,
@@ -3252,15 +3277,35 @@ fn mount_read_unmount<T>(
         .map_err(|e| format!("findmnt failed to run: {e}"))?;
     match out.status.code() {
         Some(0) => {
-            for there in String::from_utf8_lossy(&out.stdout).lines() {
-                if there != dir_s {
-                    return Err(format!(
-                        "{spec} is mounted at {there} — left as it is, not read"
-                    ));
-                }
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if let Some(there) = text.lines().find(|there| *there != dir_s) {
+                // Another program's mount (bd DAS-Backup-Manager-eg4j.19):
+                // by the stop policy of a job that writes nothing. The
+                // partition by its PARTUUID path, as a block device number.
+                let part = partuuid_dir.join(pu.to_ascii_lowercase());
+                let part_s = part.to_str().ok_or("the ESP's device path is not UTF-8")?;
+                let held = |why: &str| {
+                    format!("{spec} is mounted at {there}: {why} — not read ({ESP_HELD})")
+                };
+                let dev = (clear.block_dev)(part_s)
+                    .map_err(|e| format!("{spec} is mounted at {there}: {e} — not read"))?;
+                let id = crate::holders::PartitionId {
+                    path: part_s.to_string(),
+                    dev,
+                };
+                clear_partitions_with(
+                    runner,
+                    clear,
+                    &target.label,
+                    &[id],
+                    None,
+                    &crate::progress::NullProgress,
+                )
+                .map_err(|why| held(&why))?;
+            } else {
+                take_down_leftover_with(runner, dir_s, &crate::progress::NullProgress, None)
+                    .map_err(|why| format!("{spec} was left mounted at {dir_s}: {why}"))?;
             }
-            take_down_leftover_with(runner, dir_s, &crate::progress::NullProgress, None)
-                .map_err(|why| format!("{spec} was left mounted at {dir_s}: {why}"))?;
         }
         Some(1) => {}
         _ => return Err(exit_why("findmnt", out.status)),
@@ -8664,7 +8709,18 @@ mod tests {
             seen.lock().unwrap().push(dir.to_path_buf());
             answer.clone()
         };
-        let r = read_recovery_esp_with(runner, root, target, &esp_drive_ids(), &read);
+        let host = Host::default();
+        let r = host.with_clear(runner, |c| {
+            read_recovery_esp_with(
+                runner,
+                root,
+                c,
+                Path::new("/nonexistent-by-partuuid"),
+                target,
+                &esp_drive_ids(),
+                &read,
+            )
+        });
         assert_eq!(
             r.left_mounted, None,
             "left mounted: use read_esp_reading for that case"
@@ -8803,8 +8859,103 @@ mod tests {
         assert!(runner.calls().is_empty() && seen.is_empty());
     }
 
+    /// Another program's mount of the ESP, on a described host: udisks has
+    /// it at [`ESP_AT`] (mount id 50, device 8:17), `holder` uses it, the
+    /// reading is a job that writes nothing (it may not stop readers).
+    fn read_esp_elsewhere(
+        holder: Option<crate::holders::testproc::Proc<'_>>,
+    ) -> (Result<Vec<String>, String>, Arc<ScriptedRunner>, Host, bool) {
+        let scratch = tempfile::tempdir().unwrap();
+        let pdir = scratch.path().join("by-partuuid");
+        let mut host = esp_mounted_by_udisks(holder);
+        host.read_only_job = true;
+        host.block_devs.push((
+            pdir.join(ESP_PU).to_str().unwrap().to_string(),
+            "8:17".to_string(),
+        ));
+        let [_, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{ESP_AT}\n")),
+                    stderr: "",
+                },
+            ),
+            q,
+            verified(),
+        ]);
+        let seen = Mutex::new(false);
+        let read = |_: &Path| {
+            *seen.lock().unwrap() = true;
+            Ok(vec!["found".to_string()])
+        };
+        let r = host.with_clear(&runner, |c| {
+            read_recovery_esp_with(
+                &*runner,
+                scratch.path(),
+                c,
+                &pdir,
+                &esp_target(Some(ESP_PU)),
+                &esp_drive_ids(),
+                &read,
+            )
+        });
+        let read_ran = *seen.lock().unwrap();
+        (r.read, runner, host, read_ran)
+    }
+
+    /// bd eg4j.19: another program's idle mount of the ESP is unmounted (by
+    /// the stop policy of a read-only job) and the reading goes on.
     #[test]
-    fn an_esp_mounted_elsewhere_is_left_as_it_is_and_not_read() {
+    fn esp_mounted_elsewhere_idle_is_unmounted_and_read() {
+        let (r, runner, host, read_ran) = read_esp_elsewhere(None);
+        assert_eq!(r, Ok(vec!["found".to_string()]));
+        assert!(read_ran);
+        assert_eq!(
+            argvs(&runner, "umount")[0],
+            vec!["umount", "--no-canonicalize", ESP_AT]
+        );
+        assert_eq!(
+            argvs(&runner, "mount").len(),
+            1,
+            "then its own read-only mount"
+        );
+        assert!(host.signals().is_empty());
+    }
+
+    /// A reader keeps another program's mount: not read, the reader named,
+    /// nothing signalled, nothing unmounted (a read-only job never stops one).
+    #[test]
+    fn esp_mounted_elsewhere_held_by_reader_not_read_nothing_signalled() {
+        let (r, runner, host, read_ran) = read_esp_elsewhere(Some(esp_user(300, "0100000")));
+        let why = r.unwrap_err();
+        assert!(
+            why.contains("pid 300")
+                && why.contains("never stops a process")
+                && why.contains(ESP_HELD),
+            "{why}"
+        );
+        assert!(!read_ran);
+        assert!(host.signals().is_empty());
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+    }
+
+    #[test]
+    fn esp_mounted_elsewhere_held_by_a_writer_is_not_read_and_not_signalled() {
+        let (r, runner, host, read_ran) = read_esp_elsewhere(Some(esp_user(301, "0100002")));
+        let why = r.unwrap_err();
+        assert!(why.contains("pid 301") && why.contains(ESP_HELD), "{why}");
+        assert!(!read_ran);
+        assert!(host.signals().is_empty());
+        assert!(argvs(&runner, "umount").is_empty());
+    }
+
+    /// The partition's PARTUUID path is no block device (the drive went):
+    /// nothing is unmounted on a guess; not a "held" finding.
+    #[test]
+    fn an_esp_mounted_elsewhere_whose_partition_is_no_block_device_is_not_touched() {
         let scratch = tempfile::tempdir().unwrap();
         let runner = ScriptedRunner::with_rules(&[(
             "-S",
@@ -8821,7 +8972,11 @@ mod tests {
             Ok(vec![]),
         );
         let why = r.unwrap_err();
-        assert!(why.contains("/media/someone"), "{why}");
+        assert!(
+            why.contains("/media/someone") && why.contains("not a block device"),
+            "{why}"
+        );
+        assert!(!why.contains(ESP_HELD), "{why}");
         assert!(argvs(&runner, "mount").is_empty() && argvs(&runner, "umount").is_empty());
         assert!(seen.is_empty());
     }
@@ -8966,13 +9121,18 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let [s, q] = unmounted_host();
         let runner = ScriptedRunner::with_rules(&[s, q, verified(), ("umount", Reply::exit(32))]);
-        let r = read_recovery_esp_with(
-            &*runner,
-            scratch.path(),
-            &esp_target(Some(ESP_PU)),
-            &esp_drive_ids(),
-            &|_: &Path| Ok(vec!["a problem".to_string()]),
-        );
+        let host = Host::default();
+        let r = host.with_clear(&runner, |c| {
+            read_recovery_esp_with(
+                &*runner,
+                scratch.path(),
+                c,
+                Path::new("/nonexistent-by-partuuid"),
+                &esp_target(Some(ESP_PU)),
+                &esp_drive_ids(),
+                &|_: &Path| Ok(vec!["a problem".to_string()]),
+            )
+        });
         assert_eq!(r.read, Ok(vec!["a problem".to_string()]));
         let why = r.left_mounted.unwrap();
         assert!(why.contains("still mounted"), "{why}");
