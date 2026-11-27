@@ -2402,7 +2402,29 @@ name runs where a wrapper or
 is given the name, or where the definition is not reached. A script that
 ends inside a quote or after a joining backslash is unknown. One whose
 .B #!
-names another interpreter is that interpreter's. A binary is not looked into.
+names another interpreter is that interpreter's. The interpreter a program's
+.B #!
+line names is itself read as a program the script runs, since the kernel
+takes a script as an interpreter too: a stock shell or python is read no
+further than its first bytes, which are no
+.BR #! ,
+and a script planted under its name is read. The program
+.B env
+runs is looked up in the
+.BR PATH ,
+and the command line
+.B env \-S
+splits is read as a command line given to
+.BR env ;
+any other
+.B env
+option than
+.BR \-i ,
+.BR \-0 ,
+.B \-v
+or
+.B \-\-
+is unknown. A relative interpreter is unknown. A binary is not looked into.
 .PP
 A word a program is given may be one it runs, so it is read like one: a
 .B #!
