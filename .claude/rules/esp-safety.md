@@ -36,4 +36,4 @@ it there: `MountGuard::release_esps` (bd `s5jv.2`), `backup-run.sh` `unmount_all
 ### Target mounts
 
 The targets are mounted by `backup-run.sh` / `btrdasd` only, hidden from udisks2 by a generated ignore rule
-(`sudo btrdasd setup --check`).
+(`sudo btrdasd setup --check`). The same generated rule names each configured recovery ESP `RECOVERY` in udev, by `esp_partuuid` only, so fwupd skips it; the on-disk GPT is untouched (bd `eg4j.18`).

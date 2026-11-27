@@ -135,7 +135,7 @@ by UUID. The setup wizard records it for a new target whose drive is attached;
 
 The backup scripts use `smartctl` to detect which `/dev/sdX` currently corresponds to each serial at runtime. This means your backup runs correctly regardless of device letter assignment.
 
-`btrdasd setup` also renders the serials and `mount_uuid` into `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, which hides the targets from udisks so no desktop session mounts them under `/run/media`, and the serials alone into `/etc/udev/rules.d/99-das-backup-io-scheduler.rules`, which keeps each target drive on `[das].io_scheduler` across a re-plug, an enclosure power cycle and a reboot (bd `DAS-Backup-Manager-su1b.4`). After changing a serial (a replaced drive), run `sudo btrdasd setup --upgrade` to regenerate both; `sudo btrdasd setup --check` confirms each attached target carries the flag and runs the configured scheduler.
+`btrdasd setup` also renders the serials and `mount_uuid` into `/etc/udev/rules.d/99-das-backup-udisks-ignore.rules`, which hides the targets from udisks so no desktop session mounts them under `/run/media` (and, for a recovery drive with an `esp_partuuid`, names its ESP `RECOVERY` in udev so fwupd skips it), and the serials alone into `/etc/udev/rules.d/99-das-backup-io-scheduler.rules`, which keeps each target drive on `[das].io_scheduler` across a re-plug, an enclosure power cycle and a reboot (bd `DAS-Backup-Manager-su1b.4`). After changing a serial (a replaced drive), run `sudo btrdasd setup --upgrade` to regenerate both; `sudo btrdasd setup --check` confirms each attached target carries the flag and runs the configured scheduler.
 
 ## Re-cabling and moving the enclosure — POWER IT DOWN FIRST
 

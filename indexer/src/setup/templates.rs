@@ -469,6 +469,54 @@ pub fn render_udev_udisks_ignore(config: &Config) -> String {
             }
         }
     }
+    out.push_str(&render_recovery_esp_names(config));
+    out
+}
+
+/// The PARTUUIDs of the configured recovery ESPs as udev reports them (lower
+/// case), each `Ok` when it is a PARTUUID and `Err(raw)` when it is not. A
+/// value is checked with `config::is_partuuid` before it can reach a rule.
+pub fn recovery_esp_partuuids(config: &Config) -> Vec<Result<String, String>> {
+    config
+        .targets
+        .iter()
+        .filter_map(|t| t.esp_partuuid.as_deref())
+        .map(|pu| {
+            if buttered_dasd::config::is_partuuid(pu) {
+                Ok(pu.to_ascii_lowercase())
+            } else {
+                Err(pu.to_string())
+            }
+        })
+        .collect()
+}
+
+/// The rule lines that name each configured recovery ESP `RECOVERY` in udev
+/// (bd `DAS-Backup-Manager-eg4j.18`). fwupd enumerates every ESP by partition
+/// type and mounts each read-write as root; it skips one whose partition name
+/// is on udisks' recovery list (`fu_volume_check_is_recovery`). Only a udev
+/// property changes: the on-disk GPT is never written. Keyed on the
+/// configured PARTUUID alone, never on type or discovery (`esp-safety.md`).
+fn render_recovery_esp_names(config: &Config) -> String {
+    let uuids = recovery_esp_partuuids(config);
+    if uuids.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n# Recovery ESPs: name the partition RECOVERY in udev so fwupd (which skips an ESP\n\
+         # whose name is on udisks' recovery list, fu_volume_check_is_recovery) never mounts\n\
+         # one. A udev property only; the on-disk partition table is untouched.\n\
+         # bd DAS-Backup-Manager-eg4j.18\n",
+    );
+    for uuid in uuids {
+        match uuid {
+            Ok(uuid) => out.push_str(&format!(
+                "ACTION!=\"remove\", SUBSYSTEM==\"block\", ENV{{DEVTYPE}}==\"partition\", \
+                 ENV{{ID_PART_ENTRY_UUID}}==\"{uuid}\", ENV{{ID_PART_ENTRY_NAME}}=\"RECOVERY\"\n"
+            )),
+            Err(_) => out.push_str("# SKIPPED an esp_partuuid that is not a PARTUUID\n"),
+        }
+    }
     out
 }
 
@@ -1246,6 +1294,75 @@ pub(crate) mod tests {
         assert_eq!(result.matches("ENV{UDISKS_IGNORE}=\"1\"").count(), 0);
         assert!(!result.contains("BAD"));
         assert_eq!(result.matches("# SKIPPED").count(), 2);
+    }
+
+    fn config_with_esp_targets(partuuids: &[Option<&str>]) -> Config {
+        let mut config = Config::default();
+        for (i, pu) in partuuids.iter().enumerate() {
+            config.targets.push(Target {
+                label: format!("recovery-{i}"),
+                serial: format!("SERIAL0{i}"),
+                serials: vec![format!("SERIAL0{i}")],
+                mount_uuid: None,
+                mount: format!("/mnt/recovery-{i}"),
+                role: TargetRole::Mirror,
+                retention: Retention {
+                    weekly: 0,
+                    monthly: 0,
+                    daily: 7,
+                    yearly: 0,
+                },
+                display_name: String::new(),
+                esp_partuuid: pu.map(str::to_string),
+            });
+        }
+        config
+    }
+
+    fn recovery_name_line(partuuid: &str) -> String {
+        format!(
+            "ACTION!=\"remove\", SUBSYSTEM==\"block\", ENV{{DEVTYPE}}==\"partition\", \
+             ENV{{ID_PART_ENTRY_UUID}}==\"{partuuid}\", ENV{{ID_PART_ENTRY_NAME}}=\"RECOVERY\"\n"
+        )
+    }
+
+    #[test]
+    fn render_udev_udisks_ignore_names_each_configured_recovery_esp_recovery() {
+        // bd DAS-Backup-Manager-eg4j.18: fwupd skips an ESP whose partition
+        // name is RECOVERY; one line per configured esp_partuuid, lower case.
+        let config = config_with_esp_targets(&[
+            Some("5eed0025-0000-4000-8000-000000000025"),
+            Some("5EED0023-0000-4000-8000-000000000023"),
+        ]);
+        let result = render_udev_udisks_ignore(&config);
+        assert!(result.contains(&recovery_name_line("5eed0025-0000-4000-8000-000000000025")));
+        assert!(result.contains(&recovery_name_line("5eed0023-0000-4000-8000-000000000023")));
+        assert_eq!(result.matches("ID_PART_ENTRY_NAME").count(), 2);
+        assert!(result.contains("fu_volume_check_is_recovery"));
+        // The existing ignore lines are untouched: two serials, no UUID.
+        assert_eq!(result.matches("ENV{UDISKS_IGNORE}=\"1\"").count(), 2);
+    }
+
+    #[test]
+    fn render_udev_udisks_ignore_names_one_esp_and_none() {
+        let one = render_udev_udisks_ignore(&config_with_esp_targets(&[
+            Some("5eed0025-0000-4000-8000-000000000025"),
+            None,
+        ]));
+        assert_eq!(one.matches("ID_PART_ENTRY_NAME").count(), 1);
+        let none = render_udev_udisks_ignore(&config_with_esp_targets(&[None, None]));
+        assert_eq!(none.matches("ID_PART_ENTRY_NAME").count(), 0);
+        assert!(!none.contains("fu_volume_check_is_recovery"));
+    }
+
+    #[test]
+    fn render_udev_udisks_ignore_never_writes_an_invalid_esp_partuuid() {
+        let config =
+            config_with_esp_targets(&[Some("x\", ENV{X}==\"y"), Some("not-a-partuuid"), Some("")]);
+        let result = render_udev_udisks_ignore(&config);
+        assert_eq!(result.matches("ID_PART_ENTRY_NAME").count(), 0);
+        assert!(!result.contains("ENV{X}"));
+        assert_eq!(result.matches("# SKIPPED an esp_partuuid").count(), 3);
     }
 
     #[test]
