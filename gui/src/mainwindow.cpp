@@ -48,6 +48,28 @@
 #include <QVBoxLayout>
 
 namespace {
+// Every divider the operator drags — the dock separator above Progress and
+// each splitter in the window — drawn in the theme's highlight colour, wider
+// than Qt's default, so it stands out from the background; brighter under the
+// pointer (operator 2026-11-27). The palette() roles follow the desktop theme.
+constexpr const char *DividerStyle =
+    "QMainWindow::separator { background: palette(highlight); width: 6px; height: 6px; }"
+    "QMainWindow::separator:hover { background: palette(highlighted-text); }"
+    "QSplitter::handle { background: palette(highlight); }"
+    "QSplitter::handle:hover { background: palette(highlighted-text); }"
+    "QSplitter::handle:horizontal { width: 6px; }"
+    "QSplitter::handle:vertical { height: 6px; }";
+
+void styleDividers(QMainWindow *window)
+{
+    window->setStyleSheet(QString::fromLatin1(DividerStyle));
+    const auto splitters = window->findChildren<QSplitter *>();
+    for (QSplitter *splitter : splitters) {
+        for (int i = 1; i < splitter->count(); ++i)
+            splitter->handle(i)->setToolTip(i18n("Drag to resize"));
+    }
+}
+
 // A failure the operator must read: one short line says what failed, and a
 // text of several segments or more than a line's worth goes in the dialog's
 // details, whole, rather than as one run-on message (spec 2026-11-27, bd
@@ -134,6 +156,7 @@ MainWindow::MainWindow(QWidget *parent)
             });
 
     setupUi();
+    styleDividers(this);
     setupActions();
     setupTrayIcon();
     setupGUI(Default, QStringLiteral("btrdasd-gui.rc"));

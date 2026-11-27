@@ -151,6 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GUI: every divider is easy to see** (operator 2026-11-27): the bar above the Progress dock and each splitter handle (sidebar, Browse page, Growth chart) are drawn 6 px wide in the theme's highlight colour, brighter under the pointer, instead of Qt's faint dotted grip; splitter handles say "Drag to resize" (`gui/src/mainwindow.cpp`, `styleDividers`)
 - **`backup-run.sh` 4.26.0: the nightly emailed report reads at a glance** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
   - The header time carries its zone (`2026-11-27 03:19 CST`), in the full report and in the ABORTED one
   - A `── NEEDS ATTENTION ──` block follows the header whenever an operation FAILed or WARNed: each one, status word first, with its reason, ahead of the table; an operation with no row of its own (a run history that was not recorded) is named there too
