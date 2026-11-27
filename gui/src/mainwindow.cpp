@@ -47,6 +47,25 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+namespace {
+// A failure the operator must read: one short line says what failed, and a
+// text of several segments or more than a line's worth goes in the dialog's
+// details, whole, rather than as one run-on message (spec 2026-11-27, bd
+// DAS-Backup-Manager-3gzs.12). A short one-line error is shown as before.
+void showFailure(QWidget *parent, const QString &what, const QString &error)
+{
+    const QStringList parts = OutcomeText::segments(error);
+    constexpr int OneLine = 200;
+    if (parts.size() <= 1 && error.size() <= OneLine) {
+        KMessageBox::error(parent, i18n("%1: %2", what, error));
+        return;
+    }
+    const QString first = parts.isEmpty() ? error : parts.first();
+    const QString headline = first.size() <= OneLine ? first : first.left(OneLine - 1) + QChar(0x2026);
+    KMessageBox::detailedError(parent, i18n("%1: %2", what, headline), error);
+}
+} // namespace
+
 MainWindow::MainWindow(QWidget *parent)
     : KXmlGuiWindow(parent)
 {
@@ -58,7 +77,7 @@ MainWindow::MainWindow(QWidget *parent)
         if (success) {
             statusBar()->showMessage(i18n("Restore complete"), 5000);
         } else {
-            KMessageBox::error(this, i18n("Restore failed: %1", error));
+            showFailure(this, i18n("Restore failed"), error);
         }
     });
 
@@ -71,7 +90,7 @@ MainWindow::MainWindow(QWidget *parent)
     // Show D-Bus errors to the user
     connect(m_dbusClient, &DBusClient::errorOccurred,
             this, [this](const QString &operation, const QString &error) {
-                KMessageBox::error(this, i18n("%1: %2", operation, error));
+                showFailure(this, operation, error);
             });
 
     // One-shot notification when the helper service is unreachable at startup.
@@ -218,7 +237,7 @@ void MainWindow::setupUi()
             updateStatusBar();
             statusBar()->showMessage(i18n("Re-indexing complete"), 5000);
         } else {
-            KMessageBox::error(this, i18n("Indexing failed: %1", error));
+            showFailure(this, i18n("Indexing failed"), error);
         }
     });
 

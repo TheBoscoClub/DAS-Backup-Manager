@@ -93,6 +93,11 @@ private:
     QPushButton *m_end = nullptr;
     QPushButton *m_record = nullptr;
     QLabel *m_status = nullptr;
+    // What the status line says, as plain text: what it was before it was
+    // structured, kept for the tests and for the comparisons that clear it.
+    QString m_statusPlain;
+    void setStatus(const QString &plain);
+    void setOutcome(const OutcomeText &outcome);
     QTimer *m_timer = nullptr;
     bool m_refreshInFlight = false;
     bool m_scheduleClearing = false; // the last RecoveryOsScheduleSet sent was a clear (time 0)

@@ -1,5 +1,7 @@
 #include "recoverypanel.h"
 #include "dbusclient.h"
+#include "recoverystatus.h"
+#include "statustext.h"
 
 #include <KColorScheme>
 #include <KLocalizedString>
@@ -99,7 +101,9 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
         if (op == RecordOperation) {
             m_recordRequested = false;
             m_earlyFinished.clear();
-            m_status->setText(i18n("Record refused: %1", error));
+            OutcomeText refused = OutcomeText::make(QStringLiteral("REFUSED"), error);
+            refused.plain = i18n("Record refused: %1", error);
+            setOutcome(refused);
         }
         if (op == QLatin1String("RecoveryOsScheduleSet") || op == QLatin1String("RecoveryOsConsole"))
             refresh();
@@ -117,7 +121,7 @@ RecoveryPanel::RecoveryPanel(DBusClient *client, QWidget *parent)
 
     if (!m_client->isAvailable()) {
         m_parseError = m_client->unavailableReason();
-        m_status->setText(m_parseError);
+        setStatus(m_parseError);
     }
     rederive();
 }
@@ -225,9 +229,9 @@ void RecoveryPanel::applyDocument(const QByteArray &json)
     } else {
         // A parse error or a failed refresh the status line reported is over
         // once a document reads.
-        if ((!m_parseError.isEmpty() && m_status->text() == m_parseError)
-            || (!m_staleReason.isEmpty() && m_status->text() == m_staleReason))
-            m_status->clear();
+        if ((!m_parseError.isEmpty() && m_statusPlain == m_parseError)
+            || (!m_staleReason.isEmpty() && m_statusPlain == m_staleReason))
+            setStatus(QString());
         m_parseError.clear();
         m_staleReason.clear();
         const int keep = m_selector->currentIndex();
@@ -450,7 +454,7 @@ void RecoveryPanel::rederive()
         for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
             bind(b, off);
         if (!m_parseError.isEmpty())
-            m_status->setText(m_parseError);
+            setStatus(m_parseError);
         return;
     }
     if (!m_staleReason.isEmpty()) {
@@ -458,7 +462,7 @@ void RecoveryPanel::rederive()
         const Action stale{false, i18n("the last status refresh failed: %1", m_staleReason)};
         for (QPushButton *b : {m_upgrade, m_record, m_schedule, m_clear, m_console, m_end})
             bind(b, stale);
-        m_status->setText(m_staleReason);
+        setStatus(m_staleReason);
         return;
     }
     // A document naming no drive: nothing to act on, whatever the buttons said before.
@@ -542,7 +546,7 @@ void RecoveryPanel::onRecord()
     if (labels.size() != 1)
         return;
     m_recordRequested = true;
-    m_status->setText(i18n("Recording the boot record of %1…", labels.first()));
+    setStatus(i18n("Recording the boot record of %1…", labels.first()));
     rederive();
     m_client->recoveryOsRecord(labels.first());
 }
@@ -591,7 +595,7 @@ void RecoveryPanel::onConsoleResult(const QString &label, const QString &path)
 {
     const auto [program, args] = DBusClient::consoleCommand(path);
     if (!QStandardPaths::findExecutable(program).isEmpty() && QProcess::startDetached(program, args)) {
-        m_status->setText(i18n("Console of %1 opened in %2", label, program));
+        setStatus(i18n("Console of %1 opened in %2", label, program));
         return;
     }
     QMessageBox box(QMessageBox::Information, i18n("Console socket"),
@@ -620,8 +624,14 @@ void RecoveryPanel::onEndSession()
 void RecoveryPanel::onSessionEndResult(const QString &label, bool ok, const QString &lines)
 {
     m_endInFlight = false;
-    m_status->setText(ok ? i18n("Session of %1 ended:\n%2", label, lines)
-                         : i18n("Ending the session of %1 failed:\n%2", label, lines));
+    if (ok) {
+        setStatus(i18n("Session of %1 ended:\n%2", label, lines));
+    } else {
+        OutcomeText failed = OutcomeText::make(QStringLiteral("FAILED"), lines, QString(),
+                                               i18n("Ending the session of %1 failed.", label));
+        failed.plain = i18n("Ending the session of %1 failed:\n%2", label, lines);
+        setOutcome(failed);
+    }
     rederive();
     refresh();
 }
@@ -629,7 +639,7 @@ void RecoveryPanel::onSessionEndResult(const QString &label, bool ok, const QStr
 void RecoveryPanel::onScheduleResult(const QString &unit)
 {
     // One method sets and clears (time 0 clears); say which this answer was for.
-    m_status->setText(m_scheduleClearing ? i18n("Schedule cleared: %1", unit) : i18n("Schedule written: %1", unit));
+    setStatus(m_scheduleClearing ? i18n("Schedule cleared: %1", unit) : i18n("Schedule written: %1", unit));
     refresh();
 }
 
@@ -684,29 +694,37 @@ void RecoveryPanel::onJobStarted(const QString &jobId, const QString &operation)
 void RecoveryPanel::showRecordOutcome(bool success, const QString &summary)
 {
     if (success)
-        m_status->setText(i18n("Recorded: %1", summary));
+        setStatus(i18n("Recorded: %1", summary));
     else if (recordDeferred(summary))
-        m_status->setText(i18n("Not started: %1", summary)); // a lock was held; nothing changed
-    else
-        m_status->setText(i18n("Recording failed: %1", summary));
+        setStatus(i18n("Not started: %1", summary)); // a lock was held; nothing changed
+    else {
+        OutcomeText failed = OutcomeText::make(QStringLiteral("FAILED"), summary, QString(),
+                                               i18n("Recording the boot record failed."));
+        failed.plain = i18n("Recording failed: %1", summary);
+        setOutcome(failed);
+    }
 }
 
 void RecoveryPanel::showSessionOutcome(bool success, const QString &summary)
 {
     if (success)
-        m_status->setText(i18n("Done: %1", summary));
+        setStatus(i18n("Done: %1", summary));
     else if (sessionKept(summary)) {
         // Its session runs on until session-end; this window still knows how
         // it started it, which the document cannot say (uk3v.10).
         m_keptOwnLabels = m_ownJobLabels;
         m_keptOwnAttended = m_ownJobAttended;
-        m_status->setText(keptWords(summary, false));
+        setStatus(keptWords(summary, false));
     } else if (summary.startsWith(QLatin1String("warnings:")))
-        m_status->setText(i18n("Needs a look: %1", summary));
+        setStatus(i18n("Needs a look: %1", summary));
     else if (sessionRefusedForRecord(summary))
-        m_status->setText(recordRefusalWords(summary));
-    else
-        m_status->setText(i18n("Failed: %1", summary));
+        setOutcome(recordRefusalOutcome(summary));
+    else {
+        OutcomeText failed = OutcomeText::make(QStringLiteral("FAILED"), summary, QString(),
+                                               i18n("The recovery OS session failed."));
+        failed.plain = i18n("Failed: %1", summary);
+        setOutcome(failed);
+    }
 }
 
 void RecoveryPanel::onJobFinished(const QString &jobId, bool success, const QString &summary)
@@ -766,5 +784,23 @@ void RecoveryPanel::setShown(bool shown)
 
 QString RecoveryPanel::statusLine() const
 {
-    return m_status->text();
+    return m_statusPlain;
+}
+
+void RecoveryPanel::setStatus(const QString &plain)
+{
+    m_statusPlain = plain;
+    m_status->setTextFormat(Qt::PlainText); // helper and script text, shown as typed (bd v173 item 4)
+    m_status->setText(plain);
+    m_status->setToolTip(QString());
+}
+
+void RecoveryPanel::setOutcome(const OutcomeText &outcome)
+{
+    m_statusPlain = outcome.plain;
+    // Rich text, but every piece of helper or script text in it is escaped;
+    // the whole text is the tooltip.
+    m_status->setTextFormat(Qt::RichText);
+    m_status->setText(outcome.html);
+    m_status->setToolTip(OutcomeText::tip(outcome.plain));
 }

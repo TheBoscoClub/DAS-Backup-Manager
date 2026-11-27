@@ -383,7 +383,14 @@ private Q_SLOTS:
         auto *bar = panel.findChild<QProgressBar *>();
         QVERIFY(op && stage && bar);
         QCOMPARE(op->text(), QStringLiteral("Not started"));
-        QCOMPARE(stage->text(), recordRefusalWords(refused));
+        // The reason leads, set apart behind the status word, and the label
+        // shows it as structure; the script's whole text is the tooltip
+        // (bd DAS-Backup-Manager-3gzs.12).
+        QCOMPARE(stage->textFormat(), Qt::RichText);
+        QVERIFY2(stage->text().startsWith(QStringLiteral("<p><b style=\"color:#cc0000\">NOT STARTED</b>&nbsp; the record was made before")),
+                 qPrintable(stage->text()));
+        QVERIFY(stage->text().contains(QStringLiteral("Record button")));
+        QVERIFY(stage->toolTip().contains(recordRefusalWords(refused).toHtmlEscaped().left(80)));
         QVERIFY(!bar->styleSheet().contains(QStringLiteral("#cc0000"))); // no red bar
 
         // A real failure after it is still a red Failed.
@@ -391,6 +398,8 @@ private Q_SLOTS:
         panel.onJobFinished(QStringLiteral("job-2"), false, QStringLiteral("stopped at upgrade (exit 7): x"));
         QCOMPARE(op->text(), QStringLiteral("Failed"));
         QVERIFY(bar->styleSheet().contains(QStringLiteral("#cc0000")));
+        QVERIFY2(stage->text().startsWith(QStringLiteral("<p><b style=\"color:#cc0000\">FAILED</b>&nbsp; stopped at upgrade (exit 7): x</p>")),
+                 qPrintable(stage->text()));
         // ... and the field case's whole summary is one the shared rule (which
         // the notification title also asks) recognises.
         QVERIFY(sessionRefusedForRecord(refused));
@@ -2077,6 +2086,63 @@ private Q_SLOTS:
         panel.applyDocument(QJsonDocument(o).toJson());
         for (QPushButton *b : {p.upgrade, p.schedule, p.clear, p.console, p.end, p.record})
             QVERIFY2(!b->isEnabled(), qPrintable(b->objectName()));
+    }
+
+    // bd DAS-Backup-Manager-3gzs.12: the deciding line first behind its status
+    // word, the rest listed, a long list cut to a count, the whole text kept.
+    void aJobsFailureIsOneDecidingLineAndAShortListNotAWallOfText()
+    {
+        QStringList parts;
+        parts << QStringLiteral("stderr: unit list a1 a2 a3") << QStringLiteral("stderr: more routine output");
+        parts << QStringLiteral("stopped at upgrade (exit 7): the VM did not shut down");
+        for (int i = 0; i < 7; ++i)
+            parts << QStringLiteral("stderr: <routine %1>").arg(i);
+        const QString summary = parts.join(QStringLiteral("; "));
+        const OutcomeText out = OutcomeText::make(QStringLiteral("FAILED"), summary);
+        // The deciding line is the one naming the stop, not the first segment.
+        QVERIFY2(out.html.startsWith(QStringLiteral(
+                     "<p><b style=\"color:#cc0000\">FAILED</b>&nbsp; stopped at upgrade (exit 7): the VM did not shut down</p>")),
+                 qPrintable(out.html));
+        // Five of the nine others are listed; the rest is a count.
+        QCOMPARE(out.html.count(QStringLiteral("<li>")), int(OutcomeText::ShownSegments));
+        QVERIFY2(out.html.contains(QStringLiteral("and 4 more")), qPrintable(out.html));
+        // Nothing lost: the whole text, and no markup from the job's own text.
+        QCOMPARE(out.plain, summary);
+        QVERIFY(!out.html.contains(QStringLiteral("<routine")));
+        QVERIFY(out.html.contains(QStringLiteral("&lt;routine 0&gt;")));
+        // A short failure has no list and no count.
+        const OutcomeText one = OutcomeText::make(QStringLiteral("FAILED"), QStringLiteral("exit 1"));
+        QCOMPARE(one.html, QStringLiteral("<p><b style=\"color:#cc0000\">FAILED</b>&nbsp; exit 1</p>"));
+        // The caller's lead wins, and the segment it came from is not listed again.
+        const OutcomeText led = OutcomeText::make(QStringLiteral("REFUSED"), QStringLiteral("x: REFUSED: why; y"),
+                                                  QStringLiteral("why"), QStringLiteral("Do this."));
+        QVERIFY2(led.html.contains(QStringLiteral("&nbsp; why</p><p>Do this.</p><ul style=\"margin-top:0\"><li>y</li>")),
+                 qPrintable(led.html));
+    }
+
+    void theRecoveryPanelShowsAFailureAsAStatusWordThenItsReasonAndKeepsThePlainLine()
+    {
+        DBusClient client;
+        RecoveryPanel panel(&client);
+        const RecoveryParts p = recoveryPartsOf(panel);
+        QVERIFY(p.ok());
+        requestSession(panel, p);
+        panel.onJobStarted(QStringLiteral("job-1"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-1"), false, QStringLiteral("stopped at upgrade (exit 7): x; stderr: y"));
+        QLabel *line = panel.findChild<QLabel *>(QStringLiteral("statusLine"));
+        QVERIFY(line);
+        QCOMPARE(line->textFormat(), Qt::RichText);
+        QVERIFY2(line->text().startsWith(QStringLiteral("<p><b style=\"color:#cc0000\">FAILED</b>&nbsp; stopped at upgrade (exit 7): x</p>")),
+                 qPrintable(line->text()));
+        // The plain line is what it always was.
+        QVERIFY2(panel.statusLine().startsWith(QStringLiteral("Failed: stopped at upgrade (exit 7): x")),
+                 qPrintable(panel.statusLine()));
+        // A later plain message is shown as typed again, never as markup.
+        requestSession(panel, p);
+        panel.onJobStarted(QStringLiteral("job-2"), QStringLiteral("Recovery OS session"));
+        panel.onJobFinished(QStringLiteral("job-2"), true, QStringLiteral("all done <b>x</b>"));
+        QCOMPARE(line->textFormat(), Qt::PlainText);
+        QVERIFY2(line->text().contains(QStringLiteral("<b>x</b>")), qPrintable(line->text()));
     }
 
     void theStatusLineIsPlainText()

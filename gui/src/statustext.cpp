@@ -57,3 +57,83 @@ QString StatusText::lastBackupLine(qint64 ageSecs)
     return hours > 0 ? i18n("%1 hours ago", hours)
                      : i18n("%1 minutes ago", (ageSecs % 3600) / 60);
 }
+
+QString OutcomeText::tip(const QString &plain)
+{
+    return QStringLiteral("<qt>%1</qt>").arg(plain.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+}
+
+QStringList OutcomeText::segments(const QString &summary)
+{
+    QStringList out;
+    for (const QString &line : summary.split(QLatin1Char('\n'))) {
+        for (const QString &part : line.split(QStringLiteral("; "))) {
+            const QString t = part.trimmed();
+            if (!t.isEmpty())
+                out << t;
+        }
+    }
+    return out;
+}
+
+namespace {
+bool namesTheStop(const QString &segment)
+{
+    static const char *const words[] = {"REFUSED", "FAILED", "FAIL", "ERROR", "stopped at", "refused"};
+    for (const char *w : words)
+        if (segment.contains(QLatin1String(w)))
+            return true;
+    return false;
+}
+
+QString elided(const QString &text)
+{
+    constexpr int Longest = 240;
+    return text.size() <= Longest ? text : text.left(Longest - 1) + QChar(0x2026);
+}
+} // namespace
+
+OutcomeText OutcomeText::make(const QString &word, const QString &summary, const QString &lead,
+                              const QString &note)
+{
+    QStringList rest = segments(summary);
+    QString deciding = lead;
+    if (deciding.isEmpty() && !rest.isEmpty()) {
+        qsizetype at = 0;
+        for (qsizetype i = 0; i < rest.size(); ++i) {
+            if (namesTheStop(rest.at(i))) {
+                at = i;
+                break;
+            }
+        }
+        deciding = rest.takeAt(at);
+    } else if (!lead.isEmpty()) {
+        // The lead is part of one segment: list the others.
+        for (qsizetype i = 0; i < rest.size(); ++i) {
+            if (rest.at(i).contains(lead)) {
+                rest.removeAt(i);
+                break;
+            }
+        }
+    }
+
+    OutcomeText out;
+    out.plain = summary;
+    QString html = QStringLiteral("<p><b style=\"color:#cc0000\">%1</b>&nbsp; %2</p>")
+                       .arg(word.toHtmlEscaped(), elided(deciding).toHtmlEscaped());
+    if (!note.isEmpty())
+        html += QStringLiteral("<p>%1</p>").arg(note.toHtmlEscaped());
+    if (!rest.isEmpty()) {
+        html += QStringLiteral("<ul style=\"margin-top:0\">");
+        const int shown = int(qMin<qsizetype>(rest.size(), ShownSegments));
+        for (int i = 0; i < shown; ++i)
+            html += QStringLiteral("<li>%1</li>").arg(elided(rest.at(i)).toHtmlEscaped());
+        html += QStringLiteral("</ul>");
+        if (rest.size() > shown)
+            html += QStringLiteral("<p><i>%1</i></p>")
+                        .arg(i18n("… and %1 more. The whole text is in the tooltip.", rest.size() - shown)
+                                 .toHtmlEscaped());
+    }
+    out.html = html;
+    return out;
+}
