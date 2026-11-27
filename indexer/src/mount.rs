@@ -1742,8 +1742,21 @@ fn clear_partitions_with(
                 .join(", ")
         ));
     }
-    if let (Some(fsid), Some(b)) = (btrfs_fsid, ours.iter().find(|m| m.fstype == "btrfs")) {
-        maintenance_on(runner, site, Some(fsid), &b.mount_point)?;
+    // Every btrfs mount of the drive gets the maintenance check, the target's
+    // `mount_uuid` or not (review N4): without one, the filesystem UUID is
+    // the one the mount carries, and one that cannot be read refuses.
+    if let Some(b) = ours.iter().find(|m| m.fstype == "btrfs") {
+        let fsid = match btrfs_fsid {
+            Some(f) => f.to_string(),
+            None => filesystem_uuid_with(runner, &b.mount_point).ok_or_else(|| {
+                format!(
+                    "the filesystem UUID of the btrfs mount at {} cannot be read, so whether \
+                     btrfs maintenance runs on it cannot be told",
+                    b.mount_point
+                )
+            })?,
+        };
+        maintenance_on(runner, site, Some(&fsid), &b.mount_point)?;
     }
     if site.report_only {
         return would_clear(runner, site, who, &ours, progress).map(Some);
@@ -5420,6 +5433,44 @@ mod tests {
         let err = clear_parts(&host, &runner, Some("u-r"), &Recorder::default()).unwrap_err();
 
         assert!(err.contains("balance"), "{err}");
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// Review N4 (bd eg4j.19): a target with no `mount_uuid` still gets the
+    /// btrfs-maintenance check on a btrfs mount of its drive, by the UUID
+    /// the mount itself carries.
+    #[test]
+    fn clear_partitions_btrfs_balance_refuses_without_a_mount_uuid() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] = "50 22 0:60 / /run/media/u/b rw - btrfs /dev/sdx1 rw,subvolid=5".into();
+        host.exclusive = vec![("u-r".into(), "balance\n".into())];
+        host.in_sysfs = vec!["u-r".into()];
+        let runner = ScriptedRunner::with_rules(&[(
+            "UUID",
+            Reply::Exit {
+                code: 0,
+                stdout: "u-r\n",
+                stderr: "",
+            },
+        )]);
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("balance"), "{err}");
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// N4: the UUID of such a mount cannot be read → refused, never taken
+    /// as "no maintenance".
+    #[test]
+    fn clear_partitions_btrfs_mount_whose_uuid_cannot_be_read_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] = "50 22 0:60 / /run/media/u/b rw - btrfs /dev/sdx1 rw,subvolid=5".into();
+        let runner = ScriptedRunner::with_rules(&[("UUID", Reply::exit(1))]);
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("filesystem UUID"), "{err}");
         assert!(umounts(&runner).is_empty());
     }
 
