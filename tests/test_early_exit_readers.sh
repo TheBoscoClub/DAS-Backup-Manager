@@ -649,6 +649,68 @@ check "SMART health, one FAILED line: issues" "$(run_health "$WORK/health-failed
 : >"$WORK/health-none.txt"
 check "SMART health, no health line: issues" "$(run_health "$WORK/health-none.txt")" "issues"
 
+# The RESULT block's rows (bd DAS-Backup-Manager-3gzs.12): one per drive, the
+# status word first in a fixed column, the reason beside it; a drive that is
+# not healthy is a FAIL row, never an OK one.
+run_health_row() { # run_health_row <smartctl -H output file>: the drive's RESULT row
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/check_smart_health.sh"
+        HEALTH_OUT="$1"
+        RED="" GREEN="" YELLOW="" BLUE="" NC=""
+        DAS_DEVICES=(/dev/sdz)
+        declare -A DRIVE_MAP=([TESTSERIAL]="test drive")
+        DRIVE_RESULTS=()
+        SMART_FAILED=false
+        smartctl() {
+            case "$1" in
+            -H) cat "$HEALTH_OUT" ;;
+            *) return 0 ;;
+            esac
+        }
+        read_drive_serial() { echo TESTSERIAL; }
+        smart_attr_raw() { echo 0; }
+        report_sector_attr() { return 0; }
+        format_attr() { echo "$1${2:-}"; }
+        log_header() { :; }
+        log_info() { :; }
+        log_warn() { :; }
+        check_smart_health >/dev/null 2>&1
+        printf '%s\n' "${DRIVE_RESULTS[@]}"
+    )
+}
+check "RESULT row, PASSED: OK" "$(run_health_row "$WORK/health-passed.txt")" \
+    "/dev/sdz (test drive)|OK|SMART health PASSED"
+check "RESULT row, FAILED: FAIL, with the verdict" "$(run_health_row "$WORK/health-failed.txt")" \
+    "/dev/sdz (test drive)|FAIL|SMART health not PASSED (FAILED!)"
+check "RESULT row, no health line: FAIL" "$(run_health_row "$WORK/health-none.txt")" \
+    "/dev/sdz (test drive)|FAIL|SMART health not PASSED (UNKNOWN)"
+
+extract backup-verify.sh result_row '%-34s'
+extract backup-verify.sh show_summary 'RESULT'
+run_summary() {
+    (
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$WORK/result_row.sh"
+        # shellcheck source=/dev/null
+        source "$WORK/show_summary.sh"
+        RED="" GREEN="" YELLOW="" BLUE="" NC=""
+        DAS_DEVICES=(/dev/sdz /dev/sdy)
+        DRIVE_RESULTS=("/dev/sdz (test drive)|FAIL|SMART health not PASSED (FAILED!)" "/dev/sdy (other)|OK|SMART health PASSED")
+        BTRBK_RESULT="SKIPPED|the DAS maintenance lock is held or could not be opened"
+        log_header() { echo "## $1"; }
+        show_summary
+    )
+}
+check "RESULT block: one row per drive, then the backup-status check" \
+    "$(run_summary | sed -n '/^── RESULT ──/,/^$/p')" \
+    "── RESULT ──
+  /dev/sdz (test drive)              FAIL     SMART health not PASSED (FAILED!)
+  /dev/sdy (other)                   OK       SMART health PASSED
+  btrbk backup status                SKIPPED  the DAS maintenance lock is held or could not be opened"
+
 # ---------------------------------------------------------------------------
 echo "== das-wipe-all-drives-and-partition-from-scratch.sh: check_smart_tests, the self-test gate"
 # ---------------------------------------------------------------------------
