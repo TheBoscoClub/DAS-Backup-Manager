@@ -207,16 +207,27 @@ fn mounts_matching(
 }
 
 /// Mounts of other filesystems stacked under one of `ours`: a refusal, never
-/// unmounted by this module (they are not the target).
+/// unmounted by this module (they are not the target). A mount over one of
+/// ours at the same path counts too (review N1): it comes after ours in the
+/// table, and `umount <path>` would take it down instead of ours. One that
+/// ours was mounted over (before it) is beneath ours, not on it.
 pub fn stacked_under<'a>(entries: &'a [MountEntry], ours: &[MountEntry]) -> Vec<&'a MountEntry> {
     let ids: BTreeSet<u64> = ours.iter().map(|m| m.id).collect();
+    let pos = |id: u64| entries.iter().position(|e| e.id == id);
     entries
         .iter()
-        .filter(|e| !ids.contains(&e.id))
-        .filter(|e| {
-            ours.iter()
-                .any(|m| e.mount_point != m.mount_point && under(&e.mount_point, &m.mount_point))
+        .enumerate()
+        .filter(|(_, e)| !ids.contains(&e.id))
+        .filter(|(i, e)| {
+            ours.iter().any(|m| {
+                if e.mount_point == m.mount_point {
+                    pos(m.id).is_some_and(|p| p < *i)
+                } else {
+                    under(&e.mount_point, &m.mount_point)
+                }
+            })
         })
+        .map(|(_, e)| e)
         .collect()
 }
 
@@ -1350,6 +1361,31 @@ mod tests {
         let stacked = stacked_under(&all, &ours);
         assert_eq!(stacked.len(), 1);
         assert_eq!(stacked[0].mount_point, "/run/media/user/das/inner");
+    }
+
+    /// Review N1 (bd eg4j.19): another filesystem mounted over one of ours at
+    /// the same path (after it in the table) is stacked on it; one ours was
+    /// mounted over (before it) is not.
+    #[test]
+    fn a_same_path_overmount_is_stacked_and_an_undermount_is_not() {
+        let over = "\
+22 1 0:21 / / rw - btrfs /dev/nvme0n1p2 rw\n\
+50 22 8:17 / /mnt rw - vfat /dev/sdx1 rw\n\
+61 50 0:70 / /mnt rw - ext4 /dev/sdz1 rw\n";
+        let all = parse_mountinfo(over);
+        let ours = mounts_of_partitions(&all, &[part("/dev/sdx1", "8:17")]);
+        assert_eq!(ours.len(), 1);
+        let stacked = stacked_under(&all, &ours);
+        assert_eq!(stacked.len(), 1, "{stacked:?}");
+        assert_eq!(stacked[0].source, "/dev/sdz1");
+
+        let under = "\
+22 1 0:21 / / rw - btrfs /dev/nvme0n1p2 rw\n\
+61 22 0:70 / /mnt rw - ext4 /dev/sdz1 rw\n\
+50 61 8:17 / /mnt rw - vfat /dev/sdx1 rw\n";
+        let all = parse_mountinfo(under);
+        let ours = mounts_of_partitions(&all, &[part("/dev/sdx1", "8:17")]);
+        assert!(stacked_under(&all, &ours).is_empty());
     }
 
     fn part(path: &str, dev: &str) -> PartitionId {

@@ -1266,6 +1266,17 @@ pub fn check_esp(
     target: &crate::config::Target,
     ids: Result<&BTreeSet<String>, &str>,
 ) -> Option<Result<esp::Findings, String>> {
+    check_esp_with(target, ids, false)
+}
+
+/// [`check_esp`] for a dry run when `report_only` (`recovery-os status
+/// --report-only`, review N2): another program's mount of the ESP is said,
+/// never taken down, and the ESP then not read.
+pub fn check_esp_with(
+    target: &crate::config::Target,
+    ids: Result<&BTreeSet<String>, &str>,
+    report_only: bool,
+) -> Option<Result<esp::Findings, String>> {
     Some(match ids {
         // Unlisted partitions cannot show the key names this drive's ESP.
         Err(why) if target.esp_partuuid.is_some() => {
@@ -1275,6 +1286,7 @@ pub fn check_esp(
         Ok(ids) => esp_findings(crate::mount::read_recovery_esp(
             target,
             ids,
+            report_only,
             &esp::read_loader,
         )),
     })
@@ -1392,7 +1404,7 @@ fn drive_partition_ids_with(
         "-n",
         "-P",
         "-o",
-        "LABEL,UUID,PARTUUID,PARTLABEL",
+        "LABEL,UUID,PARTUUID,PARTLABEL,MAJ:MIN",
         &format!("/dev/{disk}"),
     ])?;
     let ids = partition_ids(&listed);
@@ -1402,18 +1414,40 @@ fn drive_partition_ids_with(
     Ok(ids)
 }
 
-/// The names in `lsblk -P -o LABEL,UUID,PARTUUID,PARTLABEL` output, each as
-/// an fstab would write it (`LABEL=x`); an empty value is no name.
+/// The key of the id pairing a partition's PARTUUID with its block device
+/// number: `PARTUUID-DEV=<partuuid>@<major>:<minor>` (review B1, bd
+/// DAS-Backup-Manager-eg4j.19). [`fstab_problems`] never matches it (it
+/// knows only `LABEL`, `UUID`, `PARTUUID` and `PARTLABEL`).
+pub const PARTUUID_DEV: &str = "PARTUUID-DEV";
+
+/// The names in `lsblk -P -o LABEL,UUID,PARTUUID,PARTLABEL,MAJ:MIN` output,
+/// each as an fstab would write it (`LABEL=x`); an empty value is no name.
+/// The device number is no name of its own: it is only paired with the
+/// line's PARTUUID ([`PARTUUID_DEV`]), so the ESP reading can tell the
+/// drive's partition from another disk's that carries the same PARTUUID.
 fn partition_ids(listed: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     for line in listed.lines() {
+        let (mut partuuid, mut dev) = (None, None);
         for pair in line.split("\" ") {
             let pair = pair.trim().trim_end_matches('"');
             if let Some((key, value)) = pair.split_once("=\"")
                 && !value.is_empty()
             {
-                ids.insert(format!("{key}={value}"));
+                match key {
+                    // Some util-linux releases spell it MAJ_MIN under -P.
+                    "MAJ:MIN" | "MAJ_MIN" => dev = Some(value),
+                    _ => {
+                        if key == "PARTUUID" {
+                            partuuid = Some(value);
+                        }
+                        ids.insert(format!("{key}={value}"));
+                    }
+                }
             }
+        }
+        if let (Some(pu), Some(dev)) = (partuuid, dev) {
+            ids.insert(format!("{PARTUUID_DEV}={pu}@{dev}"));
         }
     }
     ids
@@ -4377,8 +4411,9 @@ mod tests {
         (r, asked.into_inner())
     }
 
-    const LISTED: &str = "LABEL=\"RECOV-ESP-1\" UUID=\"ABCD-0003\" PARTUUID=\"5eed0025-0000-4000-8000-000000000025\" PARTLABEL=\"\"\n\
-                          LABEL=\"das-r\" UUID=\"5eed0008-0000-4000-8000-000000000008\" PARTUUID=\"5eed0026-0000-4000-8000-000000000026\" PARTLABEL=\"\"\n";
+    const LISTED: &str = "LABEL=\"\" UUID=\"\" PARTUUID=\"\" PARTLABEL=\"\" MAJ:MIN=\"8:16\"\n\
+                          LABEL=\"RECOV-ESP-1\" UUID=\"ABCD-0003\" PARTUUID=\"5eed0025-0000-4000-8000-000000000025\" PARTLABEL=\"\" MAJ:MIN=\"8:17\"\n\
+                          LABEL=\"das-r\" UUID=\"5eed0008-0000-4000-8000-000000000008\" PARTUUID=\"5eed0026-0000-4000-8000-000000000026\" PARTLABEL=\"\" MAJ:MIN=\"8:18\"\n";
 
     #[test]
     fn the_drive_s_partitions_are_read_from_the_disk_under_the_mount() {
@@ -4392,18 +4427,23 @@ mod tests {
             [
                 "findmnt -n -o SOURCE --target /mnt/r",
                 "lsblk -n -d -o PKNAME /dev/sdx2",
-                "lsblk -n -P -o LABEL,UUID,PARTUUID,PARTLABEL /dev/sdx",
+                "lsblk -n -P -o LABEL,UUID,PARTUUID,PARTLABEL,MAJ:MIN /dev/sdx",
             ]
         );
+        // Review B1 (bd eg4j.19): each PARTUUID also paired with its
+        // partition's device number; the disk's own line (a device number
+        // and no name) adds nothing, and no bare MAJ:MIN id is made.
         assert_eq!(
             r,
             Ok(ids(&[
                 "LABEL=RECOV-ESP-1",
                 "UUID=ABCD-0003",
                 "PARTUUID=5eed0025-0000-4000-8000-000000000025",
+                "PARTUUID-DEV=5eed0025-0000-4000-8000-000000000025@8:17",
                 "LABEL=das-r",
                 "UUID=5eed0008-0000-4000-8000-000000000008",
                 "PARTUUID=5eed0026-0000-4000-8000-000000000026",
+                "PARTUUID-DEV=5eed0026-0000-4000-8000-000000000026@8:18",
             ]))
         );
     }
@@ -4412,7 +4452,7 @@ mod tests {
     fn a_step_that_cannot_answer_is_an_error_never_an_empty_set() {
         let ok_mount = ("findmnt /mnt/r", Ok("/dev/sdx2\n"));
         let ok_disk = ("lsblk /dev/sdx2", Ok("sdx\n"));
-        let cases: [(&[Answer], &str); 6] = [
+        let cases: [(&[Answer], &str); 7] = [
             (
                 &[("findmnt /mnt/r", Err("findmnt exited with 1"))],
                 "findmnt exited with 1",
@@ -4439,6 +4479,17 @@ mod tests {
             ),
             (
                 &[ok_mount, ok_disk, ("lsblk /dev/sdx", Ok("\n"))],
+                "lsblk named no partition of /dev/sdx",
+            ),
+            (
+                &[
+                    ok_mount,
+                    ok_disk,
+                    (
+                        "lsblk /dev/sdx",
+                        Ok("LABEL=\"\" UUID=\"\" PARTUUID=\"\" PARTLABEL=\"\" MAJ:MIN=\"8:16\"\n"),
+                    ),
+                ],
                 "lsblk named no partition of /dev/sdx",
             ),
         ];

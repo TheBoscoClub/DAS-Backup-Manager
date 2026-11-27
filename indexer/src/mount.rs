@@ -1640,9 +1640,11 @@ fn unmount_each(
             }
             // Never by path alone: the mount scanned must still be the one
             // at that path (a path can be unmounted and mounted over by
-            // something else between the scan and now).
+            // something else between the scan and now), and the TOPMOST one
+            // there — the last in the table — since `umount <path>` takes
+            // the top one down (review N1).
             let now = crate::holders::parse_mountinfo(&(site.mountinfo)()?);
-            match now.iter().find(|n| n.mount_point == m.mount_point) {
+            match now.iter().rfind(|n| n.mount_point == m.mount_point) {
                 None => {
                     down = true;
                     break;
@@ -1742,8 +1744,21 @@ fn clear_partitions_with(
                 .join(", ")
         ));
     }
-    if let (Some(fsid), Some(b)) = (btrfs_fsid, ours.iter().find(|m| m.fstype == "btrfs")) {
-        maintenance_on(runner, site, Some(fsid), &b.mount_point)?;
+    // Every btrfs mount of the drive gets the maintenance check, the target's
+    // `mount_uuid` or not (review N4): without one, the filesystem UUID is
+    // the one the mount carries, and one that cannot be read refuses.
+    if let Some(b) = ours.iter().find(|m| m.fstype == "btrfs") {
+        let fsid = match btrfs_fsid {
+            Some(f) => f.to_string(),
+            None => filesystem_uuid_with(runner, &b.mount_point).ok_or_else(|| {
+                format!(
+                    "the filesystem UUID of the btrfs mount at {} cannot be read, so whether \
+                     btrfs maintenance runs on it cannot be told",
+                    b.mount_point
+                )
+            })?,
+        };
+        maintenance_on(runner, site, Some(&fsid), &b.mount_point)?;
     }
     if site.report_only {
         return would_clear(runner, site, who, &ours, progress).map(Some);
@@ -3352,15 +3367,20 @@ pub const ESP_MOUNT_ROOT: &str = "/run/das-backup/esp";
 /// read, the user named, nothing signalled ([`ESP_HELD`]). Mounted at its own
 /// directory, an earlier reading left it, and it is taken down as a target an
 /// earlier job left is (bd jgm).
+///
+/// `report_only` (a dry run, review N2): another program's mount is said
+/// ("would unmount", "would stop"), never taken down, and the ESP is then
+/// not read.
 pub fn read_recovery_esp<T>(
     target: &crate::config::Target,
     drive_ids: &std::collections::BTreeSet<String>,
+    report_only: bool,
     read: &dyn Fn(&Path) -> Result<T, String>,
 ) -> EspReading<T> {
     read_recovery_esp_with(
         &SystemRunner,
         Path::new(ESP_MOUNT_ROOT),
-        &host_clear_site(false, false),
+        &host_clear_site(report_only, false),
         Path::new("/dev/disk/by-partuuid"),
         target,
         drive_ids,
@@ -3436,6 +3456,29 @@ fn mount_read_unmount<T>(
             "{spec} is not a partition of this drive — not mounted"
         ));
     }
+    // The ESP's device is the one the drive's own listing pairs with the
+    // PARTUUID (review B1): another attached partition may carry the same
+    // PARTUUID (a cloned GPT), and `/dev/disk/by-partuuid` may then point
+    // at it — the host's `/boot`, say.
+    let drive_dev =
+        drive_esp_dev(drive_ids, pu).map_err(|why| format!("{spec}: {why} — not read"))?;
+    let part = partuuid_dir.join(pu.to_ascii_lowercase());
+    let part_s = part.to_str().ok_or("the ESP's device path is not UTF-8")?;
+    // `by-partuuid` must be that device, before anything is cleared and
+    // again before the mount (`where_` names where it was found mounted).
+    let is_drive_s = |where_: &str| -> Result<(), String> {
+        let dev =
+            (clear.block_dev)(part_s).map_err(|e| format!("{spec}{where_}: {e} — not read"))?;
+        if majmin(&dev) == Some(drive_dev) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{spec}{where_}: {part_s} is device {dev}, but this drive's partition with that \
+                 PARTUUID is {}:{} — another partition carries the same PARTUUID; not read",
+                drive_dev.0, drive_dev.1
+            ))
+        }
+    };
     let dir = root.join(esp_dir_name(&target.label));
     let dir_s = dir
         .to_str()
@@ -3451,19 +3494,17 @@ fn mount_read_unmount<T>(
             if let Some(there) = text.lines().find(|there| *there != dir_s) {
                 // Another program's mount (bd DAS-Backup-Manager-eg4j.19):
                 // by the stop policy of a job that writes nothing. The
-                // partition by its PARTUUID path, as a block device number.
-                let part = partuuid_dir.join(pu.to_ascii_lowercase());
-                let part_s = part.to_str().ok_or("the ESP's device path is not UTF-8")?;
+                // partition by the drive's own device number for it, once
+                // by-partuuid is shown to be that device (review B1).
                 let held = |why: &str| {
                     format!("{spec} is mounted at {there}: {why} — not read ({ESP_HELD})")
                 };
-                let dev = (clear.block_dev)(part_s)
-                    .map_err(|e| format!("{spec} is mounted at {there}: {e} — not read"))?;
+                is_drive_s(&format!(" is mounted at {there}"))?;
                 let id = crate::holders::PartitionId {
                     path: part_s.to_string(),
-                    dev,
+                    dev: format!("{}:{}", drive_dev.0, drive_dev.1),
                 };
-                clear_partitions_with(
+                match clear_partitions_with(
                     runner,
                     clear,
                     &target.label,
@@ -3471,7 +3512,37 @@ fn mount_read_unmount<T>(
                     None,
                     &crate::progress::NullProgress,
                 )
-                .map_err(|why| held(&why))?;
+                .map_err(|why| held(&why))?
+                {
+                    // findmnt saw the PARTUUID mounted there, yet no mount of
+                    // the drive's partition is: it is another partition's,
+                    // and the ESP is never mounted beside it (review B1).
+                    None => {
+                        return Err(format!(
+                            "{spec} is mounted at {there}, but no mount of this drive's partition \
+                             ({}:{}) is — another partition carries the same PARTUUID; not read",
+                            drive_dev.0, drive_dev.1
+                        ));
+                    }
+                    // A dry run (review N2): what a real reading would do
+                    // is said, nothing is taken down, and the ESP is never
+                    // read beside another program's mount.
+                    Some(would) if clear.report_only => {
+                        return Err(format!(
+                            "{spec} is mounted at {there}: a dry run takes nothing down ({}) — \
+                             not read",
+                            would.join("; ")
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            } else if clear.report_only {
+                // A dry run changes nothing (review N2): not even a mount an
+                // earlier reading left at its own directory.
+                return Err(format!(
+                    "{spec} was left mounted at {dir_s}: a dry run takes nothing down (would \
+                     unmount {dir_s}) — not read"
+                ));
             } else {
                 take_down_leftover_with(runner, dir_s, &crate::progress::NullProgress, None)
                     .map_err(|why| format!("{spec} was left mounted at {dir_s}: {why}"))?;
@@ -3481,6 +3552,7 @@ fn mount_read_unmount<T>(
         _ => return Err(exit_why("findmnt", out.status)),
     }
 
+    is_drive_s("")?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -3507,7 +3579,7 @@ fn mount_read_unmount<T>(
         "vfat",
         "-o",
         "ro,nodev,nosuid,noexec,noatime",
-        &spec,
+        part_s,
         dir_s,
     ])) {
         Ok(s) if s.success() => {}
@@ -3515,16 +3587,31 @@ fn mount_read_unmount<T>(
         Err(e) => return gone(Err(format!("mount failed to run: {e}"))),
     }
 
-    // Read only what is shown to be that partition.
+    // Read only what is shown to be that partition: its PARTUUID and the
+    // drive's device number for it (review B1: the link may have moved
+    // between the check and the mount).
     let found = runner
-        .output(Command::new("findmnt").args(["-n", "-o", "PARTUUID", "--mountpoint", dir_s]))
+        .output(Command::new("findmnt").args([
+            "-n",
+            "-P",
+            "-o",
+            "PARTUUID,MAJ:MIN",
+            "--mountpoint",
+            dir_s,
+        ]))
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        .map(|o| pairs(&String::from_utf8_lossy(&o.stdout)));
     let read = match found {
-        Some(f) if f.eq_ignore_ascii_case(pu) => read(&dir),
-        Some(f) => Err(format!("{dir_s} holds PARTUUID={f}, not {spec} — not read")),
-        None => Err(format!(
+        Some((Some(f), _)) if !f.eq_ignore_ascii_case(pu) => {
+            Err(format!("{dir_s} holds PARTUUID={f}, not {spec} — not read"))
+        }
+        Some((Some(_), Some(d))) if majmin(&d) == Some(drive_dev) => read(&dir),
+        Some((Some(_), Some(d))) => Err(format!(
+            "{dir_s} holds device {d}, not this drive's partition {}:{} — not read",
+            drive_dev.0, drive_dev.1
+        )),
+        _ => Err(format!(
             "what is mounted at {dir_s} could not be told — not read"
         )),
     };
@@ -3538,6 +3625,55 @@ fn mount_read_unmount<T>(
             read
         }
     }
+}
+
+/// The device number the drive's own listing pairs with PARTUUID `pu`
+/// ([`crate::recovery_os::PARTUUID_DEV`]); `Err` when it pairs none, or more
+/// than one.
+fn drive_esp_dev(
+    drive_ids: &std::collections::BTreeSet<String>,
+    pu: &str,
+) -> Result<(u32, u32), String> {
+    let mut devs: Vec<(u32, u32)> = drive_ids
+        .iter()
+        .filter_map(|id| id.split_once('='))
+        .filter(|(k, _)| *k == crate::recovery_os::PARTUUID_DEV)
+        .filter_map(|(_, v)| v.rsplit_once('@'))
+        .filter(|(p, _)| p.eq_ignore_ascii_case(pu))
+        .map(|(_, d)| majmin(d).ok_or_else(|| format!("its device number '{d}' cannot be read")))
+        .collect::<Result<_, _>>()?;
+    devs.sort_unstable();
+    devs.dedup();
+    match devs.as_slice() {
+        [one] => Ok(*one),
+        [] => Err("the drive's listing pairs no device number with it".into()),
+        _ => Err("the drive's listing pairs more than one device number with it".into()),
+    }
+}
+
+/// `major:minor` as numbers; `None` for anything else.
+fn majmin(s: &str) -> Option<(u32, u32)> {
+    let (maj, min) = s.trim().split_once(':')?;
+    Some((maj.parse().ok()?, min.parse().ok()?))
+}
+
+/// The `PARTUUID` and `MAJ:MIN` (or `MAJ_MIN`) values of `findmnt -P`
+/// output's first line; an empty value is none.
+fn pairs(text: &str) -> (Option<String>, Option<String>) {
+    let (mut pu, mut dev) = (None, None);
+    for pair in text.lines().next().unwrap_or("").split("\" ") {
+        let pair = pair.trim().trim_end_matches('"');
+        if let Some((key, value)) = pair.split_once("=\"")
+            && !value.is_empty()
+        {
+            match key {
+                "PARTUUID" => pu = Some(value.to_string()),
+                "MAJ:MIN" | "MAJ_MIN" => dev = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    (pu, dev)
 }
 
 /// A target's label as one safe file name under [`ESP_MOUNT_ROOT`].
@@ -5423,6 +5559,44 @@ mod tests {
         assert!(umounts(&runner).is_empty());
     }
 
+    /// Review N4 (bd eg4j.19): a target with no `mount_uuid` still gets the
+    /// btrfs-maintenance check on a btrfs mount of its drive, by the UUID
+    /// the mount itself carries.
+    #[test]
+    fn clear_partitions_btrfs_balance_refuses_without_a_mount_uuid() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] = "50 22 0:60 / /run/media/u/b rw - btrfs /dev/sdx1 rw,subvolid=5".into();
+        host.exclusive = vec![("u-r".into(), "balance\n".into())];
+        host.in_sysfs = vec!["u-r".into()];
+        let runner = ScriptedRunner::with_rules(&[(
+            "UUID",
+            Reply::Exit {
+                code: 0,
+                stdout: "u-r\n",
+                stderr: "",
+            },
+        )]);
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("balance"), "{err}");
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// N4: the UUID of such a mount cannot be read → refused, never taken
+    /// as "no maintenance".
+    #[test]
+    fn clear_partitions_btrfs_mount_whose_uuid_cannot_be_read_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] = "50 22 0:60 / /run/media/u/b rw - btrfs /dev/sdx1 rw,subvolid=5".into();
+        let runner = ScriptedRunner::with_rules(&[("UUID", Reply::exit(1))]);
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(err.contains("filesystem UUID"), "{err}");
+        assert!(umounts(&runner).is_empty());
+    }
+
     /// The kernel has the target's btrfs mounted where this host cannot see:
     /// the answer is a refusal, not "mounted nowhere".
     #[test]
@@ -5445,6 +5619,29 @@ mod tests {
         host.mountinfo_later = Some(vec![
             "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
             format!("99 22 0:99 / {ESP_AT} rw - tmpfs tmpfs rw"),
+        ]);
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(
+            err.contains("no longer the mount that was scanned"),
+            "{err}"
+        );
+        assert!(umounts(&runner).is_empty(), "{:?}", runner.calls());
+    }
+
+    /// Review N1 (bd eg4j.19): another filesystem mounted OVER the scanned
+    /// mount at the same path between the scan and the unmount: the scanned
+    /// id is still in the table, but not on top, and `umount <path>` would
+    /// take the top one down. Refused.
+    #[test]
+    fn clear_partitions_overmounted_before_unmount_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo_later = Some(vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            format!("50 22 8:17 / {ESP_AT} rw,nosuid - vfat /dev/sdx1 rw,fmask=0022"),
+            format!("99 50 0:99 / {ESP_AT} rw - tmpfs tmpfs rw"),
         ]);
         let runner = ScriptedRunner::succeeding();
 
@@ -9316,6 +9513,7 @@ mod tests {
             "LABEL=RECOV-ESP-1".to_string(),
             "UUID=ABCD-0003".into(),
             format!("PARTUUID={}", ESP_PU.to_uppercase()),
+            format!("PARTUUID-DEV={}@8:17", ESP_PU.to_uppercase()),
             "UUID=5eed0008-0000-4000-8000-000000000008".into(),
             "PARTUUID=5eed0026-0000-4000-8000-000000000026".into(),
         ]
@@ -9340,13 +9538,13 @@ mod tests {
             seen.lock().unwrap().push(dir.to_path_buf());
             answer.clone()
         };
-        let host = Host::default();
+        let host = esp_by_partuuid_host("8:17");
         let r = host.with_clear(runner, |c| {
             read_recovery_esp_with(
                 runner,
                 root,
                 c,
-                Path::new("/nonexistent-by-partuuid"),
+                Path::new(BY_PU),
                 target,
                 &esp_drive_ids(),
                 &read,
@@ -9368,17 +9566,33 @@ mod tests {
             .collect()
     }
 
-    /// `findmnt -o PARTUUID` on the ESP's directory answers this partition,
-    /// so the mount is shown to be it.
+    /// `findmnt -o PARTUUID,MAJ:MIN` on the ESP's directory answers this
+    /// partition and the drive's device number for it, so the mount is shown
+    /// to be it.
     fn verified() -> (&'static str, Reply) {
+        verified_as(ESP_PU, "8:17")
+    }
+
+    fn verified_as(pu: &str, dev: &str) -> (&'static str, Reply) {
         (
-            "PARTUUID",
+            "PARTUUID,MAJ:MIN",
             Reply::Exit {
                 code: 0,
-                stdout: leak(format!("{ESP_PU}\n")),
+                stdout: leak(format!("PARTUUID=\"{pu}\" MAJ:MIN=\"{dev}\"\n")),
                 stderr: "",
             },
         )
+    }
+
+    /// Where the tests' `/dev/disk/by-partuuid` is.
+    const BY_PU: &str = "/nonexistent-by-partuuid";
+
+    /// A host on which the ESP's by-partuuid path is the block device `dev`.
+    fn esp_by_partuuid_host(dev: &str) -> Host {
+        Host {
+            block_devs: vec![(format!("{BY_PU}/{ESP_PU}"), dev.to_string())],
+            ..Host::default()
+        }
     }
 
     /// `findmnt -S` and `mountpoint -q` find nothing: the ESP is mounted
@@ -9402,7 +9616,6 @@ mod tests {
         let dir_s = dir.to_str().unwrap();
         assert_eq!(r, Ok(vec!["a problem".to_string()]));
         assert_eq!(seen, vec![dir.clone()]);
-        let spec = format!("PARTUUID={ESP_PU}");
         assert_eq!(
             argvs(&runner, "mount"),
             vec![vec![
@@ -9411,9 +9624,10 @@ mod tests {
                 "vfat".into(),
                 "-o".into(),
                 "ro,nodev,nosuid,noexec,noatime".into(),
-                spec,
+                format!("{BY_PU}/{ESP_PU}"),
                 dir_s.into(),
-            ]]
+            ]],
+            "the by-partuuid path shown to be the drive's partition, never PARTUUID="
         );
         assert_eq!(
             argvs(&runner, "umount"),
@@ -9470,7 +9684,7 @@ mod tests {
         assert_eq!(r, Ok(vec![]));
         let spec = format!("PARTUUID={ESP_PU}");
         assert!(
-            argvs(&runner, "mount")[0].contains(&spec),
+            argvs(&runner, "mount")[0].contains(&format!("{BY_PU}/{ESP_PU}")),
             "{:?}",
             runner.calls()
         );
@@ -9573,6 +9787,90 @@ mod tests {
         assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
     }
 
+    /// Review N2 (bd eg4j.19): a dry run (`recovery-os status --report-only`)
+    /// says what it would unmount, unmounts nothing, and does not read the
+    /// ESP beside another program's mount.
+    #[test]
+    fn a_dry_run_reading_says_it_would_unmount_and_reads_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pdir = scratch.path().join("by-partuuid");
+        let mut host = esp_mounted_by_udisks(None);
+        host.read_only_job = true;
+        host.report_only = true;
+        host.block_devs.push((
+            pdir.join(ESP_PU).to_str().unwrap().to_string(),
+            "8:17".to_string(),
+        ));
+        let [_, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{ESP_AT}\n")),
+                    stderr: "",
+                },
+            ),
+            q,
+            verified(),
+        ]);
+        let seen = Mutex::new(false);
+        let read = |_: &Path| {
+            *seen.lock().unwrap() = true;
+            Ok(vec!["found".to_string()])
+        };
+        let r = host.with_clear(&runner, |c| {
+            read_recovery_esp_with(
+                &*runner,
+                scratch.path(),
+                c,
+                &pdir,
+                &esp_target(Some(ESP_PU)),
+                &esp_drive_ids(),
+                &read,
+            )
+        });
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains(&format!("would unmount {ESP_AT}")) && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!*seen.lock().unwrap());
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+        assert!(host.signals().is_empty());
+    }
+
+    /// N2: a dry run finding a mount an earlier reading left at its own
+    /// directory says it would unmount it, unmounts nothing, reads nothing
+    /// (the spec's anti-goal: a dry run changes nothing).
+    #[test]
+    fn a_dry_run_leaves_an_earlier_reading_s_mount_and_reads_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("recovery-a");
+        let mut host = esp_by_partuuid_host("8:17");
+        host.report_only = true;
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{}\n", dir.display())),
+                    stderr: "",
+                },
+            ),
+            ("-q", Reply::exit(32)),
+            verified(),
+        ]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains(&format!("would unmount {}", dir.display())) && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!ran);
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+    }
+
     #[test]
     fn esp_mounted_elsewhere_held_by_a_writer_is_not_read_and_not_signalled() {
         let (r, runner, host, read_ran) = read_esp_elsewhere(Some(esp_user(301, "0100002")));
@@ -9596,20 +9894,168 @@ mod tests {
                 stderr: "",
             },
         )]);
-        let (r, seen) = read_esp(
-            &runner,
-            scratch.path(),
-            &esp_target(Some(ESP_PU)),
-            Ok(vec![]),
-        );
-        let why = r.unwrap_err();
+        // No block device at the by-partuuid path on this host.
+        let (r, ran) = read_esp_on(&Host::default(), &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
         assert!(
             why.contains("/media/someone") && why.contains("not a block device"),
             "{why}"
         );
         assert!(!why.contains(ESP_HELD), "{why}");
         assert!(argvs(&runner, "mount").is_empty() && argvs(&runner, "umount").is_empty());
-        assert!(seen.is_empty());
+        assert!(!ran);
+    }
+
+    // --- review B1 (bd eg4j.19): the ESP is the drive's own partition by
+    // its device number, never by what `/dev/disk/by-partuuid` points at ---
+
+    /// The reading on `host` (its block devices and mount table) with the
+    /// drive's ids `ids`; whether `read` ran.
+    fn read_esp_on(
+        host: &Host,
+        runner: &ScriptedRunner,
+        root: &Path,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> (EspReading<Vec<String>>, bool) {
+        let seen = Mutex::new(false);
+        let read = |_: &Path| {
+            *seen.lock().unwrap() = true;
+            Ok(vec!["found".to_string()])
+        };
+        let r = host.with_clear(runner, |c| {
+            read_recovery_esp_with(
+                runner,
+                root,
+                c,
+                Path::new(BY_PU),
+                &esp_target(Some(ESP_PU)),
+                ids,
+                &read,
+            )
+        });
+        let ran = *seen.lock().unwrap();
+        (r, ran)
+    }
+
+    /// Another attached partition carries the same PARTUUID (a cloned GPT)
+    /// and is the host's `/boot`; by-partuuid resolves to IT (259:5), not to
+    /// the drive's partition (8:17). Nothing is cleared, nothing mounted.
+    #[test]
+    fn a_cloned_partuuid_on_another_disk_mounted_as_boot_is_never_unmounted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut host = esp_by_partuuid_host("259:5");
+        host.mountinfo = vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            "40 22 259:5 / /boot rw - vfat /dev/nvme0n1p3 rw".into(),
+        ];
+        host.block_devs
+            .push(("/dev/nvme0n1p3".into(), "259:5".into()));
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "/boot\n",
+                    stderr: "",
+                },
+            ),
+            ("-q", Reply::exit(32)),
+            verified(),
+        ]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains("259:5") && why.contains("8:17") && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!ran);
+        assert!(
+            argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty(),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(host.signals().is_empty());
+    }
+
+    /// Mounted nowhere, but by-partuuid resolves to another disk's partition
+    /// with the same PARTUUID: never mounted.
+    #[test]
+    fn a_by_partuuid_path_that_is_not_the_drive_s_partition_is_never_mounted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let host = esp_by_partuuid_host("259:5");
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified()]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(why.contains("259:5") && why.contains("8:17"), "{why}");
+        assert!(!ran && argvs(&runner, "mount").is_empty());
+    }
+
+    /// The drive's listing pairs no device number with the PARTUUID: not
+    /// read, nothing asked of the host.
+    #[test]
+    fn no_paired_device_number_is_not_read_and_nothing_is_run() {
+        let scratch = tempfile::tempdir().unwrap();
+        let host = esp_by_partuuid_host("8:17");
+        let runner = ScriptedRunner::succeeding();
+        let ids: std::collections::BTreeSet<String> = esp_drive_ids()
+            .into_iter()
+            .filter(|i| !i.starts_with("PARTUUID-DEV="))
+            .collect();
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &ids);
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains("device number") && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!ran);
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    /// findmnt reports the PARTUUID mounted elsewhere, but no mount of the
+    /// drive's partition (by device number) is there: the mount is another
+    /// partition's; never mounted beside it.
+    #[test]
+    fn a_mount_elsewhere_that_is_not_the_drive_s_partition_stops_the_reading() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut host = esp_by_partuuid_host("8:17");
+        host.mountinfo = vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            "40 22 259:5 / /boot rw - vfat /dev/nvme0n1p3 rw".into(),
+        ];
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: "/boot\n",
+                    stderr: "",
+                },
+            ),
+            ("-q", Reply::exit(32)),
+            verified(),
+        ]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(why.contains("/boot") && why.contains("not read"), "{why}");
+        assert!(!ran);
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
+    }
+
+    /// The mount made is shown, after it, to be another device than the
+    /// drive's (the link moved between check and mount): not read, our own
+    /// mount taken down.
+    #[test]
+    fn a_mount_whose_device_number_is_not_the_drive_s_is_unmounted_unread() {
+        let scratch = tempfile::tempdir().unwrap();
+        let host = esp_by_partuuid_host("8:17");
+        let [s, q] = unmounted_host();
+        let runner = ScriptedRunner::with_rules(&[s, q, verified_as(ESP_PU, "259:5")]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(why.contains("259:5") && why.contains("not read"), "{why}");
+        assert!(!ran);
+        assert_eq!(argvs(&runner, "umount").len(), 1);
     }
 
     #[test]
@@ -9708,14 +10154,7 @@ mod tests {
         let runner = ScriptedRunner::with_rules(&[
             s,
             q,
-            (
-                "PARTUUID",
-                Reply::Exit {
-                    code: 0,
-                    stdout: "5eed0026-0000-4000-8000-000000000026\n",
-                    stderr: "",
-                },
-            ),
+            verified_as("5eed0026-0000-4000-8000-000000000026", "8:17"),
         ]);
         let (r, seen) = read_esp(
             &runner,
@@ -9752,13 +10191,13 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let [s, q] = unmounted_host();
         let runner = ScriptedRunner::with_rules(&[s, q, verified(), ("umount", Reply::exit(32))]);
-        let host = Host::default();
+        let host = esp_by_partuuid_host("8:17");
         let r = host.with_clear(&runner, |c| {
             read_recovery_esp_with(
                 &*runner,
                 scratch.path(),
                 c,
-                Path::new("/nonexistent-by-partuuid"),
+                Path::new(BY_PU),
                 &esp_target(Some(ESP_PU)),
                 &esp_drive_ids(),
                 &|_: &Path| Ok(vec!["a problem".to_string()]),

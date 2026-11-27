@@ -916,6 +916,11 @@ enum RecoveryOsAction {
         /// for `btrdasd health`; a drive not mounted keeps its earlier record
         #[arg(long, value_name = "PATH")]
         state_file: Option<PathBuf>,
+        /// A dry run (backup-run.sh --dryrun passes it): another program's
+        /// mount of a drive's ESP is said ("would unmount", "would stop"),
+        /// never taken down, and that ESP is not read
+        #[arg(long)]
+        report_only: bool,
     },
     /// Mount the recovery drives, read their OSes, record them in the state
     /// file a backup run writes, and unmount — what a backup does for them,
@@ -2176,7 +2181,11 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
             }
             ros::exit_code(std::slice::from_ref(&entry))
         }
-        RecoveryOsAction::Status { config, state_file } => {
+        RecoveryOsAction::Status {
+            config,
+            state_file,
+            report_only,
+        } => {
             let Ok(cfg) = load(&config) else { return 2 };
             let host = ros::host_versions();
             let now = std::time::SystemTime::now()
@@ -2194,7 +2203,7 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
                 &health::is_mountpoint,
                 &ros::mounted_uuid,
                 &ros::drive_partition_ids,
-                &ros::check_esp,
+                &move |t, ids| ros::check_esp_with(t, ids, report_only),
                 &mut |n| eprintln!("recovery-os: {n}"),
             );
             if json {

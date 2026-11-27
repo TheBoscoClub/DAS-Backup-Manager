@@ -127,7 +127,7 @@ STATIC_REPORT=""
 # --- dry run: read, never record ------------------------------------------------
 reset
 check_recovery_os dryrun
-check "dry run: no --state-file" "$(cat "$WORK/calls")" "recovery-os status --config $DAS_CONFIG"
+check "dry run: no --state-file, report-only" "$(cat "$WORK/calls")" "recovery-os status --config $DAS_CONFIG --report-only"
 check "dry run: still recorded OK" "${OP_STATUS[recovery_os]}" "OK"
 
 # --- stale ------------------------------------------------------------------
