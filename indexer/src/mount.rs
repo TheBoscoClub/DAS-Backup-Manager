@@ -1082,6 +1082,102 @@ fn clear_target_with(
     }
 }
 
+/// What `btrdasd recovery-os clear-drive` found (bd DAS-Backup-Manager-eg4j.19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearDrive {
+    /// No partition of the drive is mounted on the host any more.
+    Cleared(String),
+    /// A writer, a protected process, a stacked mount or one that will not
+    /// come down: the drive is not to be used.
+    Refused(String),
+    /// The drive, its partitions or the mount table could not be read.
+    CannotRun(String),
+}
+
+impl ClearDrive {
+    /// The one line `recovery-os-vm.sh` reads, and the exit code: 0, 3, 2.
+    pub fn line(&self) -> (String, i32) {
+        match self {
+            ClearDrive::Cleared(d) => (format!("CLEAR DRIVE: OK  ({d})"), 0),
+            ClearDrive::Refused(d) => (format!("CLEAR DRIVE: REFUSED  ({d})"), 3),
+            ClearDrive::CannotRun(d) => (format!("CLEAR DRIVE: CANNOT-RUN  ({d})"), 2),
+        }
+    }
+}
+
+/// For `recovery-os-vm.sh` (bd DAS-Backup-Manager-eg4j.19): every mount of
+/// any partition of a single-drive target's drive — found by the drive's
+/// configured serial only, never by type — cleared as a job that writes the
+/// whole disk clears it: the stop policy (`backup.md` §Maintenance Interlock),
+/// each mount unmounted deepest first, the mount table read again. `_held`
+/// proves the maintenance lock.
+pub fn clear_drive(
+    target: &Target,
+    report_only: bool,
+    progress: &dyn ProgressCallback,
+    _held: &MaintenanceHeld,
+) -> ClearDrive {
+    clear_drive_with(
+        &SystemRunner,
+        &HOST_PROBES,
+        &host_clear_site(report_only, true),
+        target,
+        progress,
+    )
+}
+
+fn clear_drive_with(
+    runner: &dyn CommandRunner,
+    probes: &MountProbes<'_>,
+    site: &ClearSite<'_>,
+    target: &Target,
+    progress: &dyn ProgressCallback,
+) -> ClearDrive {
+    let serials = target.effective_serials();
+    let [serial] = serials.as_slice() else {
+        return ClearDrive::CannotRun(if serials.is_empty() {
+            format!("target '{}' names no drive serial", target.label)
+        } else {
+            format!(
+                "target '{}' names {} serials: not a single-drive target",
+                target.label,
+                serials.len()
+            )
+        });
+    };
+    let Some(disk) = (probes.device_from_serial)(serial) else {
+        return ClearDrive::CannotRun(format!("no attached drive has serial {serial}"));
+    };
+    let out = match runner.output(Command::new("lsblk").args(["-nrp", "-o", "NAME,TYPE", &disk])) {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => return ClearDrive::CannotRun(failed("lsblk", &o)),
+        Err(e) => return ClearDrive::CannotRun(format!("lsblk could not be run: {e}")),
+    };
+    // The whole disk too: a filesystem made on it directly.
+    let mut parts = vec![disk.clone()];
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split_whitespace();
+        if let (Some(name), Some("part")) = (f.next(), f.next()) {
+            parts.push(name.to_string());
+        }
+    }
+    let fsid = target.mount_uuid.as_deref().filter(|u| !u.is_empty());
+    match clear_partitions_with(runner, site, &target.label, &parts, fsid, progress) {
+        Ok(None) => ClearDrive::Cleared(format!("nothing of {disk} is mounted on this host")),
+        Ok(Some(would)) if site.report_only => {
+            ClearDrive::Cleared(format!("dry run: {}", would.join("; ")))
+        }
+        Ok(Some(sent)) if sent.is_empty() => ClearDrive::Cleared(format!(
+            "another program's mount of {disk}, held by nothing, was unmounted"
+        )),
+        Ok(Some(sent)) => ClearDrive::Cleared(format!(
+            "another program's mount of {disk} was unmounted, {STOPPED}: {}",
+            sent.join(", ")
+        )),
+        Err(why) => ClearDrive::Refused(why),
+    }
+}
+
 /// [`take_down_leftover_with`] on this host, for a job that mounts a target
 /// by its own code (the scrub engine). Its caller has already shown the
 /// mount is the target.
@@ -1414,7 +1510,6 @@ fn unmount_each(
 /// gone afterwards (or must never have been there with nothing visibly
 /// mounted). `Ok(None)`: mounted nowhere; `Ok(Some(signals))`: cleared (a
 /// dry run: the "would …" lines); `Err`: refused, why.
-#[cfg_attr(not(test), expect(dead_code, reason = "first caller: the next commit"))]
 fn clear_partitions_with(
     runner: &dyn CommandRunner,
     site: &ClearSite<'_>,
@@ -4588,6 +4683,197 @@ mod tests {
         let err = clear_parts(&host, &runner, Some("u-r"), &Recorder::default()).unwrap_err();
 
         assert!(err.contains("another mount namespace"), "{err}");
+    }
+
+    // --- recovery-os clear-drive -----------------------------------------
+
+    const LSBLK_OK: &str = "/dev/sdx disk\n/dev/sdx1 part RECOV-ESP-1\n/dev/sdx2 part\n";
+
+    /// A single-drive recovery target whose drive (serial `SER-R`) is the
+    /// whole disk `/dev/sdx`.
+    fn recovery_target() -> Target {
+        target("recovery", "SER-R", "/mnt/r", TargetRole::Mirror)
+    }
+
+    fn cd_host(mut host: Host) -> Host {
+        host.devices = vec![("SER-R".into(), "/dev/sdx".into())];
+        host
+    }
+
+    fn cd_runner(extra: &[(&str, Reply)]) -> Arc<ScriptedRunner> {
+        let mut rules: Vec<(&str, Reply)> = vec![("lsblk", Reply::Out(0, LSBLK_OK.into()))];
+        rules.extend(extra.iter().cloned());
+        ScriptedRunner::with_rules(&rules)
+    }
+
+    fn clear_drive_on(host: &Host, runner: &Arc<ScriptedRunner>, t: &Target) -> ClearDrive {
+        host.with_clear(runner, |c| {
+            host.with_probes(runner, |p| {
+                clear_drive_with(&**runner, p, c, t, &Recorder::default())
+            })
+        })
+    }
+
+    #[test]
+    fn clear_drive_line_and_exit_code_are_the_stop_policys() {
+        assert_eq!(
+            ClearDrive::Cleared("a".into()).line(),
+            ("CLEAR DRIVE: OK  (a)".to_string(), 0)
+        );
+        assert_eq!(
+            ClearDrive::Refused("b".into()).line(),
+            ("CLEAR DRIVE: REFUSED  (b)".to_string(), 3)
+        );
+        assert_eq!(
+            ClearDrive::CannotRun("c".into()).line(),
+            ("CLEAR DRIVE: CANNOT-RUN  (c)".to_string(), 2)
+        );
+    }
+
+    /// Review 5.
+    #[test]
+    fn clear_drive_unknown_serial_cannot_run() {
+        let host = esp_mounted_by_udisks(None); // no drive attached
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::CannotRun(w) if w.contains("SER-R")),
+            "{got:?}"
+        );
+        assert_eq!(got.line().1, 2);
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn clear_drive_two_serials_cannot_run() {
+        let host = cd_host(esp_mounted_by_udisks(None));
+        let runner = cd_runner(&[]);
+        let mut t = recovery_target();
+        t.serials = vec!["SER-R".into(), "SER-S".into()];
+
+        let got = clear_drive_on(&host, &runner, &t);
+
+        assert!(
+            matches!(&got, ClearDrive::CannotRun(w) if w.contains("not a single-drive target")),
+            "{got:?}"
+        );
+        assert!(umounts(&runner).is_empty());
+    }
+
+    #[test]
+    fn clear_drive_lsblk_failure_cannot_run() {
+        let host = cd_host(esp_mounted_by_udisks(None));
+        let runner = ScriptedRunner::with_rules(&[("lsblk", Reply::exit(32))]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::CannotRun(w) if w.contains("lsblk")),
+            "{got:?}"
+        );
+        assert!(umounts(&runner).is_empty());
+    }
+
+    #[test]
+    fn clear_drive_nothing_mounted_is_ok() {
+        let mut host = cd_host(esp_mounted_by_udisks(None));
+        host.mountinfo.truncate(1);
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(matches!(got, ClearDrive::Cleared(_)), "{got:?}");
+        assert_eq!(got.line().1, 0);
+        assert!(umounts(&runner).is_empty());
+    }
+
+    #[test]
+    fn clear_drive_idle_esp_unmounted_ok() {
+        let host = cd_host(esp_mounted_by_udisks(None));
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(matches!(got, ClearDrive::Cleared(_)), "{got:?}");
+        assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
+        assert!(host.signals().is_empty());
+    }
+
+    #[test]
+    fn clear_drive_reader_is_stopped_then_unmounted() {
+        let host = cd_host(esp_mounted_by_udisks(Some(esp_user(300, "0100000"))));
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::Cleared(d) if d.contains("SIGTERM to pid 300")),
+            "{got:?}"
+        );
+        assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
+        assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
+    }
+
+    #[test]
+    fn clear_drive_writer_refused_exit_3() {
+        let host = cd_host(esp_mounted_by_udisks(Some(esp_user(301, "0100002"))));
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::Refused(d) if d.contains("pid 301")),
+            "{got:?}"
+        );
+        assert_eq!(got.line().1, 3);
+        assert!(host.signals().is_empty());
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// Review 3: the partition goes away under the unmount: never "OK".
+    #[test]
+    fn clear_drive_partition_gone_before_unmount_is_not_ok() {
+        let host = cd_host(esp_mounted_by_udisks(None));
+        let runner = cd_runner(&[("umount", Reply::exit(32))]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::Refused(d) if d.contains("will not unmount")),
+            "{got:?}"
+        );
+        assert_eq!(umounts(&runner).len(), UMOUNT_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn clear_drive_report_only_unmounts_and_signals_nothing() {
+        let mut host = cd_host(esp_mounted_by_udisks(Some(esp_user(300, "0100000"))));
+        host.report_only = true;
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::Cleared(d) if d.starts_with("dry run:") && d.contains("would unmount")),
+            "{got:?}"
+        );
+        assert!(umounts(&runner).is_empty());
+        assert!(host.signals().is_empty());
+    }
+
+    /// The whole disk is asked about too: a filesystem made on it directly.
+    #[test]
+    fn clear_drive_a_mount_of_the_whole_disk_is_cleared_too() {
+        let mut host = cd_host(esp_mounted_by_udisks(None));
+        host.mountinfo[1] = format!("50 22 0:60 / {ESP_AT} rw - vfat /dev/sdx rw");
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(matches!(got, ClearDrive::Cleared(_)), "{got:?}");
+        assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
     }
 
     /// The other program's mount is never bound: its reader is stopped, it
