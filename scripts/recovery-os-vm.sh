@@ -1479,7 +1479,7 @@ clear_host_mounts() {
         line="$(printable "$line")"
         HOST_MOUNT_LINES+=("$line")
         log "    $line"
-        if [[ "$line" =~ ^CLEAR\ DRIVE:\ [A-Z-]+\ +\((.*)\)$ ]]; then
+        if [[ "$line" =~ ^CLEAR\ DRIVE:\ [[:upper:]-]+\ +\((.*)\)$ ]]; then
             detail=${BASH_REMATCH[1]}
         fi
     done <<<"$body"
