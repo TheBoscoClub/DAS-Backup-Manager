@@ -1214,6 +1214,21 @@ pub fn format_report(report: &DriftReport) -> String {
     r
 }
 
+/// The emailed body when the drift check could not run at all (`btrdasd
+/// doctor --email`, bd DAS-Backup-Manager-3gzs.12): the header of
+/// [`format_report`], the reason set apart status word first, one RESULT row.
+/// The word `FAILURE` stays in the status line, where the mailer reads it.
+pub fn format_could_not_run(why: &str) -> String {
+    let sep = "═".repeat(63);
+    let thin = "─".repeat(63);
+    format!(
+        "{sep}\n  DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n{sep}\n\
+         ── NEEDS ATTENTION ──\n  {:<8}The drift check could not run: {why}\n\n\
+         RESULT\n{thin}\n  {:<22}{:<7}could not run\n\n{sep}\n",
+        "FAILED", "Drift check", "FAIL"
+    )
+}
+
 /// One check of the drift report as its RESULT row shows it: what was
 /// checked, `OK`, `DRIFT` (a finding) or `FAIL` (something could not be
 /// examined), the counts in words, and the section that lists the details.
@@ -1826,6 +1841,24 @@ mod tests {
         };
         let text = format_report(&report);
         assert!(text.contains("hdd-projects, hdd-media"), "{text}");
+    }
+
+    /// bd 3gzs.12: the could-not-run mail sets its reason apart, status word
+    /// first, and closes with one RESULT row; the header and its `Status:`
+    /// line (where the mailer reads FAILURE) are the report's own.
+    #[test]
+    fn the_could_not_run_body_sets_the_reason_apart_and_closes_with_a_result_row() {
+        let sep = "═".repeat(63);
+        let thin = "─".repeat(63);
+        let text = format_could_not_run("cannot read /etc/das-backup/config.toml");
+        assert_eq!(
+            text,
+            format!(
+                "{sep}\n  DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n{sep}\n\
+                 ── NEEDS ATTENTION ──\n  FAILED  The drift check could not run: cannot read /etc/das-backup/config.toml\n\n\
+                 RESULT\n{thin}\n  Drift check           FAIL   could not run\n\n{sep}\n"
+            )
+        );
     }
 
     #[test]

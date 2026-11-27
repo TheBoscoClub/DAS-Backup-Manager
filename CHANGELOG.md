@@ -143,6 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The doctor's could-not-run email sets its reason apart** (bd `DAS-Backup-Manager-3gzs.12`): `doctor::format_could_not_run` builds the body, with the report's own header and `Status: COULD NOT RUN — FAILURE` line (the word the mailer reads), a `── NEEDS ATTENTION ──` block naming the reason status word first, and one `RESULT` row; `tests/test_report_mail.sh` expects the same body
+
 - **`btrdasd scrub run`, `scrub status` and the emailed scrub report are reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
   - `scrub status` opens with `━━ btrdasd scrub status — <local time and zone> ━━`, sets each filesystem that failed (FAIL) or needs a look (WARN: never scrubbed, paused, yielded) in a `── NEEDS ATTENTION ──` block, keeps its table and detail lines as they were, and closes with a `RESULT` block of one row per filesystem; `--json` is unchanged
   - `scrub run` prints the line it always printed (`Scrub pass <status>: N of M filesystems clean`), then the attention block and a `RESULT` row per filesystem

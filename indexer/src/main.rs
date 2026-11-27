@@ -4428,12 +4428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     eprintln!("Error: {e}");
                     if email {
-                        let failure_text = format!(
-                            "═══════════════════════════════════════════════════════════\n  \
-                             DAS Subvolume Drift Report\n  Status: COULD NOT RUN — FAILURE\n\
-                             ═══════════════════════════════════════════════════════════\n\n\
-                             The drift check could not run: {e}\n"
-                        );
+                        let failure_text = doctor::format_could_not_run(&e.to_string());
                         eprintln!(
                             "{}",
                             email_doctor_report(&failure_text, &cfg, true, &report::MAILX)
