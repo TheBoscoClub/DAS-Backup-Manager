@@ -49,6 +49,7 @@ Each has its test in the owning task.
 **Files:** Modify `indexer/src/holders.rs` (beside `mounts_of`), `indexer/src/mount.rs` (beside `clear_mounted_elsewhere`).
 
 **Interfaces:**
+
 - Produces: `holders::mounts_of_partitions(entries: &[MountEntry], partitions: &[String]) -> Vec<MountEntry>` —
   any fstype, source matched as given and canonicalized, deepest mount point first (same order as `mounts_of`).
 - Produces: `mount::clear_partitions_with(runner: &dyn CommandRunner, site: &ClearSite<'_>, who: &str,
@@ -73,6 +74,7 @@ Each has its test in the owning task.
 **Files:** `indexer/src/mount.rs`, `indexer/src/main.rs` (`RecoveryOsAction`, beside `HoldDisk`; dispatcher in `run_recovery_os`).
 
 **Interfaces:**
+
 - Consumes: Task 1.
 - Produces: `pub enum ClearDrive { Cleared(String), Refused(String), CannotRun(String) }` with
   `line(&self) -> (String, i32)` → `CLEAR DRIVE: OK  (<d>)` 0 / `CLEAR DRIVE: REFUSED  (<d>)` 3 /
