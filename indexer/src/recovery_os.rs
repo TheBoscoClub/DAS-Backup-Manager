@@ -696,6 +696,14 @@ pub fn inspect(root: &Path) -> RecoveryOs {
 
 /// [`inspect`], reading a link only where `probe` says that records nothing.
 fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
+    inspect_with_fs(root, probe, None)
+}
+
+/// [`inspect_with`] of a root that is a subvolume of the filesystem `fs_uuid`
+/// mounted at the root's parent: what the OS's fstab mounts from that same
+/// filesystem is read from its sibling subvolumes
+/// ([`boot::read_with_fs`], bd DAS-Backup-Manager-3nb).
+fn inspect_with_fs(root: &Path, probe: MountFlags, fs_uuid: Option<&str>) -> RecoveryOs {
     let mut os = RecoveryOs::default();
     let unreadable = |e: ReadErr, problems: &mut Vec<String>| {
         if let ReadErr::Unreadable(why) = e {
@@ -781,7 +789,7 @@ fn inspect_with(root: &Path, probe: MountFlags) -> RecoveryOs {
         }
         Err(e) => unreadable(e, &mut os.problems),
     }
-    let boot = boot::read_with(root, probe);
+    let boot = boot::read_with_fs(root, probe, fs_uuid);
     os.guest_agent = guest_agent_in(root, agent_installed, &boot.units);
     os.enabled_units = boot.units;
     os.btrbk_config = boot.config;
@@ -1206,6 +1214,7 @@ pub struct DriveEntry {
 /// look like the recovery OS.
 fn read_drive(
     root: &Path,
+    fs_uuid: Option<&str>,
     host: &HostVersions,
     today: &str,
     max_age_days: u32,
@@ -1216,7 +1225,7 @@ fn read_drive(
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()));
     }
-    let os = inspect(root);
+    let os = inspect_with_fs(root, mount_flags, fs_uuid);
     let assessment = assess(&os, host, today, max_age_days);
     Ok((os, assessment))
 }
@@ -1230,7 +1239,22 @@ pub fn inspect_drive(
     today: &str,
     max_age_days: u32,
 ) -> DriveEntry {
-    let report = match read_drive(root, host, today, max_age_days) {
+    inspect_drive_on(label, root, None, host, today, max_age_days)
+}
+
+/// [`inspect_drive`] of a root that is the `@` subvolume of the filesystem
+/// `fs_uuid`, as `findmnt` named it for the mount point the root is under:
+/// what that OS's fstab mounts from the same filesystem is read, not
+/// unknown (bd DAS-Backup-Manager-3nb). `None` reads the root alone.
+pub fn inspect_drive_on(
+    label: &str,
+    root: &Path,
+    fs_uuid: Option<&str>,
+    host: &HostVersions,
+    today: &str,
+    max_age_days: u32,
+) -> DriveEntry {
+    let report = match read_drive(root, fs_uuid, host, today, max_age_days) {
         Ok((os, assessment)) => DriveReport::Inspected {
             os: Box::new(os),
             assessment,
@@ -1541,7 +1565,8 @@ pub fn status_noting_until(
                 note(format!("reading {} at {}", t.label, root.display()));
                 let started = std::time::Instant::now();
                 let before = fs_uuid(mount);
-                let mut entry = inspect_drive(&t.label, &root, host, today, max);
+                let mut entry =
+                    inspect_drive_on(&t.label, &root, before.as_deref(), host, today, max);
                 if let DriveReport::Inspected { assessment, .. } = &mut entry.report
                     && let Some(ids) = drive_ids(mount)
                 {
@@ -2058,7 +2083,15 @@ pub fn health_reading(
     for t in cfg.targets.iter().filter(|t| t.role == TargetRole::Mirror) {
         let label = &t.label;
         if !held && is_mounted(Path::new(&t.mount)) {
-            match read_drive(&os_root(&t.mount), host(), today, max) {
+            // The filesystem is named before and after, as `status` does: a
+            // reading made across a change of it reads the root alone.
+            let root = os_root(&t.mount);
+            let before = mounted_uuid(Path::new(&t.mount));
+            let mut read = read_drive(&root, before.as_deref(), host(), today, max);
+            if before.is_some() && mounted_uuid(Path::new(&t.mount)) != before {
+                read = read_drive(&root, None, host(), today, max);
+            }
+            match read {
                 Ok((os, assessment)) => {
                     h.lines.push(summary(label, "live", &os, &assessment));
                     h.warnings.extend(assessment_warnings(label, &assessment));
@@ -4353,6 +4386,45 @@ mod tests {
 
     fn ids(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// bd DAS-Backup-Manager-3nb: the filesystem `status` names for a mounted
+    /// drive is what lets the boot reading read its `/home`, a subvolume of
+    /// that filesystem, beside its root instead of calling it unknown.
+    #[test]
+    fn status_reads_a_mount_of_the_drive_s_own_filesystem_where_it_names_that_filesystem() {
+        let top = tempfile::tempdir().unwrap();
+        let root = top.path().join("@");
+        full_root(&root);
+        write(
+            &root,
+            "etc/fstab",
+            "UUID=fs-a / btrfs subvol=/@,noatime 0 0\n\
+             UUID=fs-a /home btrfs subvol=/@home,noatime 0 0\n",
+        );
+        write(
+            &root,
+            "usr/lib/systemd/system/daemon.service",
+            "[Service]\nExecStart=/usr/bin/true --profile /home/u/profile.conf\n",
+        );
+        enable(&root, VENDOR, "multi-user.target.wants", "daemon.service");
+        write(&top.path().join("@home"), "u/profile.conf", "level=1\n");
+        let cfg = mirror_config(&[("A", top.path().to_str().unwrap())]);
+        let is_mounted = |p: &Path| p == top.path();
+        let verdict = |uuid: &'static str| {
+            let fs_uuid = move |_: &Path| Some(uuid.to_string());
+            let entries = status_with(&cfg, &host("7.2.8"), TODAY, &is_mounted, &fs_uuid);
+            match &entries[0].report {
+                DriveReport::Inspected { os, .. } => {
+                    (os.btrbk_at_boot.verdict, os.btrbk_at_boot.reasons.clone())
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(verdict("fs-a"), (BootVerdict::No, vec![]));
+        // Another filesystem there: the same fstab line is not its subvolume.
+        let (other, why) = verdict("fs-b");
+        assert_eq!(other, BootVerdict::May, "{why:?}");
     }
 
     #[test]
