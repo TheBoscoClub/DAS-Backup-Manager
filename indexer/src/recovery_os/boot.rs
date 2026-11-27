@@ -33,7 +33,9 @@
 //! bit allows, which it reads too. The
 //! script a shell is given is read as sh; another interpreter's script is
 //! searched for btrbk's name and for the absolute paths it names that lead
-//! to a sh script, each read as one it runs; the command a wrapper (`env`,
+//! to a sh script, each read as one it runs; a program's `#!` interpreter,
+//! unless a known binary one, is read as a program it runs (the kernel
+//! takes a script as interpreter); the command a wrapper (`env`,
 //! `nice`, `flock`, `timeout`, `sudo`…) runs is read, its own operand (a
 //! lock file, a duration, a user) not. A word a program is given, it may
 //! run: it is read like a program, unless the program is [`INERT`] as that
@@ -1780,6 +1782,28 @@ fn runs_sh(text: &str) -> bool {
             .unwrap_or_default();
     }
     SHELLS.contains(&program.rsplit('/').next().unwrap_or_default())
+}
+
+/// Binary interpreters a `#!` line may name that are read no further: by
+/// name alone through `env`, else only at `/usr/bin` or `/bin`.
+const BINARY_INTERPRETERS: [&str; 6] = ["awk", "gawk", "mawk", "nawk", "sed", "busybox"];
+
+/// Whether `word`, the interpreter a `#!` line names (`env`'s program when
+/// `env`), is a known binary one: one of [`SHELLS`], [`INTERPRETERS`] (a
+/// version after the name too: `python3.14`) or [`BINARY_INTERPRETERS`],
+/// at `/usr/bin` or `/bin` unless found through `env`.
+fn binary_interpreter(word: &str, env: bool) -> bool {
+    let (dir, name) = word.rsplit_once('/').unwrap_or(("", word));
+    if !env && !matches!(dir, "/usr/bin" | "/bin") {
+        return false;
+    }
+    let versioned = |known: &str| {
+        name.strip_prefix(known)
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    };
+    SHELLS.contains(&name)
+        || INTERPRETERS.iter().any(|i| versioned(i))
+        || BINARY_INTERPRETERS.contains(&name)
 }
 
 /// Whether the regular file `at`, a path with no link on it, has an execute
@@ -4327,7 +4351,16 @@ impl Findings<'_> {
         match program_at(self.root, self.mounts, self.probe, resolved, how.role) {
             Program::Btrbk => vec![(at.script.map(String::from), btrbk_config(&how.args))],
             Program::Script(text) => self.read_sh(at, path, resolved, &text, how.sourced),
-            Program::Code(text) => self.read_code(at, path, resolved, &text),
+            Program::Code(text) => {
+                // A program's `#!` line, not an interpreter's operand: the
+                // kernel runs its interpreter (bd DAS-Backup-Manager-eg4j.24).
+                let mut runs = match how.role {
+                    Role::Program | Role::Argument => self.interpreter(at, path, resolved, &text),
+                    _ => Vec::new(),
+                };
+                runs.extend(self.read_code(at, path, resolved, &text));
+                runs
+            }
             Program::Other => Vec::new(),
             Program::Unknown(why) => {
                 self.unknown(
@@ -4360,6 +4393,69 @@ impl Findings<'_> {
             *path = after;
         }
         runs
+    }
+
+    /// The interpreter the `#!` line of `script`, a program not in sh, names:
+    /// the kernel runs it with `script` as its operand, and takes a script
+    /// as the interpreter too (binfmt_script). A known binary interpreter
+    /// ([`binary_interpreter`]) is not read; any other is read as a program
+    /// `script` runs, one script deeper — btrbk named there will, its own
+    /// unknowns may — and past [`MAX_SCRIPT_DEPTH`] it may. Through `env`,
+    /// the program it runs is found in `path`.
+    fn interpreter(&mut self, at: At, path: &mut SearchPath, script: &str, text: &str) -> Runs {
+        let line = text.lines().next().unwrap_or_default();
+        let Some(mut words) = line.strip_prefix("#!").map(str::split_whitespace) else {
+            return Vec::new();
+        };
+        let Some(mut word) = words.next() else {
+            return Vec::new();
+        };
+        let env = word.rsplit('/').next() == Some("env");
+        if env {
+            match words.find(|w| !w.starts_with('-') && !w.contains('=')) {
+                Some(program) => word = program,
+                None => return Vec::new(),
+            }
+        }
+        if binary_interpreter(word, env) {
+            return Vec::new();
+        }
+        if !env && !word.starts_with('/') {
+            self.unknown(
+                format!(
+                    "{} may run btrbk through {script}: its #! interpreter {word} is a relative \
+                     path, from a directory only that OS knows",
+                    at.who
+                ),
+                None,
+            );
+            return Vec::new();
+        }
+        if at.depth >= MAX_SCRIPT_DEPTH {
+            self.unknown(
+                format!(
+                    "{} may run btrbk through {script}: its #! interpreter {word}, \
+                     {MAX_SCRIPT_DEPTH} scripts deep, not read",
+                    at.who
+                ),
+                None,
+            );
+            return Vec::new();
+        }
+        let inside = At {
+            depth: at.depth + 1,
+            script: Some(script),
+            ..at
+        };
+        let how = Use {
+            role: Role::Program,
+            literal: false,
+            sourced: false,
+            path: None,
+            shell: false,
+            args: Vec::new(),
+        };
+        self.program(inside, path, word, &how)
     }
 
     /// Another interpreter's script `script`, which is not read as sh: btrbk
@@ -10394,6 +10490,79 @@ mod tests {
             "PATH=$X:$PATH\nfin() { :; }\nfin\n",
         );
         assert_eq!(at_boot(root).verdict, BootVerdict::May);
+    }
+
+    /// An executable file at `rel` whose whole text is `text`.
+    fn program_file(root: &Path, rel: &str, text: &str) {
+        write(root, rel, text);
+        fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn eg4j24_a_hashbang_interpreter_that_is_a_script_is_read_as_the_program_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos_mounted(root);
+        nightly_runs(root, "ExecStart=/usr/local/bin/job");
+        // The kernel runs evil with job as its operand (binfmt_script takes
+        // a script as the interpreter): evil's btrbk runs.
+        program_file(
+            root,
+            "usr/local/bin/job",
+            "#!/usr/local/bin/evil\nanything\n",
+        );
+        snap(root, "usr/local/bin", "evil");
+        let b = at_boot(root);
+        assert_eq!(b.verdict, BootVerdict::Will, "{:?}", b.reasons);
+        assert_eq!(b.runners[0].script.as_deref(), Some("/usr/local/bin/evil"));
+        // An interpreter that is another interpreter's script naming btrbk
+        // may; through `env`, an unknown name is found in the PATH.
+        program_file(
+            root,
+            "usr/local/bin/evil",
+            "#!/usr/bin/python3\nx = 'btrbk'\n",
+        );
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        snap(root, "usr/local/bin", "evil");
+        program_file(root, "usr/local/bin/job", "#!/usr/bin/env evil\nanything\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::Will);
+        // One that cannot be read may: what boot sees under /run is not here.
+        program_file(root, "usr/local/bin/job", "#!/run/evil\nanything\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // A chain of interpreters past the bound may.
+        program_file(root, "usr/local/bin/job", "#!/usr/local/bin/i1\n");
+        for n in 1..6 {
+            program_file(
+                root,
+                &format!("usr/local/bin/i{n}"),
+                &format!("#!/usr/local/bin/i{}\n", n + 1),
+            );
+        }
+        snap(root, "usr/local/bin", "i6");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // The converse: an interpreter that is a binary, absent, or a script
+        // running nothing — and ordinary interpreters — run no btrbk.
+        binary(root, "usr/local/bin/i1");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        program_file(root, "usr/local/bin/job", "#!/usr/local/bin/none\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        script(root, "usr/local/bin/evil", "true\n");
+        program_file(root, "usr/local/bin/job", "#!/usr/local/bin/evil\nbtrbk\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May, "job names btrbk");
+        program_file(root, "usr/local/bin/job", "#!/usr/local/bin/evil -x\n");
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        for text in [
+            "#!/bin/bash\necho hi\n",
+            "#!/usr/bin/bash\necho hi\n",
+            "#!/usr/bin/python3\nprint(1)\n",
+            "#!/usr/bin/python3.14 -u\nprint(1)\n",
+            "#!/usr/bin/env python3\nprint(1)\n",
+            "#!/usr/bin/env -S perl -w\nprint 1;\n",
+            "#!/usr/bin/awk -f\nBEGIN { print 1 }\n",
+        ] {
+            program_file(root, "usr/local/bin/job", text);
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{text}");
+        }
     }
 
     #[test]

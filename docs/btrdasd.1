@@ -2402,7 +2402,12 @@ name runs where a wrapper or
 is given the name, or where the definition is not reached. A script that
 ends inside a quote or after a joining backslash is unknown. One whose
 .B #!
-names another interpreter is that interpreter's. A binary is not looked into.
+names another interpreter is that interpreter's; that interpreter, unless a
+shell, a known one (python, perl, ruby, node, php, lua, awk, sed, busybox) in
+/usr/bin or /bin, or one
+.B env
+finds by such a name, is read as a program the script runs, since the kernel
+takes a script as an interpreter too. A binary is not looked into.
 .PP
 A word a program is given may be one it runs, so it is read like one: a
 .B #!
