@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.6.0
+# Version: 2.7.0
 # Date: 2026-11-27
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -774,9 +774,35 @@ warn() {
     logger -p user.warning -t "$LOG_TAG" -- "${LOG_PREFIX}WARNING: $*" || :
 }
 
+# The reader's layout (bd DAS-Backup-Manager-eg4j.19): a fact is one row, its
+# name in a fixed column, so the eye finds it; a long list is counted and says
+# where it is kept in full (the boot record, the history), never repeated
+# inline; the line that decides the outcome stands apart from routine ones,
+# and every run ends with a RESULT block. Times are the host's local time with
+# its zone. Same words in the journal and the GUI: they travel one pipe.
+row() { # row <name> <text...>
+    local name=$1
+    shift
+    log "$(printf '%-14s %s' "$name" "$*")"
+}
+section() { log "━━ $* ━━"; }
+subsection() { log "── $* ──"; }
+
+LAST_REFUSAL=""     # the reason of the refusal that ended this run, for its RESULT row
+RESULT_CONTEXT=""   # a session, a two-drive run or a provision: refusals end in a RESULT block
+RESULT_PRINTED=false
+REASON_FILE="${DAS_RECOVERY_VM_REASON_FILE:-}" # a two-drive run's drive: where its status and reason go for the run's RESULT block
+
 refuse() {
-    printf '%sREFUSED: %s\n' "$LOG_PREFIX" "$*" >&2
+    LAST_REFUSAL="$*"
+    # Apart from the routine lines above it: a blank line, on the stream the
+    # GUI shows with the reason.
+    printf '\n%sREFUSED: %s\n' "$LOG_PREFIX" "$*" >&2
     logger -p user.err -t "$LOG_TAG" -- "${LOG_PREFIX}REFUSED: $*" || :
+    # Nothing taken: no session end will come, so the run's result is said here.
+    if [[ -n "$RESULT_CONTEXT" && -z "$LOCK_FD" && "$HISTORY_ARMED" != true ]]; then
+        print_result 1
+    fi
     exit 1
 }
 
@@ -1569,8 +1595,9 @@ age_text() {
     fi
 }
 
-utc() {
-    date -u -d "@$1" '+%Y-%m-%d %H:%M UTC'
+# A time as the operator reads it: the host's local time and its zone.
+local_time() {
+    date -d "@$1" '+%Y-%m-%d %H:%M %Z'
 }
 
 # This label's last session time from SESSIONS_FILE into LAST_SESSION (empty
@@ -1693,6 +1720,54 @@ resolve_os_state() {
     GUARD_KEEP_DIR="$(dirname -- "$OS_STATE_FILE")/recovery-os-vm-guard"
 }
 
+# The record's reasons, each once, those that differ only by the paths they
+# say they go "via" joined into one line per head: "<head> via <path>, <path>".
+# Everything they say stays in the record.
+group_reasons() {
+    local r head paths rorder=() i seen
+    local -a parts
+    local -A via=()
+    local -A plain=()
+    for r in "$@"; do
+        if [[ "$r" =~ ^(.+)\ via\ (.+)$ ]]; then
+            head=${BASH_REMATCH[1]}
+            paths=${BASH_REMATCH[2]}
+            if [[ -z "${via[$head]+set}" ]]; then
+                via[$head]=$paths
+                rorder+=("via:$head")
+            else
+                seen=", ${via[$head]}, "
+                IFS=',' read -r -a parts <<<"$paths"
+                for i in "${parts[@]}"; do
+                    i=${i# }
+                    [[ "$seen" == *", $i, "* ]] || { via[$head]+=", $i"; seen+="$i, "; }
+                done
+            fi
+        elif [[ -z "${plain[$r]+set}" ]]; then
+            plain[$r]=1
+            rorder+=("plain:$r")
+        fi
+    done
+    for r in "${rorder[@]}"; do
+        case "$r" in
+            via:*) log "              ${r#via:} via ${via[${r#via:}]}" ;;
+            plain:*) log "              ${r#plain:}" ;;
+        esac
+    done
+}
+
+# The guest agent's reading in words ("read <installed> <enabled>").
+agent_words() { # agent_words <reading> <why>
+    local reading=$1 why=$2
+    case "$reading" in
+        "read true true") printf 'installed, starts at boot%s' "${why:+ ($why)}" ;;
+        "read true false") printf 'installed, not enabled at boot%s' "${why:+ ($why)}" ;;
+        "read false"*) printf 'not installed%s' "${why:+ ($why)}" ;;
+        "") printf 'not recorded' ;;
+        *) printf '%s%s' "$reading" "${why:+ ($why)}" ;;
+    esac
+}
+
 # Read this drive's boot record and go on only when it does not say btrbk
 # will run when its OS boots -- before anything is taken. "may" goes on: the
 # session guard is what keeps btrbk from running, and what the record names
@@ -1767,7 +1842,7 @@ check_boot_record() {
     if [[ "$checkedtype" != number || ! "$checked" =~ ^[123456789][[:digit:]]{0,17}$ ]]; then
         refuse "the boot record for '$LABEL' has no check time ('$checked', a $checkedtype) -- a whole number of seconds above 0 is needed"
     fi
-    when="$(utc "$checked" 2>&1)" ||
+    when="$(local_time "$checked" 2>&1)" ||
         refuse "the boot record for '$LABEL' has a check time this host cannot read as a date ($checked: $when) -- not a time in seconds"
     now=$(date +%s)
     age=$((now - checked))
@@ -1798,23 +1873,27 @@ check_boot_record() {
     if [[ "$fs" != "$want" ]]; then
         refuse "the boot record for '$LABEL' (checked $when, $(age_text "$age")) was read from filesystem $(printable "$fs"), not $want, the mount_uuid of '$LABEL' in $DAS_CONFIG -- the label names another drive now, or its filesystem was made again since; never overridable: $again"
     fi
-    log "boot record for $LABEL ($file, schema $schema):"
-    log "  checked        $when, $(age_text "$age")"
-    log "  filesystem     $fs (the mount_uuid of $LABEL)"
+    row "boot record" "checked $when ($(age_text "$age")), schema $schema, from $file"
+    row "  filesystem" "$fs (the mount_uuid of $LABEL)"
     if [[ "$units_state" == listed ]]; then
-        log "  enabled units  $(
-            IFS=,
+        # Names inline only while they fit a glance; the whole list is in the record.
+        if ((${#units[@]} <= 8)); then
             p="${units[*]}"
-            printf '%s' "${p//,/, }"
-        ) (${#units[@]})"
+            row "  units" "${p// /, } (${#units[@]})"
+        else
+            row "  units" "${#units[@]} enabled (full list: $file)"
+        fi
     else
-        log "  enabled units  $units_state"
+        row "  units" "$units_state"
     fi
-    log "  btrbk at boot  $verdict"
-    for p in "${reasons[@]}"; do
-        log "    - $p"
-    done
-    log "  guest agent    ${REC_AGENT:-not recorded}${REC_AGENT_WHY:+ ($REC_AGENT_WHY)}"
+    case "$verdict" in
+        no) row "  btrbk" "will not run at boot" ;;
+        may) row "  btrbk" "may run at boot -- the session guard is what keeps it from running" ;;
+        will) row "  btrbk" "will run at boot -- the session guard stops it now" ;;
+        *) row "  btrbk" "$verdict" ;;
+    esac
+    group_reasons "${reasons[@]}"
+    row "  guest agent" "$(agent_words "$REC_AGENT" "$REC_AGENT_WHY")"
     VERDICT=$verdict
     REC_REASONS=("${reasons[@]}")
     REC_RUNNERS=("${runners[@]}")
@@ -1823,9 +1902,6 @@ check_boot_record() {
         REC_UNITS=("${units[@]}")
     fi
 
-    if [[ "$verdict" == may ]]; then
-        log "boot record: btrbk may run when this OS boots: the session guard is what keeps it from running"
-    fi
     # Unattended (decisions 1 and 3): only through an agent the record says
     # runs at boot, and never on "will" -- that is for an operator at the
     # console. Neither is for --accept-boot-record-risk to let through.
@@ -1858,13 +1934,10 @@ check_boot_record() {
         problems+=("cannot tell when this drive's last VM session ended ($SESSIONS_FAILURE)")
         hints+=("remove the bad line, or the whole file, at $SESSIONS_FILE, then run a backup with the drive attached")
     elif [[ -n "$LAST_SESSION" ]] && ((checked <= LAST_SESSION)); then
-        problems+=("the record was made before this drive's last VM session ended ($(utc "$LAST_SESSION")): the OS may have changed in it")
+        problems+=("the record was made before this drive's last VM session ended ($(local_time "$LAST_SESSION")): the OS may have changed in it")
         hints+=("$again")
     fi
     if ((${#problems[@]} == 0)); then
-        if [[ "$verdict" == no ]]; then
-            log "boot record: btrbk will not run when this OS boots"
-        fi
         return 0
     fi
     if [[ "$ACCEPT_BOOT_RISK" == true ]]; then
@@ -2016,7 +2089,7 @@ build_guard() {
         GUARD_ENTRIES+=("io.systemd.credential:systemd.extra-unit.$u=")
         GUARD_ENTRIES+=("io.systemd.credential.binary:systemd.unit-dropin.$u~$GUARD_MASK_DROPIN=$never_b64")
     done
-    log "session guard: a refusing btrbk bound over $(join_and "${GUARD_BTRBK_PATHS[@]}") where present; masks $(
+    row "session guard" "a refusing btrbk bound over ${#GUARD_BTRBK_PATHS[@]} paths where present ($(join_and "${GUARD_BTRBK_PATHS[@]}")); masks $(
         IFS=,
         p="${MASKS[*]}"
         printf '%s' "${p//,/, }"
@@ -3389,7 +3462,7 @@ take_lock() {
         fi
         LOCK_FD=$fd
         LOCK_INHERITED=true
-        log "holding the DAS maintenance lock $MAINTENANCE_LOCK through the two-drive run that took it"
+        row lock "held through the two-drive run that took it ($MAINTENANCE_LOCK)"
         return 0
     fi
     if ! exec {LOCK_FD}<>"$MAINTENANCE_LOCK"; then
@@ -3407,7 +3480,7 @@ take_lock() {
         refuse "the DAS maintenance lock $MAINTENANCE_LOCK is held by: ${holder:-(no holder line)} -- try again when it is free"
     fi
     write_lock_record "$$"
-    log "took the DAS maintenance lock $MAINTENANCE_LOCK: backups and scrubs now wait for this ${LOCK_JOB:-session}"
+    row lock "held: $MAINTENANCE_LOCK -- backups and scrubs wait for this ${LOCK_JOB:-session}"
 }
 
 # The backup singleton, as take_lock takes the maintenance lock: opened <>
@@ -4055,7 +4128,7 @@ egress_add() {
         ((EGRESS_COUNT > 0)) || refuse "ip rule add succeeded, but no rule from $EGRESS_SUBNET is at priority $EGRESS_PRIORITY -- nothing was booted"
     fi
     EGRESS_RESULT="in place (from $EGRESS_SUBNET lookup main priority $EGRESS_PRIORITY)"
-    log "egress: the VM's subnet $EGRESS_SUBNET goes direct (ip rule priority $EGRESS_PRIORITY, above a VPN exit node's)"
+    row egress "$EGRESS_SUBNET direct (ip rule priority $EGRESS_PRIORITY, above a VPN exit node's)"
 }
 
 # Take the rule out, every copy of it, and prove it gone. A rule that stays
@@ -5193,7 +5266,49 @@ write_history() {
 session_exit() {
     write_history "$1"
     write_causes "$1"
+    print_result "$1"
     exit "$1"
+}
+
+# "<STATUS>|<one clause>" for a run that ended with exit status $1 (the exit
+# statuses are the script's header; the history keeps every word of the rest).
+result_words() {
+    case "$1" in
+        0) printf 'OK|' ;;
+        5) printf 'WARNINGS|ended, everything given back; something needs a look (the summary above)' ;;
+        3 | 4) printf 'KEPT|the recovery OS or the disk is still held: finish with session-end' ;;
+        6) printf 'FAILED|the session guard did not confirm on a record that does not rule btrbk out' ;;
+        7) printf 'FAILED|the unattended update stopped%s' "${UNATTENDED_STAGE:+ at $UNATTENDED_STAGE}" ;;
+        *)
+            if [[ -n "$LAST_REFUSAL" ]]; then
+                printf 'REFUSED|%s' "$(printable "$LAST_REFUSAL")"
+            else
+                printf 'FAILED|exit %s' "$1"
+            fi
+            ;;
+    esac
+}
+
+# One result row: <label> <STATUS|clause>.
+result_row() {
+    local status=${2%%|*} clause=${2#*|}
+    printf '  %-26s %-9s %s\n' "$1" "$status" "${clause:+($clause)}"
+}
+
+# The end of a session, a provision or a refusal before either: the one place
+# that says how the run went, once. A drive of a two-drive run only leaves its
+# status for the run's block (its own lines carry the [label] prefix).
+print_result() {
+    local words
+    [[ "$RESULT_PRINTED" != true ]] || return 0
+    RESULT_PRINTED=true
+    words="$(result_words "$1")"
+    if [[ -n "$REASON_FILE" ]]; then
+        printf '%s\n' "$words" >"$REASON_FILE" 2>/dev/null || :
+    fi
+    [[ -z "$LOG_PREFIX" ]] || return 0
+    printf '\n━━ RESULT ━━ %s\n' "$(local_time "$(date +%s)")"
+    result_row "$LABEL" "$words"
 }
 
 # The history's lines, each checked to be one JSON object with a label: 1,
@@ -5345,7 +5460,8 @@ pair_status() {
 }
 
 cmd_session_pair() {
-    local first=$1 second=$2 labels=() l rcs=() pids=() i rc kept=false flags=() cause_file="" why=()
+    local first=$1 second=$2 labels=() l rcs=() pids=() i rc kept=false flags=() cause_file="" why=() reason reason_name
+    RESULT_CONTEXT=true
     require_root
     command -v jq >/dev/null || refuse "jq is not installed: every session reads its boot record with it"
     load_targets
@@ -5357,6 +5473,11 @@ cmd_session_pair() {
         refuse "'$first' and '$second' are the same drive (${labels[0]})"
     fi
     LABEL="${labels[0]}+${labels[1]}"
+    section "recovery-OS update: both drives, $PAIR_MODE: ${labels[0]}, then ${labels[1]}$([[ "$DRY_RUN" == true ]] && printf ' (dry run)') -- $(local_time "$(date +%s)")"
+    for l in "${labels[@]}"; do
+        reason_name="${l:?}.reason"
+        rm -f -- "${STATE_DIR:?}/${reason_name:?}"
+    done
     [[ "$DRY_RUN" != true ]] || flags+=(--dry-run)
     [[ "$UNATTENDED" != true ]] || flags+=(--unattended)
     [[ "$ACCEPT_BOOT_RISK" != true ]] || flags+=(--accept-boot-record-risk)
@@ -5372,13 +5493,14 @@ cmd_session_pair() {
     if [[ "$DRY_RUN" != true ]]; then
         egress_add
     fi
-    log "both drives, $PAIR_MODE: ${labels[0]}, then ${labels[1]}$([[ "$PAIR_MODE" == parallel ]] && printf ' -- at once')"
+    [[ "$PAIR_MODE" != parallel ]] || log "the two drives run at once"
     if [[ "$PAIR_MODE" == parallel ]]; then
         for l in "${labels[@]}"; do
             # Started with `&`, a child begins with SIGINT ignored and cannot
             # take that back; env resets it before the exec, so Ctrl-C and
             # the helper's JobCancel reach both drives' sessions (bd c8lf).
             DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=parallel \
+                DAS_RECOVERY_VM_REASON_FILE="$STATE_DIR/$l.reason" \
                 env --default-signal=INT bash "$SELF" session "$l" "${flags[@]}" &
             pids+=($!)
         done
@@ -5413,7 +5535,8 @@ cmd_session_pair() {
             cause_file="$STATE_DIR/${labels[$i]}.exit5"
             rm -f -- "${cause_file:?}"
             DAS_RECOVERY_VM_LOCK_FD=$LOCK_FD DAS_RECOVERY_VM_EGRESS_HELD=1 DAS_RECOVERY_VM_MODE=sequential \
-                DAS_RECOVERY_VM_CAUSE_FILE=$cause_file bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
+                DAS_RECOVERY_VM_CAUSE_FILE=$cause_file DAS_RECOVERY_VM_REASON_FILE="$STATE_DIR/${labels[$i]}.reason" \
+                bash "$SELF" session "${labels[$i]}" "${flags[@]}" || rc=$?
             rcs[i]=$rc
         done
         local exit5_a="${labels[0]:?}.exit5" exit5_b="${labels[1]:?}.exit5"
@@ -5432,6 +5555,24 @@ cmd_session_pair() {
     PAIR_KEPT=$kept
     PAIR_DONE=true
     rc="$(pair_status "${rcs[@]}")"
+    # One row per drive, the one place the run's outcome is said: what a drive
+    # said when it ended, else its exit status in words; a drive not started
+    # says why.
+    printf '\n━━ RESULT ━━ %s\n' "$(local_time "$(date +%s)")"
+    for i in 0 1; do
+        if [[ "${rcs[$i]}" == skipped ]]; then
+            reason="not started|${why[$i]#skipped: }"
+        elif [[ -s "$STATE_DIR/${labels[$i]}.reason" ]]; then
+            reason="$(head -n 1 -- "$STATE_DIR/${labels[$i]}.reason")"
+        else
+            LAST_REFUSAL=""
+            reason="$(result_words "${rcs[$i]}")"
+        fi
+        result_row "${labels[$i]}" "$reason"
+        reason_name="${labels[$i]:?}.reason"
+        rm -f -- "${STATE_DIR:?}/${reason_name:?}"
+    done
+    RESULT_PRINTED=true
     exit "$rc"
 }
 
@@ -5955,6 +6096,7 @@ run_detached() {
 }
 
 cmd_session() {
+    RESULT_CONTEXT=true
     parse_session_args "$@"
     if [[ "$DETACH" == true ]]; then
         run_detached session "$@"
@@ -5976,6 +6118,9 @@ cmd_session() {
     resolve_label "$TARGET_ARG"
     if [[ "$RUN_MODE" != single ]]; then
         LOG_PREFIX="[$LABEL] "
+        subsection "$LABEL"
+    else
+        section "recovery-OS session: $LABEL$([[ "$DRY_RUN" == true ]] && printf ' (dry run)') -- $(local_time "$(date +%s)")"
     fi
     if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
@@ -5998,7 +6143,7 @@ cmd_session() {
         refuse "the boot record says btrbk $VERDICT run when this OS boots, and names units the session guard cannot mask: ${UNMASKABLE[*]} -- put them right in the recovery OS on bare metal (see the disaster recovery guide), then let a backup run record it again"
     fi
     resolve_disk
-    log "session for $LABEL: $DISK ($DISK_DEV)$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
+    row drive "$DISK ($DISK_DEV), matched by serial$([[ "$DRY_RUN" == true ]] && printf ' -- dry run')"
     check_units
     check_not_mounted
     check_domain_idle
@@ -6031,6 +6176,7 @@ cmd_session() {
         if ! return_disk; then
             keep_after_failure
             DONE=true
+            print_result 4
             exit 4
         fi
         DONE=true
@@ -6039,8 +6185,10 @@ cmd_session() {
         if ((${#BOOT_OVERRIDES[@]} > 0)); then
             warn "dry run: the boot-record check was overridden (--accept-boot-record-risk) -- exit 5"
             write_causes 5
+            print_result 5
             exit 5
         fi
+        print_result 0
         exit 0
     fi
 
@@ -6632,6 +6780,7 @@ provision_preflight() {
     if [[ ! "$LABEL" =~ ^[${ASCII_LETTERS}[:digit:]:_.-]+$ ]]; then
         refuse "the label '$LABEL' has characters a systemd unit name cannot carry"
     fi
+    section "recovery-OS provision: $LABEL$([[ "$DRY_RUN" == true ]] && printf ' (dry run)')$([[ "$P_UNDO" == true ]] && printf ' (undo)') -- $(local_time "$(date +%s)")"
     display="$(display_name_of "$LABEL")"
     [[ "$display" =~ [Bb]ay[[:space:]]*([[:digit:]]+) ]] ||
         refuse "no bay number in the display_name of $LABEL ('$display'): the ESP label and hostname are derived from it"
@@ -7283,6 +7432,7 @@ provision_undo() {
 }
 
 cmd_provision() {
+    RESULT_CONTEXT=true
     provision_parse_args "$@"
     if [[ "$DETACH" == true ]]; then
         run_detached provision "$@"
@@ -7295,6 +7445,7 @@ cmd_provision() {
                 log "a real run clears these host mounts by the stop policy (a writer refuses); this dry run holds no lock and clears nothing"
             fi
             log "undo the provision of $LABEL stamped $PROVISION_STAMP (also set aside: ${P_ALSO[*]:-none}): boot the live system, run the installer's undo -- allowed until delete-replaced has started; the new root is set aside, never deleted"
+            print_result 0
             exit 0
         fi
         provision_undo
@@ -7305,6 +7456,7 @@ cmd_provision() {
             log "a real run clears these host mounts by the stop policy (a writer refuses); this dry run holds no lock and clears nothing"
         fi
         provision_plan_text
+        print_result 0
         exit 0
     fi
     # The new OS is the one the guard must prove (Phase 3); its record is

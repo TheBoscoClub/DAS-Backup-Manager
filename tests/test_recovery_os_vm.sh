@@ -1872,7 +1872,7 @@ run_driver session A --wait-lock 20
 stop_blocker
 check "wait-lock waits, then the session goes through: exit 0" "$RC" "0"
 has "wait-lock: says it is waiting, naming the holder" "$OUT" "waiting for the DAS maintenance lock (held by: stub holder pid 77)"
-has "wait-lock: then takes the lock" "$OUT" "took the DAS maintenance lock"
+has "wait-lock: then takes the lock" "$OUT" "lock           held: "
 check "wait-lock: lock free at the end" "$(lock_state)" "free"
 
 # The --wait-lock=N form waits the same way.
@@ -2368,14 +2368,60 @@ check "detach fails, holder gone: exit 4" "$RC" "4"
 has "detach fails, holder gone: the claim is gone" "$OUT" "the claim is gone"
 lacks "detach fails, holder gone: no dead holder named as claiming" "$OUT" "still claims"
 
+echo "--- the reader's layout (bd eg4j.19): facts in rows, the deciding line apart, a RESULT block"
+fixture
+run_driver session A
+check "layout: a real session ends 0" "$RC" "0"
+has "layout: the section header" "$OUT" "━━ recovery-OS session: system-recovery-A-2tb"
+matches "layout: the header carries the local time and its zone" "$OUT" "━━ recovery-OS session: system-recovery-A-2tb -- [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Za-z0-9+-]+ ━━"
+has "layout: the lock row" "$OUT" "lock           held: $LOCK -- backups and scrubs wait for this session"
+has "layout: the egress row" "$OUT" "egress         192.168.122.0/24 direct (ip rule priority"
+has "layout: the drive row" "$OUT" "drive          $DISK_A ($T/dev/sdj), matched by serial"
+matches "layout: the guard row counts the paths" "$OUT" "session guard +a refusing btrbk bound over 6 paths"
+has "layout: the RESULT block" "$OUT" "━━ RESULT ━━"
+matches "layout: its row for the drive" "$OUT" "
+  system-recovery-A-2tb +OK +"
+matches "layout: the machine line the helper parses is unchanged" "$OUT" "(^|
+)RESULT system-recovery-A-2tb 0 clean(
+|$)"
+
+fixture
+units=()
+for n in 1 2 3 4 5 6 7 8 9 10 11 12; do units+=("unit$n.service"); done
+write_state 3 "$(record_with_runners system-recovery-A-2tb no '[]' '[]' "${units[@]}")"
+run_driver session A --dry-run
+check "layout: a long unit list: the session goes on" "$RC" "0"
+has "layout: the units are counted, with where the list is" "$OUT" "13 enabled (full list: $STATE_FILE)"
+lacks "layout: and not listed inline" "$OUT" "unit7.service"
+
+fixture
+write_state 3 "$(record_with_runners system-recovery-A-2tb may '["x.service runs btrbk via /a/b, /c/d","x.service runs btrbk via /c/d, /e/f","a plain reason","a plain reason"]' '[]')"
+run_driver session A --dry-run
+check "layout: reasons: the session goes on" "$RC" "0"
+has "layout: reasons that differ by their paths are one line, each path once" "$OUT" "x.service runs btrbk via /a/b, /c/d, /e/f"
+check "layout: a repeated reason is said once" "$(grep -c 'a plain reason' <<<"$OUT")" "1"
+
+fixture
+host_mount 3 "$WRITER_OUT"
+run_driver session A
+matches "layout: a refusal ends in a RESULT row that says why" "$OUT" "
+  system-recovery-A-2tb +REFUSED +\\(drive in use on this host -- pid 4121 kate"
+matches "layout: the refusal stands apart (a blank line before it)" "$OUT" "
+REFUSED: drive in use on this host"
+
+fixture
+run_driver session A --dry-run --accept-boot-record-risk
+matches "layout: a dry run has its RESULT too" "$OUT" "
+  system-recovery-A-2tb +OK +"
+
 echo "--- the boot record: would btrbk run when this OS boots (bd 1yg)"
 fixture
 run_driver session A --dry-run
 check "record no: the session goes on" "$RC" "0"
-has "record no: the verdict shown" "$OUT" "btrbk at boot  no"
-has "record no: the enabled units shown" "$OUT" "enabled units  fstrim.timer, sshd.service (2)"
-matches "record no: when it was checked, and how long ago" "$OUT" "checked        [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC, 1h 00m ago"
-has "record no: which record" "$OUT" "boot record for system-recovery-A-2tb ($STATE_FILE, schema 3)"
+matches "record no: the verdict shown" "$OUT" "btrbk +will not run at boot"
+matches "record no: the enabled units shown" "$OUT" "units +fstrim.timer, sshd.service \\(2\\)"
+matches "record no: when it was checked (local time, its zone), and how long ago" "$OUT" "checked [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Za-z0-9+-]+ \\(1h 00m ago\\)"
+has "record no: which record" "$OUT" "schema 3, from $STATE_FILE"
 
 # Attended, "will" goes on with a banner (decision 3 of bd 8249): the guard
 # stops btrbk, the operator disables it in the session.
@@ -2384,8 +2430,8 @@ write_state 3 "$(record_json system-recovery-A-2tb will)" "$(record_json system-
 run_driver session A --dry-run
 check "record will, attended: the session goes on (decision 3)" "$RC" "0"
 has "record will, attended: the banner" "$OUT" "WARNING: this OS runs btrbk at boot; the guard is stopping it now; disable it in this session"
-has "record will: the reason shown" "$OUT" "  - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot"
-has "record will: the verdict shown" "$OUT" "btrbk at boot  will"
+has "record will: the reason shown" "$OUT" "              btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot"
+matches "record will: the verdict shown" "$OUT" "btrbk +will run at boot"
 lacks "record will, attended: not refused" "$OUT" "REFUSED"
 lacks "record will, attended: nothing overridden" "$OUT" "OVERRIDDEN"
 fixture
@@ -2399,9 +2445,9 @@ lacks "record no, a real session: no banner" "$OUT" "this OS runs btrbk at boot"
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb may)"
 run_driver session A --dry-run
-has "record may: the reason shown" "$OUT" "  - not read"
+has "record may: the reason shown" "$OUT" "              not read"
 check "record may: the session goes on, the guard enforces" "$RC" "0"
-has "record may: says the guard is what enforces" "$OUT" "btrbk may run when this OS boots: the session guard is what keeps it from running"
+matches "record may: says the guard is what enforces" "$OUT" "btrbk +may run at boot -- the session guard is what keeps it from running"
 
 fixture
 rm "${STATE_FILE:?}"
@@ -2516,7 +2562,7 @@ write_state 3 "$(record_json system-recovery-A-2tb no -7200)"
 run_driver session A --dry-run
 check "record from the future: refused" "$RC" "1"
 has "record from the future: says so" "$OUT" "dated in the future"
-has "record from the future: no negative age" "$OUT" "UTC, in the future)"
+has "record from the future: no negative age" "$OUT" "(in the future)"
 
 fixture
 write_state 3 "$(record_json system-recovery-A-2tb no 7200)"
@@ -2689,7 +2735,7 @@ echo "--- the boot record: the filesystem it was read from (bd DAS-Backup-Manage
 fixture
 run_driver session A --dry-run
 check "df0, the record names config's filesystem: goes on" "$RC" "0"
-has "df0, the record names config's filesystem: shown" "$OUT" "  filesystem     $UUID_A (the mount_uuid of system-recovery-A-2tb)"
+matches "df0, the record names config's filesystem: shown" "$OUT" "filesystem +$UUID_A \\(the mount_uuid of system-recovery-A-2tb\\)"
 for f in ABSENT null '"unknown"' '""' 7; do
     for o in "" --accept-boot-record-risk; do
         fixture
@@ -2854,9 +2900,9 @@ EOF
     check "contract, no: schema 4" "$(jq -c '.schema_version' "$STATE_FILE")" "4"
     run_driver session A --dry-run
     check "contract, no: the driver goes on" "$RC" "0"
-    has "contract, no: the driver read the binary's verdict" "$OUT" "btrbk at boot  no"
-    has "contract, no: and its reason" "$OUT" "    - btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot, but /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent, so it stops at once"
-    has "contract, no: and its filesystem" "$OUT" "  filesystem     $UUID_A (the mount_uuid of system-recovery-A-2tb)"
+    matches "contract, no: the driver read the binary's verdict" "$OUT" "btrbk +will not run at boot"
+    has "contract, no: and its reason" "$OUT" "              btrbk.timer starts btrbk.service, which runs btrbk at its next scheduled time after boot, but /etc/btrbk.conf and /etc/btrbk/btrbk.conf are absent, so it stops at once"
+    matches "contract, no: and its filesystem" "$OUT" "filesystem +$UUID_A \\(the mount_uuid of system-recovery-A-2tb\\)"
 
     contract_record "$CW/will" ""
     rm -f "${S:?}/flock.calls" "${S:?}/holder.calls" # the dry run above took and gave back both
@@ -2881,7 +2927,7 @@ EOF
     check "contract, agent: the binary read it installed and started at boot" "$(contract_get '.os.guest_agent | [.state, .installed, .enabled]')" '["read",true,true]'
     run_driver session A --dry-run --unattended
     check "contract, agent: the driver goes on unattended" "$RC" "0"
-    has "contract, agent: the driver read the binary's reading" "$OUT" "guest agent    read true true (started by usr/lib/udev/rules.d/99-qemu-guest-agent.rules"
+    matches "contract, agent: the driver read the binary's reading, in words" "$OUT" "guest agent +installed, starts at boot \\(started by usr/lib/udev/rules.d/99-qemu-guest-agent.rules"
     contract_record "$CW/no" ""
     check "contract, no agent: the binary read it unknown (no pacman database)" "$(contract_get '.os.guest_agent.state')" '"unreadable"'
     run_driver session A --dry-run --unattended
@@ -3487,7 +3533,7 @@ fixture
 run_driver session A --dry-run
 check "guard, dry run: exit 0" "$RC" "0"
 lacks "guard, dry run: nothing defined" "$(file "$S/virsh.calls")" "define"
-has "guard, dry run: the guard it would carry, shown" "$OUT" "session guard: a refusing btrbk bound over /usr/bin/btrbk, /usr/local/bin/btrbk, /usr/local/sbin/btrbk, /usr/sbin/btrbk, /bin/btrbk and /sbin/btrbk where present; masks btrbk.service, btrbk.timer, cronie.service, crond.service"
+has "guard, dry run: the guard it would carry, shown" "$OUT" "a refusing btrbk bound over 6 paths where present (/usr/bin/btrbk, /usr/local/bin/btrbk, /usr/local/sbin/btrbk, /usr/sbin/btrbk, /bin/btrbk and /sbin/btrbk); masks btrbk.service, btrbk.timer, cronie.service, crond.service"
 
 for knob in 0 12x; do
     GUARD_SECS=$knob run_driver status
@@ -4720,7 +4766,7 @@ write_state 3 "$(record_json system-recovery-A-2tb no 3600 '"eeeeeeee-0000-4000-
 hatch_state no
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch: DAS_RECOVERY_OS_STATE honoured" "$RC" "0"
-has "hatch: says which record it read" "$OUT" "boot record for system-recovery-A-2tb ($T/hatch/recovery-os.json, schema 3)"
+has "hatch: says which record it read" "$OUT" "schema 3, from $T/hatch/recovery-os.json"
 printf '{"schema_version":3,"drives":{%s}}\n' "$(record_json system-recovery-A-2tb no 3600 '"ffffffff-0000-4000-8000-000000000000"')" >"$T/hatch/recovery-os.json"
 run_driver session system-recovery-A-2tb --dry-run
 check "hatch, df0: a record of another filesystem refused" "$RC" "1"
@@ -5249,15 +5295,34 @@ has "both: B's result" "$OUT" "DRIVE system-recovery-B-2tb 0"
 check "both, sequential: A's steps, then B's" "$(tr '\n' ' ' <"$S/stages.log")" "$STEPS $STEPS "
 has "both: A's lines carry its label" "$OUT" "[system-recovery-A-2tb] took the session guard out"
 has "both: B's too" "$OUT" "[system-recovery-B-2tb] took the session guard out"
-has "both: each drive holds the run's lock" "$OUT" "holding the DAS maintenance lock $LOCK through the two-drive run that took it"
-lacks "both: no drive took the lock itself" "$OUT" "] took the DAS maintenance lock"
-check "both: the run took it, once" "$(grep -c 'took the DAS maintenance lock' <<<"$OUT")" "1"
+has "both: each drive holds the run's lock" "$OUT" "lock           held through the two-drive run that took it ($LOCK)"
+lacks "both: no drive took the lock itself" "$OUT" "] lock           held: "
+check "both: the run took it, once" "$(grep -c '^lock           held: ' <<<"$OUT")" "1"
 check "both: the lock's record names the run while it runs" "$(sort -u "$S/lock.records" | grep -c 'recovery-os VM session system-recovery-A-2tb+system-recovery-B-2tb pid ')" "1"
 check "both: lock free at the end" "$(lock_state)" "free"
 check "both: the egress rule put in place once" "$(grep -c 'rule add' "$S/ip.calls")" "1"
 check "both: and taken out" "$(file "$S/ip.rules")" ""
 check "both: two history lines, sequential" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 sequential"
 check "both: nothing unexpected" "$(file "$S/forbidden")" ""
+
+# bd eg4j.19: the run's RESULT block, one row per drive.
+unattended_fixture
+run_driver session A B --unattended
+has "both, layout: the run's header" "$OUT" "━━ recovery-OS update: both drives, sequential: system-recovery-A-2tb, then system-recovery-B-2tb"
+has "both, layout: each drive's section" "$OUT" "[system-recovery-B-2tb] ── system-recovery-B-2tb ──"
+check "both, layout: one RESULT block, the run's" "$(grep -c '━━ RESULT ━━' <<<"$OUT")" "1"
+matches "both, layout: A's row" "$OUT" "
+  system-recovery-A-2tb +OK +"
+matches "both, layout: B's row" "$OUT" "
+  system-recovery-B-2tb +OK +"
+
+unattended_fixture
+echo 3 >"$S/stage.upgrade.rc"
+run_driver session A B --unattended --mode sequential
+matches "both, A fails: A's row says FAILED" "$OUT" "
+  system-recovery-A-2tb +FAILED +"
+matches "both, A fails: B's row says it was not started, and why" "$OUT" "
+  system-recovery-B-2tb +not started +\\(system-recovery-A-2tb exited 7"
 
 # bd eg4j.19: a drive's session of a two-drive run clears a host mount of its
 # own drive under the run's lock, which it holds through the inherited descriptor.
