@@ -575,7 +575,7 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Clear what holds a target's filesystem, for backup-run.sh (bd DAS-Backup-Manager-su1b.12), under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Without --leftover: a RAID-1 target's filesystem mounted anywhere but its own path — every such mount, its origin and every process using it said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted. With --leftover: the busy mount an earlier job left at the target's own path, shown to be the target first; its holders are cleared the same way and the caller unmounts it. One line per mount, holder and signal, then `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
+    /// Clear what holds a target's filesystem, for backup-run.sh (bd DAS-Backup-Manager-su1b.12), under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Without --leftover: a target's filesystem (RAID-1 or a single drive; the target needs a mount_uuid) mounted anywhere but its own path — every such mount, its origin and every process using it said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted. With --leftover: the busy mount an earlier job left at the target's own path, shown to be the target first; its holders are cleared the same way and the caller unmounts it. One line per mount, holder and signal, then `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
     #[command(hide = true)]
     ClearTarget {
         /// The target's label
@@ -953,6 +953,19 @@ enum RecoveryOsAction {
         /// The whole disk, e.g. /dev/disk/by-id/ata-<model>_<serial>
         #[arg(long, value_name = "PATH")]
         device: PathBuf,
+    },
+    /// Clear every mount another program made of a recovery drive's partitions (bd DAS-Backup-Manager-eg4j.19), for recovery-os-vm.sh, under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). The drive is the target's configured serial; every partition of it, and the disk itself, is looked for in the mount table. Each mount, its origin and every process using it is said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted, deepest first, and the table read again. One line per mount, holder and signal, then `CLEAR DRIVE: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
+    #[command(hide = true)]
+    ClearDrive {
+        /// The recovery target's label
+        #[arg(long)]
+        label: String,
+        /// A dry run: say what would be stopped and unmounted, signal and unmount nothing; exit 0 if it would clear, 3 if it would refuse
+        #[arg(long)]
+        report_only: bool,
+        /// Path to config.toml
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
 }
 
@@ -2062,6 +2075,17 @@ fn run_recovery_os(action: RecoveryOsAction, json: bool) -> i32 {
             }
             ros::hold_disk::run(&device)
         }
+        RecoveryOsAction::ClearDrive {
+            label,
+            report_only,
+            config,
+        } => {
+            if json {
+                println!("CLEAR DRIVE: CANNOT-RUN  (clear-drive has no JSON output)");
+                return 2;
+            }
+            cmd_clear_drive(&label, &config, report_only)
+        }
         RecoveryOsAction::Inspect {
             root,
             label,
@@ -2378,7 +2402,8 @@ fn mount_target_outcome(
 
 /// `btrdasd backup clear-target` (bd DAS-Backup-Manager-su1b.12): only
 /// under a maintenance lock handed down, as `mount-target`. Without
-/// `--leftover` the target must be a RAID-1 target; a leftover may be any.
+/// `--leftover` the target must have a `mount_uuid` (RAID-1 or a single
+/// drive, bd eg4j.19); a leftover may be any.
 fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: bool) -> i32 {
     let lock = CliLock::production();
     let (line, code) = clear_target_outcome(label, config, leftover, &lock, &|target, held| {
@@ -2412,19 +2437,28 @@ fn clear_target_outcome(
     let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
         return cannot_run(format!("no [[target]] labelled '{label}'"));
     };
-    if !leftover && !buttered_dasd::raid_guard::is_guarded(target) {
+    if !leftover && target.mount_uuid.as_deref().is_none_or(str::is_empty) {
         return cannot_run(format!(
-            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+            "target '{label}' has no mount_uuid: there is no filesystem to look for"
         ));
     }
+    let held = match handed_down_hold(lock) {
+        Ok(h) => h,
+        Err(e) => return cannot_run(e),
+    };
+    clearer(target, &held).line()
+}
+
+/// The maintenance lock a caller handed down (`DAS_MAINTENANCE_LOCK_FD`),
+/// proved; `Err` says why there is none.
+fn handed_down_hold(lock: &CliLock) -> Result<maintenance::MaintenanceHeld, String> {
     let Some(raw) = &lock.delegated else {
-        return cannot_run(format!(
+        return Err(format!(
             "only under a maintenance lock handed down by {}",
             maintenance::DELEGATED_FD_ENV
         ));
     };
-    let held = match raw
-        .to_str()
+    raw.to_str()
         .and_then(|s| s.trim().parse::<std::os::fd::RawFd>().ok())
         .ok_or_else(|| {
             format!(
@@ -2433,11 +2467,44 @@ fn clear_target_outcome(
             )
         })
         .and_then(|fd| maintenance::MaintenanceHeld::delegated_at(&lock.site.path, fd))
-    {
-        Ok(h) => h,
-        Err(e) => return cannot_run(e),
+}
+
+/// `btrdasd recovery-os clear-drive` (bd DAS-Backup-Manager-eg4j.19): only
+/// under a maintenance lock handed down, as `clear-target`.
+fn cmd_clear_drive(label: &str, config: &Path, report_only: bool) -> i32 {
+    let lock = CliLock::production();
+    let (line, code) = clear_drive_outcome(label, config, &lock, &|target, held| {
+        mount::clear_drive(target, report_only, &CliProgress, held)
+    });
+    println!("{line}");
+    code
+}
+
+/// The drive clearing `clear-drive` asks for.
+type DriveClearer<'a> =
+    dyn Fn(&buttered_dasd::config::Target, &maintenance::MaintenanceHeld) -> mount::ClearDrive + 'a;
+
+/// What `clear-drive` prints and exits with: exit 2 and a `CANNOT-RUN` line
+/// when the configuration, label or lock is wrong, else the clearing's own
+/// line and exit code (0 cleared, 3 refused, 2 could not run).
+fn clear_drive_outcome(
+    label: &str,
+    config: &Path,
+    lock: &CliLock,
+    clearer: &DriveClearer<'_>,
+) -> (String, i32) {
+    let cannot_run = |why: String| mount::ClearDrive::CannotRun(why).line();
+    let cfg = match Config::load(config) {
+        Ok(c) => c,
+        Err(e) => return cannot_run(format!("cannot read {}: {e}", config.display())),
     };
-    clearer(target, &held).line()
+    let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
+        return cannot_run(format!("no [[target]] labelled '{label}'"));
+    };
+    match handed_down_hold(lock) {
+        Ok(held) => clearer(target, &held).line(),
+        Err(e) => cannot_run(e),
+    }
 }
 
 /// The mount options `btrdasd backup mount-target` passes the guard: the
@@ -7014,15 +7081,16 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert_eq!(code, 2);
         assert!(line.contains("is not an open descriptor"), "{line}");
 
-        // Without --leftover the target must be a RAID-1 one (one serial is
-        // not); with it, any target will do.
+        // Without --leftover the target must have a mount_uuid (one serial is
+        // enough: bd eg4j.19); with it, any target will do.
         let mut one = Config::load(&cfg).unwrap();
         one.targets[0].serials = vec!["SERIAL11".into()];
+        one.targets[0].mount_uuid = None;
         let one_path = dir.path().join("one.toml");
         std::fs::write(&one_path, one.to_toml().unwrap()).unwrap();
         let (line, code) = run("pair", &one_path, false, &lock);
         assert_eq!(code, 2);
-        assert!(line.contains("is not a RAID-1 target"), "{line}");
+        assert!(line.contains("has no mount_uuid"), "{line}");
     }
 
     /// Past the checks the clearing's own result decides the line and the
@@ -7039,7 +7107,12 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let (_held, lock) = handed_down_lock(dir.path());
         let seen: Clearing = Default::default();
 
-        for (config, leftover) in [(&cfg, false), (&cfg, true), (&one_path, true)] {
+        for (config, leftover) in [
+            (&cfg, false),
+            (&cfg, true),
+            (&one_path, true),
+            (&one_path, false),
+        ] {
             for (answer, line, code) in [
                 (
                     mount::ClearTarget::Cleared("fine".into()),
@@ -7078,6 +7151,99 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let dir = tempfile::tempdir().unwrap();
         let code = cmd_clear_target("pair", &dir.path().join("absent.toml"), false, false);
         assert_eq!(code, 2);
+    }
+
+    // --- recovery-os clear-drive (bd DAS-Backup-Manager-eg4j.19) ----------
+
+    #[test]
+    fn clear_drive_parses_cli() {
+        let cli = Cli::try_parse_from([
+            "btrdasd",
+            "recovery-os",
+            "clear-drive",
+            "--label",
+            "rec",
+            "--report-only",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::RecoveryOs {
+                action:
+                    RecoveryOsAction::ClearDrive {
+                        label,
+                        report_only,
+                        config,
+                    },
+            } => {
+                assert_eq!(label, "rec");
+                assert!(report_only);
+                assert_eq!(config, PathBuf::from(DEFAULT_CONFIG));
+            }
+            _ => panic!("parsed as something other than recovery-os clear-drive"),
+        }
+        assert!(Cli::try_parse_from(["btrdasd", "recovery-os", "clear-drive"]).is_err());
+    }
+
+    #[test]
+    fn clear_drive_without_lock_fd_cannot_run_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mount_target_config(dir.path(), &dir.path().to_string_lossy());
+        let (_held, lock) = handed_down_lock(dir.path());
+        let none = CliLock {
+            site: lock.site.clone(),
+            delegated: None,
+        };
+        let refuse = |_: &Target, _: &maintenance::MaintenanceHeld| -> mount::ClearDrive {
+            panic!("the clearing ran although the command could not start")
+        };
+
+        let (line, code) = clear_drive_outcome("pair", &cfg, &none, &refuse);
+        assert_eq!(code, 2);
+        assert!(
+            line.starts_with("CLEAR DRIVE: CANNOT-RUN  (")
+                && line.contains("handed down by DAS_MAINTENANCE_LOCK_FD"),
+            "{line}"
+        );
+        let (line, code) = clear_drive_outcome("nobody", &cfg, &lock, &refuse);
+        assert_eq!(code, 2);
+        assert!(line.contains("no [[target]] labelled 'nobody'"), "{line}");
+        let (line, code) =
+            clear_drive_outcome("pair", &dir.path().join("absent.toml"), &lock, &refuse);
+        assert_eq!(code, 2);
+        assert!(line.contains("cannot read "), "{line}");
+    }
+
+    #[test]
+    fn clear_drive_exit_status_is_the_clearings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mount_target_config(dir.path(), &dir.path().to_string_lossy());
+        let (_held, lock) = handed_down_lock(dir.path());
+        for (answer, line, code) in [
+            (
+                mount::ClearDrive::Cleared("fine".into()),
+                "CLEAR DRIVE: OK  (fine)",
+                0,
+            ),
+            (
+                mount::ClearDrive::Refused("a writer".into()),
+                "CLEAR DRIVE: REFUSED  (a writer)",
+                3,
+            ),
+            (
+                mount::ClearDrive::CannotRun("no table".into()),
+                "CLEAR DRIVE: CANNOT-RUN  (no table)",
+                2,
+            ),
+        ] {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let clearer = |t: &Target, h: &maintenance::MaintenanceHeld| {
+                seen.borrow_mut().push((t.label.clone(), h.is_delegated()));
+                answer.clone()
+            };
+            let got = clear_drive_outcome("pair", &cfg, &lock, &clearer);
+            assert_eq!(got, (line.to_string(), code));
+            assert_eq!(*seen.borrow(), vec![("pair".to_string(), true)]);
+        }
     }
 
     /// `raid accept` is root only: anyone else is refused with exit 1 before
