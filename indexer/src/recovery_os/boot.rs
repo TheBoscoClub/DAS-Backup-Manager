@@ -79,7 +79,11 @@
 //! own `tmpfiles.d` makes there — one plain `f`/`f+`/`d` line, nothing else
 //! naming it, a parent or a glob matching it ([`tmpfiles`]) — is read as the
 //! file (a script too) or directory it makes, on the limit below for what a
-//! running system puts in place.
+//! running system puts in place. Another under a mount point: a program,
+//! script or argument under a mount point that mounts a subvolume of the
+//! root's own filesystem, which the caller names by its UUID, is read in that
+//! subvolume's directory beside the root, where [`program_on_sibling`] can
+//! show it is what boot sees (bd DAS-Backup-Manager-3nb).
 //!
 //! Not read, so a `no` holds only within it (the man page lists each in
 //! plain words): a program named through a variable or in an option's
@@ -105,7 +109,7 @@ mod tmpfiles;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     BTRBK_CONFIGS, BootVerdict, BtrbkAtBoot, BtrbkConfig, BtrbkRunner, DIR_FLAGS, EnabledUnit,
@@ -977,6 +981,20 @@ struct Mounts {
     /// What its tmpfiles.d declares under `/run` (bd DAS-Backup-Manager-3nb);
     /// `None` where none was read.
     declared: Option<tmpfiles::Declarations>,
+    /// The mount points of `points` that are a subvolume of the very
+    /// filesystem this root was read from, and the directory that subvolume
+    /// is there ([`fstab_siblings`]).
+    siblings: Vec<Sibling>,
+}
+
+/// A mount point of that OS's fstab whose source is the filesystem its root
+/// is read from: the subvolume it mounts is a directory beside the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sibling {
+    /// The mount point, relative to the root.
+    point: String,
+    /// The subvolume's directory, beside the root's own.
+    dir: PathBuf,
 }
 
 impl Mounts {
@@ -989,6 +1007,34 @@ impl Mounts {
             .map(|(point, by)| {
                 format!("{rel}: under /{point}, which that OS mounts from elsewhere ({by})")
             })
+    }
+
+    /// Where `rel`, at or under a mount point, is on this root's own
+    /// filesystem: the subvolume's directory and the rest of `rel` in it.
+    /// Only when the deepest mount point of `rel` is named once, under no
+    /// other mount point, by one fstab line that mounts a subvolume of that
+    /// filesystem
+    /// ([`fstab_siblings`]): a unit that mounts the same point, a second
+    /// line, or any other filesystem there is what boot may see instead.
+    fn sibling<'a>(&'a self, rel: &'a str) -> Option<(&'a Path, &'a str)> {
+        let covering = || self.points.iter().filter(|(point, _)| under(rel, point));
+        let depth = covering().map(|(point, _)| point.len()).max()?;
+        let mut deepest = covering().filter(|(point, _)| point.len() == depth);
+        let (point, _) = deepest.next()?;
+        if deepest.next().is_some() {
+            return None;
+        }
+        // A mount point under another: if it fails (`nofail`) or comes late,
+        // boot sees what the covering mount holds there, which is not read.
+        if covering().any(|(other, _)| other.len() < depth) {
+            return None;
+        }
+        let mut named = self.siblings.iter().filter(|s| s.point == *point);
+        let sibling = named.next()?;
+        if named.next().is_some() {
+            return None;
+        }
+        Some((&sibling.dir, rel[point.len()..].trim_start_matches('/')))
     }
 
     /// Why `rel` is not what that OS sees at boot: under a [`VOLATILE`]
@@ -1014,13 +1060,20 @@ impl Mounts {
 /// for a space and `\011` for a tab), relative to the root, but `/` and the
 /// ones a [`MEMORY_FS`] filesystem is mounted on.
 fn fstab_points(text: &str) -> Vec<String> {
+    fstab_points_of(text, false)
+}
+
+/// The mount points of an fstab's lines that mount a [`MEMORY_FS`]
+/// filesystem (`memory`), or the rest: [`fstab_points`].
+fn fstab_points_of(text: &str, memory: bool) -> Vec<String> {
     let mut points = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         let (Some(spec), Some(point)) = (fields.next(), fields.next()) else {
             continue;
         };
-        if spec.starts_with('#') || MEMORY_FS.contains(&fields.next().unwrap_or_default()) {
+        if spec.starts_with('#') || MEMORY_FS.contains(&fields.next().unwrap_or_default()) != memory
+        {
             continue;
         }
         // `none` or `swap` for a swap area: no mount point.
@@ -1071,9 +1124,27 @@ fn unit_mount_point(name: &str) -> Option<String> {
 /// `.automount` unit its trees hold or enable but the memory filesystems'
 /// (a mount unit's `Type=`). One under [`VOLATILE`] counts for nothing:
 /// what is there is unknown already.
-fn read_mounts(root: &Path, trees: &[Tree], enabled: &EnabledUnits, probe: MountFlags) -> Mounts {
+fn read_mounts(
+    root: &Path,
+    trees: &[Tree],
+    enabled: &EnabledUnits,
+    probe: MountFlags,
+    fs_uuid: Option<&str>,
+) -> Mounts {
+    let mut siblings = Vec::new();
+    // Every mount point as written, and whether as an fstab writes it:
+    // checked once all mounts are known ([`irregular_mount_point`]).
+    let mut written: Vec<(String, bool)> = Vec::new();
+    // The mount points of memory filesystems, not in `points`: still a
+    // mount another mount point may be under.
+    let mut memory: Vec<String> = Vec::new();
     let (listed, fstab) = match read_file(root, FSTAB, probe, None) {
-        FileRead::Text(text) => (fstab_points(&text), None),
+        FileRead::Text(text) => {
+            siblings = fs_uuid.map_or_else(Vec::new, |uuid| fstab_siblings(root, &text, uuid));
+            written = fstab_written_points(&text);
+            memory = fstab_points_of(&text, true);
+            (fstab_points(&text), None)
+        }
         FileRead::Nothing => (Vec::new(), None),
         FileRead::NotFile => (Vec::new(), Some(format!("{FSTAB}: not a regular file"))),
         FileRead::Unread(why) | FileRead::Unknown(why) => (Vec::new(), Some(why)),
@@ -1097,6 +1168,7 @@ fn read_mounts(root: &Path, trees: &[Tree], enabled: &EnabledUnits, probe: Mount
         let Some(point) = unit_mount_point(&name) else {
             continue;
         };
+        written.push((point.clone(), false));
         if kind == "mount"
             && let Loaded::Settings(settings) = load_unit(root, trees, &name, &[], probe, None)
             && settings
@@ -1104,18 +1176,301 @@ fn read_mounts(root: &Path, trees: &[Tree], enabled: &EnabledUnits, probe: Mount
                 .as_deref()
                 .is_some_and(|t| MEMORY_FS.contains(&t))
         {
+            memory.push(point);
             continue;
         }
         points.push((point, name));
+    }
+    let irregular = written
+        .iter()
+        .any(|(rel, fstab)| irregular_mount_point(root, rel, *fstab, &points, &memory, &siblings));
+    if irregular {
+        siblings.clear();
     }
     let mut mounts = Mounts {
         points,
         fstab,
         declared: None,
+        siblings,
     };
     mounts.declared = Some(tmpfiles::read_declarations(root, probe, &mounts));
     mounts
 }
+
+/// Every absolute mount point of an fstab's lines, relative to the root,
+/// as written (escapes and all), for [`irregular_mount_point`].
+fn fstab_written_points(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some(spec), Some(point)) if !spec.starts_with('#') => {
+                    point.strip_prefix('/').map(|rel| (rel.to_string(), true))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The mount points under `/dev`, `/proc` and `/sys` that the kernel and
+/// systemd's own units use, each exactly, at kernel directories no link is
+/// on the way to: any other mount point under a [`VOLATILE`] tree but the
+/// tree itself (`/run`) may go through a link only a running system makes
+/// there (`/proc/1/root`, a tmpfiles.d `L` line under `/run`, a link put in
+/// the `/dev/shm` tmpfs), so it is irregular ([`irregular_mount_point`]).
+const KERNEL_MOUNT_POINTS: [&str; 15] = [
+    "dev/hugepages",
+    "dev/mqueue",
+    "dev/pts",
+    "dev/shm",
+    "proc/fs/nfsd",
+    "proc/sys/fs/binfmt_misc",
+    "sys/firmware/efi/efivars",
+    "sys/fs/bpf",
+    "sys/fs/cgroup",
+    "sys/fs/fuse/connections",
+    "sys/fs/pstore",
+    "sys/kernel/config",
+    "sys/kernel/debug",
+    "sys/kernel/security",
+    "sys/kernel/tracing",
+];
+
+/// Whether `rel`, a mount point relative to the root as an fstab gives it
+/// (`fstab`, with its escapes) or as a unit's name stands for it, is not
+/// spelled as systemd canonicalises one: an empty, `.` or `..` component, a
+/// trailing slash, an escape but `\040` and `\011`, or a link among its
+/// components. The text of such a point is not the place it is mounted on,
+/// so no mount point of that OS is trusted as a sibling's ([`read_mounts`];
+/// bd DAS-Backup-Manager-3nb).
+///
+/// The components are looked at twice: in the root alone, which is what
+/// boot sees where a mount on the way fails (`nofail`) or comes late; and
+/// through the mounts on the way, `points` and `memory`: past a component
+/// that is itself a mount point, the rest is in what is mounted there — a
+/// [`Sibling`] named once, in its directory beside the root. A mount on the
+/// way that is anything else (another filesystem, a `.mount` unit, a memory
+/// filesystem, a second line), or a tree under [`VOLATILE`] but the kernel's
+/// own ([`KERNEL_MOUNT_POINTS`]), holds what this cannot see: irregular.
+fn irregular_mount_point(
+    root: &Path,
+    rel: &str,
+    fstab: bool,
+    points: &[(String, String)],
+    memory: &[String],
+    siblings: &[Sibling],
+) -> bool {
+    let rel = if fstab {
+        rel.replace("\\040", " ").replace("\\011", "\t")
+    } else {
+        rel.to_string()
+    };
+    // The root itself.
+    if rel.is_empty() {
+        return false;
+    }
+    if (fstab && rel.contains('\\')) || rel.ends_with('/') {
+        return true;
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return true;
+    }
+    if VOLATILE.iter().any(|v| under(&rel, v) && rel != *v)
+        && !KERNEL_MOUNT_POINTS.contains(&rel.as_str())
+    {
+        return true;
+    }
+    // Where a component is: a link is irregular, a missing one has nothing
+    // under it, anything else is walked on.
+    enum Seen {
+        Link,
+        Missing,
+        There,
+    }
+    let look = |at: &Path| match fs::symlink_metadata(at) {
+        Ok(meta) if meta.file_type().is_symlink() => Seen::Link,
+        Ok(_) => Seen::There,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Seen::Missing,
+        Err(_) => Seen::Link,
+    };
+    // In the root alone.
+    let mut at = root.to_path_buf();
+    for part in &parts {
+        at.push(part);
+        match look(&at) {
+            Seen::Link => return true,
+            Seen::Missing => break,
+            Seen::There => {}
+        }
+    }
+    // Through the mounts on the way.
+    let mut at = root.to_path_buf();
+    let mut missing = false;
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let prefix = parts[..i].join("/");
+            let mounted = points.iter().filter(|(p, _)| *p == prefix).count();
+            if mounted > 0 || memory.contains(&prefix) {
+                let mut named = siblings.iter().filter(|s| s.point == prefix);
+                let (Some(sibling), None) = (named.next(), named.next()) else {
+                    return true;
+                };
+                if mounted != 1
+                    || memory.contains(&prefix)
+                    || !fs::symlink_metadata(&sibling.dir).is_ok_and(|m| m.is_dir())
+                {
+                    return true;
+                }
+                at = sibling.dir.clone();
+                missing = false;
+            }
+        }
+        if missing {
+            continue;
+        }
+        at.push(part);
+        match look(&at) {
+            Seen::Link => return true,
+            Seen::Missing => missing = true,
+            Seen::There => {}
+        }
+    }
+    false
+}
+
+/// The `etc/fstab` lines that mount a subvolume of the filesystem `fs_uuid`
+/// this root is read from — `UUID=<fs_uuid>`, btrfs, a `subvol=` naming one
+/// directory at that filesystem's top (`@home` or `/@home`) — as
+/// [`Sibling`]s, the directories beside `root`. Only a line that cannot
+/// mount anything else: every option is one of [`HARMLESS_OPTIONS`] (so no
+/// `subvolid=`, which outranks `subvol=` in the kernel and a directory has
+/// no id to read, no `noauto` or `x-systemd.automount`, not mounted at boot,
+/// no `X-mount.subdir=`, `bind`…), and a `subvol=` given once. A mount point
+/// more than one line or unit names is no sibling's ([`Mounts::sibling`]),
+/// and none is when a mount point is not spelled as systemd canonicalises it
+/// ([`irregular_mount_point`]).
+fn fstab_siblings(root: &Path, text: &str, fs_uuid: &str) -> Vec<Sibling> {
+    let Some(top) = root.parent() else {
+        return Vec::new();
+    };
+    let own = root.file_name();
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(spec), Some(point), Some(kind), Some(options)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let uuid = spec
+            .strip_prefix("UUID=")
+            .map(|u| u.trim_matches(['"', '\'']));
+        if kind != "btrfs" || !uuid.is_some_and(|u| u.eq_ignore_ascii_case(fs_uuid)) {
+            continue;
+        }
+        let mut subvols = Vec::new();
+        let mut plain = true;
+        for option in options.split(',') {
+            match option.split_once('=') {
+                Some(("subvol", value)) => subvols.push(value),
+                Some((name, _)) if HARMLESS_VALUED.contains(&name) => {}
+                None if HARMLESS_OPTIONS.contains(&option) => {}
+                _ => plain = false,
+            }
+        }
+        let [subvol] = subvols[..] else {
+            continue;
+        };
+        let name = subvol.trim_start_matches('/');
+        let one_name = !name.is_empty()
+            && !name.contains(['/', '\\'])
+            && name != ".."
+            && name != "."
+            && own != Some(std::ffi::OsStr::new(name));
+        let Some(point) = point.strip_prefix('/') else {
+            continue;
+        };
+        let point = point
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .trim_end_matches('/')
+            .to_string();
+        if plain && one_name && !point.is_empty() {
+            found.push(Sibling {
+                point,
+                dir: top.join(name),
+            });
+        }
+    }
+    found
+}
+
+/// The mount options (mount(8), btrfs(5), systemd.mount(5)) that cannot
+/// change which tree is mounted at a mount point, or whether it is mounted:
+/// a line gives a [`Sibling`] only when every option of it is one of these
+/// or the one `subvol=` ([`fstab_siblings`]). Listed means it cannot; an
+/// option not listed (`subvolid=`, `noauto`, `bind`, `X-mount.subdir=`,
+/// `x-systemd.automount`, `x-systemd.requires…`, `_netdev`, `user`, an
+/// unknown word, an empty one) may, and its mount point stays "may".
+const HARMLESS_OPTIONS: [&str; 40] = [
+    "defaults",
+    "rw",
+    "ro",
+    "noatime",
+    "relatime",
+    "nodiratime",
+    "lazytime",
+    "strictatime",
+    "compress",
+    "compress-force",
+    "space_cache",
+    "ssd",
+    "nossd",
+    "ssd_spread",
+    "discard",
+    "nodiscard",
+    "autodefrag",
+    "noautodefrag",
+    "nofail",
+    "nodev",
+    "nosuid",
+    "noexec",
+    "exec",
+    "suid",
+    "dev",
+    "auto",
+    "user_subvol_rm_allowed",
+    "noacl",
+    "acl",
+    "datacow",
+    "nodatacow",
+    "datasum",
+    "nodatasum",
+    "barrier",
+    "nobarrier",
+    "flushoncommit",
+    "noflushoncommit",
+    "skip_balance",
+    "clear_cache",
+    "degraded",
+];
+/// The [`HARMLESS_OPTIONS`] that take a value: `name=value`.
+const HARMLESS_VALUED: [&str; 9] = [
+    "compress",
+    "compress-force",
+    "space_cache",
+    "discard",
+    "commit",
+    "thread_pool",
+    "max_inline",
+    "x-systemd.device-timeout",
+    "x-systemd.mount-timeout",
+];
 
 /// What an absolute path a command names is, for whether it runs btrbk.
 enum Program {
@@ -1180,7 +1535,12 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
         };
     }
     if let Some(why) = mounts.covers(rel) {
-        return Program::Unknown(why);
+        return match mounts.sibling(rel) {
+            Some((sibling, rest)) => {
+                program_on_sibling(root, probe, path, role, sibling, rest, why)
+            }
+            None => Program::Unknown(why),
+        };
     }
     let (located, hops) = locate_via(root, rel, probe);
     if let Some(why) = hops.iter().find_map(|hop| mounts.shadows(hop)) {
@@ -1191,15 +1551,7 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
             if let Some(why) = leads_elsewhere(mounts, path, &at) {
                 return Program::Unknown(why);
             }
-            if at.rsplit('/').next() == Some(BTRBK) {
-                return match role {
-                    Role::Argument => Program::Unknown(format!(
-                        "{path}: leads to btrbk, which what it is given to may run"
-                    )),
-                    _ => Program::Btrbk,
-                };
-            }
-            read_script(root, &at, role)
+            file_program(root, &at, path, role)
         }
         Located::Absent {
             rel: at,
@@ -1237,6 +1589,63 @@ fn program_at(root: &Path, mounts: &Mounts, probe: MountFlags, path: &str, role:
             None => Program::Unknown(format!("{at}: not a regular file, which it reads")),
         },
         Located::Unread { why, .. } | Located::Unknown(why) => Program::Unknown(why),
+    }
+}
+
+/// The regular file `at` under `root`, which `path` names, run as `role`:
+/// btrbk itself when it is named so, else a script ([`read_script`]).
+fn file_program(root: &Path, at: &str, path: &str, role: Role) -> Program {
+    if at.rsplit('/').next() == Some(BTRBK) {
+        return match role {
+            Role::Argument => Program::Unknown(format!(
+                "{path}: leads to btrbk, which what it is given to may run"
+            )),
+            _ => Program::Btrbk,
+        };
+    }
+    read_script(root, at, role)
+}
+
+/// `path`, under a mount point of that OS's fstab that mounts `sibling`, a
+/// subvolume of the filesystem the root was read from: `rest` of it in that
+/// directory (bd DAS-Backup-Manager-3nb). `why` is [`Mounts::covers`]'s
+/// reason, the answer wherever this cannot be shown to be what boot sees:
+///
+/// - the subvolume's own directory is a link, or is not there;
+/// - the path leads through a link in it: where it leads is for that OS's
+///   mounts to say, not this directory's (`readlinkat` is not tried: an
+///   absolute target is the mount's, not the sibling's);
+/// - the root has something at that path under its mount point, which boot
+///   sees if the mount fails (`nofail`) or comes late.
+///
+/// What is there is read as a path in the root is ([`file_program`]).
+fn program_on_sibling(
+    root: &Path,
+    probe: MountFlags,
+    path: &str,
+    role: Role,
+    sibling: &Path,
+    rest: &str,
+    why: String,
+) -> Program {
+    if !fs::symlink_metadata(sibling).is_ok_and(|m| m.is_dir()) {
+        return Program::Unknown(why);
+    }
+    let rel = path.trim_matches('/');
+    // Nothing of the root's own under the mount point.
+    match locate_via(root, rel, probe) {
+        (Located::Absent { mapped: None, .. }, hops) if hops.is_empty() => {}
+        _ => return Program::Unknown(why),
+    }
+    match locate_via(sibling, rest, probe) {
+        (Located::File(at, _), hops) if hops.is_empty() => file_program(sibling, &at, path, role),
+        (Located::Dir(_), hops) if hops.is_empty() => Program::Other,
+        // exec fails on a FIFO or a device; a shell reads one.
+        (Located::Node(_), hops) if hops.is_empty() && role == Role::Program => Program::Other,
+        // Nothing is there, as of now: what is put there at boot is the
+        // limit of every path.
+        (Located::Absent { mapped: None, .. }, hops) if hops.is_empty() => Program::Other,
+        _ => Program::Unknown(why),
     }
 }
 
@@ -4496,7 +4905,7 @@ fn runner_text(runner: &BtrbkRunner, outcome: &Outcome) -> String {
     format!("{what}{through} {}, {config}", runner.when)
 }
 
-/// What [`read_with`] found in one OS root.
+/// What [`read_with_fs`] found in one OS root.
 pub(super) struct Reading {
     pub units: EnabledUnits,
     pub config: BtrbkConfig,
@@ -4507,12 +4916,27 @@ pub(super) struct Reading {
 
 /// Read what this OS starts at boot and whether any of it runs btrbk,
 /// reading a link only where `probe` says that records nothing.
+#[cfg(test)]
 pub(super) fn read_with(root: &Path, probe: MountFlags) -> Reading {
-    read_within(root, probe, MAX_PULLS)
+    read_core(root, probe, MAX_PULLS, None)
+}
+
+/// Read what this OS starts at boot and whether any of it runs btrbk,
+/// reading a link only where `probe` says that records nothing. The root is
+/// a subvolume of the filesystem `fs_uuid`, whose top is the root's parent
+/// (`None`: the root alone is read): what its fstab mounts from that same
+/// filesystem is read there ([`Mounts::sibling`]).
+pub(super) fn read_with_fs(root: &Path, probe: MountFlags, fs_uuid: Option<&str>) -> Reading {
+    read_core(root, probe, MAX_PULLS, fs_uuid)
 }
 
 /// [`read_with`], following at most `pulls` starts.
+#[cfg(test)]
 fn read_within(root: &Path, probe: MountFlags, pulls: usize) -> Reading {
+    read_core(root, probe, pulls, None)
+}
+
+fn read_core(root: &Path, probe: MountFlags, pulls: usize, fs_uuid: Option<&str>) -> Reading {
     let trees: Vec<Tree> = UNIT_TREES
         .iter()
         .map(|rel| Tree {
@@ -4521,7 +4945,7 @@ fn read_within(root: &Path, probe: MountFlags, pulls: usize) -> Reading {
         })
         .collect();
     let units = read_enabled_units(root, &trees);
-    let mounts = read_mounts(root, &trees, &units, probe);
+    let mounts = read_mounts(root, &trees, &units, probe, fs_uuid);
     let config = read_btrbk_config(root, &mounts, probe);
     let owned = match &units {
         EnabledUnits::Listed { units } => dependency_dirs(units),
@@ -4598,6 +5022,7 @@ mod tests {
         points: Vec::new(),
         fstab: None,
         declared: None,
+        siblings: Vec::new(),
     };
     /// Links read, as on a `noatime` mount — where every DAS target is.
     const FOLLOW: MountFlags = |_| Some(libc::ST_NOATIME);
@@ -11710,5 +12135,650 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "read as no: {wrong:?}");
+    }
+
+    // ---- bd DAS-Backup-Manager-3nb: what a desktop OS reads as "may" ------
+
+    /// The filesystem of the fixture drive.
+    const FS: &str = "0a1b2c3d-0000-4000-8000-00000000000a";
+
+    /// The reading of `root` as the OS root of a drive whose filesystem is
+    /// `uuid`, links read as production reads them.
+    fn on_drive(root: &Path, uuid: Option<&str>) -> (BootVerdict, Vec<String>) {
+        let b = read_with_fs(root, FOLLOW, uuid).at_boot;
+        (b.verdict, b.reasons)
+    }
+
+    /// A recovery drive's filesystem top in `top`: the OS root `@` of
+    /// [`cachyos_mounted`] with `fstab` for its fstab, a `@home` beside it
+    /// holding `u/profile.conf`, a data file, and a service that gives that
+    /// file, in `/home`, to a daemon.
+    fn drive(top: &Path, fstab: &str) -> PathBuf {
+        let root = top.join("@");
+        fs::create_dir_all(&root).unwrap();
+        cachyos_mounted(&root);
+        write(&root, "etc/fstab", fstab);
+        write(&top.join("@home"), "u/profile.conf", "level=1\n");
+        nightly_runs(
+            &root,
+            "ExecStart=/usr/bin/true --profile /home/u/profile.conf",
+        );
+        root
+    }
+
+    fn fstab_of(home: &str) -> String {
+        format!("UUID={FS} / btrfs subvol=/@,noatime 0 0\n{home}\n")
+    }
+
+    fn home_line(options: &str) -> String {
+        format!("UUID={FS} /home btrfs {options} 0 0")
+    }
+
+    #[test]
+    fn a_data_file_on_a_subvolume_of_the_drive_s_own_filesystem_is_read_not_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(dir.path(), &fstab_of(&home_line("subvol=/@home,noatime")));
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+        // The quotes fstab allows and a UUID in capitals are the same one.
+        write(
+            &root,
+            "etc/fstab",
+            &fstab_of(&format!(
+                "UUID=\"{}\" /home btrfs subvol=@home 0 0",
+                FS.to_uppercase()
+            )),
+        );
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn a_script_on_that_subvolume_is_read_and_its_btrbk_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(dir.path(), &fstab_of(&home_line("subvol=/@home")));
+        let home = dir.path().join("@home");
+        // Given to a daemon, as a word it may run.
+        script(&home, "u/profile.conf", "exec btrbk run\n");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::Will, "{why:?}");
+        // Run as the service's program.
+        nightly_runs(&root, "ExecStart=/home/u/backup.sh");
+        script(&home, "u/backup.sh", "btrbk -c /etc/btrbk/btrbk.conf run\n");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::Will, "{why:?}");
+        // Read through a script of the root's that runs it.
+        nightly_runs(&root, "ExecStart=/usr/local/bin/wrap");
+        script(&root, "usr/local/bin/wrap", ". /home/u/backup.sh\n");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::Will, "{why:?}");
+    }
+
+    /// Each reading that must stay unknown: a mount that is not shown to be
+    /// that subvolume of that filesystem, with a data file in the sibling a
+    /// wrong mapping would read as nothing.
+    #[test]
+    fn a_mount_not_shown_to_be_a_subvolume_of_the_same_filesystem_stays_unknown() {
+        let other = "11111111-0000-4000-8000-000000000001";
+        let own = "subvol=/@home,noatime";
+        let lines: Vec<(String, String)> = vec![
+            (
+                "another filesystem".into(),
+                fstab_of(&format!("UUID={other} /home btrfs {own} 0 0")),
+            ),
+            (
+                "subvolid outranks subvol".into(),
+                fstab_of(&home_line("subvolid=257,subvol=/@home")),
+            ),
+            (
+                "no subvol: the default one".into(),
+                fstab_of(&home_line("noatime")),
+            ),
+            (
+                "subvolid alone".into(),
+                fstab_of(&home_line("subvolid=257")),
+            ),
+            (
+                "not mounted at boot".into(),
+                fstab_of(&home_line("subvol=/@home,noauto")),
+            ),
+            (
+                "mounted on access".into(),
+                fstab_of(&home_line("subvol=/@home,x-systemd.automount")),
+            ),
+            (
+                "two subvol=".into(),
+                fstab_of(&home_line("subvol=/@home,subvol=/@other")),
+            ),
+            (
+                "a nested subvolume".into(),
+                fstab_of(&home_line("subvol=/@home/x")),
+            ),
+            (
+                "the top of the filesystem".into(),
+                fstab_of(&home_line("subvol=/")),
+            ),
+            (
+                "the root's own subvolume".into(),
+                fstab_of(&home_line("subvol=/@")),
+            ),
+            (
+                "not btrfs".into(),
+                fstab_of(&format!("UUID={FS} /home ext4 {own} 0 0")),
+            ),
+            (
+                "a device path".into(),
+                fstab_of(&format!("/dev/sda2 /home btrfs {own} 0 0")),
+            ),
+            (
+                "mounted twice".into(),
+                fstab_of(&format!(
+                    "{}\n{}",
+                    home_line(own),
+                    home_line("subvol=/@other")
+                )),
+            ),
+            (
+                "mounted twice, once by a unit".into(),
+                fstab_of(&home_line(own)),
+            ),
+        ];
+        for (what, fstab) in lines {
+            let dir = tempfile::tempdir().unwrap();
+            let root = drive(dir.path(), &fstab);
+            fs::create_dir_all(dir.path().join("@other/u")).unwrap();
+            fs::write(dir.path().join("@other/u/profile.conf"), "x\n").unwrap();
+            if what.contains("unit") {
+                unit(
+                    &root,
+                    VENDOR,
+                    "home.mount",
+                    "[Mount]\nWhat=/dev/sdb1\nWhere=/home\nType=ext4\n",
+                );
+            }
+            assert_eq!(on_drive(&root, Some(FS)).0, BootVerdict::May, "{what}");
+        }
+        // The same fstab with the filesystem not known to the caller, or
+        // another one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(dir.path(), &fstab_of(&home_line("subvol=/@home")));
+        assert_eq!(on_drive(&root, None).0, BootVerdict::May);
+        assert_eq!(on_drive(&root, Some(other)).0, BootVerdict::May);
+        // And the guard is the only thing that withheld it.
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn what_the_subvolume_reaches_through_a_link_or_hides_under_it_stays_unknown() {
+        let setup = |top: &Path| drive(top, &fstab_of(&home_line("subvol=/@home")));
+        let go = |root: &Path| on_drive(root, Some(FS)).0;
+        // The file is a link: where it leads depends on what the OS mounts.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        let home = dir.path().join("@home");
+        fs::remove_file(home.join("u/profile.conf")).unwrap();
+        fs::write(home.join("real.conf"), "x\n").unwrap();
+        symlink("/home/real.conf", home.join("u/profile.conf")).unwrap();
+        assert_eq!(go(&root), BootVerdict::May);
+        // A directory on the way is one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        let home = dir.path().join("@home");
+        fs::create_dir_all(home.join("real")).unwrap();
+        fs::rename(home.join("u/profile.conf"), home.join("real/profile.conf")).unwrap();
+        fs::remove_dir(home.join("u")).unwrap();
+        symlink("real", home.join("u")).unwrap();
+        assert_eq!(go(&root), BootVerdict::May);
+        // The subvolume's own directory is one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        fs::rename(dir.path().join("@home"), dir.path().join("elsewhere")).unwrap();
+        symlink("elsewhere", dir.path().join("@home")).unwrap();
+        assert_eq!(go(&root), BootVerdict::May);
+        // Something at that path in the root itself, under the mount point,
+        // is what the OS sees if the mount fails.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        write(&root, "home/u/profile.conf", "level=2\n");
+        assert_eq!(go(&root), BootVerdict::May);
+        // No subvolume beside the root at all: the mount names one that is
+        // not there.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        fs::remove_dir_all(dir.path().join("@home")).unwrap();
+        assert_eq!(go(&root), BootVerdict::May);
+        // And a path that is not there, in a subvolume that is, is nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup(dir.path());
+        fs::remove_file(dir.path().join("@home/u/profile.conf")).unwrap();
+        assert_eq!(go(&root), BootVerdict::No);
+    }
+
+    #[test]
+    fn the_deepest_mount_point_decides_which_filesystem_a_path_is_on() {
+        let other = "11111111-0000-4000-8000-000000000001";
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = fstab_of(&format!(
+            "{}\nUUID={other} /home/u/data btrfs subvol=/@data 0 0",
+            home_line("subvol=/@home")
+        ));
+        let root = drive(dir.path(), &fstab);
+        nightly_runs(
+            &root,
+            "ExecStart=/usr/bin/true --profile /home/u/profile.conf /home/u/data/x",
+        );
+        write(&dir.path().join("@data"), "x", "x\n");
+        // /home/u/data/x is on another filesystem: unknown.
+        assert_eq!(on_drive(&root, Some(FS)).0, BootVerdict::May);
+        nightly_runs(
+            &root,
+            "ExecStart=/usr/bin/true --profile /home/u/profile.conf",
+        );
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+    }
+
+    #[test]
+    fn an_fstab_siblings_are_its_btrfs_subvolumes_of_the_drive_s_filesystem() {
+        let root = Path::new("/mnt/t/@");
+        let text = format!(
+            "# UUID={FS} /nope btrfs subvol=/@nope 0 0\n\
+             UUID={FS} / btrfs subvol=/@ 0 0\n\
+             UUID={FS} /home btrfs subvol=/@home,noatime 0 0\n\
+             UUID={FS} /srv/a\\040b btrfs subvol=@srv 0 0\n\
+             UUID={FS} /var/cache/ btrfs defaults,subvol=/@cache 0 0\n\
+             UUID={FS} none btrfs subvol=/@swap 0 0\n\
+             short line\n"
+        );
+        let points: Vec<(String, String)> = fstab_siblings(root, &text, FS)
+            .into_iter()
+            .map(|s| (s.point, s.dir.display().to_string()))
+            .collect();
+        assert_eq!(
+            points,
+            [
+                ("home".to_string(), "/mnt/t/@home".to_string()),
+                ("srv/a b".to_string(), "/mnt/t/@srv".to_string()),
+                ("var/cache".to_string(), "/mnt/t/@cache".to_string()),
+            ]
+        );
+    }
+
+    // ---- no word given to a program reads as data (rule c dropped) ------
+
+    /// bd DAS-Backup-Manager-3nb, operator 2026-11-27: no word like btrbk's
+    /// name is excused for the program it is given to (the dropped rule c:
+    /// an alias, `hash -p`, `enable -f` or an inherited `BASH_ENV` can make
+    /// `rm` a shell). Each of rule c's fixtures reads "may", as it always did.
+    #[test]
+    fn a_btrbk_like_name_given_to_rm_touch_or_test_still_reads_may() {
+        for body in [
+            // rule c's "runs nothing" fixture, whole.
+            "[ -d /mnt/x/.btrbk-snapshots ] || mkdir -p /mnt/x/.btrbk-snapshots\n\
+             rm -rf /mnt/x/.btrbk-snapshots/old\n\
+             test -e /var/lib/run-btrbk.lock\n\
+             touch /var/lib/btrbk.stamp\n\
+             mountpoint -q /mnt/btrbk-pool\n\
+             rmdir /mnt/btrbk.d\n\
+             chown btrbk:btrbk /var/lib/x\n\
+             chgrp btrbk-users /var/lib/x\n",
+            // rule c's "keeps the excuse" fixture.
+            "rm /opt/btrbk-job.sh\ntouch ./x\n",
+            // Each line alone whose last name is like btrbk's.
+            "mkdir -p /mnt/x/.btrbk-snapshots\n",
+            "test -e /var/lib/run-btrbk.lock\n",
+            "touch /var/lib/btrbk.stamp\n",
+            "mountpoint -q /mnt/btrbk-pool\n",
+            "rmdir /mnt/btrbk.d\n",
+            "chown btrbk:btrbk /var/lib/x\n",
+            "chgrp btrbk-users /var/lib/x\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            cachyos_mounted(root);
+            nightly_runs(root, "ExecStart=/usr/local/bin/gen");
+            script(root, "usr/local/bin/gen", body);
+            script(root, "opt/btrbk-job.sh", "btrbk run\n");
+            let (verdict, why) = verdict_of(root);
+            assert_eq!(verdict, BootVerdict::May, "{body}: {why:?}");
+        }
+    }
+
+    /// A drive whose `/home/u/backup.sh` is, on its filesystem's `@evil`
+    /// subvolume, a script that runs btrbk, and absent from `@home`, with
+    /// `fstab` and a unit that runs it.
+    fn evil_drive(top: &Path, fstab: &str) -> PathBuf {
+        let root = drive(top, fstab);
+        nightly_runs(&root, "ExecStart=/home/u/backup.sh");
+        script(&top.join("@evil"), "backup.sh", "btrbk run\n");
+        root
+    }
+
+    /// systemd canonicalises a mount point: each spelling below is the same
+    /// place as `/home/u`, where a second line mounts `@evil`, which the
+    /// text of the point does not show. No sibling is trusted, so "may".
+    #[test]
+    fn a_mount_point_spelled_other_than_canonically_reads_may() {
+        let line = |point: &str| format!("UUID={FS} {point} btrfs subvol=@evil 0 0");
+        for (what, point) in [
+            ("an empty component", "/home//u"),
+            ("a dot", "/home/./u"),
+            ("a dot-dot", "/home/x/../u"),
+            ("a trailing slash", "/home/u/"),
+            ("an unknown escape", "/home/\\134u"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fstab = format!(
+                "{}\n{}\n",
+                fstab_of(&home_line("subvol=@home")),
+                line(point)
+            );
+            let root = evil_drive(dir.path(), &fstab);
+            let (verdict, why) = on_drive(&root, Some(FS));
+            assert_eq!(verdict, BootVerdict::May, "{what}: {why:?}");
+        }
+    }
+
+    #[test]
+    fn a_mount_point_through_a_link_of_the_root_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = format!(
+            "{}\nUUID={FS} /srv/l btrfs subvol=@evil 0 0\n",
+            fstab_of(&home_line("subvol=@home"))
+        );
+        let root = evil_drive(dir.path(), &fstab);
+        link(&root, "srv/l", "/home/u");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+    }
+
+    /// A mount point under another mount point goes through what that mount
+    /// holds: `/home/l` is in `@home`, where `l` links to `/home/u`, so
+    /// `@evil` may be mounted on `/home/u`. Read from the root alone the link
+    /// is not seen, whether the root lacks `home/l` or has a directory there
+    /// (bd DAS-Backup-Manager-3nb, the 2026-11-12 final look).
+    #[test]
+    fn a_nested_mount_point_through_a_link_in_the_covering_subvolume_reads_may() {
+        for root_has_it in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fstab = format!(
+                "{}\nUUID={FS} /home/l btrfs subvol=@evil 0 0\n",
+                fstab_of(&home_line("subvol=@home"))
+            );
+            let root = evil_drive(dir.path(), &fstab);
+            link(&dir.path().join("@home"), "l", "/home/u");
+            if root_has_it {
+                fs::create_dir_all(root.join("home/l")).unwrap();
+            }
+            let (verdict, why) = on_drive(&root, Some(FS));
+            assert_eq!(
+                verdict,
+                BootVerdict::May,
+                "root has home/l: {root_has_it}: {why:?}"
+            );
+        }
+    }
+
+    /// Three deep: `/home/a` mounts `@data`, whose `l` is the link.
+    #[test]
+    fn a_link_two_mounts_down_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = format!(
+            "{}\nUUID={FS} /home/a btrfs subvol=@data 0 0\n\
+             UUID={FS} /home/a/l btrfs subvol=@evil 0 0\n",
+            fstab_of(&home_line("subvol=@home"))
+        );
+        let root = evil_drive(dir.path(), &fstab);
+        fs::create_dir_all(dir.path().join("@home/a")).unwrap();
+        link(&dir.path().join("@data"), "l", "/home/u");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+    }
+
+    /// A mount point under a mount of another filesystem: what that holds is
+    /// not seen, so a link there may lead anywhere.
+    #[test]
+    fn a_mount_point_under_another_filesystem_s_mount_reads_may() {
+        let other = "11111111-0000-4000-8000-000000000001";
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = format!(
+            "{}\nUUID={other} /mnt btrfs subvol=@x 0 0\nUUID={FS} /mnt/l btrfs subvol=@evil 0 0\n",
+            fstab_of(&home_line("subvol=@home"))
+        );
+        let root = evil_drive(dir.path(), &fstab);
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+    }
+
+    /// The twin: a nested mount point with no link on the way, its last
+    /// components absent or a real directory in the covering subvolume,
+    /// keeps the reading.
+    #[test]
+    fn a_nested_mount_point_with_no_link_keeps_the_sibling_reading() {
+        for in_home in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fstab = format!(
+                "{}\nUUID={FS} /home/l btrfs subvol=@evil 0 0\n\
+                 UUID={FS} /home/l/deep/er btrfs subvol=@data 0 0\n",
+                fstab_of(&home_line("subvol=@home"))
+            );
+            let root = evil_drive(dir.path(), &fstab);
+            fs::create_dir_all(dir.path().join("@data")).unwrap();
+            if in_home {
+                fs::create_dir_all(dir.path().join("@home/l")).unwrap();
+                fs::create_dir_all(dir.path().join("@evil/deep")).unwrap();
+            }
+            assert_eq!(
+                on_drive(&root, Some(FS)),
+                (BootVerdict::No, vec![]),
+                "{in_home}"
+            );
+        }
+    }
+
+    /// systemd's own mount units under `/dev`, `/proc` and `/sys` keep the
+    /// reading; a mount point anywhere else under a tree only a running
+    /// system fills may go through a link made there (`/proc/1/root`, a
+    /// tmpfiles.d `L` line under `/run`), and reads "may".
+    #[test]
+    fn a_mount_point_under_a_running_system_s_tree_reads_may_but_the_kernel_s_own() {
+        let stock = [
+            "dev-hugepages.mount",
+            "dev-mqueue.mount",
+            "proc-fs-nfsd.mount",
+            "proc-sys-fs-binfmt_misc.automount",
+            "proc-sys-fs-binfmt_misc.mount",
+            "sys-fs-fuse-connections.mount",
+            "sys-kernel-config.mount",
+            "sys-kernel-debug.mount",
+            "sys-kernel-tracing.mount",
+            "var-lib-machines.mount",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(dir.path(), &fstab_of(&home_line("subvol=@home")));
+        for name in stock {
+            unit(&root, VENDOR, name, "[Mount]\nWhat=x\nWhere=/x\nType=x\n");
+        }
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+        for (what, point) in [
+            ("/proc/1/root", "/proc/1/root/home/u"),
+            ("/run", "/run/l"),
+            ("/var/run", "/var/run/l"),
+            ("/dev elsewhere", "/dev/disk/l"),
+            ("/dev/shm", "/dev/shm/l"),
+            ("under /dev/hugepages", "/dev/hugepages/l"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fstab = format!(
+                "{}\nUUID={FS} {point} btrfs subvol=@evil 0 0\n",
+                fstab_of(&home_line("subvol=@home"))
+            );
+            let root = evil_drive(dir.path(), &fstab);
+            let (verdict, why) = on_drive(&root, Some(FS));
+            assert_eq!(verdict, BootVerdict::May, "{what}: {why:?}");
+        }
+    }
+
+    /// A mount point under another is read in neither: if `/home/u`'s mount
+    /// fails (`nofail`) or comes late, boot sees what `@home` holds there.
+    #[test]
+    fn a_path_under_a_nested_mount_point_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = format!(
+            "{}\nUUID={FS} /home/u btrfs subvol=@data,nofail 0 0\n",
+            fstab_of(&home_line("subvol=@home"))
+        );
+        let root = drive(dir.path(), &fstab);
+        nightly_runs(&root, "ExecStart=/home/u/backup.sh");
+        script(&dir.path().join("@home"), "u/backup.sh", "btrbk run\n");
+        fs::create_dir_all(dir.path().join("@data")).unwrap();
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+    }
+
+    #[test]
+    fn a_mount_unit_with_a_non_canonical_point_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = evil_drive(dir.path(), &fstab_of(&home_line("subvol=@home")));
+        // `home--u.mount` stands for `/home//u`.
+        write(
+            &root,
+            "etc/systemd/system/home--u.mount",
+            "[Mount]\nWhat=/dev/x\nWhere=/home//u\nType=btrfs\n",
+        );
+        enable(&root, ETC, "local-fs.target.wants", "home--u.mount");
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+    }
+
+    /// The twin: regular mount points, spaces escaped as fstab writes them,
+    /// and an unrelated link in the root, keep the reading.
+    #[test]
+    fn regular_mount_points_and_an_unrelated_link_keep_the_sibling_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let fstab = format!(
+            "{}\nUUID={FS} /srv/a\\040b btrfs subvol=@srv 0 0\nUUID={FS} /var/cache btrfs \
+             subvol=@cache 0 0\nUUID=ABCD-0001 /boot vfat rw 0 2\n",
+            fstab_of(&home_line("subvol=@home"))
+        );
+        let root = drive(dir.path(), &fstab);
+        link(&root, "etc/unrelated", "/usr/share");
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+    }
+
+    /// Mount options that change which tree is mounted give no sibling.
+    #[test]
+    fn a_mount_option_not_known_to_leave_the_tree_alone_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        for (what, options) in [
+            ("a subdir", "subvol=@home,X-mount.subdir=alt"),
+            ("an unknown option", "subvol=@home,frobnicate"),
+            ("a bind", "subvol=@home,bind"),
+            ("a user mount", "subvol=@home,user"),
+            (
+                "a required mount",
+                "subvol=@home,x-systemd.requires=foo.service",
+            ),
+            ("a network device", "subvol=@home,_netdev"),
+            ("an empty option", "subvol=@home,,noatime"),
+        ] {
+            let parent = top.join(what.replace(' ', "-"));
+            let root = parent.join("@");
+            fs::create_dir_all(&root).unwrap();
+            cachyos_mounted(&root);
+            write(&root, "etc/fstab", &fstab_of(&home_line(options)));
+            // What the option would mount is `@home/alt`, not `@home`.
+            script(&parent.join("@home"), "alt/u/backup.sh", "btrbk run\n");
+            nightly_runs(&root, "ExecStart=/home/u/backup.sh");
+            let (verdict, why) = on_drive(&root, Some(FS));
+            assert_eq!(verdict, BootVerdict::May, "{what}: {why:?}");
+        }
+    }
+
+    /// The twin: a stock install's line keeps the reading, `subvol=/@home`
+    /// with its leading slash included.
+    #[test]
+    fn a_stock_fstab_line_keeps_the_sibling_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(
+            dir.path(),
+            &fstab_of(&home_line(
+                "rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home",
+            )),
+        );
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
+    }
+
+    /// Arch's `mkinitcpio-generate-shutdown-ramfs.service` is given a kernel
+    /// on the ESP and a config in `/run`. Neither is a subvolume of the
+    /// drive's filesystem (the ESP is a filesystem of its own, which this
+    /// project never mounts for reading but through its one read-only path,
+    /// and `/run` is filled only by a running system), and `mkinitcpio` is no
+    /// [`INERT`] program: it sources its `-c` file as shell. So it reads
+    /// "may", for both words.
+    #[test]
+    fn mkinitcpio_given_a_kernel_on_the_esp_and_a_config_in_run_still_reads_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(
+            dir.path(),
+            &format!(
+                "{}\nUUID=ABCD-0001 /boot vfat rw,noatime 0 2\n",
+                fstab_of(&home_line("subvol=/@home"))
+            ),
+        );
+        write(
+            &root,
+            "usr/lib/systemd/system/mkinitcpio-generate-shutdown-ramfs.service",
+            "[Service]\nType=oneshot\nExecStart=/usr/bin/mkinitcpio -k /boot/vmlinuz-linux \
+             -c /run/initramfs/mkinitcpio-shutdown.conf\n",
+        );
+        enable(
+            &root,
+            VENDOR,
+            "multi-user.target.wants",
+            "mkinitcpio-generate-shutdown-ramfs.service",
+        );
+        let (verdict, why) = on_drive(&root, Some(FS));
+        assert_eq!(verdict, BootVerdict::May, "{why:?}");
+        assert!(why.iter().any(|r| r.contains("under /boot")), "{why:?}");
+        assert!(why.iter().any(|r| r.contains("under /run")), "{why:?}");
+    }
+
+    // ---- the alias a desktop's graphical target pulls in --------------------
+
+    #[test]
+    fn a_stock_desktop_reads_no_where_links_are_read_and_may_where_they_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos(root);
+        sddm(root);
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // A mount that records access times cannot have its links read:
+        // every link of the boot is then a unit that may be anything.
+        let b = read_refusing(root).at_boot;
+        assert_eq!(b.verdict, BootVerdict::May, "{:?}", b.reasons);
+    }
+
+    /// Why no `Alias=` and link-length reading stands in for the link's
+    /// text: a unit file linked into `/etc` of the same length as the alias's
+    /// target, a different file that runs btrbk, looks the same to it. Read
+    /// where links are read, it is found.
+    #[test]
+    fn a_display_manager_link_of_an_alias_s_length_to_another_file_is_what_it_leads_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cachyos(root);
+        sddm(root);
+        let alias = "/usr/lib/systemd/system/sddm.service";
+        let evil = format!("/opt/{}", "x".repeat(alias.len() - "/opt/".len()));
+        assert_eq!(evil.len(), alias.len());
+        fs::remove_file(root.join("etc/systemd/system/display-manager.service")).unwrap();
+        link(root, "etc/systemd/system/display-manager.service", &evil);
+        write(
+            root,
+            &evil[1..],
+            "[Service]\nExecStart=/usr/bin/btrbk run\n",
+        );
+        let b = read(root).at_boot;
+        assert_eq!(b.verdict, BootVerdict::Will, "{:?}", b.reasons);
+        assert_eq!(read_refusing(root).at_boot.verdict, BootVerdict::May);
     }
 }

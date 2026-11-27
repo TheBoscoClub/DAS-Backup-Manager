@@ -2597,6 +2597,73 @@ memory filesystem's mount point (a tmpfs
 is not counted as one: what is under it is read as the disk holds it (see
 what is not seen, below).
 .PP
+One mount point is not unknown: when the reading knows the filesystem the
+drive's root is on (the UUID
+.B findmnt
+gives for the target's mount point, asked before the reading and again
+after it), a program, script or argument at or under a mount point of
+.I etc/fstab
+that is a btrfs subvolume of that same filesystem
+.RB ( UUID= "that UUID, " subvol=@home )
+is read in that subvolume's directory beside the root's own. Only when the
+deepest mount point of the path is named once (no second line, no
+.B .mount
+unit) and lies under no other mount point, the line has one
+.B subvol=
+naming one directory at the filesystem's top and no option but a known
+harmless one
+.RB ( defaults ,
+.BR rw ,
+.BR noatime ,
+.BR compress=\fI...\fP ,
+.BR discard=\fI...\fP ,
+.BR commit=\fI...\fP ,
+.BR nofail ,
+.BR x\-systemd.device\-timeout=\fI...\fP
+and the like, the ones that cannot change which tree is mounted or whether it
+is; any other
+.RB ( subvolid= ,
+.BR noauto ,
+.BR x\-systemd.automount ,
+.BR X\-mount.subdir= ,
+.BR bind ,
+an unknown word) leaves that mount point unknown); no mount point of that OS,
+in
+.I etc/fstab
+or a
+.B .mount
+unit, is spelled other than as systemd canonicalises it (an empty,
+.B .
+or
+.B ..
+component, a trailing slash, an escape but
+.B \e040
+and
+.BR \e011 ,
+a link among its components, in the root or, past a component that is
+itself a mount point, in the subvolume mounted there; a mount point under
+another that is not such a subvolume (another filesystem, a
+.B .mount
+unit, a memory filesystem), or under
+.IR /run ,
+.IR /var/run ,
+.IR /var/lock ,
+.IR /dev ,
+.I /proc
+or
+.I /sys
+but the tree itself and the kernel's own mount points systemd uses,
+.I /dev/hugepages
+or
+.I /sys/kernel/debug
+exactly), else no mount point is
+read as a subvolume at all; the directory is a real directory, not a link; the root itself holds nothing
+at that path under the mount point; and no link lies on the way. Anything
+else stays unknown, and so does a mount point of another filesystem (the
+ESP's, a separate disk's). A reading made with no filesystem named
+.RB ( "btrdasd recovery\-os inspect" )
+reads the root alone.
+.PP
 When a cron daemon is among the units
 .RB ( cronie.service ,
 .BR crond.service ,
