@@ -533,6 +533,63 @@ pub fn mount_guarded_target(
     )
 }
 
+/// [`mount_guarded_target`] for the scrub engine (bd
+/// DAS-Backup-Manager-eg4j.20): another program's mount of the filesystem
+/// is cleared first by the stop policy, as a job that writes (a scrub
+/// repairs), exactly as every other mounting path does (bd eg4j.19). What
+/// cannot be cleared, or any such mount under a handed-down hold, is the
+/// `Refused`: the filesystem is not scrubbed, and the mount is never made
+/// beside the other program's.
+pub fn mount_guarded_target_clearing(
+    config: &Config,
+    target: &Target,
+    intent: raid_guard::Intent,
+    progress: &dyn ProgressCallback,
+    held: &MaintenanceHeld,
+) -> Result<raid_guard::Outcome, raid_guard::Failure> {
+    mount_guarded_clearing_with(
+        config,
+        target,
+        intent,
+        &raid_guard::record_dir(),
+        progress,
+        &HOST_PROBES,
+        &SystemRunner,
+        &host_clear_site(false, true),
+        held.is_delegated(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // one host, one target, one job
+fn mount_guarded_clearing_with(
+    config: &Config,
+    target: &Target,
+    intent: raid_guard::Intent,
+    record_dir: &Path,
+    progress: &dyn ProgressCallback,
+    probes: &MountProbes<'_>,
+    runner: &dyn CommandRunner,
+    clear: &ClearSite<'_>,
+    delegated: bool,
+) -> Result<raid_guard::Outcome, raid_guard::Failure> {
+    let fsid = target.mount_uuid.as_deref().unwrap_or_default();
+    clear_elsewhere_with(
+        runner,
+        probes,
+        clear,
+        &target.label,
+        fsid,
+        &target.mount,
+        delegated,
+        progress,
+    )
+    .map_err(|why| raid_guard::Failure::Refused {
+        why: format!("another program's mount of {fsid} cannot be cleared: {why}"),
+        left_mounted: false,
+    })?;
+    mount_guarded_with(config, target, intent, record_dir, progress, probes, runner)
+}
+
 fn mount_guarded_with(
     config: &Config,
     target: &Target,
@@ -4593,6 +4650,128 @@ mod tests {
             ),
         ]);
         (config, host, runner, mnt)
+    }
+
+    // --- bd DAS-Backup-Manager-eg4j.20: the scrub engine's guarded mount --
+
+    /// The scrub engine's guarded mount of the RAID-1 target on the host
+    /// `raid1_mounted_by_udisks` describes, under `held`.
+    fn scrub_guarded_mount(
+        config: &Config,
+        host: &Host,
+        runner: &Arc<ScriptedRunner>,
+        progress: &Recorder,
+        delegated: bool,
+    ) -> Result<raid_guard::Outcome, raid_guard::Failure> {
+        std::fs::create_dir_all(&config.targets[0].mount).unwrap();
+        let raid_dir = host.raid_dir.clone().unwrap();
+        host.with_clear(runner, |clear| {
+            host.with_probes(runner, |p| {
+                mount_guarded_clearing_with(
+                    config,
+                    &config.targets[0],
+                    raid_guard::Job::Scrub.intent(),
+                    &raid_dir,
+                    progress,
+                    p,
+                    &**runner,
+                    clear,
+                    delegated,
+                )
+            })
+        })
+    }
+
+    /// A scrub of a RAID-1 target another program mounted elsewhere clears
+    /// that mount first, as a writing job, then mounts through the guard.
+    #[test]
+    fn scrub_guarded_mount_clears_another_programs_idle_mount_first() {
+        let scratch = Scratch::new();
+        let (config, host, runner, mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+        let progress = Recorder::default();
+
+        let got = scrub_guarded_mount(&config, &host, &runner, &progress, false);
+
+        assert!(got.is_ok(), "{:?}", got.err());
+        assert!(!binds(&runner), "{:?}", runner.calls());
+        assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
+        let calls = runner.calls();
+        let umount = calls
+            .iter()
+            .position(|c| c == &status_call(&["umount", "--no-canonicalize", "/run/media/u/das"]))
+            .expect("the other program's mount is unmounted");
+        let mount = calls
+            .iter()
+            .position(|c| {
+                c == &output_call(&[
+                    "mount",
+                    "-t",
+                    "btrfs",
+                    "-o",
+                    "noatime,compress=zstd",
+                    "UUID=u-p",
+                    &mnt,
+                ])
+            })
+            .expect("the guarded mount at the target's own path");
+        assert!(umount < mount, "{calls:?}");
+    }
+
+    /// Another program's writer is never stopped: the target is refused, the
+    /// writer named, and nothing is mounted or signalled.
+    #[test]
+    fn scrub_guarded_mount_refused_for_another_programs_writer() {
+        let scratch = Scratch::new();
+        let writer = crate::holders::testproc::Proc {
+            pid: 301,
+            cmd: "rsync",
+            fds: vec![(4, "/run/media/u/das/big", "0100001", Some(77))],
+            ..Default::default()
+        };
+        let (config, host, runner, _mnt) = raid1_mounted_by_udisks(&scratch, writer);
+
+        let got = scrub_guarded_mount(&config, &host, &runner, &Recorder::default(), false);
+
+        let Err(raid_guard::Failure::Refused { why, left_mounted }) = got else {
+            panic!("{got:?}");
+        };
+        assert!(why.contains("pid 301"), "{why}");
+        assert!(!left_mounted);
+        assert!(host.signals().is_empty());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" || c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// Under a handed-down hold nothing is cleared and nothing is mounted
+    /// beside the other program's mount: not scrubbed, the mount named.
+    #[test]
+    fn scrub_guarded_mount_under_a_delegated_hold_clears_and_mounts_nothing() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            raid1_mounted_by_udisks(&scratch, reader_at(300, "/run/media/u/das/a"));
+
+        let got = scrub_guarded_mount(&config, &host, &runner, &Recorder::default(), true);
+
+        let Err(raid_guard::Failure::Refused { why, .. }) = got else {
+            panic!("{got:?}");
+        };
+        assert!(why.contains("/run/media/u/das"), "{why}");
+        assert!(host.signals().is_empty());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" || c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
     }
 
     // --- bd DAS-Backup-Manager-eg4j.19: single-drive targets --------------

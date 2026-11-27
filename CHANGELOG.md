@@ -192,6 +192,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A scrub of a RAID-1 target another program has mounted clears that mount first, as every other path does** (bd `DAS-Backup-Manager-eg4j.20`): the scrub engine's guarded mount cleared nothing, so a pass on the RAID-1 primary mounted it beside the other program's mount
+  - The engine now goes through `mount::mount_guarded_target_clearing`, which clears as a writing job (idle mounts unmounted, readers stopped by the stop policy) before the guarded mount; a writer, or any such mount under a handed-down hold, means the filesystem is not scrubbed and the error names why, with nothing signalled or mounted
+
 - **`btrdasd setup --check`'s RESULT status comes from each check, not from words in its lines** (bd `DAS-Backup-Manager-3gzs.13`): `render_check` guessed OK, WARN or FAIL from status words in a topic's lines, so a failing check worded without them read OK; each check now returns its lines with the status it decided (`CheckLine`), a continuation line takes the status of the line above, and the word heuristic is gone — the printed text is unchanged
 
 - **Removing the package retires what `btrdasd setup` installed, keeping the configuration** (bd `DAS-Backup-Manager-hzxr`): no package format had a removal hook, so `pacman -R`, `apt remove` or `dnf remove` left the generated units, their links and the enabled timers behind, firing at a script that was gone

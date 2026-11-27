@@ -2893,7 +2893,7 @@ fn ensure_mounted(
     };
 
     if let Some((config, target)) = guarded {
-        match crate::mount::mount_guarded_target(
+        match crate::mount::mount_guarded_target_clearing(
             config,
             target,
             crate::raid_guard::Job::Scrub.intent(),
@@ -4977,6 +4977,18 @@ pub fn format_scrub_report(pass: &ScrubPass, config: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd DAS-Backup-Manager-eg4j.20: the engine's RAID-1 mount is the one
+    /// that clears another program's mount first (the clearing itself is
+    /// proven in `mount::tests::scrub_guarded_mount_*`); the plain guarded
+    /// mount, which clears nothing, is never called from this file.
+    #[test]
+    fn the_engine_mounts_a_raid1_target_only_through_the_clearing_mount() {
+        let src = include_str!("scrub.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(code.contains("mount_guarded_target_clearing("));
+        assert!(!code.contains("mount_guarded_target("));
+    }
 
     /// bd DAS-Backup-Manager-qab: flock works on a read-only descriptor, so a
     /// lock file anyone can open is a lock anyone can hold, keeping the
