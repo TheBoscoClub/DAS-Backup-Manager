@@ -1640,9 +1640,11 @@ fn unmount_each(
             }
             // Never by path alone: the mount scanned must still be the one
             // at that path (a path can be unmounted and mounted over by
-            // something else between the scan and now).
+            // something else between the scan and now), and the TOPMOST one
+            // there — the last in the table — since `umount <path>` takes
+            // the top one down (review N1).
             let now = crate::holders::parse_mountinfo(&(site.mountinfo)()?);
-            match now.iter().find(|n| n.mount_point == m.mount_point) {
+            match now.iter().rfind(|n| n.mount_point == m.mount_point) {
                 None => {
                     down = true;
                     break;
@@ -5496,6 +5498,29 @@ mod tests {
         host.mountinfo_later = Some(vec![
             "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
             format!("99 22 0:99 / {ESP_AT} rw - tmpfs tmpfs rw"),
+        ]);
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(
+            err.contains("no longer the mount that was scanned"),
+            "{err}"
+        );
+        assert!(umounts(&runner).is_empty(), "{:?}", runner.calls());
+    }
+
+    /// Review N1 (bd eg4j.19): another filesystem mounted OVER the scanned
+    /// mount at the same path between the scan and the unmount: the scanned
+    /// id is still in the table, but not on top, and `umount <path>` would
+    /// take the top one down. Refused.
+    #[test]
+    fn clear_partitions_overmounted_before_unmount_refuses() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo_later = Some(vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            format!("50 22 8:17 / {ESP_AT} rw,nosuid - vfat /dev/sdx1 rw,fmask=0022"),
+            format!("99 50 0:99 / {ESP_AT} rw - tmpfs tmpfs rw"),
         ]);
         let runner = ScriptedRunner::succeeding();
 

@@ -220,6 +220,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Clearing another program's mount of a recovery drive acts only on what it shows is that drive's** (bd `DAS-Backup-Manager-eg4j.19`, final review)
   - A btrfs mount of the drive gets the btrfs-maintenance check (a running balance, replace or scrub refuses, never interrupted) when the target has no `mount_uuid` too, by the filesystem UUID the mount carries; a UUID that cannot be read refuses
+  - Before each `umount --no-canonicalize <mount point>` the scanned mount must be the topmost one at that point (the last in the mount table), not merely present: another filesystem mounted over it at the same path would otherwise have been the one unmounted; `holders::stacked_under` counts such a same-path overmount as stacked on ours, a refusal
 
 - **A scrub of a RAID-1 target another program has mounted clears that mount first, as every other path does** (bd `DAS-Backup-Manager-eg4j.20`): the scrub engine's guarded mount cleared nothing, so a pass on the RAID-1 primary mounted it beside the other program's mount
   - The engine now goes through `mount::mount_guarded_target_clearing`, which clears as a writing job (idle mounts unmounted, readers stopped by the stop policy) before the guarded mount; a writer, or any such mount under a handed-down hold, means the filesystem is not scrubbed and the error names why, with nothing signalled or mounted
