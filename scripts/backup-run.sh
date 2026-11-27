@@ -4753,7 +4753,7 @@ LATEST SNAPSHOTS
 ${BTRBK_LATEST:-  (none yet)}
 
 ===============================================================
-  backup-run.sh v4.24.1
+  backup-run.sh v4.25.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
