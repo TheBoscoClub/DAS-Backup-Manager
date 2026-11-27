@@ -1,6 +1,7 @@
 #include "progresspanel.h"
 #include "dbusclient.h"
 #include "recoverystatus.h"
+#include "statustext.h"
 
 #include <QFontDatabase>
 #include <QHBoxLayout>
@@ -154,6 +155,7 @@ void ProgressPanel::onJobStarted(const QString &jobId, const QString &operation)
     m_operatorHint->setVisible(false);
     m_operationLabel->setText(operation);
     m_coverageButton->setVisible(false);
+    m_stageLabel->setTextFormat(Qt::PlainText);
     m_stageLabel->clear();
     m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();
@@ -184,6 +186,7 @@ void ProgressPanel::onJobProgress(const QString &jobId, const QString &stage,
         m_progressBar->setRange(0, 100);
         m_progressBar->setValue(percent);
     }
+    m_stageLabel->setTextFormat(Qt::PlainText);
     m_stageLabel->setText(stage);
     m_stageLabel->setToolTip(stage);
     if (isOperatorWaitStage(stage)) {
@@ -270,6 +273,9 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
     // (bd sp78.4): offer the dialog that lists and accepts the pairs.
     m_coverageButton->setVisible(summary.contains(QLatin1String("subvolume coverage WARN")));
 
+    // Plain text again unless a branch below sets a structured outcome: the
+    // helper's and the script's words are shown as typed, never as markup.
+    m_stageLabel->setTextFormat(Qt::PlainText);
     if (success) {
         m_progressBar->setValue(100);
         m_operationLabel->setText(tr("Complete"));
@@ -297,18 +303,21 @@ void ProgressPanel::onJobFinished(const QString &jobId, bool success,
         // failure of anything (bd DAS-Backup-Manager-eg4j.14). Only a session
         // job: a backup's text can name a record job holding the lock.
         // DBusClient::recoveryOsSession starts its job under this operation.
-        const QString words = recordRefusalWords(summary);
+        const OutcomeText words = recordRefusalOutcome(summary);
         m_progressBar->setValue(0);
         m_operationLabel->setText(tr("Not started"));
-        m_stageLabel->setText(words);
-        m_stageLabel->setToolTip(words);
+        m_stageLabel->setTextFormat(Qt::RichText); // every piece of text in it is escaped
+        m_stageLabel->setText(words.html);
+        m_stageLabel->setToolTip(OutcomeText::tip(words.plain));
     } else {
         // Error styling: red text on the progress bar
         m_progressBar->setStyleSheet(
             QStringLiteral("QProgressBar::chunk { background-color: #cc0000; }"));
         m_operationLabel->setText(tr("Failed"));
-        m_stageLabel->setText(summary);
-        m_stageLabel->setToolTip(summary);
+        const OutcomeText failure = OutcomeText::make(QStringLiteral("FAILED"), summary);
+        m_stageLabel->setTextFormat(Qt::RichText); // every piece of text in it is escaped
+        m_stageLabel->setText(failure.html);
+        m_stageLabel->setToolTip(OutcomeText::tip(failure.plain));
     }
 
     // Expand the log automatically so the user can review the results
@@ -379,6 +388,7 @@ void ProgressPanel::resetPanel()
     m_progressBar->setValue(0);
     m_progressBar->setStyleSheet(QString());  // reset any error styling
     m_operationLabel->clear();
+    m_stageLabel->setTextFormat(Qt::PlainText);
     m_stageLabel->clear();
     m_stageLabel->setToolTip(QString());
     m_throughputLabel->clear();

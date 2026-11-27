@@ -1045,41 +1045,25 @@ pub fn format_report(report: &DriftReport) -> String {
     };
 
     r.push_str(&format!(
-        "{sep}\n  DAS Subvolume Drift Report\n  Status: {overall}\n{sep}\n\n"
+        "{sep}\n  DAS Subvolume Drift Report\n  Status: {overall}\n{sep}\n"
     ));
 
-    r.push_str(&format!("SUMMARY\n{thin}\n"));
-    r.push_str(&format!(
-        "  Volumes checked       {}\n",
-        report.volumes_checked
-    ));
-    r.push_str(&format!(
-        "  Volumes failed        {}\n",
-        report.volumes_failed.len()
-    ));
-    r.push_str(&format!(
-        "  Missing subvolumes    {}\n",
-        report.missing.len()
-    ));
-    r.push_str(&format!("  Stale config entries  {}\n", report.stale.len()));
-    r.push_str(&format!(
-        "  Targets checked       {}\n",
-        report.targets_checked
-    ));
-    r.push_str(&format!(
-        "  Targets failed        {}\n",
-        report.targets_failed.len()
-    ));
-    r.push_str(&format!(
-        "  Undelivered pairs     {}\n",
-        report.undelivered.len()
-    ));
-    if report.has_recovery_os_item() {
-        r.push_str(&format!(
-            "  Recovery OSes stale   {}\n",
-            report.recovery_os_stale.len()
-        ));
+    // The deciding lines first (spec rule 2): each check that found
+    // something, status word first, and the section below that says more.
+    // The same rows close the report as its RESULT (rule 3).
+    let checks = result_rows(report);
+    if report.not_clean() {
+        r.push_str("── NEEDS ATTENTION ──\n");
+        for c in checks.iter().filter(|c| c.status != "OK") {
+            r.push_str(&format!(
+                "  {:<8}{}: {}  (see {} below)\n",
+                c.status, c.name, c.text, c.section
+            ));
+        }
+        r.push('\n');
     }
+    // The first section a reader meets under the status is the first finding.
+    r.push_str("\n".trim_end_matches('\n'));
 
     if !report.volumes_failed.is_empty() {
         r.push_str(&format!("\nVOLUMES NOT CHECKED\n{thin}\n"));
@@ -1222,8 +1206,122 @@ pub fn format_report(report: &DriftReport) -> String {
         }
     }
 
+    r.push_str(&format!("\nRESULT\n{thin}\n"));
+    for c in &checks {
+        r.push_str(&format!("  {:<22}{:<7}{}\n", c.name, c.status, c.text));
+    }
     r.push_str(&format!("\n{sep}\n"));
     r
+}
+
+/// One check of the drift report as its RESULT row shows it: what was
+/// checked, `OK`, `DRIFT` (a finding) or `FAIL` (something could not be
+/// examined), the counts in words, and the section that lists the details.
+struct ResultRow {
+    name: &'static str,
+    status: &'static str,
+    text: String,
+    section: &'static str,
+}
+
+/// The RESULT rows, in the order the old SUMMARY gave its counts; a check
+/// the old SUMMARY did not count (scrub tool, RAID-1 records, volumes left
+/// mounted) has a row only when it found something.
+fn result_rows(report: &DriftReport) -> Vec<ResultRow> {
+    let row = |name, bad: bool, fail: bool, text: String, section| ResultRow {
+        name,
+        status: if !bad {
+            "OK"
+        } else if fail {
+            "FAIL"
+        } else {
+            "DRIFT"
+        },
+        text,
+        section,
+    };
+    let mut rows = vec![
+        row(
+            "Volumes",
+            !report.volumes_failed.is_empty(),
+            true,
+            format!(
+                "{} checked, {} not checked",
+                report.volumes_checked,
+                report.volumes_failed.len()
+            ),
+            "VOLUMES NOT CHECKED",
+        ),
+        row(
+            "Missing subvolumes",
+            !report.missing.is_empty(),
+            false,
+            format!("{} not backed up", report.missing.len()),
+            "NOT BACKED UP",
+        ),
+        row(
+            "Stale config entries",
+            !report.stale.is_empty(),
+            false,
+            format!("{} found", report.stale.len()),
+            "STALE CONFIG ENTRIES",
+        ),
+        row(
+            "Targets",
+            !report.targets_failed.is_empty(),
+            true,
+            format!(
+                "{} checked, {} not checked",
+                report.targets_checked,
+                report.targets_failed.len()
+            ),
+            "TARGETS NOT CHECKED",
+        ),
+        row(
+            "Undelivered pairs",
+            !report.undelivered.is_empty(),
+            false,
+            format!("{} found", report.undelivered.len()),
+            "UNDELIVERED",
+        ),
+    ];
+    if report.has_recovery_os_item() {
+        rows.push(row(
+            "Recovery OSes",
+            !report.recovery_os_stale.is_empty(),
+            false,
+            format!("{} stale", report.recovery_os_stale.len()),
+            "STALE RECOVERY OSES",
+        ));
+    }
+    if let Some(f) = &report.scrub_tool {
+        rows.push(row(
+            "Scrub tool",
+            true,
+            false,
+            format!("{} may reject the scrub options", f.version),
+            "SCRUB TOOL",
+        ));
+    }
+    if !report.raid_records.is_empty() {
+        rows.push(row(
+            "RAID-1 targets",
+            true,
+            false,
+            format!("{} with a finding", report.raid_records.len()),
+            "RAID-1 TARGETS",
+        ));
+    }
+    if !report.left_mounted.is_empty() {
+        rows.push(row(
+            "Left mounted",
+            true,
+            true,
+            format!("{} not unmounted", report.left_mounted.len()),
+            "LEFT MOUNTED",
+        ));
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,9 +2342,8 @@ mod tests {
             "{text}"
         );
         for line in [
-            "  Targets checked       1\n",
-            "  Targets failed        1\n",
-            "  Undelivered pairs     2\n",
+            "  Targets               FAIL   1 checked, 1 not checked\n",
+            "  Undelivered pairs     DRIFT  2 found\n",
             "UNDELIVERED — a target holds no snapshot of a declared pair newer than its limit\n",
             "  @data  (source: ssd, target: big): newest snapshot 2026-11-06, 4 days old (limit 3)\n",
             "  @x  (source: ssd, target: big): no snapshot at all (limit 3 days)\n",
@@ -2255,11 +2352,31 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
+        // The deciding lines stand apart, status word first, ahead of the
+        // detail sections; the same checks close the report as its RESULT.
+        let attention = text.find("── NEEDS ATTENTION ──\n").expect("block");
+        assert!(attention < text.find("UNDELIVERED —").unwrap(), "{text}");
+        assert!(
+            text.contains(
+                "  FAIL    Targets: 1 checked, 1 not checked  (see TARGETS NOT CHECKED below)\n  DRIFT   Undelivered pairs: 2 found  (see UNDELIVERED below)\n"
+            ),
+            "{text}"
+        );
+        assert!(text.find("RESULT\n").unwrap() > text.find("TARGETS NOT CHECKED\n").unwrap());
+        assert!(
+            text.contains("  Volumes               OK     1 checked, 0 not checked\n"),
+            "{text}"
+        );
         let clean = format_report(&DriftReport {
             volumes_checked: 1,
             targets_checked: 2,
             ..Default::default()
         });
+        assert!(!clean.contains("NEEDS ATTENTION"), "{clean}");
+        assert!(
+            clean.contains("  Targets               OK     2 checked, 0 not checked\n"),
+            "{clean}"
+        );
         assert!(clean.contains("NO DRIFT — CLEAN"), "{clean}");
         assert!(!clean.contains("UNDELIVERED") && !clean.contains("TARGETS NOT CHECKED"));
     }
@@ -2812,7 +2929,10 @@ mod recovery_os_report_tests {
             "{text}"
         );
         assert!(text.contains("2026-11-09 03:40 UTC"), "{text}");
-        assert!(text.contains("Recovery OSes stale   1"), "{text}");
+        assert!(
+            text.contains("  Recovery OSes         DRIFT  1 stale\n"),
+            "{text}"
+        );
     }
 
     #[test]

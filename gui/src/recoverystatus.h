@@ -6,6 +6,8 @@
 #include <QString>
 #include <QStringList>
 
+#include "statustext.h"
+
 #include <optional>
 
 // The helper's recovery-drive status document (RecoveryOsStatus, schema 1)
@@ -178,6 +180,10 @@ bool sessionRefusedForRecord(const QString &summary);
 // What the panel says for it: "Not started" and the script's REFUSED reason first,
 // the Record button as the remedy, then the script's whole output.
 QString recordRefusalWords(const QString &summary);
+// The same refusal as a label shows it: NOT STARTED and the reason first, the Record
+// button as the remedy, the script's other lines listed (a long list cut to a count);
+// `plain` is `recordRefusalWords`, the whole text.
+OutcomeText recordRefusalOutcome(const QString &summary);
 // A record job's summary that is its deferral (a backup, a scrub or a session holds
 // a lock): it changed nothing, so it is "Not started", never a failure
 // (RecordOutcome::finish_line, bd DAS-Backup-Manager-3gzs.5).

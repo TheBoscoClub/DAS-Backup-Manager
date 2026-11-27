@@ -207,7 +207,7 @@ Validates the current installation without changing anything:
 - Loads and validates `/etc/das-backup/config.toml`
 - Checks all dependencies are installed
 - Verifies all manifest files exist on disk
-- Reports any issues found
+- Reports any issues found: the lines that need you come first under `NEEDS ATTENTION` (status word first, `FAIL` or `WARN`, with their fix), the routine lines follow by topic, and a closing `RESULT` has one row per topic
 
 ## Manual Installation (without the wizard)
 

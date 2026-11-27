@@ -212,6 +212,7 @@ pub fn render_capacity_and_smart(health: Option<&crate::health::HealthReport>) -
         ));
     }
     r.push_str(&format!("\nSMART STATUS\n{thin}\n"));
+    r.push_str("  Target                   Serial     SMART   Temp    Hours\n");
     for th in &health.targets {
         // One row per configured drive, an absent one saying ABSENT: a RAID-1
         // target used to show only its first drive (bd DAS-Backup-Manager-uhi).
@@ -301,8 +302,15 @@ pub fn format_report_from(
         unsafe { libc::time(&mut t) };
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         unsafe { libc::localtime_r(&t, &mut tm) };
+        // Local time with its zone, as the operator reads it (spec rule 6).
+        let zone = if tm.tm_zone.is_null() {
+            String::new()
+        } else {
+            let z = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+            format!(" {}", z.to_string_lossy())
+        };
         let ts = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}",
+            "{:04}-{:02}-{:02} {:02}:{:02}{zone}",
             tm.tm_year + 1900,
             tm.tm_mon + 1,
             tm.tm_mday,
@@ -364,41 +372,61 @@ pub fn format_report_from(
     };
     let index_status = if result.indexed { "OK" } else { "N/A" };
 
-    r.push_str(&format!("BACKUP OPERATIONS\n{thin}\n"));
+    // The operations rows are built first: the ones that need the reader
+    // (FAIL, WARN) are set apart at the top, before the routine rows.
+    let mut ops: Vec<String> = Vec::new();
     // First, where backup-run.sh's `Maintenance lock` row (which this path has
     // no counterpart for) is followed by it.
-    r.push_str(&format!(
-        "  USB link              {}\n",
-        result.usb_link.row()
+    ops.push(format!("  USB link              {}", result.usb_link.row()));
+    ops.push(format!(
+        "  btrbk send/receive    {btrbk_status}  ({elapsed_min}m {elapsed_sec}s)"
     ));
-    r.push_str(&format!(
-        "  btrbk send/receive    {btrbk_status}  ({elapsed_min}m {elapsed_sec}s)\n"
-    ));
-    r.push_str(&format!("  Boot subvolumes       {}\n", result.boot.row()));
-    r.push_str(&format!(
-        "  Retired expiry        {}\n",
-        result.expiry.row()
-    ));
-    r.push_str(&format!(
-        "  Static subvolumes     {}\n",
+    ops.push(format!("  Boot subvolumes       {}", result.boot.row()));
+    ops.push(format!("  Retired expiry        {}", result.expiry.row()));
+    ops.push(format!(
+        "  Static subvolumes     {}",
         result.static_subvolumes.row()
     ));
-    r.push_str(&format!(
-        "  Recovery OS           {}\n",
+    ops.push(format!(
+        "  Recovery OS           {}",
         result.recovery_os.row()
     ));
-    r.push_str(&format!("  Content indexer       {index_status}\n"));
-    for row in data.raid_rows.iter().chain(&data.clear_rows) {
+    ops.push(format!("  Content indexer       {index_status}"));
+    ops.extend(data.raid_rows.iter().chain(&data.clear_rows).cloned());
+    if let Some(sync) = sync {
+        let status = if sync.failed { "FAIL" } else { "OK" };
+        ops.push(format!("  Subvolume sync        {status}"));
+        ops.push(format!(
+            "  Subvolume coverage    {}",
+            crate::coverage::row_or_not_run(sync.coverage.as_ref())
+        ));
+    }
+
+    // The deciding lines, apart from the routine ones (spec rule 2): each
+    // error, and each row that failed or warned, status word first. The
+    // rows stay in their table; the errors are listed only here.
+    let flagged: Vec<(&str, String)> = ops
+        .iter()
+        .filter_map(|row| row_status(row).map(|st| (st, row_without_status(row, st))))
+        .filter(|(st, _)| matches!(*st, "FAIL" | "WARN"))
+        .collect();
+    if !result.errors.is_empty() || !flagged.is_empty() {
+        r.push_str("── NEEDS ATTENTION ──\n");
+        for e in &result.errors {
+            r.push_str(&format!("  {:<8}{e}\n", "FAILED"));
+        }
+        for (st, text) in &flagged {
+            r.push_str(&format!("  {st:<8}{text}\n"));
+        }
+        r.push('\n');
+    }
+
+    r.push_str(&format!("BACKUP OPERATIONS\n{thin}\n"));
+    for row in &ops {
         r.push_str(row);
         r.push('\n');
     }
     if let Some(sync) = sync {
-        let status = if sync.failed { "FAIL" } else { "OK" };
-        r.push_str(&format!("  Subvolume sync        {status}\n"));
-        r.push_str(&format!(
-            "  Subvolume coverage    {}\n",
-            crate::coverage::row_or_not_run(sync.coverage.as_ref())
-        ));
         r.push('\n');
         r.push_str(&sync.report);
     }
@@ -467,13 +495,15 @@ pub fn format_report_from(
     r.push_str(&data.capacity_and_smart);
     r.push_str(&data.latest_snapshots);
 
-    // Errors
-    if !result.errors.is_empty() {
-        r.push_str(&format!("\nERRORS\n{thin}\n"));
-        for e in &result.errors {
-            r.push_str(&format!("  - {e}\n"));
-        }
-    }
+    // The result, one line, so the end of a long report says what the top did.
+    let failed = ops.iter().filter(|o| row_status(o) == Some("FAIL")).count();
+    let warned = ops.iter().filter(|o| row_status(o) == Some("WARN")).count();
+    r.push_str(&format!(
+        "\nRESULT\n{thin}\n  {overall}  ({} operations: {failed} FAIL, {warned} WARN, {} OK or not applicable; {} errors)\n",
+        ops.len(),
+        ops.len() - failed - warned,
+        result.errors.len()
+    ));
 
     // Footer
     let version = crate::VERSION;
@@ -495,6 +525,37 @@ pub fn format_report_from(
     ));
 
     r
+}
+
+/// The status word of an operations row (`  <name><padding>FAIL  (…)`): the
+/// first of FAIL, WARN, OK, N/A that stands after the name, set off by a
+/// space and followed by two spaces or the end. A name may hold spaces and
+/// be longer than its column (`Target <label>`), so the column is not used.
+fn row_status(row: &str) -> Option<&'static str> {
+    const WORDS: [&str; 4] = ["FAIL", "WARN", "OK", "N/A"];
+    row.trim_start().match_indices(' ').find_map(|(i, _)| {
+        let rest = row.trim_start()[i..].trim_start_matches(' ');
+        WORDS.iter().copied().find(|w| {
+            rest.strip_prefix(w)
+                .is_some_and(|t| t.is_empty() || t.starts_with("  "))
+        })
+    })
+}
+
+/// An operations row as the attention block shows it: name and reason, the
+/// status word (which the block puts first) taken out.
+fn row_without_status(row: &str, status: &str) -> String {
+    let trimmed = row.trim_start();
+    let at = trimmed.find(&format!(" {status}")).unwrap_or(trimmed.len());
+    let name = trimmed[..at].trim_end();
+    let reason = trimmed[at..]
+        .trim_start()
+        .strip_prefix(status)
+        .unwrap_or("");
+    // The name column, as the table has it, so the reasons line up.
+    format!("{name:<21} {}", reason.trim())
+        .trim_end()
+        .to_string()
 }
 
 /// Format bytes into human-readable form (KiB, MiB, GiB, TiB).
@@ -1068,7 +1129,11 @@ mod tests {
         assert!(report.contains("THROUGHPUT"));
         assert!(report.contains("DISK CAPACITY"));
         assert!(report.contains("SMART STATUS"));
-        assert!(!report.contains("ERRORS"));
+        assert!(!report.contains("NEEDS ATTENTION"), "{report}");
+        assert!(
+            report.contains("RESULT\n") && report.contains("ALL OPERATIONS SUCCESSFUL  ("),
+            "{report}"
+        );
     }
 
     /// A boot-step outcome in a finished run's report.
@@ -1642,9 +1707,84 @@ mod tests {
         let cfg = Config::default();
         let report = format_report(&result, &cfg);
         assert!(report.contains("FAILURES DETECTED"));
-        assert!(report.contains("ERRORS"));
-        assert!(report.contains("btrbk failed"));
-        assert!(report.contains("target not mounted"));
+        // The errors are the deciding lines: their own block, status word
+        // first, ahead of the routine operations table, listed once.
+        let attention = report.find("── NEEDS ATTENTION ──\n").expect("block");
+        assert!(
+            attention < report.find("BACKUP OPERATIONS").unwrap(),
+            "{report}"
+        );
+        assert!(report.contains("  FAILED  btrbk failed\n"), "{report}");
+        assert!(
+            report.contains("  FAILED  target not mounted\n"),
+            "{report}"
+        );
+        assert_eq!(report.matches("target not mounted").count(), 1, "{report}");
+        assert!(!report.contains("ERRORS\n"), "{report}");
+        // The result block closes the report with the counts.
+        assert!(
+            report.contains("FAILURES DETECTED  (7 operations: 1 FAIL, 0 WARN, 6 OK or not applicable; 2 errors)"),
+            "{report}"
+        );
+    }
+
+    /// A WARN row is set apart too, status word first, its reason kept; a
+    /// target name longer than the name column is still read right.
+    #[test]
+    fn a_warn_row_is_listed_in_the_attention_block_with_its_reason() {
+        let mut result = result_with(Some(0), Some(0), 0, &[]);
+        result.usb_link = crate::run_steps::UsbLinkStep::checked_for_test(
+            crate::recovery_os::RecordStatus::Warn,
+            "no USB device's product contains 'X'",
+        );
+        let mut data = ReportData {
+            capacity_and_smart: String::new(),
+            latest_snapshots: String::new(),
+            raid_rows: Vec::new(),
+            clear_rows: vec![
+                "  Target a-very-long-target-label WARN  (before the mount: stopped 3 processes)"
+                    .into(),
+            ],
+        };
+        let report = format_report_from(&result, None, &data);
+        assert!(
+            report.contains(
+                "── NEEDS ATTENTION ──\n  WARN    USB link              (no USB device's product contains 'X')\n  WARN    Target a-very-long-target-label (before the mount: stopped 3 processes)\n\nBACKUP OPERATIONS"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("COMPLETED WITH WARNINGS  (8 operations: 0 FAIL, 2 WARN, 6 OK"),
+            "{report}"
+        );
+        // Clean: no block at all.
+        data.clear_rows.clear();
+        result.usb_link = crate::run_steps::UsbLinkStep::NotChecked;
+        assert!(!format_report_from(&result, None, &data).contains("NEEDS ATTENTION"));
+    }
+
+    #[test]
+    fn the_report_header_names_the_zone_and_smart_has_a_column_header() {
+        let report = format_report(&result_with(Some(0), Some(0), 0, &[]), &Config::default());
+        let stamp = report.lines().nth(1).unwrap();
+        // "  DAS Backup Report — 2026-11-27 03:19 CST": the zone is a word after the minute.
+        let after = stamp.rsplit_once(':').unwrap().1;
+        assert!(after.trim().len() > 2 && after.contains(' '), "{stamp}");
+        let health = crate::health::HealthReport {
+            status: crate::health::HealthStatus::Healthy,
+            targets: vec![target_health("t", true)],
+            last_backup: None,
+            targets_busy: false,
+            growth_points: Vec::new(),
+            warnings: Vec::new(),
+            recovery_os: Vec::new(),
+        };
+        let text = render_capacity_and_smart(Some(&health));
+        assert!(text.contains("SMART STATUS\n─────"), "{text}");
+        assert!(
+            text.contains("  Target                   Serial     SMART   Temp    Hours\n"),
+            "{text}"
+        );
     }
 
     fn target_health(label: &str, mounted: bool) -> crate::health::TargetHealth {

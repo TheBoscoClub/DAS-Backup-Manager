@@ -516,6 +516,24 @@ QString recordRefusalWords(const QString &summary)
         .arg(lead, summary);
 }
 
+OutcomeText recordRefusalOutcome(const QString &summary)
+{
+    const QStringList reasons = refusedReasons(summary);
+    const QString lead = reasons.isEmpty() ? QStringLiteral("the drive's boot record is missing or out of date.")
+                                           : reasons.join(QStringLiteral("; "));
+    // The refusal is the deciding line; what else the script said is listed.
+    QStringList others;
+    for (const QString &segment : OutcomeText::segments(summary))
+        if (!segment.contains(QLatin1String("REFUSED:")))
+            others << segment;
+    OutcomeText out = OutcomeText::make(
+        QStringLiteral("NOT STARTED"), others.join(QStringLiteral("; ")), lead,
+        QStringLiteral("Press the Record button beside Upgrade (it does what `sudo btrdasd recovery-os record <label>` "
+                       "does in a terminal), then start the update again."));
+    out.plain = recordRefusalWords(summary);
+    return out;
+}
+
 QString ageWords(std::optional<qint64> epoch, qint64 nowEpoch)
 {
     if (!epoch)

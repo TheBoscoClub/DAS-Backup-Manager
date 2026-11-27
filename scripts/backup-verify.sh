@@ -1,7 +1,14 @@
 #!/bin/bash
 # backup-verify.sh - Verify DAS drive health and backup status (config-driven)
-# Version: 3.4.1
-# Date: 2026-11-24
+# Version: 3.5.0
+# Date: 2026-11-27
+#
+# 3.5.0: reader-friendly output (bd DAS-Backup-Manager-3gzs.12). A run header
+# and one `── item ──` header per section and per drive, and a closing RESULT
+# block with one row per drive and one for the backup-status check, the status
+# word (OK, WARN, FAIL, SKIPPED) in a fixed column and a clause saying why. The
+# time carries its zone. Every message the checks pass to log_info, log_warn and
+# log_error, the `Health:` lines and the exit status are unchanged.
 #
 # 3.4.1: `btrbk list latest` is scoped to the primary's target directories
 # (`<mount>/*`); unscoped it failed on the unmounted recovery targets and the
@@ -130,6 +137,12 @@ load_configuration() {
     # exits nonzero on it so this script can be used as a gate.
     SMART_FAILED=false
 
+    # What the closing RESULT block shows: one `<drive>|<status>|<why>` per
+    # drive (set by check_smart_health) and the backup-status check's
+    # `<status>|<why>` (set by check_btrbk_status, or by main for --quick).
+    DRIVE_RESULTS=()
+    BTRBK_RESULT="SKIPPED|the backup-status check was not run"
+
     # Colors
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -156,9 +169,12 @@ log_error() {
 
 log_header() {
     echo ""
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}── $1 ──${NC}"
+}
+
+# One RESULT row: <what> <status> <why>, the status word in a fixed column.
+result_row() {
+    printf '  %-34s %-8s %s\n' "$1" "$2" "$3"
 }
 
 check_root() {
@@ -396,7 +412,10 @@ check_smart_health() {
         local role="${DRIVE_MAP[$serial]:-Unknown}"
 
         echo ""
-        echo -e "${BLUE}--- $dev ($role) ---${NC}"
+        echo -e "${BLUE}── $dev ($role) ──${NC}"
+
+        # What the RESULT block says of this drive: the worst thing found.
+        local drive_status="OK" drive_why=""
 
         # Get SMART health
         local health
@@ -411,6 +430,8 @@ check_smart_health() {
         else
             echo -e "  Health: ${RED}$health${NC}"
             all_passed=false
+            drive_status="FAIL"
+            drive_why="SMART health not PASSED (${health##*: })"
         fi
 
         # Check for pending/reallocated sectors. "attribute missing" and
@@ -420,8 +441,22 @@ check_smart_health() {
         reallocated=$(smart_attr_raw "$dev" "Reallocated_Sector")
         pending=$(smart_attr_raw "$dev" "Current_Pending_Sector")
 
-        report_sector_attr "Reallocated Sectors" "$reallocated" || all_passed=false
-        report_sector_attr "Pending Sectors" "$pending" || all_passed=false
+        if ! report_sector_attr "Reallocated Sectors" "$reallocated"; then
+            all_passed=false
+            drive_status="FAIL"
+            drive_why="${drive_why:+$drive_why; }reallocated sectors could not be read"
+        elif [[ $reallocated != 0 && $drive_status == "OK" ]]; then
+            drive_status="WARN"
+            drive_why="$reallocated reallocated sectors"
+        fi
+        if ! report_sector_attr "Pending Sectors" "$pending"; then
+            all_passed=false
+            drive_status="FAIL"
+            drive_why="${drive_why:+$drive_why; }pending sectors could not be read"
+        elif [[ $pending != 0 && $drive_status == "OK" ]]; then
+            drive_status="WARN"
+            drive_why="$pending pending sectors"
+        fi
 
         # Check power-on hours and temperature
         local hours temp
@@ -438,6 +473,7 @@ check_smart_health() {
         selftest_log=$(smartctl -l selftest "$dev" 2>/dev/null) || true
         test_status=$(printf '%s\n' "$selftest_log" | grep -E "^# *1[[:space:]]" | head -1 || true)
         echo "  Last Test: ${test_status:-unavailable (no self-test log entry)}"
+        DRIVE_RESULTS+=("$dev ($role)|$drive_status|${drive_why:-SMART health PASSED}")
     done
 
     echo ""
@@ -587,6 +623,7 @@ check_btrbk_status() {
 
     if [[ ! -f "$DAS_BTRBK_CONF" ]]; then
         log_warn "btrbk not configured ($DAS_BTRBK_CONF missing)"
+        BTRBK_RESULT="WARN|btrbk not configured"
         return
     fi
 
@@ -694,7 +731,7 @@ check_btrbk_status() {
         echo "Latest snapshots:"
         # "btrbk failed" and "btrbk ran and found nothing" are different facts;
         # `|| echo "(no snapshots yet)"` reported the first as the second.
-        local btrbk_out btrbk_stderr
+        local btrbk_out btrbk_stderr btrbk_failed=false
         btrbk_stderr=$(mktemp)
         # Scoped to the primary's target directories (a quoted glob, read by
         # btrbk): only the primary is mounted here, and an unscoped listing
@@ -708,6 +745,7 @@ check_btrbk_status() {
             fi
         else
             log_error "  btrbk list failed - snapshot status UNKNOWN: $(tr '\n' ' ' < "$btrbk_stderr")"
+            btrbk_failed=true
         fi
         [[ -z "${btrbk_stderr:-}" ]] || rm -f "${btrbk_stderr:?}"
 
@@ -720,10 +758,19 @@ check_btrbk_status() {
         btrfs filesystem usage "$primary_mount" 2>/dev/null | head -8
 
         # Cleanup
-        umount "$primary_mount" 2>/dev/null || log_warn "Failed to unmount $primary_mount"
+        if $btrbk_failed; then
+            BTRBK_RESULT="FAIL|btrbk list failed, snapshot status unknown"
+        else
+            BTRBK_RESULT="OK|primary mounted read-only, snapshots and usage read"
+        fi
+        umount "$primary_mount" 2>/dev/null || {
+            log_warn "Failed to unmount $primary_mount"
+            BTRBK_RESULT="WARN|primary read, but $primary_mount was not unmounted"
+        }
     elif $skipped; then
-        :
+        BTRBK_RESULT="SKIPPED|the DAS maintenance lock is held or could not be opened"
     elif $attempted; then
+        BTRBK_RESULT="FAIL|the primary could not be mounted"
         if $primary_guarded && [[ -n "$primary_label" ]]; then
             log_error "Failed to mount $primary_label at $primary_mount through the RAID-1 guard ${mount_err:-(no error output)}"
         else
@@ -731,8 +778,10 @@ check_btrbk_status() {
         fi
     elif [[ -z "$primary_dev" ]]; then
         log_warn "Primary backup drive (serial ${primary_serial:-unset}) not among the detected DAS devices"
+        BTRBK_RESULT="WARN|the primary drive is not among the detected DAS devices"
     elif [[ ! -b "$primary_dev" ]]; then
         log_warn "Primary backup partition $primary_dev is not a block device"
+        BTRBK_RESULT="WARN|the primary partition is not a block device"
     fi
 }
 
@@ -740,6 +789,14 @@ show_summary() {
     log_header "Summary"
 
     echo "DAS Drives Detected: ${#DAS_DEVICES[@]}"
+    echo ""
+    echo -e "${BLUE}── RESULT ──${NC}"
+    local row
+    for row in "${DRIVE_RESULTS[@]}"; do
+        local rest="${row#*|}"
+        result_row "${row%%|*}" "${rest%%|*}" "${rest#*|}"
+    done
+    result_row "btrbk backup status" "${BTRBK_RESULT%%|*}" "${BTRBK_RESULT#*|}"
     echo ""
     echo "Next steps:"
     echo "  1. If SMART tests are still running, wait for completion"
@@ -756,12 +813,11 @@ main() {
 
     if [[ "${1:-}" == "--quick" ]] || [[ "${1:-}" == "-q" ]]; then
         quick_mode=true
+        BTRBK_RESULT="SKIPPED|--quick: the backup-status check was not run"
     fi
 
-    echo "========================================"
-    echo "  DAS Backup Verification"
-    echo "  Date: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "========================================"
+    echo -e "${BLUE}━━ DAS Backup Verification ━━${NC}"
+    echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
     load_configuration
     check_root

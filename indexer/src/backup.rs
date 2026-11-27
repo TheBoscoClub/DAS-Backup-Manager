@@ -11770,7 +11770,7 @@ Legend:
         let text = left.report_texts.lock().unwrap()[0].clone();
         assert!(text.contains("FAILURES DETECTED"), "{text}");
         assert!(
-            text.contains("  - still mounted: /mnt/backup-22tb"),
+            text.contains("  FAILED  still mounted: /mnt/backup-22tb"),
             "{text}"
         );
         assert!(
