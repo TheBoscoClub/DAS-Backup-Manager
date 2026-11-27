@@ -1079,7 +1079,15 @@ fn clear_target_with(
         Ok(m) => m,
         Err(e) => return ClearTarget::CannotRun(e),
     };
-    match clear_mounted_elsewhere(runner, site, target, fsid, &members, progress) {
+    match clear_mounted_elsewhere(
+        runner,
+        site,
+        &target.label,
+        &target.mount,
+        fsid,
+        &members,
+        progress,
+    ) {
         Ok(None) => ClearTarget::Cleared("not mounted anywhere else".into()),
         Ok(Some(would)) if site.report_only => {
             ClearTarget::Cleared(format!("dry run: {}", would.join("; ")))
@@ -1359,7 +1367,8 @@ fn clear_logged(
 fn clear_mounted_elsewhere(
     runner: &dyn CommandRunner,
     site: &ClearSite<'_>,
-    target: &Target,
+    label: &str,
+    mount: &str,
     fsid: &str,
     members: &[String],
     progress: &dyn ProgressCallback,
@@ -1368,13 +1377,13 @@ fn clear_mounted_elsewhere(
     let warn = |m: String| {
         progress.on_log(
             crate::progress::LogLevel::Warning,
-            &format!("Target '{}': {m}", target.label),
+            &format!("Target '{label}': {m}"),
         )
     };
     let elsewhere = |all: &[crate::holders::MountEntry]| -> Vec<crate::holders::MountEntry> {
         mounts_of(all, members)
             .into_iter()
-            .filter(|m| m.mount_point != target.mount)
+            .filter(|m| m.mount_point != mount)
             .collect()
     };
     let all = parse_mountinfo(&(site.mountinfo)()?);
@@ -1399,8 +1408,7 @@ fn clear_mounted_elsewhere(
     for m in &ours {
         warn(format!(
             "its filesystem is mounted at {} by {} (root {}, options {}, filesystem options {}) \
-             — not this job's mount; it is taken down so the target is mounted through the \
-             RAID-1 guard",
+             — not this job's mount; it is taken down so the target is mounted as configured",
             m.mount_point,
             origin_of(runner, &m.mount_point),
             m.root,
@@ -1421,10 +1429,10 @@ fn clear_mounted_elsewhere(
     }
     maintenance_on(runner, site, Some(fsid), &ours[0].mount_point)?;
     if site.report_only {
-        return would_clear(runner, site, &target.label, &ours, progress).map(Some);
+        return would_clear(runner, site, label, &ours, progress).map(Some);
     }
-    let mut sent = clear_logged(site, runner, &target.label, &ours, progress)?;
-    unmount_each(runner, site, &target.label, &ours, progress, &mut sent)?;
+    let mut sent = clear_logged(site, runner, label, &ours, progress)?;
+    unmount_each(runner, site, label, &ours, progress, &mut sent)?;
     let left = elsewhere(&parse_mountinfo(&(site.mountinfo)()?));
     if !left.is_empty() {
         return Err(format!(
@@ -1642,6 +1650,69 @@ fn clear_partitions_with(
         warn(format!("{STOPPED}: {}", sent.join(", ")));
     }
     Ok(Some(sent))
+}
+
+/// Another program's mount of the filesystem `fsid` anywhere but `mount`,
+/// cleared by the stop policy for a job (bd DAS-Backup-Manager-eg4j.19): the
+/// members are the partitions `blkid` lists for the UUID, so a single drive
+/// is served as a RAID-1 one is. Under a handed-down maintenance lock
+/// (`delegated`) nothing is cleared, and any such mount is the `Err`: the
+/// parent owns the mounts, and another program's is never used as found.
+/// `Ok(None)`: mounted nowhere else; `Ok(Some(signals))`: cleared.
+#[allow(clippy::too_many_arguments)] // one host, one filesystem, one job
+fn clear_elsewhere_with(
+    runner: &dyn CommandRunner,
+    probes: &MountProbes<'_>,
+    site: &ClearSite<'_>,
+    label: &str,
+    fsid: &str,
+    mount: &str,
+    delegated: bool,
+    progress: &dyn ProgressCallback,
+) -> Result<Option<Vec<String>>, String> {
+    let host = SystemMembers { runner, probes };
+    let members = raid_guard::MemberHost::members(&host, fsid)?;
+    if delegated {
+        let all = crate::holders::parse_mountinfo(&(site.mountinfo)()?);
+        let elsewhere: Vec<String> = crate::holders::mounts_of(&all, &members)
+            .into_iter()
+            .filter(|m| m.mount_point != mount)
+            .map(|m| m.mount_point)
+            .collect();
+        return if elsewhere.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!(
+                "its filesystem is mounted by another program at {} — never bound, and not \
+                 cleared under a handed-down maintenance lock",
+                elsewhere.join(", ")
+            ))
+        };
+    }
+    clear_mounted_elsewhere(runner, site, label, mount, fsid, &members, progress)
+}
+
+/// [`clear_elsewhere_with`] on this host for the scrub engine's mount of a
+/// single-drive target (bd DAS-Backup-Manager-eg4j.19): a scrub repairs, so
+/// it stops readers as a writing job does. `held` says whether the lock was
+/// handed down.
+pub fn clear_filesystem_elsewhere(
+    label: &str,
+    fsid: &str,
+    mount: &str,
+    held: &MaintenanceHeld,
+    progress: &dyn ProgressCallback,
+) -> Result<Option<Vec<String>>, String> {
+    clear_elsewhere_with(
+        &SystemRunner,
+        &HOST_PROBES,
+        &host_clear_site(false, true),
+        label,
+        fsid,
+        mount,
+        held.is_delegated(),
+        progress,
+    )
 }
 
 /// Whether what is mounted at `target.mount` is the target: its filesystem
@@ -2200,54 +2271,33 @@ fn ensure_targets_mounted_with(
         // Under a handed-down hold such a mount is not cleared either, and
         // still never bound: the target is NOT available (the parent may
         // have skipped it for a writer that holds it).
-        let guarded = raid_guard::is_guarded(target);
-        if guarded {
+        // Every target with a `mount_uuid` — a RAID-1 one or a single drive
+        // (a recovery drive) — is looked for by its filesystem UUID, and its
+        // other mounts are cleared, never used as found or written through
+        // (bd DAS-Backup-Manager-eg4j.19). Only a target with no `mount_uuid`
+        // has nothing to look for, and keeps the bind fallback below.
+        let clearable = target.mount_uuid.as_deref().is_some_and(|u| !u.is_empty());
+        if clearable {
             let fsid = target.mount_uuid.as_deref().unwrap_or_default();
-            let host = SystemMembers {
-                runner: &*guard.runner,
+            let cleared = clear_elsewhere_with(
+                &*guard.runner,
                 probes,
-            };
-            let members = raid_guard::MemberHost::members(&host, fsid);
-            let cleared = if held.is_delegated() {
-                members.and_then(|members| {
-                    let all = crate::holders::parse_mountinfo(&(clear.mountinfo)()?);
-                    let elsewhere: Vec<String> = crate::holders::mounts_of(&all, &members)
-                        .into_iter()
-                        .filter(|m| m.mount_point != target.mount)
-                        .map(|m| m.mount_point)
-                        .collect();
-                    if elsewhere.is_empty() {
-                        Ok(None)
-                    } else {
-                        Err(format!(
-                            "its filesystem is mounted by another program at {} — never bound, \
-                             and not cleared under a handed-down maintenance lock",
-                            elsewhere.join(", ")
-                        ))
-                    }
-                })
-            } else {
-                members
-                    .and_then(|members| {
-                        clear_mounted_elsewhere(
-                            &*guard.runner,
-                            clear,
-                            target,
-                            fsid,
-                            &members,
-                            progress,
-                        )
-                    })
-                    .and_then(|done| match done {
-                        // A dry run touched nothing: that mount is still
-                        // there, and the target is never mounted beside it.
-                        Some(would) if clear.report_only => Err(format!(
-                            "dry run: {} — nothing was stopped or unmounted",
-                            would.join("; ")
-                        )),
-                        other => Ok(other),
-                    })
-            };
+                clear,
+                &target.label,
+                fsid,
+                &target.mount,
+                held.is_delegated(),
+                progress,
+            )
+            .and_then(|done| match done {
+                // A dry run touched nothing: that mount is still there, and
+                // the target is never mounted beside it.
+                Some(would) if clear.report_only => Err(format!(
+                    "dry run: {} — nothing was stopped or unmounted",
+                    would.join("; ")
+                )),
+                other => Ok(other),
+            });
             // What it did to other programs' processes, for the report (bd
             // su1b.31): stopped, would stop (a dry run), or skipped.
             match &cleared {
@@ -2287,7 +2337,7 @@ fn ensure_targets_mounted_with(
         // Already mounted elsewhere (e.g. udisks2 at /run/media/) — bind-mount
         // at the configured path so btrbk can find the target where it expects it.
         if let Some(actual) =
-            (probes.find_mount_for_device)(&target.serial, &target.role).filter(|_| !guarded)
+            (probes.find_mount_for_device)(&target.serial, &target.role).filter(|_| !clearable)
         {
             // Create configured mount point directory if needed
             let created = !mount_path.exists();
@@ -4385,7 +4435,7 @@ mod tests {
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
         assert_eq!(
-            runner.calls(),
+            sans_blkid(&runner),
             vec![
                 output_call(&["findmnt", "-n", "-o", "UUID", "--target", &mnt]),
                 status_call(&["umount", &mnt]),
@@ -4404,7 +4454,7 @@ mod tests {
             )]
         );
         drop(guard);
-        assert_eq!(runner.calls()[3..], [status_call(&["umount", &mnt])]);
+        assert_eq!(sans_blkid(&runner)[3..], [status_call(&["umount", &mnt])]);
     }
 
     /// The plain unmount is retried; when every try finds it busy, one
@@ -4431,7 +4481,7 @@ mod tests {
 
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
-        let calls = runner.calls();
+        let calls = sans_blkid(&runner);
         assert_eq!(calls[1..6], vec![status_call(&["umount", &mnt]); 5][..]);
         // Still busy: whether btrfs maintenance runs on it is asked first
         // (bd su1b.12); nothing holds it, so straight to the forced unmount.
@@ -4545,6 +4595,274 @@ mod tests {
         (config, host, runner, mnt)
     }
 
+    // --- bd DAS-Backup-Manager-eg4j.19: single-drive targets --------------
+
+    /// A single-drive target (one serial, a `mount_uuid`) whose filesystem
+    /// udisks also mounted under /run/media (mount id 77), with `holder`
+    /// using it. `uuid`: whether the target is configured with `mount_uuid`.
+    fn single_mounted_by_udisks(
+        scratch: &Scratch,
+        holder: Option<crate::holders::testproc::Proc<'_>>,
+        uuid: bool,
+    ) -> (Config, Host, Arc<ScriptedRunner>, String) {
+        let (mut config, mut host, part_b, mnt) = attached_primary(scratch);
+        config.targets[0].mount_uuid = uuid.then(|| "u-p".to_string());
+        config.das.mount_opts = "noatime".into();
+        host.mounted_elsewhere = vec![("SER-P".into(), "/run/media/u/das".into())];
+        host.uuids = vec![("u-p".into(), part_b.clone())];
+        host.mountinfo = vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            format!(
+                "77 22 0:52 / /run/media/u/das rw,nosuid - btrfs {part_b} rw,subvolid=5,subvol=/"
+            ),
+        ];
+        let proc = crate::holders::testproc::FakeProc::new();
+        if let Some(h) = holder {
+            proc.add(h);
+        }
+        host.proc = Some(Arc::new(proc));
+        let runner = ScriptedRunner::with_rules(&[("blkid", Reply::Out(0, format!("{part_b}\n")))]);
+        (config, host, runner, mnt)
+    }
+
+    fn single_mount_call(mnt: &str) -> Call {
+        output_call(&["mount", "-t", "btrfs", "-o", "noatime", "UUID=u-p", mnt])
+    }
+
+    #[test]
+    fn single_drive_target_mounted_elsewhere_is_cleared_then_mounted() {
+        let scratch = Scratch::new();
+        let (config, host, runner, mnt) =
+            single_mounted_by_udisks(&scratch, Some(reader_at(300, "/run/media/u/das/a")), true);
+        let progress = Recorder::default();
+
+        let guard = host.mount_targets(&config, &progress, &runner).unwrap();
+
+        assert!(!binds(&runner), "bound as found: {:?}", runner.calls());
+        assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
+        let calls = runner.calls();
+        let umount = calls
+            .iter()
+            .position(|c| c == &status_call(&["umount", "--no-canonicalize", "/run/media/u/das"]))
+            .expect("the other program's mount is unmounted");
+        let mount = calls
+            .iter()
+            .position(|c| c == &single_mount_call(&mnt))
+            .expect("the target mounted at its own path");
+        assert!(umount < mount, "{calls:?}");
+        assert_eq!(guard.count(), 1);
+        assert!(logged(&progress, "pid 300"), "{:?}", progress.logs());
+        assert_eq!(guard.clear_notes()[0].outcome, ClearOutcome::Stopped);
+    }
+
+    #[test]
+    fn single_drive_target_writer_elsewhere_not_available() {
+        let scratch = Scratch::new();
+        let writer = crate::holders::testproc::Proc {
+            pid: 301,
+            cmd: "rsync",
+            fds: vec![(4, "/run/media/u/das/big", "0100001", Some(77))],
+            ..Default::default()
+        };
+        let (config, host, runner, mnt) = single_mounted_by_udisks(&scratch, Some(writer), true);
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        let Err(MountError::AllTargetsRefused { notes }) = result else {
+            panic!("{:?}", result.err());
+        };
+        assert_eq!(notes[0].outcome, ClearOutcome::Refused);
+        assert!(notes[0].detail.contains("pid 301"), "{notes:?}");
+        assert!(host.signals().is_empty());
+        assert!(!binds(&runner));
+        assert!(!runner.calls().contains(&single_mount_call(&mnt)));
+        assert!(logged(&progress, "NOT available"), "{:?}", progress.logs());
+    }
+
+    /// An idle mount of a single-drive target with a `mount_uuid` is never
+    /// bound (a backup written through another program's mount): unmounted,
+    /// then the target mounted as configured.
+    #[test]
+    fn single_drive_target_never_bind_mounted_when_uuid_configured() {
+        let scratch = Scratch::new();
+        let (config, host, runner, mnt) = single_mounted_by_udisks(&scratch, None, true);
+
+        let guard = host
+            .mount_targets(&config, &Recorder::default(), &runner)
+            .unwrap();
+
+        assert!(!binds(&runner), "{:?}", runner.calls());
+        assert!(runner.calls().contains(&single_mount_call(&mnt)));
+        assert_eq!(guard.count(), 1);
+    }
+
+    /// No `mount_uuid`: nothing identifies the filesystem to look for, so the
+    /// bind fallback stays for it (bd 804's WARN).
+    #[test]
+    fn target_without_uuid_still_bind_mounts() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) = single_mounted_by_udisks(&scratch, None, false);
+
+        host.mount_targets(&config, &Recorder::default(), &runner)
+            .unwrap();
+
+        assert!(binds(&runner), "{:?}", runner.calls());
+        // Only the guard's own take-back of what it bound, never the other
+        // program's mount.
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv.iter().any(|a| a == "/run/media/u/das") && c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// Under a handed-down hold nothing is cleared or bound: NOT available
+    /// (the parent owns the mounts).
+    #[test]
+    fn delegated_hold_single_drive_elsewhere_not_available() {
+        let scratch = Scratch::new();
+        let (config, host, runner, _mnt) =
+            single_mounted_by_udisks(&scratch, Some(reader_at(300, "/run/media/u/das/a")), true);
+        let progress = Recorder::default();
+
+        let result = host.mount_targets_held(
+            &config,
+            &progress,
+            &runner,
+            &MaintenanceHeld::delegated_for_test(),
+        );
+
+        assert!(
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(!binds(&runner));
+        assert!(host.signals().is_empty());
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|c| c.argv[0] == "mount" || c.argv[0] == "umount"),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    /// A job that writes nothing under the target (the doctor, walk, restore,
+    /// the recovery-OS reading) never stops another program's reader of a
+    /// single-drive target: refused, the reader named, nothing signalled.
+    #[test]
+    fn doctor_single_drive_reader_elsewhere_refused_nothing_signalled() {
+        let scratch = Scratch::new();
+        let (config, mut host, runner, _mnt) =
+            single_mounted_by_udisks(&scratch, Some(reader_at(300, "/run/media/u/das/a")), true);
+        host.read_only_job = true;
+        let progress = Recorder::default();
+
+        let result = host.mount_targets(&config, &progress, &runner);
+
+        assert!(
+            matches!(result, Err(MountError::AllTargetsRefused { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(host.signals().is_empty());
+        assert!(!runner.calls().iter().any(|c| c.argv[0] == "umount"));
+        assert!(
+            logged(&progress, "never stops a process") && logged(&progress, "pid 300"),
+            "{:?}",
+            progress.logs()
+        );
+    }
+
+    /// The scrub engine's mount of a single-drive target clears another
+    /// program's mount first, as a job that writes (a scrub repairs).
+    #[test]
+    fn scrub_single_drive_mounted_elsewhere_cleared_then_scrubbed() {
+        let scratch = Scratch::new();
+        let (_config, host, runner, mnt) =
+            single_mounted_by_udisks(&scratch, Some(reader_at(300, "/run/media/u/das/a")), true);
+        let progress = Recorder::default();
+
+        let got = host.with_clear(&runner, |c| {
+            host.with_probes(&runner, |p| {
+                clear_elsewhere_with(&*runner, p, c, "primary", "u-p", &mnt, false, &progress)
+            })
+        });
+
+        let sent = got.unwrap().expect("cleared");
+        assert!(sent[0].starts_with("SIGTERM to pid 300"), "{sent:?}");
+        assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
+        assert!(runner.calls().contains(&status_call(&[
+            "umount",
+            "--no-canonicalize",
+            "/run/media/u/das"
+        ])));
+    }
+
+    #[test]
+    fn scrub_single_drive_writer_elsewhere_not_scrubbed() {
+        let scratch = Scratch::new();
+        let writer = crate::holders::testproc::Proc {
+            pid: 301,
+            cmd: "rsync",
+            fds: vec![(4, "/run/media/u/das/big", "0100001", Some(77))],
+            ..Default::default()
+        };
+        let (_config, host, runner, mnt) = single_mounted_by_udisks(&scratch, Some(writer), true);
+
+        let got = host.with_clear(&runner, |c| {
+            host.with_probes(&runner, |p| {
+                clear_elsewhere_with(
+                    &*runner,
+                    p,
+                    c,
+                    "primary",
+                    "u-p",
+                    &mnt,
+                    false,
+                    &Recorder::default(),
+                )
+            })
+        });
+
+        assert!(got.unwrap_err().contains("pid 301"));
+        assert!(host.signals().is_empty());
+        assert!(!runner.calls().iter().any(|c| c.argv[0] == "umount"));
+    }
+
+    /// Under a handed-down hold the scrub's mount does not clear either.
+    #[test]
+    fn scrub_under_a_delegated_hold_does_not_clear_another_programs_mount() {
+        let scratch = Scratch::new();
+        let (_config, host, runner, mnt) =
+            single_mounted_by_udisks(&scratch, Some(reader_at(300, "/run/media/u/das/a")), true);
+
+        let got = host.with_clear(&runner, |c| {
+            host.with_probes(&runner, |p| {
+                clear_elsewhere_with(
+                    &*runner,
+                    p,
+                    c,
+                    "primary",
+                    "u-p",
+                    &mnt,
+                    true,
+                    &Recorder::default(),
+                )
+            })
+        });
+
+        assert!(got.unwrap_err().contains("not cleared under a handed-down"));
+        assert!(host.signals().is_empty());
+        assert!(!runner.calls().iter().any(|c| c.argv[0] == "umount"));
+    }
+
     fn reader_at(pid: i32, path: &'static str) -> crate::holders::testproc::Proc<'static> {
         crate::holders::testproc::Proc {
             pid,
@@ -4559,6 +4877,17 @@ mod tests {
             .calls()
             .iter()
             .any(|c| c.argv[0] == "mount" && c.argv.iter().any(|a| a == "--bind"))
+    }
+
+    /// The runner's commands without the `blkid` that looks for the
+    /// filesystem's members before another program's mounts are cleared
+    /// (bd eg4j.19): what these tests are about is what mounts.
+    fn sans_blkid(runner: &ScriptedRunner) -> Vec<Call> {
+        runner
+            .calls()
+            .into_iter()
+            .filter(|c| c.argv[0] != "blkid")
+            .collect()
     }
 
     fn logged(progress: &Recorder, fragment: &str) -> bool {
@@ -6178,7 +6507,7 @@ mod tests {
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
         assert_eq!(
-            runner.calls(),
+            sans_blkid(&runner),
             vec![output_call(&[
                 "mount",
                 "-t",
@@ -6210,7 +6539,7 @@ mod tests {
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
         assert_eq!(
-            runner.calls(),
+            sans_blkid(&runner),
             vec![output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt])]
         );
         assert_eq!(guard.count(), 1);
@@ -6558,7 +6887,7 @@ mod tests {
         let result = host.mount_targets(&config, &progress, &runner);
 
         assert!(matches!(result, Err(MountError::NoDrivesFound)));
-        assert!(runner.calls().is_empty());
+        assert!(sans_blkid(&runner).is_empty());
         progress.assert_only_log(
             LogLevel::Warning,
             &[
@@ -6592,13 +6921,14 @@ mod tests {
         let scratch = Scratch::new();
         let (mut config, host, part, mnt) = attached_primary(&scratch);
         config.targets[0].mount_uuid = Some("u-p".into());
-        let runner = ScriptedRunner::with_rules(&[("UUID=u-p", Reply::exit(32))]);
+        let runner =
+            ScriptedRunner::with_rules(&[("blkid", Reply::ok()), ("UUID=u-p", Reply::exit(32))]);
         let progress = Recorder::default();
 
         let guard = host.mount_targets(&config, &progress, &runner).unwrap();
 
         assert_eq!(
-            runner.calls(),
+            sans_blkid(&runner),
             vec![
                 output_call(&["mount", "-t", "btrfs", "UUID=u-p", &mnt]),
                 output_call(&["mount", "-t", "btrfs", &part, &mnt]),
@@ -6625,12 +6955,13 @@ mod tests {
             uuids: vec![("u-loop".into(), "/dev/loop7".into())],
             ..Host::default()
         };
-        let runner = ScriptedRunner::with_rules(&[("UUID=u-loop", Reply::exit(32))]);
+        let runner =
+            ScriptedRunner::with_rules(&[("blkid", Reply::ok()), ("UUID=u-loop", Reply::exit(32))]);
 
         let result = host.mount_targets(&config, &Recorder::default(), &runner);
 
         assert!(matches!(result, Err(MountError::NoDrivesFound)));
-        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(sans_blkid(&runner).len(), 1);
         assert!(!Path::new(&mnt).exists());
     }
 
@@ -6657,7 +6988,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            runner.calls(),
+            sans_blkid(&runner),
             vec![output_call(&["mount", "-t", "btrfs", "UUID=u-rec", &mnt])]
         );
     }

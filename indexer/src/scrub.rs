@@ -2927,6 +2927,20 @@ fn ensure_mounted(
         return verify_engine_mount(mount_point, fsuuid, progress, cleanup_dir);
     }
 
+    // A single-drive target (no guard) that another program mounted
+    // elsewhere is cleared by the stop policy first, as a writing job: a
+    // scrub is never run beside, or through, another program's mount (bd
+    // DAS-Backup-Manager-eg4j.19). Refused: this filesystem is not scrubbed.
+    if let Err(why) =
+        crate::mount::clear_filesystem_elsewhere(mount_point, fsuuid, mount_point, held, progress)
+    {
+        cleanup_dir(progress);
+        return Err(format!(
+            "{fsuuid} is mounted by another program and cannot be cleared ({why}) — refusing to \
+             scrub it"
+        ));
+    }
+
     let mut cmd = Command::new("mount");
     cmd.args(["-t", "btrfs"]);
     if !mount_opts.is_empty() {

@@ -1,9 +1,15 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.24.1
-# Date: 2026-11-25
+# Version: 4.25.0
+# Date: 2026-11-27
 #
 # Features:
+#   - The stop policy covers every target with a mount_uuid (v4.25.0, bd
+#     DAS-Backup-Manager-eg4j.19): a single-drive target's filesystem — a
+#     recovery drive's — that another program mounted elsewhere is cleared by
+#     `btrdasd backup clear-target` before its mount exactly as a RAID-1
+#     target's is, and never written through; a target with no mount_uuid has
+#     nothing to look for and keeps the old route.
 #   - The I/O scheduler reaches every disk carrying a target's filesystem
 #     UUID (v4.24.1, bd DAS-Backup-Manager-su1b.4): `blkid -t UUID=` lists
 #     every member, each partition resolved to its parent disk through sysfs
@@ -2498,7 +2504,7 @@ clear_target() { # clear_target <label> [--leftover]
         local why="$label: the clearing of its other mounts could not run (exit $rc): ${line:-no CLEAR TARGET line}"
         log_error "ABORTING: $why"
         record_op "target_${label}" "FAIL" "$why"
-        abort_reason "a RAID-1 target's mount" "$why"
+        abort_reason "$(is_guarded_target "$label" && echo "a RAID-1 target's mount" || echo "a target's mount")" "$why"
         exit 3
         ;;
     esac
@@ -2810,9 +2816,11 @@ mount_targets() {
             take_down_leftover "$label"
         fi
 
-        # A RAID-1 target: the guarded mount, never `degraded` as configured
-        # and never the partition fallback (bd DAS-Backup-Manager-su1b.10).
-        if is_guarded_target "$label"; then
+        # A target with a filesystem UUID, RAID-1 or a single drive (bd
+        # su1b.10, eg4j.19): another program's mount of it is never used as
+        # found, and a RAID-1 target is mounted only through the guard,
+        # never `degraded` as configured and never by the partition fallback.
+        if [[ -n "$uuid" ]]; then
             # Another program's mount of it is never used as found (bd
             # su1b.12): cleared by the stop policy and unmounted first; what
             # will not clear leaves the target NOT available this run, a FAIL
@@ -2836,9 +2844,11 @@ mount_targets() {
                 rmdir -- "$mnt" 2>/dev/null || log_warn "  $label: $mnt could not be removed (the bare-mountpoint guard decides)"
                 continue
             fi
-            warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
-            guarded_mount "$label"
-            continue
+            if is_guarded_target "$label"; then
+                warn_mounted_elsewhere "$label" "UUID=$uuid" "$mnt"
+                guarded_mount "$label"
+                continue
+            fi
         fi
 
         # Prefer mount-by-UUID when configured (a single-device target here).

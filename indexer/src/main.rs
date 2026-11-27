@@ -575,7 +575,7 @@ enum BackupAction {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
-    /// Clear what holds a target's filesystem, for backup-run.sh (bd DAS-Backup-Manager-su1b.12), under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Without --leftover: a RAID-1 target's filesystem mounted anywhere but its own path — every such mount, its origin and every process using it said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted. With --leftover: the busy mount an earlier job left at the target's own path, shown to be the target first; its holders are cleared the same way and the caller unmounts it. One line per mount, holder and signal, then `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
+    /// Clear what holds a target's filesystem, for backup-run.sh (bd DAS-Backup-Manager-su1b.12), under the maintenance lock handed down (DAS_MAINTENANCE_LOCK_FD). Without --leftover: a target's filesystem (RAID-1 or a single drive; the target needs a mount_uuid) mounted anywhere but its own path — every such mount, its origin and every process using it said; a process holding a file there open for writing is never signalled (REFUSED); readers get SIGTERM, 10 s, then SIGKILL; then each mount is unmounted. With --leftover: the busy mount an earlier job left at the target's own path, shown to be the target first; its holders are cleared the same way and the caller unmounts it. One line per mount, holder and signal, then `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)`. EXIT CODE: 0 cleared, 3 refused, 2 could not run.
     #[command(hide = true)]
     ClearTarget {
         /// The target's label
@@ -2402,7 +2402,8 @@ fn mount_target_outcome(
 
 /// `btrdasd backup clear-target` (bd DAS-Backup-Manager-su1b.12): only
 /// under a maintenance lock handed down, as `mount-target`. Without
-/// `--leftover` the target must be a RAID-1 target; a leftover may be any.
+/// `--leftover` the target must have a `mount_uuid` (RAID-1 or a single
+/// drive, bd eg4j.19); a leftover may be any.
 fn cmd_clear_target(label: &str, config: &Path, leftover: bool, report_only: bool) -> i32 {
     let lock = CliLock::production();
     let (line, code) = clear_target_outcome(label, config, leftover, &lock, &|target, held| {
@@ -2436,9 +2437,9 @@ fn clear_target_outcome(
     let Some(target) = cfg.targets.iter().find(|t| t.label == label) else {
         return cannot_run(format!("no [[target]] labelled '{label}'"));
     };
-    if !leftover && !buttered_dasd::raid_guard::is_guarded(target) {
+    if !leftover && target.mount_uuid.as_deref().is_none_or(str::is_empty) {
         return cannot_run(format!(
-            "target '{label}' is not a RAID-1 target (mount_uuid and two or more serials)"
+            "target '{label}' has no mount_uuid: there is no filesystem to look for"
         ));
     }
     let held = match handed_down_hold(lock) {
@@ -7080,15 +7081,16 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         assert_eq!(code, 2);
         assert!(line.contains("is not an open descriptor"), "{line}");
 
-        // Without --leftover the target must be a RAID-1 one (one serial is
-        // not); with it, any target will do.
+        // Without --leftover the target must have a mount_uuid (one serial is
+        // enough: bd eg4j.19); with it, any target will do.
         let mut one = Config::load(&cfg).unwrap();
         one.targets[0].serials = vec!["SERIAL11".into()];
+        one.targets[0].mount_uuid = None;
         let one_path = dir.path().join("one.toml");
         std::fs::write(&one_path, one.to_toml().unwrap()).unwrap();
         let (line, code) = run("pair", &one_path, false, &lock);
         assert_eq!(code, 2);
-        assert!(line.contains("is not a RAID-1 target"), "{line}");
+        assert!(line.contains("has no mount_uuid"), "{line}");
     }
 
     /// Past the checks the clearing's own result decides the line and the
@@ -7105,7 +7107,12 @@ t_resumed:0|duration:120|canceled:0|finished:1\n"
         let (_held, lock) = handed_down_lock(dir.path());
         let seen: Clearing = Default::default();
 
-        for (config, leftover) in [(&cfg, false), (&cfg, true), (&one_path, true)] {
+        for (config, leftover) in [
+            (&cfg, false),
+            (&cfg, true),
+            (&one_path, true),
+            (&one_path, false),
+        ] {
             for (answer, line, code) in [
                 (
                     mount::ClearTarget::Cleared("fine".into()),

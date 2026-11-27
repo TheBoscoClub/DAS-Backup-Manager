@@ -303,20 +303,24 @@ case "$1 ${2:-}" in
         [[ "$1" == --report-only ]] && report=" report-only"
         shift
     done
+    # The knobs name the RAID-1 primary; the single-drive recovery target
+    # (bd eg4j.19) takes the same knobs with the prefix rec_.
+    pfx=""
+    [[ "$label" == system-recovery-A-2tb ]] && pfx="rec_"
     printf '%s fd=%s leftover=%s%s\n' "$label" "${DAS_MAINTENANCE_LOCK_FD:-unset}" "$leftover" "$report" \
         >>"$S/calls/clear_target"
     if [[ -n "$report" ]]; then
-        printf '%s\n' "$(knob clear_report_line 'CLEAR TARGET: OK  (not mounted anywhere else)')"
-        exit "$(knob clear_report_rc 0)"
+        printf '%s\n' "$(knob "${pfx}clear_report_line" 'CLEAR TARGET: OK  (not mounted anywhere else)')"
+        exit "$(knob "${pfx}clear_report_rc" 0)"
     fi
     echo "  [WARN]  Target '$label': holder: pid 300 [reading] (stub, leftover=$leftover)" >&2
     if [[ "$leftover" == yes ]]; then
         [[ -f "$S/knobs/clear_releases" ]] && : >"$S/cleared"
-        printf '%s\n' "$(knob clear_leftover_line 'CLEAR TARGET: OK  (nothing holds it (stub))')"
-        exit "$(knob clear_leftover_rc 0)"
+        printf '%s\n' "$(knob "${pfx}clear_leftover_line" 'CLEAR TARGET: OK  (nothing holds it (stub))')"
+        exit "$(knob "${pfx}clear_leftover_rc" 0)"
     fi
-    printf '%s\n' "$(knob clear_line 'CLEAR TARGET: OK  (not mounted anywhere else)')"
-    exit "$(knob clear_rc 0)"
+    printf '%s\n' "$(knob "${pfx}clear_line" 'CLEAR TARGET: OK  (not mounted anywhere else)')"
+    exit "$(knob "${pfx}clear_rc" 0)"
     ;;
 "backup raid-check")
     # The end-of-run RAID-1 check (bd su1b.14): what it was handed, and
@@ -2186,7 +2190,7 @@ echo "== a RAID-1 target another program mounted (bd DAS-Backup-Manager-su1b.12)
 fresh
 run_backup
 check "clear-target: asked before the guarded mount, on fd 8" \
-    "$(cat "$STATE/calls/clear_target" 2>/dev/null)" "primary-22tb fd=8 leftover=no"
+    "$(grep -c '^primary-22tb fd=8 leftover=no$' "$STATE/calls/clear_target" 2>/dev/null)" "1"
 
 fresh
 knob clear_rc 3
@@ -2211,7 +2215,7 @@ run_backup --dryrun
 check "dry run, another program's mount: exit status" "$RC" "0"
 show_tail 0
 check "dry run, another program's mount: report-only, on fd 8" \
-    "$(cat "$STATE/calls/clear_target" 2>/dev/null)" "primary-22tb fd=8 leftover=no report-only"
+    "$(grep -c '^primary-22tb fd=8 leftover=no report-only$' "$STATE/calls/clear_target" 2>/dev/null)" "1"
 check "dry run, another program's mount: says whom it would stop" \
     "$(grep -c "primary-22tb: dry run: .*would stop: pid 300.* not mounted for the dry run" "$STATE/out")" "1"
 check "dry run, another program's mount: the guarded mount never ran" \
@@ -2225,6 +2229,45 @@ knob clear_line 'CLEAR TARGET: CANNOT-RUN  (stub)'
 run_backup
 expect_aborted "clear-target cannot run" "the clearing of its other mounts could not run (exit 2)" \
     "a RAID-1 target's mount" "CLEAR TARGET: CANNOT-RUN  (stub)"
+
+# ---------------------------------------------------------------------------
+echo "== a single-drive target another program mounted (bd DAS-Backup-Manager-eg4j.19)"
+# ---------------------------------------------------------------------------
+# The recovery drive's filesystem (one serial, a mount_uuid) gets the stop
+# policy the RAID-1 primary has: never used as found, never written through.
+fresh
+run_backup
+check "mirror target: clear-target asked for it, on fd 8" \
+    "$(grep -c '^system-recovery-A-2tb fd=8 leftover=no$' "$STATE/calls/clear_target" 2>/dev/null)" "1"
+check "mirror_target_mounted_elsewhere_cleared_then_mounted: mounted at its own path once" \
+    "$(calls_for mount "$RECOVERY_MNT")" "1"
+
+fresh
+knob rec_clear_line 'CLEAR TARGET: OK  (another program'"'"'s mount was unmounted, stopped what held it: SIGTERM to pid 310 (kate); the kernel has it mounted nowhere (stub))'
+run_backup
+expect_completed "another program's mount of a mirror target cleared, a reader stopped" 0 "COMPLETED WITH WARNINGS" "success"
+check "mirror target cleared: the kill is named in its row" \
+    "$(grep -c '^  Target system-recovery-A-2tb  *WARN  (.*before the mount: .*SIGTERM to pid 310 (kate)' "$WORK/lib/last-report.txt")" "1"
+check "mirror target cleared: mounted afterwards" "$(calls_for mount "$RECOVERY_MNT")" "1"
+
+fresh
+knob rec_clear_rc 3
+knob rec_clear_line 'CLEAR TARGET: REFUSED  (it is held open for writing by pid 311 (rsync: fd 4 /run/media/u/rec/big (WRITE)) (stub))'
+run_backup
+expect_completed "mirror_target_clear_refused_fail_row_not_available: another program writing to a mirror target" 3 "FAILURES DETECTED" "failure"
+check "mirror target refused: never mounted" "$(calls_for mount "$RECOVERY_MNT")" "0"
+check "mirror target refused: its mount point removed (the bare-mountpoint guard)" \
+    "$([[ -e "$RECOVERY_MNT" ]] && echo exists || echo gone)" "gone"
+check "mirror target refused: the row names the writer" \
+    "$(grep -c '^  Target system-recovery-A-2tb  *FAIL  (.*held open for writing by pid 311' "$WORK/lib/last-report.txt")" "1"
+check "mirror target refused: the primary still backed up" "$(ran_btrbk)" "yes"
+
+fresh
+knob rec_clear_rc 2
+knob rec_clear_line 'CLEAR TARGET: CANNOT-RUN  (stub)'
+run_backup
+expect_aborted "clear-target cannot run for a mirror target" "the clearing of its other mounts could not run (exit 2)" \
+    "a target's mount" "CLEAR TARGET: CANNOT-RUN  (stub)"
 
 # ---------------------------------------------------------------------------
 echo "== a target's filesystem already mounted somewhere else (bd DAS-Backup-Manager-804)"
