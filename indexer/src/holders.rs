@@ -57,6 +57,12 @@ pub struct MountEntry {
     pub id: u64,
     /// The directory of the filesystem shown there (field 4).
     pub root: String,
+    /// `major:minor` of the mounted filesystem's device (field 3): the
+    /// block device's own number for a filesystem on a block device (not
+    /// btrfs, whose number is an anonymous one), what a FUSE mount can
+    /// never carry. The source string is not evidence: any user can make a
+    /// FUSE mount whose source reads `/dev/sdX1`.
+    pub dev: String,
     pub mount_point: String,
     /// Per-mount options (field 6).
     pub options: String,
@@ -105,6 +111,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
         out.push(MountEntry {
             id,
             root: unescape(left[3]),
+            dev: left[2].to_string(),
             mount_point: unescape(left[4]),
             options: left[5].to_string(),
             fstype: right[0].to_string(),
@@ -124,15 +131,47 @@ pub fn mounts_of(entries: &[MountEntry], member_paths: &[String]) -> Vec<MountEn
     mounts_matching(entries, member_paths, |e| e.fstype == "btrfs")
 }
 
-/// The mounts of any filesystem whose source is one of these partitions
-/// (bd DAS-Backup-Manager-eg4j.19): the recovery drive's vfat ESP that
-/// udisks mounted is as much its mount as a btrfs one. Each path is tried as
-/// given and canonicalized (a `/dev/disk/by-partuuid/…` link names the same
-/// partition mountinfo shows as `/dev/sdX1`). Same order as [`mounts_of`]:
-/// deepest mount point first. [`mounts_of`] itself stays btrfs only, for the
-/// RAID-1 guard.
-pub fn mounts_of_partitions(entries: &[MountEntry], partitions: &[String]) -> Vec<MountEntry> {
-    mounts_matching(entries, partitions, |_| true)
+/// A partition (or whole disk) as the host knows it: its path and its
+/// block device number, `major:minor` (`st_rdev`, read by the caller from
+/// the path, which must be a block device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionId {
+    pub path: String,
+    pub dev: String,
+}
+
+/// The mounts of these partitions, of any filesystem (bd
+/// DAS-Backup-Manager-eg4j.19): the recovery drive's vfat ESP that udisks
+/// mounted is as much its mount as a btrfs one. Never by the source text:
+/// a FUSE mount can say any source it likes. A btrfs mount is matched as
+/// [`mounts_of`] does (its device number is an anonymous one); every other
+/// filesystem by its mountinfo device number equal to the partition's, and a
+/// `fuse*` filesystem is never ours. Same order as [`mounts_of`]: deepest
+/// mount point first. [`mounts_of`] itself stays btrfs only, for the RAID-1
+/// guard.
+pub fn mounts_of_partitions(entries: &[MountEntry], partitions: &[PartitionId]) -> Vec<MountEntry> {
+    let paths: Vec<String> = partitions.iter().map(|p| p.path.clone()).collect();
+    let devs: BTreeSet<&str> = partitions.iter().map(|p| p.dev.as_str()).collect();
+    let mut out: Vec<MountEntry> = entries
+        .iter()
+        .filter(|e| {
+            !e.fstype.starts_with("fuse") && e.fstype != "btrfs" && devs.contains(e.dev.as_str())
+        })
+        .cloned()
+        .collect();
+    out.extend(mounts_of(entries, &paths));
+    sort_deepest_first(&mut out);
+    out
+}
+
+fn sort_deepest_first(v: &mut [MountEntry]) {
+    v.sort_by(|a, b| {
+        b.mount_point
+            .matches('/')
+            .count()
+            .cmp(&a.mount_point.matches('/').count())
+            .then_with(|| b.id.cmp(&a.id))
+    });
 }
 
 fn mounts_matching(
@@ -1166,15 +1205,25 @@ mod tests {
         assert_eq!(stacked[0].mount_point, "/run/media/user/das/inner");
     }
 
+    fn part(path: &str, dev: &str) -> PartitionId {
+        PartitionId {
+            path: path.into(),
+            dev: dev.into(),
+        }
+    }
+
     #[test]
     fn mounts_of_partitions_matches_vfat_and_btrfs_by_partition() {
         let text = "\
 22 1 0:21 / / rw - btrfs /dev/nvme0n1p2 rw\n\
-50 30 0:60 / /run/media/user/ESP rw - vfat /dev/sdx1 rw,fmask=0022\n\
+50 30 8:17 / /run/media/user/ESP rw - vfat /dev/sdx1 rw,fmask=0022\n\
 51 30 0:61 / /mnt/b rw - btrfs /dev/sdx2 rw,subvolid=5\n\
-52 50 0:62 / /run/media/user/ESP/inner rw - vfat /dev/sdx1 rw\n";
+52 50 8:17 / /run/media/user/ESP/inner rw - vfat /dev/sdx1 rw\n";
         let all = parse_mountinfo(text);
-        let got = mounts_of_partitions(&all, &["/dev/sdx1".into(), "/dev/sdx2".into()]);
+        let got = mounts_of_partitions(
+            &all,
+            &[part("/dev/sdx1", "8:17"), part("/dev/sdx2", "8:18")],
+        );
         let points: Vec<&str> = got.iter().map(|m| m.mount_point.as_str()).collect();
         // Any filesystem type; deepest mount point first.
         assert_eq!(
@@ -1190,24 +1239,38 @@ mod tests {
     #[test]
     fn mounts_of_partitions_ignores_other_partitions() {
         let all = parse_mountinfo(
-            "50 30 0:60 / /run/media/user/ESP rw - vfat /dev/sdy1 rw\n\
-51 30 0:61 / /mnt/b rw - vfat /dev/sdx10 rw\n",
+            "50 30 8:33 / /run/media/user/ESP rw - vfat /dev/sdy1 rw\n\
+51 30 8:26 / /mnt/b rw - vfat /dev/sdx10 rw\n",
         );
-        assert!(mounts_of_partitions(&all, &["/dev/sdx1".into()]).is_empty());
+        assert!(mounts_of_partitions(&all, &[part("/dev/sdx1", "8:17")]).is_empty());
         assert!(mounts_of_partitions(&all, &[]).is_empty());
     }
 
+    /// A user can FUSE-mount anything under any `fsname`, `/dev/sdx1`
+    /// included: the source text proves nothing, and root must never unmount
+    /// that user's mount or signal their processes for it.
     #[test]
-    fn mounts_of_partitions_follows_a_symlinked_partition_path() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let real = dir.path().join("sdx1");
-        std::fs::write(&real, b"").unwrap();
-        let link = dir.path().join("by-partuuid-x");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let real_s = real.to_string_lossy().into_owned();
-        let all = parse_mountinfo(&format!("50 30 0:60 / /mnt/e rw - vfat {real_s} rw\n"));
-        let got = mounts_of_partitions(&all, &[link.to_string_lossy().into_owned()]);
+    fn mounts_of_partitions_ignores_fuse_mount_with_forged_source() {
+        let all = parse_mountinfo(
+            "70 30 0:80 / /home/user/forged rw,nosuid,nodev - fuse.sshfs /dev/sdx1 rw,user_id=1000\n\
+71 30 8:17 / /home/user/forged2 rw - fuse /dev/sdx1 rw\n\
+72 30 0:81 / /home/user/forged3 rw - vfat /dev/sdx1 rw\n",
+        );
+        // 70: device number differs and it is FUSE; 71: even a matching
+        // number is FUSE, never ours; 72: right source text, wrong device.
+        assert!(mounts_of_partitions(&all, &[part("/dev/sdx1", "8:17")]).is_empty());
+    }
+
+    #[test]
+    fn mounts_of_partitions_matches_by_major_minor_not_source() {
+        // udisks reports `/dev/mapper/…` or a by-uuid name for the same
+        // device; the number is what the kernel means.
+        let all = parse_mountinfo(
+            "50 30 8:17 / /run/media/user/ESP rw - vfat /dev/disk/by-uuid/ABCD-0001 rw\n",
+        );
+        let got = mounts_of_partitions(&all, &[part("/dev/sdx1", "8:17")]);
         assert_eq!(got.len(), 1);
+        assert_eq!(got[0].dev, "8:17");
     }
 
     #[test]
@@ -1313,6 +1376,7 @@ mod tests {
             options: "rw".into(),
             fstype: "btrfs".into(),
             source: "/dev/sdx1".into(),
+            dev: "0:52".into(),
             super_options: String::new(),
         });
         let hs = scan_holders(&p.site(), &mounts).unwrap();
@@ -1620,6 +1684,7 @@ mod tests {
             options: "rw".into(),
             fstype: "btrfs".into(),
             source: "/dev/sdx1".into(),
+            dev: "0:52".into(),
             super_options: String::new(),
         };
         let real_id = FakeProc::real_mount_id(&dir);
@@ -2020,6 +2085,7 @@ xx 30 0:52 / /mnt rw - btrfs /dev/sdx1 rw\n\
             options: "rw".into(),
             fstype: "btrfs".into(),
             source: "/dev/sdx1".into(),
+            dev: "0:52".into(),
             super_options: String::new(),
         }
     }

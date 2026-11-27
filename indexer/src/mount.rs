@@ -267,6 +267,21 @@ struct ClearSite<'a> {
     /// while mounted only in another namespace, and after a lazy unmount
     /// while something still holds it).
     sysfs_btrfs: PathBuf,
+    /// The block device number (`major:minor`) of a partition path; `Err`
+    /// when the path is not a block device (bd DAS-Backup-Manager-eg4j.19).
+    block_dev: &'a dyn Fn(&str) -> Result<String, String>,
+}
+
+/// `st_rdev` of a block device, as mountinfo writes it: never of anything
+/// that is not one.
+fn host_block_dev(path: &str) -> Result<String, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if !m.file_type().is_block_device() {
+        return Err(format!("{path} is not a block device"));
+    }
+    let r = m.rdev();
+    Ok(format!("{}:{}", libc::major(r), libc::minor(r)))
 }
 
 fn read_self_mountinfo() -> Result<String, String> {
@@ -283,6 +298,7 @@ fn host_clear_site(report_only: bool, stop_readers: bool) -> ClearSite<'static> 
         signaller: &crate::holders::SystemSignaller,
         self_pid: std::process::id() as i32,
         sysfs_btrfs: PathBuf::from("/sys/fs/btrfs"),
+        block_dev: &host_block_dev,
     }
 }
 
@@ -1154,11 +1170,20 @@ fn clear_drive_with(
         Err(e) => return ClearDrive::CannotRun(format!("lsblk could not be run: {e}")),
     };
     // The whole disk too: a filesystem made on it directly.
-    let mut parts = vec![disk.clone()];
+    let mut names = vec![disk.clone()];
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let mut f = line.split_whitespace();
         if let (Some(name), Some("part")) = (f.next(), f.next()) {
-            parts.push(name.to_string());
+            names.push(name.to_string());
+        }
+    }
+    // Each by its block device number, never by what a mount calls its
+    // source; a path that is not a block device cannot be answered for.
+    let mut parts = Vec::new();
+    for name in names {
+        match (site.block_dev)(&name) {
+            Ok(dev) => parts.push(crate::holders::PartitionId { path: name, dev }),
+            Err(e) => return ClearDrive::CannotRun(e),
         }
     }
     let fsid = target.mount_uuid.as_deref().filter(|u| !u.is_empty());
@@ -1476,7 +1501,29 @@ fn unmount_each(
                     progress,
                 )?);
             }
-            why = match runner.status(Command::new("umount").arg(&m.mount_point)) {
+            // Never by path alone: the mount scanned must still be the one
+            // at that path (a path can be unmounted and mounted over by
+            // something else between the scan and now).
+            let now = crate::holders::parse_mountinfo(&(site.mountinfo)()?);
+            match now.iter().find(|n| n.mount_point == m.mount_point) {
+                None => {
+                    down = true;
+                    break;
+                }
+                Some(n) if n.id != m.id => {
+                    return Err(format!(
+                        "{} is no longer the mount that was scanned (mount id {} became {}) \
+                         — not unmounted",
+                        m.mount_point, m.id, n.id
+                    ));
+                }
+                Some(_) => {}
+            }
+            why = match runner.status(
+                Command::new("umount")
+                    .arg("--no-canonicalize")
+                    .arg(&m.mount_point),
+            ) {
                 Ok(s) if s.success() => {
                     down = true;
                     break;
@@ -1514,7 +1561,7 @@ fn clear_partitions_with(
     runner: &dyn CommandRunner,
     site: &ClearSite<'_>,
     who: &str,
-    partitions: &[String],
+    partitions: &[crate::holders::PartitionId],
     btrfs_fsid: Option<&str>,
     progress: &dyn ProgressCallback,
 ) -> Result<Option<Vec<String>>, String> {
@@ -3550,6 +3597,13 @@ mod tests {
         /// Clear for a job that writes nothing under the target: it may
         /// not stop readers (operator 2026-11-25).
         read_only_job: bool,
+        /// path → `major:minor` of the block devices that exist (none
+        /// listed: the path is not a block device).
+        block_devs: Vec<(String, String)>,
+        /// What the mount table shows from its second reading on (none:
+        /// the same as ever): another program mounting over a path between
+        /// the scan and the unmount.
+        mountinfo_later: Option<Vec<String>>,
     }
 
     /// The described host's signals: recorded, and the process ends unless
@@ -3586,10 +3640,15 @@ mod tests {
                 std::fs::create_dir_all(sysfs.path().join(u)).unwrap();
                 std::fs::write(sysfs.path().join(u).join("exclusive_operation"), op).unwrap();
             }
+            let reads = std::cell::Cell::new(0usize);
             let mountinfo = || {
                 let gone = runner.unmounted.lock().unwrap().clone();
-                Ok(self
-                    .mountinfo
+                reads.set(reads.get() + 1);
+                let table = match (&self.mountinfo_later, reads.get()) {
+                    (Some(later), n) if n >= 2 => later,
+                    _ => &self.mountinfo,
+                };
+                Ok(table
                     .iter()
                     .filter(|l| !gone.iter().any(|g| l.split(' ').nth(4) == Some(g)))
                     .cloned()
@@ -3597,7 +3656,15 @@ mod tests {
                     .join("\n"))
             };
             let signals = HostSignals(self);
+            let block_dev = |p: &str| {
+                self.block_devs
+                    .iter()
+                    .find(|(path, _)| path == p)
+                    .map(|(_, d)| d.clone())
+                    .ok_or_else(|| format!("{p} is not a block device"))
+            };
             f(&ClearSite {
+                block_dev: &block_dev,
                 mountinfo: &mountinfo,
                 proc: site,
                 signaller: &signals,
@@ -4467,7 +4534,12 @@ mod tests {
         Host {
             mountinfo: vec![
                 "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
-                format!("50 22 0:60 / {ESP_AT} rw,nosuid - vfat /dev/sdx1 rw,fmask=0022"),
+                format!("50 22 8:17 / {ESP_AT} rw,nosuid - vfat /dev/sdx1 rw,fmask=0022"),
+            ],
+            block_devs: vec![
+                ("/dev/sdx".into(), "8:16".into()),
+                ("/dev/sdx1".into(), "8:17".into()),
+                ("/dev/sdx2".into(), "8:18".into()),
             ],
             proc: Some(Arc::new(proc)),
             ..Host::default()
@@ -4494,7 +4566,10 @@ mod tests {
                 &**runner,
                 c,
                 "recovery",
-                &["/dev/sdx1".to_string()],
+                &[crate::holders::PartitionId {
+                    path: "/dev/sdx1".into(),
+                    dev: "8:17".into(),
+                }],
                 fsid,
                 progress,
             )
@@ -4506,7 +4581,10 @@ mod tests {
             .calls()
             .iter()
             .filter(|c| c.argv[0] == "umount")
-            .map(|c| c.argv[1].clone())
+            .map(|c| {
+                assert_eq!(c.argv[1], "--no-canonicalize", "{c:?}");
+                c.argv[2].clone()
+            })
             .collect()
     }
 
@@ -4588,7 +4666,7 @@ mod tests {
     fn clear_partitions_two_mounts_come_down_deepest_first() {
         let mut host = esp_mounted_by_udisks(None);
         host.mountinfo
-            .push("51 22 0:60 / /mnt/e rw - vfat /dev/sdx1 rw".into());
+            .push("51 22 8:17 / /mnt/e rw - vfat /dev/sdx1 rw".into());
         let runner = ScriptedRunner::succeeding();
 
         let got = clear_parts(&host, &runner, None, &Recorder::default());
@@ -4685,6 +4763,56 @@ mod tests {
         assert!(err.contains("another mount namespace"), "{err}");
     }
 
+    /// Security: another program mounts over the path between the scan and
+    /// the unmount (same path, new mount id): never unmounted by path.
+    #[test]
+    fn clear_partitions_mount_id_changed_before_unmount_refuses_or_rescans() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo_later = Some(vec![
+            "22 1 0:21 / / rw - btrfs /dev/root0 rw".into(),
+            format!("99 22 0:99 / {ESP_AT} rw - tmpfs tmpfs rw"),
+        ]);
+        let runner = ScriptedRunner::succeeding();
+
+        let err = clear_parts(&host, &runner, None, &Recorder::default()).unwrap_err();
+
+        assert!(
+            err.contains("no longer the mount that was scanned"),
+            "{err}"
+        );
+        assert!(umounts(&runner).is_empty(), "{:?}", runner.calls());
+    }
+
+    /// The path went away on its own before the unmount: nothing to unmount.
+    #[test]
+    fn clear_partitions_mount_gone_before_unmount_is_not_unmounted_again() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo_later = Some(vec!["22 1 0:21 / / rw - btrfs /dev/root0 rw".into()]);
+        let runner = ScriptedRunner::succeeding();
+
+        let got = clear_parts(&host, &runner, None, &Recorder::default());
+
+        // The table read after it is the "later" one: nothing mounted.
+        assert_eq!(got, Ok(Some(Vec::new())));
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// A user's FUSE mount that calls its source `/dev/sdx1` is not the
+    /// drive's: nothing unmounted, nothing signalled.
+    #[test]
+    fn clear_partitions_ignores_a_forged_fuse_mount_and_its_user() {
+        let mut host = esp_mounted_by_udisks(Some(esp_user(300, "0100002")));
+        host.mountinfo[1] =
+            "50 22 0:80 / /home/u/forged rw - fuse.sshfs /dev/sdx1 rw,user_id=1000".into();
+        let runner = ScriptedRunner::succeeding();
+
+        let got = clear_parts(&host, &runner, None, &Recorder::default());
+
+        assert_eq!(got, Ok(None));
+        assert!(runner.calls().is_empty());
+        assert!(host.signals().is_empty());
+    }
+
     // --- recovery-os clear-drive -----------------------------------------
 
     const LSBLK_OK: &str = "/dev/sdx disk\n/dev/sdx1 part RECOV-ESP-1\n/dev/sdx2 part\n";
@@ -4771,6 +4899,24 @@ mod tests {
 
         assert!(
             matches!(&got, ClearDrive::CannotRun(w) if w.contains("lsblk")),
+            "{got:?}"
+        );
+        assert!(umounts(&runner).is_empty());
+    }
+
+    /// A partition `lsblk` names that is not a block device (the drive went
+    /// away, or a name that is something else): cannot answer — never "no
+    /// mounts".
+    #[test]
+    fn clear_drive_a_partition_that_is_not_a_block_device_cannot_run() {
+        let mut host = cd_host(esp_mounted_by_udisks(None));
+        host.block_devs.retain(|(p, _)| p != "/dev/sdx2");
+        let runner = cd_runner(&[]);
+
+        let got = clear_drive_on(&host, &runner, &recovery_target());
+
+        assert!(
+            matches!(&got, ClearDrive::CannotRun(w) if w.contains("/dev/sdx2")),
             "{got:?}"
         );
         assert!(umounts(&runner).is_empty());
@@ -4867,7 +5013,7 @@ mod tests {
     #[test]
     fn clear_drive_a_mount_of_the_whole_disk_is_cleared_too() {
         let mut host = cd_host(esp_mounted_by_udisks(None));
-        host.mountinfo[1] = format!("50 22 0:60 / {ESP_AT} rw - vfat /dev/sdx rw");
+        host.mountinfo[1] = format!("50 22 8:16 / {ESP_AT} rw - vfat /dev/sdx rw");
         let runner = cd_runner(&[]);
 
         let got = clear_drive_on(&host, &runner, &recovery_target());
@@ -4894,7 +5040,7 @@ mod tests {
         let calls = runner.calls();
         let umount = calls
             .iter()
-            .position(|c| c == &status_call(&["umount", "/run/media/u/das"]))
+            .position(|c| c == &status_call(&["umount", "--no-canonicalize", "/run/media/u/das"]))
             .expect("the other program's mount is unmounted");
         let mount = calls
             .iter()
@@ -5303,9 +5449,11 @@ mod tests {
         );
         assert!(host.signals().is_empty(), "{:?}", host.signals());
         assert!(
-            !runner
-                .calls()
-                .contains(&status_call(&["umount", "/run/media/u/das"])),
+            !runner.calls().contains(&status_call(&[
+                "umount",
+                "--no-canonicalize",
+                "/run/media/u/das"
+            ])),
             "{:?}",
             runner.calls()
         );
@@ -5464,11 +5612,11 @@ mod tests {
         assert_eq!(got.line().1, 0);
         assert!(got.line().0.starts_with("CLEAR TARGET: OK  ("), "{got:?}");
         assert_eq!(host.signals(), vec![(300, crate::holders::Sig::Term)]);
-        assert!(
-            runner
-                .calls()
-                .contains(&status_call(&["umount", "/run/media/u/das"]))
-        );
+        assert!(runner.calls().contains(&status_call(&[
+            "umount",
+            "--no-canonicalize",
+            "/run/media/u/das"
+        ])));
         assert!(
             !runner.calls().iter().any(|c| c.argv[0] == "mount"),
             "clear-target mounts nothing: {:?}",
@@ -9128,6 +9276,7 @@ mod tests {
             report_only: false,
             stop_readers: true,
             sysfs_btrfs: sysfs.to_path_buf(),
+            block_dev: &|p: &str| Err(format!("{p}: no block devices in this test")),
         };
         let got = maintenance_on(runner.as_ref(), &site, fsid, "/mnt/t");
         (got, runner)
@@ -9287,11 +9436,11 @@ mod tests {
             )
         );
         assert!(host.signals().is_empty());
-        assert!(
-            runner
-                .calls()
-                .contains(&status_call(&["umount", "/run/media/u/das"]))
-        );
+        assert!(runner.calls().contains(&status_call(&[
+            "umount",
+            "--no-canonicalize",
+            "/run/media/u/das"
+        ])));
 
         // Held by a reader: stopped, then unmounted.
         let scratch = Scratch::new();
@@ -9357,7 +9506,9 @@ mod tests {
         let umounts: Vec<usize> = calls
             .iter()
             .enumerate()
-            .filter(|(_, c)| c == &&status_call(&["umount", "/run/media/u/das"]))
+            .filter(|(_, c)| {
+                c == &&status_call(&["umount", "--no-canonicalize", "/run/media/u/das"])
+            })
             .map(|(i, _)| i)
             .collect();
         assert_eq!(umounts.len(), 2, "{calls:?}");
