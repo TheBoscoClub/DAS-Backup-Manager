@@ -1873,12 +1873,19 @@ fn hashbang_of(line: &str, is_env: impl Fn(&str) -> bool) -> Hashbang<'_> {
 /// command `env` runs ([`hashbang_of`]), the first one its split command
 /// line launches too — is one of [`SHELLS`].
 fn runs_sh(text: &str) -> bool {
+    runs_sh_with(text, named_env)
+}
+
+/// [`runs_sh`], its interpreter env when `is_env` says so
+/// ([`Findings::is_env`]: a link to env too).
+fn runs_sh_with(text: &str, is_env: impl Fn(&str) -> bool) -> bool {
     let line = text.lines().next().unwrap_or_default();
     let line = line.strip_prefix("#!").unwrap_or(line);
-    let program = match hashbang_of(line, named_env) {
+    let program = match hashbang_of(line, is_env) {
         Hashbang::Program { word, .. } => word.to_string(),
-        Hashbang::Split { env, line } => {
-            let words = shell_words(&format!("{env} {line}"));
+        // env under whatever name it was found by.
+        Hashbang::Split { line, .. } => {
+            let words = shell_words(&format!("env {line}"));
             let first = launches(&words, Grammar::Shell)
                 .into_iter()
                 .filter_map(|launch| match launch {
@@ -2641,6 +2648,11 @@ fn split(line: &str, shell: bool) -> Vec<String> {
                 .then(|| array_value(chars.clone()))
                 .flatten();
         match quote {
+            // `$'…'` (ANSI-C quoting, tracked as `$`, as [`shell_lines`]
+            // does): a backslash escapes the next character, `\'` included.
+            Some('$') if c == '\'' => quote = None,
+            Some('$') if c == '\\' => word.extend(chars.next()),
+            Some('$') => word.push(c),
             Some(q) if c == q => quote = None,
             // sh keeps a backslash in single quotes, and in double quotes one
             // before anything but `$`, `` ` ``, `"`, `\` or a newline: what
@@ -2657,6 +2669,12 @@ fn split(line: &str, shell: bool) -> Vec<String> {
             Some(_) if c == '\\' => word.extend(chars.next()),
             Some(_) => word.push(c),
             None => match c {
+                '$' if shell && chars.peek() == Some(&'\'') => {
+                    word.push(c);
+                    chars.next();
+                    quote = Some('$');
+                    in_word = true;
+                }
                 '\'' | '"' => {
                     quote = Some(c);
                     in_word = true;
@@ -4525,6 +4543,15 @@ impl Findings<'_> {
                 runs.extend(self.read_sh(at, path, resolved, &text, how.sourced));
                 runs
             }
+            // A program whose `#!` runs sh through a link to env is sh's
+            // script too (bd DAS-Backup-Manager-eg4j.25).
+            Program::Code(text)
+                if how.role != Role::Code && runs_sh_with(&text, |w| self.is_env(w)) =>
+            {
+                let mut runs = self.hashbang(at, path, resolved, &text, how);
+                runs.extend(self.read_sh(at, path, resolved, &text, how.sourced));
+                runs
+            }
             Program::Code(text) => {
                 let mut runs = self.hashbang(at, path, resolved, &text, how);
                 runs.extend(self.read_code(at, path, resolved, &text));
@@ -4697,13 +4724,28 @@ impl Findings<'_> {
     }
 
     /// Where the absolute path `word` leads when that is a file named env
-    /// ([`Findings::is_env`]).
+    /// ([`Findings::is_env`]) and boot sees the same: none under a directory
+    /// only a running system fills, a mount point or a link through one, or
+    /// leading elsewhere on another layout — as [`program_at`] reads it,
+    /// which says what such a path may be.
     fn env_at(&self, word: &str) -> Option<String> {
-        if !word.starts_with('/') {
+        let rel = word.strip_prefix('/')?.trim_matches('/');
+        if rel.is_empty()
+            || VOLATILE.iter().any(|v| under(rel, v))
+            || self.mounts.covers(rel).is_some()
+        {
             return None;
         }
-        match locate(self.root, word.trim_matches('/'), self.probe) {
-            Located::File(at, _) if named_env(&at) => Some(format!("/{}", at.trim_matches('/'))),
+        let (located, hops) = locate_via(self.root, rel, self.probe);
+        if hops.iter().any(|hop| self.mounts.shadows(hop).is_some()) {
+            return None;
+        }
+        match located {
+            Located::File(at, _)
+                if named_env(&at) && leads_elsewhere(self.mounts, word, &at).is_none() =>
+            {
+                Some(format!("/{}", at.trim_matches('/')))
+            }
             _ => None,
         }
     }
@@ -10966,6 +11008,16 @@ mod tests {
                         Environment=EVIL=/usr/local/bin/evil CMD=/usr/local/bin/evil";
         let will = &[BootVerdict::Will][..];
         let will_or_may = &[BootVerdict::Will, BootVerdict::May][..];
+        let may = &[BootVerdict::May][..];
+        link(root, "home/e", "/usr/bin/env");
+        // /srv another filesystem's mount point at boot.
+        write(
+            root,
+            "etc/fstab",
+            "UUID=x / btrfs subvol=/@ 0 0\nUUID=x /root btrfs subvol=/@root 0 0\n\
+             UUID=x /home btrfs subvol=/@home 0 0\nUUID=y /srv btrfs subvol=/@srv 0 0\n",
+        );
+        link(root, "srv/e", "/usr/bin/env");
         // (the unit's lines, the job's #! line or none, the verdicts wanted)
         let mut read_wrong = Vec::new();
         for (exec, job, wanted) in [
@@ -10990,6 +11042,20 @@ mod tests {
             // Through a script: sh keeps a backslash in quotes for env.
             (base, Some("#!/bin/sh\nenv -S 'evil\\_x'"), will_or_may),
             (base, Some("#!/bin/sh\nenv -S \"evil\\_x\""), will_or_may),
+            // A link to env running sh: the script is sh's.
+            (base, Some("#!/usr/local/bin/e sh\nevil"), will),
+            (base, Some("#!/usr/local/bin/e -S sh -e\nevil"), will),
+            // A link to env under a mount point boot fills: what is there
+            // only that OS knows.
+            ("ExecStart=/home/e /usr/bin/true", None, may),
+            (base, Some("#!/home/e python3\nprint(1)"), may),
+            (base, Some("#!/srv/e evil"), may),
+            // `$'…'`: a backslash escapes there, `\'` included.
+            (
+                base,
+                Some("#!/bin/sh\nprintf $'a\\'b'; /usr/local/bin/evil"),
+                will,
+            ),
         ] {
             nightly_runs(root, exec);
             if let Some(text) = job {
