@@ -1784,17 +1784,18 @@ fn runs_sh(text: &str) -> bool {
     SHELLS.contains(&program.rsplit('/').next().unwrap_or_default())
 }
 
-/// Binary interpreters a `#!` line may name that are read no further: by
-/// name alone through `env`, else only at `/usr/bin` or `/bin`.
+/// Binary interpreters a `#!` line may name that are read no further: as a
+/// bare name `env` looks up, or at `/usr/bin` or `/bin`.
 const BINARY_INTERPRETERS: [&str; 6] = ["awk", "gawk", "mawk", "nawk", "sed", "busybox"];
 
-/// Whether `word`, the interpreter a `#!` line names (`env`'s program when
-/// `env`), is a known binary one: one of [`SHELLS`], [`INTERPRETERS`] (a
-/// version after the name too: `python3.14`) or [`BINARY_INTERPRETERS`],
-/// at `/usr/bin` or `/bin` unless found through `env`.
-fn binary_interpreter(word: &str, env: bool) -> bool {
-    let (dir, name) = word.rsplit_once('/').unwrap_or(("", word));
-    if !env && !matches!(dir, "/usr/bin" | "/bin") {
+/// Whether `word`, the interpreter a `#!` line names (or `env`'s program),
+/// is a known binary one: one of [`SHELLS`], [`INTERPRETERS`] (a version
+/// after the name too: `python3.14`) or [`BINARY_INTERPRETERS`], named bare
+/// or at `/usr/bin` or `/bin` — by that name anywhere else it may be a
+/// script.
+fn binary_interpreter(word: &str) -> bool {
+    let (dir, name) = word.rsplit_once('/').unwrap_or(("/bin", word));
+    if !matches!(dir, "/usr/bin" | "/bin") {
         return false;
     }
     let versioned = |known: &str| {
@@ -4350,14 +4351,16 @@ impl Findings<'_> {
     fn read(&mut self, at: At, path: &mut SearchPath, resolved: &str, how: &Use) -> Runs {
         match program_at(self.root, self.mounts, self.probe, resolved, how.role) {
             Program::Btrbk => vec![(at.script.map(String::from), btrbk_config(&how.args))],
-            Program::Script(text) => self.read_sh(at, path, resolved, &text, how.sourced),
+            // A program's `#!` line, not a shell's or an interpreter's
+            // operand: the kernel runs its interpreter, one by a shell's name
+            // in another directory too (bd DAS-Backup-Manager-eg4j.24).
+            Program::Script(text) => {
+                let mut runs = self.hashbang(at, path, resolved, &text, how);
+                runs.extend(self.read_sh(at, path, resolved, &text, how.sourced));
+                runs
+            }
             Program::Code(text) => {
-                // A program's `#!` line, not an interpreter's operand: the
-                // kernel runs its interpreter (bd DAS-Backup-Manager-eg4j.24).
-                let mut runs = match how.role {
-                    Role::Program | Role::Argument => self.interpreter(at, path, resolved, &text),
-                    _ => Vec::new(),
-                };
+                let mut runs = self.hashbang(at, path, resolved, &text, how);
                 runs.extend(self.read_code(at, path, resolved, &text));
                 runs
             }
@@ -4395,13 +4398,30 @@ impl Findings<'_> {
         runs
     }
 
-    /// The interpreter the `#!` line of `script`, a program not in sh, names:
-    /// the kernel runs it with `script` as its operand, and takes a script
-    /// as the interpreter too (binfmt_script). A known binary interpreter
+    /// The interpreter of `script`'s `#!` line ([`Findings::interpreter`]),
+    /// when it is run as a program — a shell or another interpreter given
+    /// it reads its `#!` line as a comment.
+    fn hashbang(
+        &mut self,
+        at: At,
+        path: &mut SearchPath,
+        script: &str,
+        text: &str,
+        how: &Use,
+    ) -> Runs {
+        match how.role {
+            Role::Program | Role::Argument => self.interpreter(at, path, script, text),
+            Role::Script | Role::Code | Role::Inert => Vec::new(),
+        }
+    }
+
+    /// The interpreter the `#!` line of `script`, a program, names: the
+    /// kernel runs it with `script` as its operand, and takes a script as
+    /// the interpreter too (binfmt_script). A known binary interpreter
     /// ([`binary_interpreter`]) is not read; any other is read as a program
     /// `script` runs, one script deeper — btrbk named there will, its own
-    /// unknowns may — and past [`MAX_SCRIPT_DEPTH`] it may. Through `env`,
-    /// the program it runs is found in `path`.
+    /// unknowns may — and past [`MAX_SCRIPT_DEPTH`] it may. Through `env`
+    /// (`/usr/bin/env`, `/bin/env`), the program it runs is found in `path`.
     fn interpreter(&mut self, at: At, path: &mut SearchPath, script: &str, text: &str) -> Runs {
         let line = text.lines().next().unwrap_or_default();
         let Some(mut words) = line.strip_prefix("#!").map(str::split_whitespace) else {
@@ -4410,16 +4430,15 @@ impl Findings<'_> {
         let Some(mut word) = words.next() else {
             return Vec::new();
         };
-        let env = word.rsplit('/').next() == Some("env");
+        let env = matches!(word, "/usr/bin/env" | "/bin/env");
         if env {
             match words.find(|w| !w.starts_with('-') && !w.contains('=')) {
                 Some(program) => word = program,
                 None => return Vec::new(),
             }
         }
-        if binary_interpreter(word, env) {
-            return Vec::new();
-        }
+        // The kernel opens the interpreter as named: a relative one from the
+        // directory it is run in.
         if !env && !word.starts_with('/') {
             self.unknown(
                 format!(
@@ -4429,6 +4448,9 @@ impl Findings<'_> {
                 ),
                 None,
             );
+            return Vec::new();
+        }
+        if binary_interpreter(word) {
             return Vec::new();
         }
         if at.depth >= MAX_SCRIPT_DEPTH {
@@ -10528,6 +10550,33 @@ mod tests {
         assert_eq!(verdict_of(root).0, BootVerdict::Will);
         // One that cannot be read may: what boot sees under /run is not here.
         program_file(root, "usr/local/bin/job", "#!/run/evil\nanything\n");
+        assert_eq!(verdict_of(root).0, BootVerdict::May);
+        // A known name is trusted only at /usr/bin or /bin, or as a bare
+        // name env looks up: elsewhere it is read like any interpreter.
+        for (rel, line) in [
+            ("usr/local/bin/sh", "#!/usr/local/bin/sh\n"),
+            (
+                "usr/local/bin/python3",
+                "#!/usr/bin/env /usr/local/bin/python3\n",
+            ),
+            ("usr/local/bin/sh", "#!/usr/bin/env /usr/local/bin/sh\n"),
+            ("usr/local/bin/env", "#!/usr/local/bin/env x\n"),
+        ] {
+            snap(root, "usr/local/bin", rel.rsplit('/').next().unwrap());
+            program_file(root, "usr/local/bin/job", line);
+            assert_eq!(verdict_of(root).0, BootVerdict::Will, "{line}");
+            binary(root, rel);
+            assert_eq!(verdict_of(root), (BootVerdict::No, vec![]), "{line}");
+        }
+        program_file(
+            root,
+            "usr/local/bin/job",
+            "#!/usr/local/bin/bash\necho hi\n",
+        );
+        assert_eq!(verdict_of(root), (BootVerdict::No, vec![]));
+        // A relative interpreter, a known name too, is opened from a
+        // directory only that OS knows.
+        program_file(root, "usr/local/bin/job", "#!sh\necho hi\n");
         assert_eq!(verdict_of(root).0, BootVerdict::May);
         // A chain of interpreters past the bound may.
         program_file(root, "usr/local/bin/job", "#!/usr/local/bin/i1\n");
