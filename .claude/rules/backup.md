@@ -244,6 +244,14 @@ Backup, scrub, `reconcile` and `doctor` all mount and unmount the same filesyste
   Only a job that writes under the target stops readers (operator 2026-11-25; `raid_guard::Job::stops_readers`:
   backup, send, boot-archive, forget/purge, scrub, `backup-run.sh`); every other job (doctor, walk, index, reindex,
   reconcile, restore, browse, recovery-OS record, raid accept) → signals nothing, any holder refuses it, named.
+- **Every path that meets another program's mount of a target or a recovery drive's partition uses that one stop policy**
+  (bd `eg4j.19`, operator 2026-11-27), never a second copy and never a refusal alone:
+  - A target with a `mount_uuid`, RAID-1 or a single drive → another program's mount of its filesystem is cleared before the job mounts it (`mount::clear_elsewhere_with`; `backup-run.sh` `clear_target`, `btrdasd backup clear-target`), never bound, never written through; a target with no `mount_uuid` keeps the bind fallback (bd `804`'s WARN).
+  - Under a handed-down hold → nothing cleared and never bound: the target is NOT available (the parent owns the mounts).
+  - The scrub of a single-drive target → clears first as a writing job (`mount::clear_filesystem_elsewhere`); refused → that filesystem is not scrubbed, named.
+  - A recovery-OS session or provision (`recovery-os-vm.sh`) → `btrdasd recovery-os clear-drive --label <label>` under the lock the run holds and before the disk holder claims the drive: every mount of any partition of the drive found by the target's configured serial, and of the disk itself, cleared as a writing job; OK → the re-read of the mount table must show none, else refuse; REFUSED (3) or CANNOT-RUN (2) → refuse naming why; a dry run → `--report-only`, never continues beside a mount; a provision dry run holds no lock and only lists. Each line and the result are in the history line's `host_mounts`.
+  - A mount is a partition's → by its mountinfo device number (`major:minor` equal to the partition's `st_rdev`, a partition path that is no block device → CANNOT-RUN), never by the source text; a `fuse*` mount is never the drive's (any user can FUSE-mount a source named `/dev/sdX1`); a btrfs mount keeps the `mounts_of` source match.
+  - Before each `umount` → the mount table is read again and the mount point must still carry the scanned mount id, else refuse; `umount --no-canonicalize <mount point>`.
 
 **Always acquire singleton, then maintenance — never the reverse.** That ordering alone makes the pair
 deadlock-free; release order is irrelevant.

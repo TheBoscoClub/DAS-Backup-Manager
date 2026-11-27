@@ -5149,8 +5149,10 @@ EOF
 # kept = 3 or 4: the recovery OS or the disk still held, failed = anything
 # else), exit, overridden (--accept-boot-record-risk let something through),
 # kernel (an unattended session's, after its reboot; else null) and
-# stopped_at (the step an unattended update stopped at; else null). Beside
-# the boot record, readable by all.
+# stopped_at (the step an unattended update stopped at; else null) and
+# host_mounts (what clearing another program's mount of the drive said, one
+# string per line, the `CLEAR DRIVE:` result last; [] when none, bd
+# DAS-Backup-Manager-eg4j.19). Beside the boot record, readable by all.
 
 outcome_of() {
     case "$1" in

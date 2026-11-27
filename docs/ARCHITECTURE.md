@@ -112,9 +112,10 @@ The system has six major components:
          │                                    afresh; one that will not come down, a writer holding it, or not the target, aborts with 3 before btrbk,
          │                                    bd jgm, su1b.12)
          │                                   (a RAID-1 target — mount_uuid and two or more serials — is mounted by `btrdasd backup
-         │                                    mount-target` with fd 8 handed down: the guard, below; REFUSED aborts with 3, bd su1b.10;
-         │                                    first `btrdasd backup clear-target` clears another program's mounts of it — holders stopped by
-         │                                    the stop policy, each mount unmounted, never bound; REFUSED leaves it unavailable, a FAIL row, bd su1b.12)
+         │                                    mount-target` with fd 8 handed down: the guard, below; REFUSED aborts with 3, bd su1b.10)
+         │                                   (every target with a mount_uuid, RAID-1 or a single drive: first `btrdasd backup clear-target` clears
+         │                                    another program's mounts of it — holders stopped by the stop policy, each mount unmounted, never
+         │                                    bound or written through; REFUSED leaves it unavailable, a FAIL row, bd su1b.12, eg4j.19)
          ├──▶ btrbk run                    → one run_btrbk call: snapshots + send/receive to the backup targets (`btrbk dryrun` under --dryrun; --full changes only the boot-subvolume step below)
          ├──▶ btrdasd subvol expire        → deletes retired subvolumes' backups past their window, while the targets are still mounted (a dry run only, when this run's sync failed)
          ├──▶ btrdasd backup static        → sends the `[[source.static]]` subvolumes (read-only subvolumes somebody else made) to the primary targets as they are, while the targets are still mounted; nothing is written on the source (a dry run prints the plan)
