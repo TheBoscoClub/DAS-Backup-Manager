@@ -3536,6 +3536,13 @@ fn mount_read_unmount<T>(
                     }
                     Some(_) => {}
                 }
+            } else if clear.report_only {
+                // A dry run changes nothing (review N2): not even a mount an
+                // earlier reading left at its own directory.
+                return Err(format!(
+                    "{spec} was left mounted at {dir_s}: a dry run takes nothing down (would \
+                     unmount {dir_s}) — not read"
+                ));
             } else {
                 take_down_leftover_with(runner, dir_s, &crate::progress::NullProgress, None)
                     .map_err(|why| format!("{spec} was left mounted at {dir_s}: {why}"))?;
@@ -9831,6 +9838,37 @@ mod tests {
         assert!(!*seen.lock().unwrap());
         assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
         assert!(host.signals().is_empty());
+    }
+
+    /// N2: a dry run finding a mount an earlier reading left at its own
+    /// directory says it would unmount it, unmounts nothing, reads nothing
+    /// (the spec's anti-goal: a dry run changes nothing).
+    #[test]
+    fn a_dry_run_leaves_an_earlier_reading_s_mount_and_reads_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("recovery-a");
+        let mut host = esp_by_partuuid_host("8:17");
+        host.report_only = true;
+        let runner = ScriptedRunner::with_rules(&[
+            (
+                "-S",
+                Reply::Exit {
+                    code: 0,
+                    stdout: leak(format!("{}\n", dir.display())),
+                    stderr: "",
+                },
+            ),
+            ("-q", Reply::exit(32)),
+            verified(),
+        ]);
+        let (r, ran) = read_esp_on(&host, &runner, scratch.path(), &esp_drive_ids());
+        let why = r.read.unwrap_err();
+        assert!(
+            why.contains(&format!("would unmount {}", dir.display())) && why.contains("not read"),
+            "{why}"
+        );
+        assert!(!ran);
+        assert!(argvs(&runner, "umount").is_empty() && argvs(&runner, "mount").is_empty());
     }
 
     #[test]
