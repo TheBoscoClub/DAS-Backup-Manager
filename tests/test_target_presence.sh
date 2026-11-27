@@ -119,6 +119,20 @@ report="$(generate_report)"
 check "before detection: no target rows" "$(grep -c '^  Target ' <<<"$report" || true)" "0"
 check "before detection: no SMART rows" "$(sed -n '/^SMART STATUS$/,/^LATEST SNAPSHOTS$/p' <<<"$report" | grep -c SERIAL || true)" "0"
 
+# --- a real label is longer than the name column (bd 3gzs.14) -----------------
+# `Target system-recovery-A-2tb` is 28 characters: every row's status must
+# start at the same column, the longest name's, not stay at 21 and leave the
+# long row alone out of line.
+# shellcheck disable=SC2034  # read by the extracted generate_report
+declare -gA OP_STATUS=([btrbk]=OK [target_system-recovery-A-2tb]=OK [target_system-recovery-A-2tb_detail]="all present")
+report="$(generate_report)"
+table="$(sed -n '/^BACKUP OPERATIONS$/,/^$/p' <<<"$report" | grep -E ' (OK|WARN|FAIL|N/A)  \(')"
+check "long label: the table has its rows" "$(grep -c . <<<"$table")" "17"
+check "long label: its row, name whole" "$(grep -c '^  Target system-recovery-A-2tb OK  (all present)$' <<<"$table")" "1"
+check "long label: every status in the long name's column" \
+    "$(grep -cE '^  .{28} (OK|WARN|FAIL|N/A)  \(' <<<"$table")" "17"
+check "long label: the short rows keep their text" "$(grep -c '^  USB link  *N/A  (not checked)$' <<<"$table")" "1"
+
 if ((fails > 0)); then
     echo "test_target_presence: $fails FAILED"
     exit 1

@@ -339,10 +339,45 @@ pub struct Holder {
     pub uses: Vec<String>,
 }
 
+/// Text from outside made safe to print on one line (security, bd
+/// DAS-Backup-Manager-3gzs.14): every control character, a newline above all,
+/// becomes `?`. A file name on the target, a mount point, a unit name is
+/// whatever a local user made it; one holding a newline and `CLEAR TARGET: OK`
+/// must never make a line of its own. [`display_cmdline`]'s rule.
+pub fn safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// [`safe`], and cut to [`DISPLAY_CMDLINE_MAX`] characters ending in `…`: one
+/// field of a row.
+pub fn field(s: &str) -> String {
+    let clean: Vec<char> = safe(s).chars().collect();
+    if clean.len() <= DISPLAY_CMDLINE_MAX {
+        clean.into_iter().collect()
+    } else {
+        let mut cut: String = clean[..DISPLAY_CMDLINE_MAX - 1].iter().collect();
+        cut.push('\u{2026}');
+        cut
+    }
+}
+
+impl Holder {
+    /// What it holds, each entry made safe, `; ` between.
+    pub fn uses_text(&self) -> String {
+        self.uses
+            .iter()
+            .map(|u| field(u))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 impl fmt::Display for Holder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let user = match (&self.user, self.uid) {
-            (Some(u), Some(id)) => format!("{u} (uid {id})"),
+            (Some(u), Some(id)) => format!("{} (uid {id})", field(u)),
             (None, Some(id)) => format!("uid {id}"),
             _ => "uid unknown".into(),
         };
@@ -351,15 +386,77 @@ impl fmt::Display for Holder {
             "pid {} [{}] user {user}, unit {}: {} — {}",
             self.pid,
             self.mode,
-            self.unit.as_deref().unwrap_or("none"),
+            field(self.unit.as_deref().unwrap_or("none")),
             if self.cmdline.is_empty() {
-                "(no command line)"
+                "(no command line)".to_string()
             } else {
-                &self.cmdline
+                field(&self.cmdline)
             },
-            self.uses.join("; ")
+            self.uses_text()
         )
     }
+}
+
+/// One line of a clearing's account (bd DAS-Backup-Manager-3gzs.14): a kind
+/// word (`mount`, `options`, `holder`, `signal`, `action`) in a fixed column,
+/// then its facts, so a reader scans down the kinds. The `CLEAR TARGET:` /
+/// `CLEAR DRIVE:` status lines are not rows.
+pub fn row(kind: &str, body: &str) -> String {
+    format!("{kind:<9}{}", safe(body))
+}
+
+/// The holders of one block as aligned `holder` rows: pid and command padded
+/// to the block's widest, then how it uses the mount, who it is, and what
+/// the clearing does about it (`disposition`, after `->`). Every fact the
+/// holder's `Display` carries is there.
+pub fn holder_rows(items: &[(&Holder, String)]) -> Vec<String> {
+    let cmd = |h: &Holder| -> String {
+        if h.cmdline.is_empty() {
+            "(no command line)".into()
+        } else {
+            field(&h.cmdline)
+        }
+    };
+    let pid_w = items
+        .iter()
+        .map(|(h, _)| h.pid.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let cmd_w = items
+        .iter()
+        .map(|(h, _)| cmd(h).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    items
+        .iter()
+        .map(|(h, disposition)| {
+            let user = match (&h.user, h.uid) {
+                (Some(u), Some(id)) => format!("{} (uid {id})", field(u)),
+                (None, Some(id)) => format!("uid {id}"),
+                _ => "uid unknown".into(),
+            };
+            let mode = match h.mode {
+                Mode::CwdOnly => "cwd only",
+                Mode::Reader => "reader",
+                Mode::Writer => "writer",
+            };
+            let uses = if h.uses.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", h.uses_text())
+            };
+            row(
+                "holder",
+                &format!(
+                    "pid {:<pid_w$}  {:<cmd_w$}  {mode}{uses}  user {user}, unit {}  -> {disposition}",
+                    h.pid,
+                    cmd(h),
+                    field(h.unit.as_deref().unwrap_or("none")),
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Where the process table is read: `/proc` and `/etc/passwd` in production.
@@ -835,9 +932,24 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
         return Ok(done);
     }
     let mine = lineage(&env.site.proc_root, env.self_pid);
-    for h in &holders {
-        done.lines.push(format!("holder: {h}"));
-    }
+    let first: Vec<(&Holder, String)> = holders
+        .iter()
+        .map(|h| {
+            let disposition = if let Some(w) = protected(h, &mine) {
+                format!("not signalled ({w})")
+            } else if h.mode == Mode::Writer {
+                "not signalled".to_string()
+            } else if !env.stop_readers {
+                "not signalled (this job stops no process)".to_string()
+            } else if env.report_only {
+                "would stop".to_string()
+            } else {
+                "to be stopped".to_string()
+            };
+            (h, disposition)
+        })
+        .collect();
+    done.lines.extend(holder_rows(&first));
     // Decide first: anything that refuses refuses before any signal.
     let check = |hs: &[Holder]| -> Option<String> {
         let blocked: Vec<String> = hs
@@ -862,7 +974,7 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
                     } else {
                         &h.cmdline
                     },
-                    h.uses.join("; ")
+                    h.uses_text()
                 )
             })
             .collect();
@@ -902,44 +1014,48 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
     }
     if env.report_only {
         done.would_stop = holders.iter().map(|h| format!("would stop: {h}")).collect();
-        done.lines.extend(done.would_stop.iter().cloned());
         return Ok(done);
+    }
+    fn still(hs: &[Holder]) -> Vec<(&Holder, String)> {
+        hs.iter()
+            .map(|h| (h, "still holding".to_string()))
+            .collect()
     }
     let signal_all = |hs: &[Holder], sig: Sig, done: &mut Cleared| {
         for h in hs {
             if start_time(&env.site.proc_root, h.pid) != Some(h.start_time) {
-                done.lines.push(format!(
-                    "pid {}: gone or reused before {} — not signalled",
-                    h.pid,
-                    sig.name()
+                done.lines.push(row(
+                    "signal",
+                    &format!(
+                        "{} pid {} not sent: gone or reused before it was sent",
+                        sig.name(),
+                        h.pid
+                    ),
                 ));
                 continue;
             }
             match env.signaller.signal(h.pid, h.start_time, sig) {
                 Ok(()) => {
-                    done.lines.push(format!(
-                        "sent {} to pid {} ({})",
-                        sig.name(),
-                        h.pid,
-                        h.cmdline
+                    let who = format!(
+                        "user {}, unit {}",
+                        match (&h.user, h.uid) {
+                            (Some(u), _) => u.clone(),
+                            (None, Some(id)) => format!("uid {id}"),
+                            _ => "unknown".into(),
+                        },
+                        h.unit.as_deref().unwrap_or("none")
+                    );
+                    done.lines.push(row(
+                        "signal",
+                        &format!("{} pid {} ({}, {who})", sig.name(), h.pid, h.cmdline),
                     ));
                     done.signalled.push((h.pid, sig, h.cmdline.clone()));
-                    done.who.insert(
-                        h.pid,
-                        format!(
-                            "user {}, unit {}",
-                            match (&h.user, h.uid) {
-                                (Some(u), _) => u.clone(),
-                                (None, Some(id)) => format!("uid {id}"),
-                                _ => "unknown".into(),
-                            },
-                            h.unit.as_deref().unwrap_or("none")
-                        ),
-                    );
+                    done.who.insert(h.pid, who);
                 }
-                Err(e) => done
-                    .lines
-                    .push(format!("pid {}: {} not sent: {e}", h.pid, sig.name())),
+                Err(e) => done.lines.push(row(
+                    "signal",
+                    &format!("{} pid {} not sent: {e}", sig.name(), h.pid),
+                )),
             }
         }
     };
@@ -962,9 +1078,8 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
     // Classified again: one that began writing, or a new holder of a kind
     // that refuses, stops here.
     if let Some(why) = check(&left) {
-        for h in &left {
-            done.lines.push(format!("still a holder: {h}"));
-        }
+        let rows = holder_rows(&still(&left));
+        done.lines.extend(rows);
         return Err(refuse(done.lines, why));
     }
     // A holder that appeared during the grace gets SIGTERM and one grace of
@@ -982,15 +1097,18 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
     let left = if newcomers.is_empty() {
         left
     } else {
-        for h in &newcomers {
-            done.lines.push(format!("new holder: {h}"));
-        }
+        let rows = holder_rows(
+            &newcomers
+                .iter()
+                .map(|h| (h, "new, appeared while clearing".to_string()))
+                .collect::<Vec<_>>(),
+        );
+        done.lines.extend(rows);
         signal_all(&newcomers, Sig::Term, &mut done);
         let again = wait(TERM_GRACE, &done)?;
         if let Some(why) = check(&again) {
-            for h in &again {
-                done.lines.push(format!("still a holder: {h}"));
-            }
+            let rows = holder_rows(&still(&again));
+            done.lines.extend(rows);
             return Err(refuse(done.lines, why));
         }
         again
@@ -1004,9 +1122,8 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
         return Ok(done);
     }
     let names: Vec<String> = left.iter().map(|h| format!("pid {}", h.pid)).collect();
-    for h in &left {
-        done.lines.push(format!("still a holder: {h}"));
-    }
+    let rows = holder_rows(&still(&left));
+    done.lines.extend(rows);
     Err(refuse(
         done.lines,
         format!(
@@ -1164,6 +1281,36 @@ pub fn display_cmdline(raw: &[u8]) -> String {
 mod tests {
     use super::testproc::{FakeProc, Proc};
     use super::*;
+
+    /// bd 3gzs.14 security: a file name on the target is text from outside.
+    /// One holding `x\nCLEAR TARGET: OK  (forged)` must not make a line of its
+    /// own, in the rows, in the refusal's text or in a holder's `Display`.
+    #[test]
+    fn a_file_name_cannot_forge_a_status_line() {
+        const FORGED: &str = "/run/media/user/das/x\nCLEAR TARGET: OK  (forged)\u{1b}[31m";
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 301,
+            cmd: "cp",
+            fds: vec![(4, FORGED, "0100001", Some(77))],
+            ..Default::default()
+        });
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        let r = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap_err();
+        for text in r.lines.iter().chain(std::iter::once(&r.why)) {
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+        assert!(r.lines[0].contains("CLEAR TARGET: OK"), "kept, as text");
+        let held = scan_holders(&site, &das_mount()).unwrap();
+        let shown = held[0].to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains("forged"), "{shown:?}");
+    }
 
     #[test]
     fn a_command_line_cannot_forge_a_report_line_and_is_bounded() {
@@ -1503,9 +1650,68 @@ mod tests {
         assert!(
             done.lines
                 .iter()
-                .any(|l| l == "sent SIGKILL to pid 301 (reader)")
+                .any(|l| l == "signal   SIGKILL pid 301 (reader, user user, unit session-2.scope)")
         );
         assert_eq!(done.signalled.len(), 3);
+    }
+
+    /// bd DAS-Backup-Manager-3gzs.14: the lines a clearing says are rows a
+    /// reader scans down: a kind word in a fixed column, then the facts.
+    #[test]
+    fn holder_and_signal_lines_are_aligned_rows() {
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 900,
+            ppid: 899,
+            ..Default::default()
+        });
+        reader(&p, 5);
+        reader(&p, 300);
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![(5, Sig::Term), (300, Sig::Term)],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        let done = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap();
+        let holder = "reader  reader (fd 3 /run/media/user/das/a (read))  \
+                      user user (uid 1000), unit session-2.scope  -> to be stopped";
+        assert_eq!(
+            done.lines,
+            vec![
+                format!("holder   pid 5    {holder}"),
+                format!("holder   pid 300  {holder}"),
+                "signal   SIGTERM pid 5 (reader, user user, unit session-2.scope)".to_string(),
+                "signal   SIGTERM pid 300 (reader, user user, unit session-2.scope)".to_string(),
+            ]
+        );
+    }
+
+    /// A writer's row says it is not signalled; the refusal's own text (the
+    /// status line's detail) is unchanged.
+    #[test]
+    fn a_writers_row_says_it_is_not_signalled() {
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 301,
+            cmd: "cp big /run/media/user/das/",
+            fds: vec![(4, "/run/media/user/das/big", "0100001", Some(77))],
+            ..Default::default()
+        });
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        let r = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap_err();
+        assert_eq!(r.lines.len(), 1, "{:?}", r.lines);
+        assert!(
+            r.lines[0].starts_with("holder   pid 301  cp big /run/media/user/das/  writer ("),
+            "{:?}",
+            r.lines
+        );
+        assert!(r.lines[0].ends_with("  -> not signalled"), "{:?}", r.lines);
     }
 
     #[test]
@@ -1610,7 +1816,7 @@ mod tests {
         assert!(
             done.lines
                 .iter()
-                .any(|l| l.contains("pid 301: gone or reused")),
+                .any(|l| l.starts_with("signal   SIGTERM pid 301 not sent: gone or reused")),
             "{:?}",
             done.lines
         );
@@ -1719,6 +1925,13 @@ mod tests {
         assert!(
             done.would_stop[0].starts_with("would stop: pid 300"),
             "{done:?}"
+        );
+        assert_eq!(done.lines.len(), 1, "{:?}", done.lines);
+        assert!(
+            done.lines[0].starts_with("holder   pid 300  reader  reader (")
+                && done.lines[0].ends_with("  -> would stop"),
+            "{:?}",
+            done.lines
         );
         p.add(Proc {
             pid: 301,

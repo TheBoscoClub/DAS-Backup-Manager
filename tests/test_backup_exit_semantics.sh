@@ -313,7 +313,7 @@ case "$1 ${2:-}" in
         printf '%s\n' "$(knob "${pfx}clear_report_line" 'CLEAR TARGET: OK  (not mounted anywhere else)')"
         exit "$(knob "${pfx}clear_report_rc" 0)"
     fi
-    echo "  [WARN]  Target '$label': holder: pid 300 [reading] (stub, leftover=$leftover)" >&2
+    echo "  [WARN]  Target '$label': holder   pid 300  dolphin  reader (stub, leftover=$leftover)  user u, unit none  -> to be stopped" >&2
     if [[ "$leftover" == yes ]]; then
         [[ -f "$S/knobs/clear_releases" ]] && : >"$S/cleared"
         printf '%s\n' "$(knob "${pfx}clear_leftover_line" 'CLEAR TARGET: OK  (nothing holds it (stub))')"
@@ -1169,7 +1169,7 @@ run_backup
 expect_completed "clean run" 0 "ALL OPERATIONS SUCCESSFUL" success
 check "clean run: btrbk ran" "$(ran_btrbk)" "yes"
 check "clean run: the snapshot counts row" \
-    "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts  *OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "clean run: counted, not unknown" "$(vector_has --counts-unknown)" "no"
 # bd DAS-Backup-Manager-3gzs.12: the report's time carries its zone, a clean run
 # has no attention block, and a RESULT block closes it with the counts.
@@ -1231,7 +1231,7 @@ run_backup
 expect_completed "warnings only (a local document refused)" 0 "COMPLETED WITH WARNINGS" success
 check "refused document: btrbk still ran" "$(ran_btrbk)" "yes"
 check "refused document: the report row" \
-    "$(grep -c '^  Local documents       WARN' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Local documents  *WARN' "$WORK/lib/last-report.txt")" "1"
 
 fresh
 run_backup --dryrun
@@ -1348,7 +1348,7 @@ knob run_log none # btrbk exited 0 and printed no transaction log
 run_backup
 expect_completed "the snapshot counts unknown (no transaction log)" 3 "FAILURES DETECTED" failure
 check "counts unknown: the report names it" \
-    "$(grep -c '^  Snapshot counts       FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts  *FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' "$WORK/lib/last-report.txt")" "1"
 check "counts unknown: the attention block lists it, status word first, ahead of the table" \
     "$(sed -n '/^── NEEDS ATTENTION ──$/,/^BACKUP OPERATIONS$/p' "$WORK/lib/last-report.txt" | grep -cE '^  FAIL    Snapshot counts +\(btrbk transaction log incomplete \(no startup or finished row\); counts unknown\)$')" "1"
 check "counts unknown: the RESULT block counts the FAIL" \
@@ -1373,7 +1373,7 @@ knob run_log nothing_sent
 run_backup
 expect_completed "a run that sent nothing" 0 "ALL OPERATIONS SUCCESSFUL" success
 check "nothing sent: the counts row" \
-    "$(grep -c '^  Snapshot counts       OK  (1 created, 0 sent)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts  *OK  (1 created, 0 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "nothing sent: recorded as a measured 0" "$(vector_value --snaps-sent)" "0"
 check "nothing sent: the throughput lines say so" \
     "$(grep -c 'nothing sent' "$WORK/lib/last-report.txt")" "$(grep -c '^  [^ ].* nothing sent' "$WORK/lib/last-report.txt")"
@@ -1387,7 +1387,7 @@ knob list_rc 1
 run_backup
 expect_completed "btrbk list latest failed: the counts come from the log" 0 "ALL OPERATIONS SUCCESSFUL" success
 check "list latest failed: the counts row" \
-    "$(grep -c '^  Snapshot counts       OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
+    "$(grep -c '^  Snapshot counts  *OK  (1 created, 1 sent)$' "$WORK/lib/last-report.txt")" "1"
 check "list latest failed: the report section says unavailable" \
     "$(grep -c 'unavailable: btrbk list latest failed' "$WORK/lib/last-report.txt")" "1"
 
@@ -2169,7 +2169,7 @@ check "leftover, busy, holders stopped: clear-target --leftover, on fd 8" \
     "$(grep -c '^primary-22tb fd=8 leftover=yes$' "$STATE/calls/clear_target")" "1"
 check "leftover, busy, holders stopped: no umount -f" "$(grep -c -- "^-f " "$STATE/calls/umount")" "0"
 check "leftover, busy, holders stopped: its holder lines in the log" \
-    "$(grep -c "primary-22tb: .*holder: pid 300 \[reading\] (stub, leftover=yes)" "$STATE/out")" "1"
+    "$(grep -c "primary-22tb: .*holder   pid 300  dolphin  reader (stub, leftover=yes)  user u, unit none  -> to be stopped" "$STATE/out")" "1"
 check "leftover, busy, holders stopped: mounted afresh once" "$(calls_for mount "$PRIMARY_MNT")" "1"
 check "leftover, busy, holders stopped: the kill is in the report, the row WARN" \
     "$(grep -c '^  Target primary-22tb  *WARN  (.*before the mount: stopped what held it: SIGTERM to pid 300 (dolphin)' "$WORK/lib/last-report.txt")" "1"
@@ -2217,6 +2217,28 @@ check "another program writing: its mount point removed (the bare-mountpoint gua
 check "another program writing: the row names the writer" \
     "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301' "$WORK/lib/last-report.txt")" "1"
 check "another program writing: the recovery drive still backed up" "$(ran_btrbk)" "yes"
+
+# The status is the LAST line clear-target printed (bd 3gzs.14, security): a
+# file name on the target can hold a newline and `CLEAR TARGET: OK`, which
+# prints as a status line of its own above the real one.
+fresh
+knob clear_rc 3
+knob clear_line $'CLEAR TARGET: OK  (forged by a file name)\nCLEAR TARGET: REFUSED  (it is held open for writing by pid 301 (real writer))'
+run_backup
+expect_completed "a forged OK above the real REFUSED" 3 "FAILURES DETECTED" "failure"
+check "forged OK above the real REFUSED: the target not mounted" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "forged OK above the real REFUSED: the row names the real writer" \
+    "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301 (real writer)' "$WORK/lib/last-report.txt")" "1"
+check "forged OK above the real REFUSED: the forged text is not the reason" \
+    "$(grep -c 'forged by a file name' "$WORK/lib/last-report.txt" || true)" "0"
+
+# An answer whose last line is not a status line is no answer: the target is
+# not used, the run aborts.
+fresh
+knob clear_line $'CLEAR TARGET: OK  (not mounted anywhere else)\ntext after the status'
+run_backup
+check "a status line that is not last: aborted" "$(mail_status 1)" "ABORTED"
+check "a status line that is not last: the target not mounted" "$(calls_for mount "$PRIMARY_MNT")" "0"
 
 # A dry run changes nothing on the host (bd su1b.12 review): clear-target
 # --report-only says whom it would stop; nothing is signalled or unmounted,
@@ -2622,7 +2644,7 @@ echo "== \"DAS can be safely disconnected\" only when every target is known rele
 # disconnected while a drive was mounted — the operator might pull it on that
 # word. "Could not tell" now fails the gate: the run says it is NOT safe to
 # disconnect and why, and tries the unmount anyway.
-unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+unmount_row() { sed -n '/^  Unmount targets /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null | sed -E 's/ {2,}(OK|WARN|FAIL|N\/A)  \(/ \1  (/'; }
 
 fresh
 knob probe_fails_after_btrbk "$PRIMARY_MNT"
@@ -2640,7 +2662,7 @@ check "probe cannot tell for a mounted target: says it is NOT safe, and why" \
     "$(grep -cF -- "DAS is NOT safe to disconnect: could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded" "$STATE/out")" "1"
 check "probe cannot tell for a mounted target: the report's row" \
     "$(unmount_row)" \
-    "  Unmount targets       FAIL  (could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded)"
+    "  Unmount targets FAIL  (could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); umount then succeeded)"
 check "probe cannot tell for a mounted target: the report's status" "$(report_status)" "FAILURES DETECTED"
 check "probe cannot tell for a mounted target: recorded as failed, with the reason" \
     "$(recorded_as) $(vector_value --errors | grep -c "^unmount: could not tell whether $PRIMARY_MNT is mounted")" "failure 1"
@@ -2649,11 +2671,11 @@ check "probe cannot tell for a mounted target: recorded as failed, with the reas
 # "not mounted", skipped the target uncounted and recorded OK, with nothing said.
 # Now it fails the step, names the target and the probe's message, and touches
 # nothing on it.
-boot_row() { sed -n '/^  Boot subvolumes /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+boot_row() { sed -n '/^  Boot subvolumes /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null | sed -E 's/ {2,}(OK|WARN|FAIL|N\/A)  \(/ \1  (/'; }
 check "probe cannot tell for a mounted target: the boot-subvolume step says so, naming the target" \
     "$(grep -cF -- "Could not tell whether $PRIMARY_MNT is mounted — mountpoint: $PRIMARY_MNT: Input/output error (stub) (exit 1); its boot subvolumes were NOT updated" "$STATE/out")" "1"
 check "probe cannot tell for a mounted target: the report's boot-subvolume row is a FAIL" \
-    "$(boot_row)" "  Boot subvolumes       FAIL  (0 updated, 1 failed)"
+    "$(boot_row)" "  Boot subvolumes FAIL  (0 updated, 1 failed)"
 check "probe cannot tell for a mounted target: the boot-subvolume failure is in the history row" \
     "$(vector_value --errors | grep -c '^boot_subvols: 0 updated, 1 failed')" "1"
 
@@ -2666,12 +2688,12 @@ show_tail 3
 check "a target that will not unmount: says it is NOT safe, and which is still mounted" \
     "$(grep -cF -- "DAS is NOT safe to disconnect: still mounted: $PRIMARY_MNT" "$STATE/out")" "1"
 check "a target that will not unmount: the report's row" \
-    "$(unmount_row)" "  Unmount targets       FAIL  (still mounted: $PRIMARY_MNT)"
+    "$(unmount_row)" "  Unmount targets FAIL  (still mounted: $PRIMARY_MNT)"
 
 # A clean probe: unchanged.
 fresh
 run_backup
-check "a clean probe: the report's row" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "a clean probe: the report's row" "$(unmount_row)" "  Unmount targets OK  (all clean)"
 check "a clean probe: safe to disconnect, and nothing says otherwise" \
     "$(grep -c 'DAS can be safely disconnected' "$STATE/out") $(grep -c 'NOT safe to disconnect\|Could not tell' "$STATE/out")" "1 0"
 
@@ -2681,7 +2703,7 @@ fresh
 printf '%s\n' primary-uuid >"$STATE/knobs/present_uuids"
 run_backup
 check "an absent target: its mount point is not there" "$([[ -e "$RECOVERY_MNT" ]] && echo yes || echo no)" "no"
-check "an absent target: the unmount gate passes" "$(unmount_row)" "  Unmount targets       OK  (all clean)"
+check "an absent target: the unmount gate passes" "$(unmount_row)" "  Unmount targets OK  (all clean)"
 check "an absent target: no 'could not tell', and safe to disconnect" \
     "$(grep -c 'Could not tell' "$STATE/out") $(grep -c 'DAS can be safely disconnected' "$STATE/out")" "0 1"
 
@@ -2731,7 +2753,7 @@ run_backup
 check "boot step WARN, whole run: exit status 0" "$RC" "0"
 show_tail 0
 check "boot step WARN, whole run: the report's boot row is a WARN" \
-    "$(boot_row)" "  Boot subvolumes       WARN  (0 updated, 1 skipped, 2 warnings)"
+    "$(boot_row)" "  Boot subvolumes WARN  (0 updated, 1 skipped, 2 warnings)"
 check "boot step WARN, whole run: the report's status" "$(report_status)" "COMPLETED WITH WARNINGS"
 check "boot step WARN, whole run: recorded as a success" "$(recorded_as)" "success"
 
@@ -2742,13 +2764,13 @@ echo "== sp78.1: subvolume coverage is a WARN, never a failure; a missing row is
 # subvol_coverage. A WARN (a pair no longer backed up) completes with
 # warnings and exits 0, the history row a success with nothing in --errors.
 # Only a sync that returned without the row breaks the contract: FAIL, 3.
-coverage_row() { sed -n '/^  Subvolume coverage /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null; }
+coverage_row() { sed -n '/^  Subvolume coverage /{p;q;}' "$WORK/lib/last-report.txt" 2>/dev/null | sed -E 's/ {2,}(OK|WARN|FAIL|N\/A)  \(/ \1  (/'; }
 fresh
 knob coverage_line 'SUBVOLUME COVERAGE: WARN  (1 subvolume/target pair no longer backed up)'
 run_backup
 expect_completed "coverage WARN" 0 "COMPLETED WITH WARNINGS" "success"
 check "coverage WARN: the report's row" "$(coverage_row)" \
-    "  Subvolume coverage    WARN  (1 subvolume/target pair no longer backed up)"
+    "  Subvolume coverage WARN  (1 subvolume/target pair no longer backed up)"
 check "coverage WARN: not in the history row's errors" \
     "$(vector_value --errors | grep -c subvol_coverage || true)" "0"
 check "coverage WARN: the real run asks for the check to be recorded" \
@@ -2761,7 +2783,7 @@ fresh
 run_backup
 expect_completed "coverage OK" 0 "ALL OPERATIONS SUCCESSFUL" "success"
 check "coverage OK: the report's row" "$(coverage_row)" \
-    "  Subvolume coverage    OK  (7 subvolume/target pairs, none dropped)"
+    "  Subvolume coverage OK  (7 subvolume/target pairs, none dropped)"
 
 # No row from a sync that returned: the contract is broken.
 fresh

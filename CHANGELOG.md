@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The nightly report's operations table fits its longest name** (`backup-run.sh` 4.27.0, bd `DAS-Backup-Manager-3gzs.14`): the name column was a fixed 21 characters, so a real label (`Target ` and a 20-character label or more) pushed its status out of line in the emailed report
+  - The column is as wide as the longest name in the table, never under 21, as `report.rs` `align_name_column` does for the Rust report; the text of every row is unchanged, only the padding between name and status
+  - The shell suites match a row's content with flexible padding (`  *`, or the padding squeezed before an exact comparison), and `tests/test_target_presence.sh` gains the long-label case (every status in the long name's column)
+
+- **What clearing another program's mount says is aligned rows, a kind word first** (bd `DAS-Backup-Manager-3gzs.14`): the lines above `CLEAR TARGET:` and `CLEAR DRIVE:` — and the same lines the Rust jobs log, so the GUI log, the journal and `recovery-os-vm.sh`'s `host_mounts` history carry them — were sentences of 150+ characters; now one row per fact, scanned down the first column
+  - `mount` (source, filesystem and rw/ro, mount point, who made it, `-> another program's mount, not this job's`), `options` (mount options, filesystem options, root), `holder` (pid, command, reader/writer/cwd only and what it uses, user and unit, `-> to be stopped` / `would stop` / `not signalled` with the reason), `signal` (`SIGTERM pid 4122 (dolphin, user bosco, unit app-dolphin.scope)`, or `not sent` and why), `action` (`unmounted …`, `would unmount …`, `stopped what held it: …`); pid, command and mount columns are padded to the block's widest
+  - The `CLEAR TARGET: OK|REFUSED|CANNOT-RUN  (<detail>)` and `CLEAR DRIVE: …` status lines, the emailed report's `Target <label>` rows and `host_mounts` as an array of strings (one per line) are unchanged; no fact of the old lines is dropped (a holder's `would stop:` is now `-> would stop` on its row)
+
 - **The generated udev rule names each configured recovery ESP `RECOVERY`, so fwupd never mounts it** (bd `DAS-Backup-Manager-eg4j.18`): on 2026-11-26 fwupd, started after a reboot, enumerated every ESP by partition type and mounted both recovery-drive ESPs read-write as root through udisks — one stayed mounted and refused the next recovery-OS update
   - `btrdasd setup` adds one line per target `esp_partuuid` to `99-das-backup-udisks-ignore.rules`, setting `ID_PART_ENTRY_NAME=RECOVERY` on that partition; fwupd skips an ESP whose name is on udisks' recovery list (`fu_volume_check_is_recovery`). Only a udev property changes — the on-disk partition table is untouched; the existing `UDISKS_IGNORE` lines are unchanged
   - The PARTUUID is checked with `config::is_partuuid` before it reaches the rule (an invalid one is skipped with a comment), and matched by PARTUUID alone, never by partition type
@@ -360,6 +368,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`provision`'s `verify` passes a CachyOS root with no btrbk config** (bd `DAS-Backup-Manager-eg4j.8`): `recovery-os-install.sh` (1.5.5) required `btrbk at boot: no`, but every mkinitcpio OS reads `may` — `mkinitcpio-generate-shutdown-ramfs.service` is handed paths under `/boot` and `/run`, the tracer rule kept in bd `DAS-Backup-Manager-12k8` — so every rebuild stopped at `verify`; `may` now passes only beside `btrbk config: none` (btrbk with no config runs nothing), and `yes`, or `may` beside a config, is still refused
 
 ### Security
+
+- **A file name on a target can no longer forge the clearing's status line** (bd `DAS-Backup-Manager-3gzs.14`): a holder's open file, working directory or a mount point is text from outside — a local user can name a file `x`, a newline, `CLEAR TARGET: OK  (nothing holds it)`, and the new detail rows (and the refusal's own text) printed it as a line of its own above the real status
+  - Every externally derived field — a holder's open files, user and unit, a mount's source, point, options and root, its origin — goes through one sanitizer (`holders::safe`/`field`: control characters become `?`, a field is cut to 160 characters) in the shared row formatter, in `Holder`'s `Display` and in the `CLEAR TARGET:` / `CLEAR DRIVE:` lines' detail; an ordinary detail is byte for byte as before
+  - `backup-run.sh` (4.27.1) and `recovery-os-vm.sh` (2.7.1) read only the last line the command printed as its status; a last line that is not a status line is the could-not-run case (a refused target or drive, never a continued one)
 
 - **CI checkouts carry no token and every container image is pinned by digest** (bd `DAS-Backup-Manager-w3pb`): `persist-credentials: false` on the nine checkouts whose jobs only read git locally; `archlinux:latest`, `debian:trixie`, `fedora:43` and the Flatpak KDE image pinned by `sha256` digest (refreshed by hand, since Dependabot does not update workflow images); two unquoted expansions in `mutants.yml` and `release-packages.yml` quoted
 

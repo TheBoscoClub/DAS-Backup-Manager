@@ -999,8 +999,11 @@ fn take_down_leftover_with(
                         progress.on_log(
                             crate::progress::LogLevel::Warning,
                             &format!(
-                                "Target '{who}': {mount_point}: {STOPPED}: {}",
-                                sent.join(", ")
+                                "Target '{who}': {}",
+                                crate::holders::row(
+                                    "action",
+                                    &format!("{mount_point}: {STOPPED}: {}", sent.join(", "))
+                                )
                             ),
                         );
                         stopped = sent.clone();
@@ -1050,9 +1053,18 @@ impl ClearTarget {
     /// The one line `backup-run.sh` reads, and the exit code: 0, 3, 2.
     pub fn line(&self) -> (String, i32) {
         match self {
-            ClearTarget::Cleared(d) => (format!("CLEAR TARGET: OK  ({d})"), 0),
-            ClearTarget::Refused(d) => (format!("CLEAR TARGET: REFUSED  ({d})"), 3),
-            ClearTarget::CannotRun(d) => (format!("CLEAR TARGET: CANNOT-RUN  ({d})"), 2),
+            ClearTarget::Cleared(d) => (
+                format!("CLEAR TARGET: OK  ({})", crate::holders::safe(d)),
+                0,
+            ),
+            ClearTarget::Refused(d) => (
+                format!("CLEAR TARGET: REFUSED  ({})", crate::holders::safe(d)),
+                3,
+            ),
+            ClearTarget::CannotRun(d) => (
+                format!("CLEAR TARGET: CANNOT-RUN  ({})", crate::holders::safe(d)),
+                2,
+            ),
         }
     }
 }
@@ -1179,9 +1191,17 @@ impl ClearDrive {
     /// The one line `recovery-os-vm.sh` reads, and the exit code: 0, 3, 2.
     pub fn line(&self) -> (String, i32) {
         match self {
-            ClearDrive::Cleared(d) => (format!("CLEAR DRIVE: OK  ({d})"), 0),
-            ClearDrive::Refused(d) => (format!("CLEAR DRIVE: REFUSED  ({d})"), 3),
-            ClearDrive::CannotRun(d) => (format!("CLEAR DRIVE: CANNOT-RUN  ({d})"), 2),
+            ClearDrive::Cleared(d) => {
+                (format!("CLEAR DRIVE: OK  ({})", crate::holders::safe(d)), 0)
+            }
+            ClearDrive::Refused(d) => (
+                format!("CLEAR DRIVE: REFUSED  ({})", crate::holders::safe(d)),
+                3,
+            ),
+            ClearDrive::CannotRun(d) => (
+                format!("CLEAR DRIVE: CANNOT-RUN  ({})", crate::holders::safe(d)),
+                2,
+            ),
         }
     }
 }
@@ -1410,6 +1430,58 @@ fn clear_logged(
     }
 }
 
+/// Each of `mounts` as two aligned rows (bd DAS-Backup-Manager-3gzs.14): the
+/// `mount` row (source, filesystem and rw/ro, mount point, who made it, what
+/// is done about it) and the `options` row (the mount's own options, the
+/// filesystem's, the directory of it shown there). `tail` is the verdict
+/// after `->`.
+fn mount_rows(
+    runner: &dyn CommandRunner,
+    mounts: &[crate::holders::MountEntry],
+    tail: &str,
+) -> Vec<String> {
+    use crate::holders::{field, row};
+    let fs_of = |m: &crate::holders::MountEntry| {
+        format!(
+            "{} {}",
+            m.fstype,
+            if m.options.split(',').any(|o| o == "ro") {
+                "ro"
+            } else {
+                "rw"
+            }
+        )
+    };
+    let width =
+        |f: &dyn Fn(&crate::holders::MountEntry) -> usize| mounts.iter().map(f).max().unwrap_or(0);
+    let source_w = width(&|m| field(&m.source).chars().count());
+    let fs_w = width(&|m| field(&fs_of(m)).chars().count());
+    let point_w = width(&|m| field(&m.mount_point).chars().count());
+    let mut rows = Vec::new();
+    for m in mounts {
+        rows.push(row(
+            "mount",
+            &format!(
+                "{:<source_w$}  {:<fs_w$}  {:<point_w$}  by {}  -> {tail}",
+                field(&m.source),
+                field(&fs_of(m)),
+                field(&m.mount_point),
+                field(&origin_of(runner, &m.mount_point).to_string()),
+            ),
+        ));
+        rows.push(row(
+            "options",
+            &format!(
+                "mount {}  filesystem {}  root {}",
+                field(&m.options),
+                field(&m.super_options),
+                field(&m.root)
+            ),
+        ));
+    }
+    rows
+}
+
 /// A RAID-1 target's filesystem mounted anywhere but the target's own path
 /// (bd DAS-Backup-Manager-su1b.12): each such mount said (point, origin,
 /// options), its holders cleared by the operator's stop policy, each mount
@@ -1462,16 +1534,13 @@ fn clear_mounted_elsewhere(
         }
         return Ok(None);
     }
-    for m in &ours {
-        warn(format!(
-            "its filesystem is mounted at {} by {} (root {}, options {}, filesystem options {}) \
-             — not this job's mount; it is taken down so the target is mounted as configured",
-            m.mount_point,
-            origin_of(runner, &m.mount_point),
-            m.root,
-            m.options,
-            m.super_options
-        ));
+    for line in mount_rows(
+        runner,
+        &ours,
+        "another program's mount, not this job's; taken down so the target is mounted as \
+         configured",
+    ) {
+        warn(line);
     }
     let stacked = stacked_under(&all, &ours);
     if !stacked.is_empty() {
@@ -1504,7 +1573,10 @@ fn clear_mounted_elsewhere(
         return Err(hidden());
     }
     if !sent.is_empty() {
-        warn(format!("{STOPPED}: {}", sent.join(", ")));
+        warn(crate::holders::row(
+            "action",
+            &format!("{STOPPED}: {}", sent.join(", ")),
+        ));
     }
     Ok(Some(sent))
 }
@@ -1535,7 +1607,7 @@ fn would_clear(
     for w in would.iter().filter(|w| w.starts_with("would unmount")) {
         progress.on_log(
             crate::progress::LogLevel::Warning,
-            &format!("Target '{who}': dry run: {w}"),
+            &format!("Target '{who}': {}", crate::holders::row("action", w)),
         );
     }
     Ok(would)
@@ -1606,8 +1678,11 @@ fn unmount_each(
         progress.on_log(
             crate::progress::LogLevel::Warning,
             &format!(
-                "Target '{who}': unmounted {} (another program's mount)",
-                m.mount_point
+                "Target '{who}': {}",
+                crate::holders::row(
+                    "action",
+                    &format!("unmounted {} (another program's mount)", m.mount_point)
+                )
             ),
         );
     }
@@ -1653,23 +1728,8 @@ fn clear_partitions_with(
         }
         return Ok(None);
     }
-    for m in &ours {
-        warn(format!(
-            "{} is mounted at {} by {} ({} {}, root {}, options {}, filesystem options {}) — \
-             not this job's mount",
-            m.source,
-            m.mount_point,
-            origin_of(runner, &m.mount_point),
-            m.fstype,
-            if m.options.split(',').any(|o| o == "ro") {
-                "ro"
-            } else {
-                "rw"
-            },
-            m.root,
-            m.options,
-            m.super_options
-        ));
+    for line in mount_rows(runner, &ours, "another program's mount, not this job's") {
+        warn(line);
     }
     let stacked = stacked_under(&all, &ours);
     if !stacked.is_empty() {
@@ -1704,7 +1764,10 @@ fn clear_partitions_with(
         return Err(hidden(sys));
     }
     if !sent.is_empty() {
-        warn(format!("{STOPPED}: {}", sent.join(", ")));
+        warn(crate::holders::row(
+            "action",
+            &format!("{STOPPED}: {}", sent.join(", ")),
+        ));
     }
     Ok(Some(sent))
 }
@@ -5152,10 +5215,68 @@ mod tests {
         assert_eq!(got, Ok(Some(Vec::new())));
         assert_eq!(umounts(&runner), vec![ESP_AT.to_string()]);
         assert!(host.signals().is_empty());
+        let logs: Vec<String> = progress.logs().into_iter().map(|(_, m)| m).collect();
+        let who = "Target 'recovery': ";
+        let rows = [
+            format!(
+                "{who}mount    /dev/sdx1  vfat rw  {ESP_AT}  by udisks (a desktop session's \
+                 automount)  -> another program's mount, not this job's"
+            ),
+            format!("{who}options  mount rw,nosuid  filesystem rw,fmask=0022  root /"),
+            format!("{who}action   unmounted {ESP_AT} (another program's mount)"),
+        ];
+        assert_eq!(logs, rows, "bd 3gzs.14: one aligned row each");
+    }
+
+    /// bd 3gzs.14 security: mountinfo escapes a newline as `\012`, and
+    /// decoding gives it back. A mount point holding one must not make a line
+    /// of its own in what the job logs.
+    #[test]
+    fn a_mount_point_with_a_newline_makes_no_line_of_its_own() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] =
+            "50 22 8:17 / /run/media/u/x\\012CLEAR\\040TARGET:\\040OK rw,nosuid - vfat \
+                             /dev/sdx1 rw"
+                .into();
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let _ = clear_parts(&host, &runner, None, &progress);
+
+        let logs = progress.logs();
         assert!(
-            logged(&progress, &format!("mounted at {ESP_AT} by udisks")),
-            "{:?}",
-            progress.logs()
+            logs.iter()
+                .any(|(_, m)| m.contains("CLEAR?TARGET") || m.contains("x?CLEAR")),
+            "{logs:?}"
+        );
+        for (_, m) in &logs {
+            assert!(!m.chars().any(char::is_control), "{m:?}");
+        }
+    }
+
+    /// The status line is one line, whatever the detail carries.
+    #[test]
+    fn a_status_line_is_one_line_whatever_its_detail_carries() {
+        let evil = "a\nCLEAR TARGET: OK  (forged)\r";
+        for (line, _) in [
+            ClearTarget::Refused(evil.into()).line(),
+            ClearTarget::Cleared(evil.into()).line(),
+            ClearTarget::CannotRun(evil.into()).line(),
+        ] {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            assert!(line.starts_with("CLEAR TARGET: "), "{line:?}");
+        }
+        for (line, _) in [
+            ClearDrive::Refused(evil.into()).line(),
+            ClearDrive::Cleared(evil.into()).line(),
+            ClearDrive::CannotRun(evil.into()).line(),
+        ] {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            ClearTarget::Refused("it is held (pid 1)".into()).line().0,
+            "CLEAR TARGET: REFUSED  (it is held (pid 1))",
+            "an ordinary detail is byte for byte"
         );
     }
 
@@ -5611,17 +5732,17 @@ mod tests {
             .expect("the guarded mount at the target's own path");
         assert!(umount < mount, "{calls:?}");
         assert_eq!(guard.count(), 1);
-        assert!(
-            logged(&progress, "/run/media/u/das by udisks"),
-            "{:?}",
-            progress.logs()
-        );
-        assert!(logged(&progress, "pid 300"), "{:?}", progress.logs());
-        assert!(
-            logged(&progress, "sent SIGTERM to pid 300 (dolphin)"),
-            "{:?}",
-            progress.logs()
-        );
+        // bd 3gzs.14: aligned rows, a kind word first.
+        for row in [
+            "mount    ",
+            "  btrfs rw  /run/media/u/das  by udisks",
+            "options  mount rw,nosuid  filesystem rw,subvolid=5,subvol=/  root /",
+            "holder   pid 300  ",
+            "signal   SIGTERM pid 300 (dolphin, user ",
+            "action   unmounted /run/media/u/das",
+        ] {
+            assert!(logged(&progress, row), "{row}: {:?}", progress.logs());
+        }
     }
 
     /// A job that writes nothing under the target (verify, walk, restore,
@@ -5972,12 +6093,12 @@ mod tests {
             runner.calls()
         );
         assert!(
-            logged(&progress, "would stop: pid 300"),
+            logged(&progress, "holder   pid 300  ") && logged(&progress, "  -> would stop"),
             "{:?}",
             progress.logs()
         );
         assert!(
-            logged(&progress, "would unmount /run/media/u/das"),
+            logged(&progress, "action   would unmount /run/media/u/das"),
             "{:?}",
             progress.logs()
         );
@@ -6132,7 +6253,7 @@ mod tests {
         );
         assert_eq!(guard.count(), 1);
         assert!(
-            logged(&progress, "sent SIGTERM to pid 310 (bash)"),
+            logged(&progress, "signal   SIGTERM pid 310 (bash, user "),
             "{:?}",
             progress.logs()
         );

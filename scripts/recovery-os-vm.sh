@@ -1,6 +1,6 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.7.0
+# Version: 2.7.1
 # Date: 2026-11-27
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
@@ -1500,14 +1500,21 @@ clear_host_mounts() {
     fi
     status=${out##*$'\n'status=}
     body=${out%$'\n'status=*}
+    # The answer is the LAST line it printed, and it must be a status line:
+    # a text from outside (a file name on the drive) never stands in for it
+    # (bd 3gzs.14). Anything else is no answer.
+    local trimmed=${body%"${body##*[![:space:]]}"} final
+    final=${trimmed##*$'\n'}
+    if [[ "$final" =~ ^CLEAR\ DRIVE:\ [[:upper:]-]+\ +\((.*)\)$ ]]; then
+        detail=${BASH_REMATCH[1]}
+    else
+        refuse "cannot clear the drive's host mounts: the last line btrdasd recovery-os clear-drive printed is not a CLEAR DRIVE: status ($(printable "$final"))"
+    fi
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         line="$(printable "$line")"
         HOST_MOUNT_LINES+=("$line")
         log "    $line"
-        if [[ "$line" =~ ^CLEAR\ DRIVE:\ [[:upper:]-]+\ +\((.*)\)$ ]]; then
-            detail=${BASH_REMATCH[1]}
-        fi
     done <<<"$body"
     case "$status" in
         0)

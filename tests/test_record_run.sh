@@ -198,7 +198,7 @@ check "bzw: the report says FAILURES DETECTED" "$(grep -c '^  Status: FAILURES D
 check "yu9z: the report names the next run, from the real next_scheduled" \
     "$(grep -c '^  Next scheduled: unknown$' <<<"$report")" "1"
 check "bzw: and names the counters" \
-    "$(grep -c '^  Snapshot counts       FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' <<<"$report")" "1"
+    "$(grep -c '^  Snapshot counts  *FAIL  (btrbk transaction log incomplete (no startup or finished row); counts unknown)$' <<<"$report")" "1"
 record_run_args "$(run_status)" false
 check "bzw: the history row is not --success" "$(vector | grep -c '^--success$' || true)" "0"
 check "bzw: the row carries the counts decided" "$(counts_words)" "--counts-unknown "
@@ -210,7 +210,7 @@ decide_run_counts
 check "bzw: counts known: OK" "${OP_STATUS[btrbk_counters]:-unset}" "OK"
 check "bzw: counts known: SUCCESS" "$(run_status)" "SUCCESS"
 check "bzw: counts known: the row reads OK, with the counts" \
-    "$(generate_report | grep -c '^  Snapshot counts       OK  (2 created, 3 sent)$')" "1"
+    "$(generate_report | grep -c '^  Snapshot counts  *OK  (2 created, 3 sent)$')" "1"
 
 # --- round 3, M6: a row nothing decided reads N/A, as every row does ---------
 # decide_run_counts records OK itself, with the counts. The row's default was
@@ -220,8 +220,8 @@ reset
 log_normal >"$WORK/runlog"
 parse_btrbk_run_log "$WORK/runlog"
 check "M6: not decided yet: the row reads N/A" \
-    "$(generate_report | grep -c '^  Snapshot counts       N/A  (n/a)$')" "1"
-check "M6: not decided yet: never OK" "$(generate_report | grep -c '^  Snapshot counts       OK')" "0"
+    "$(generate_report | grep -c '^  Snapshot counts  *N/A  (n/a)$')" "1"
+check "M6: not decided yet: never OK" "$(generate_report | grep -c '^  Snapshot counts  *OK')" "0"
 
 # main() decides, then record_run_args decides again for its vector: the same
 # answer, and the unparsed-output warning only once.
