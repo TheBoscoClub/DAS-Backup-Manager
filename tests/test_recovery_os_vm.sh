@@ -1810,6 +1810,11 @@ has "dry run with a host mount: says nothing was changed" "$OUT" "nothing was st
 has "dry run with a host mount: still mounted" "$(file "$S/lsblk.mounts.sdj")" "RECOV-ESP-1"
 check "dry run with a host mount: nothing written to the history" "$(file "$H")" ""
 check "dry run with a host mount: lock released" "$(lock_state)" "free"
+# bd 3gzs.14 review N3: refused under the lock with no history armed, the run
+# still ends in its RESULT block, once, the row saying why.
+check "dry run with a host mount: one RESULT block" "$(grep -c '━━ RESULT ━━' <<<"$OUT")" "1"
+matches "dry run with a host mount: its RESULT row is the refusal" "$OUT" "
+  system-recovery-A-2tb +REFUSED +\\(dry run: the drive is mounted on this host"
 
 fixture
 rm "${S:?}/defined"
