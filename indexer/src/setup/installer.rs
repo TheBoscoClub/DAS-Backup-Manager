@@ -2090,6 +2090,152 @@ struct CheckProbes<'a> {
     dependencies: &'a dyn Fn(bool) -> Vec<crate::setup::detect::DepStatus>,
 }
 
+/// One topic of the `setup --check` report: what was looked at and the
+/// lines it printed (their wording is the report functions' own).
+struct CheckSection {
+    name: &'static str,
+    lines: Vec<String>,
+}
+
+/// How a `setup --check` line reads: fine, to look at, or broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LineStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl LineStatus {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+/// The status of a report line, from the words the report functions put in
+/// the lines that need a reader: `None` for a continuation (indented) line,
+/// which belongs to the line above it. A line none of these words is in reads
+/// `OK`; `check_status_words_cover_every_report_function` pins each bad
+/// line the report functions can produce.
+fn line_status(line: &str) -> Option<LineStatus> {
+    if line.starts_with(' ') {
+        return None;
+    }
+    const FAIL: [&str; 10] = [
+        "Config error",
+        "Config not found",
+        "UNREACHABLE",
+        " MISSING",
+        "STALE",
+        "EXPOSED",
+        "DIFFERS",
+        "is not loaded",
+        "generated files missing",
+        "(required, not found)",
+    ];
+    const WARN: [&str; 9] = [
+        "NOT checked",
+        "NOT read",
+        "could not",
+        "Config warning",
+        "has no mount_uuid",
+        "(optional, not found)",
+        "No manifest found",
+        "No target drive attached",
+        "not attached",
+    ];
+    let drive_off = line.starts_with("Drive ") && line.contains(", not ");
+    Some(if drive_off || FAIL.iter().any(|w| line.contains(w)) {
+        LineStatus::Fail
+    } else if WARN.iter().any(|w| line.contains(w)) {
+        LineStatus::Warn
+    } else {
+        LineStatus::Ok
+    })
+}
+
+/// A report line with the indented lines that belong to it, and its status.
+type LineGroup = (LineStatus, Vec<String>);
+
+/// The report as the operator reads it (spec rule 2, 3, 7): the lines that
+/// need a reader first, status word first, each with the lines that belong to
+/// it; then each topic's routine lines; then one RESULT row per topic. Every
+/// line of `sections` appears exactly once.
+fn render_check(sections: &[CheckSection]) -> Vec<String> {
+    let mut out = vec!["━━ btrdasd setup --check ━━".to_string()];
+    // Split each section into the groups (a line and its continuations).
+    let groups = |sec: &CheckSection| -> Vec<LineGroup> {
+        let mut g: Vec<LineGroup> = Vec::new();
+        for line in &sec.lines {
+            match (line_status(line), g.last_mut()) {
+                (Some(st), _) => g.push((st, vec![line.clone()])),
+                (None, Some(last)) => last.1.push(line.clone()),
+                (None, None) => g.push((LineStatus::Ok, vec![line.clone()])),
+            }
+        }
+        g
+    };
+    let all: Vec<(&CheckSection, Vec<LineGroup>)> =
+        sections.iter().map(|s| (s, groups(s))).collect();
+
+    let flagged: Vec<&LineGroup> = all
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .filter(|(st, _)| *st != LineStatus::Ok)
+        .collect();
+    if !flagged.is_empty() {
+        out.push(String::new());
+        out.push("── NEEDS ATTENTION ──".to_string());
+        for (st, lines) in flagged {
+            out.push(format!("  {:<5} {}", st.word(), lines[0]));
+            out.extend(
+                lines[1..]
+                    .iter()
+                    .map(|l| format!("{:8}{}", "", l.trim_start())),
+            );
+        }
+    }
+    for (sec, g) in &all {
+        let routine: Vec<&String> = g
+            .iter()
+            .filter(|(st, _)| *st == LineStatus::Ok)
+            .flat_map(|(_, l)| l.iter())
+            .collect();
+        if routine.is_empty() {
+            continue;
+        }
+        out.push(String::new());
+        out.push(format!("── {} ──", sec.name));
+        out.extend(routine.into_iter().map(|l| format!("  {l}")));
+    }
+    out.push(String::new());
+    out.push("RESULT".to_string());
+    for (sec, g) in &all {
+        if g.is_empty() {
+            continue;
+        }
+        let worst = g.iter().map(|(st, _)| *st).max().unwrap_or(LineStatus::Ok);
+        let bad = g.iter().filter(|(st, _)| *st != LineStatus::Ok).count();
+        let why = if bad == 0 {
+            String::new()
+        } else {
+            format!(
+                "{bad} line{} to read, listed above",
+                if bad == 1 { "" } else { "s" }
+            )
+        };
+        out.push(
+            format!("  {:<24}{:<6}{why}", sec.name, worst.word())
+                .trim_end()
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// `check` against an explicit config and manifest, with the host probes
 /// supplied by the caller. The report goes to `say`, one line per call.
 fn check_with(
@@ -2098,48 +2244,74 @@ fn check_with(
     probes: &CheckProbes,
     say: &mut dyn FnMut(String),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !config_path.exists() {
-        say(format!("Config not found at {}", config_path.display()));
-        say("  Run: sudo btrdasd setup".to_string());
-        return Ok(());
+    for line in render_check(&check_sections(config_path, manifest_path, probes)?) {
+        say(line);
     }
-    say(format!("Config found: {}", config_path.display()));
+    Ok(())
+}
+
+/// What `check` found, by topic. The lines are the report functions' own;
+/// how they are laid out is [`render_check`]'s.
+fn check_sections(
+    config_path: &Path,
+    manifest_path: &Path,
+    probes: &CheckProbes,
+) -> Result<Vec<CheckSection>, Box<dyn std::error::Error>> {
+    let mut sections: Vec<CheckSection> = Vec::new();
+    let mut section = |name: &'static str, lines: Vec<String>| {
+        sections.push(CheckSection { name, lines });
+    };
+    if !config_path.exists() {
+        section(
+            "Config",
+            vec![
+                format!("Config not found at {}", config_path.display()),
+                "  Run: sudo btrdasd setup".to_string(),
+            ],
+        );
+        return Ok(sections);
+    }
+    let mut lines = vec![format!("Config found: {}", config_path.display())];
 
     let text = std::fs::read_to_string(config_path)?;
     let config = Config::from_toml(&text)?;
     let errors = config.validate();
     if errors.is_empty() {
-        say("Config is valid".to_string());
+        lines.push("Config is valid".to_string());
     } else {
         for err in &errors {
-            say(format!("Config error: {}", err));
+            lines.push(format!("Config error: {}", err));
         }
     }
     // A key nothing reads (a typo the save keeps): warned, never an error.
     for w in buttered_dasd::config::unknown_key_warnings(&text)? {
-        say(format!("Config warning: {w}"));
+        lines.push(format!("Config warning: {w}"));
     }
+    section("Config", lines);
 
     // A config that still names the Bridge port is valid but undeliverable —
     // report it here rather than letting the next backup discover it.
     if config.email.enabled {
+        let mut lines = Vec::new();
         let relay = format!("{}:{}", config.email.smtp_host, config.email.smtp_port);
         if (probes.relay_up)(&config) {
-            say(format!("Mail relay reachable at {relay}"));
+            lines.push(format!("Mail relay reachable at {relay}"));
         } else {
-            say(format!("Mail relay UNREACHABLE at {relay}"));
+            lines.push(format!("Mail relay UNREACHABLE at {relay}"));
             if config.email.smtp_port == 1025 {
-                say(
+                lines.push(
                     "  Port 1025 is Protonmail Bridge, which this version no longer uses."
                         .to_string(),
                 );
-                say("  Fix with: sudo btrdasd setup --upgrade".to_string());
+                lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
             } else {
-                say("  Reports will be saved to disk but not delivered.".to_string());
+                lines.push("  Reports will be saved to disk but not delivered.".to_string());
             }
         }
+        section("Mail relay", lines);
     }
 
+    let mut lines = Vec::new();
     if manifest_path.exists() {
         let content = std::fs::read_to_string(manifest_path)?;
         let total = content.lines().count();
@@ -2148,59 +2320,58 @@ fn check_with(
             .filter(|line| !Path::new(line.trim()).exists())
             .collect();
         if missing.is_empty() {
-            say(format!("All {} generated files present", total));
+            lines.push(format!("All {} generated files present", total));
         } else {
-            say(format!(
+            lines.push(format!(
                 "{} of {} generated files missing:",
                 missing.len(),
                 total
             ));
             for m in &missing {
-                say(format!("    {}", m));
+                lines.push(format!("    {}", m));
             }
-            say("  Fix with: sudo btrdasd setup --upgrade".to_string());
+            lines.push("  Fix with: sudo btrdasd setup --upgrade".to_string());
         }
     } else {
-        say("No manifest found. Files may be from a manual install.".to_string());
+        lines.push("No manifest found. Files may be from a manual install.".to_string());
     }
+    section("Generated files", lines);
 
     // Is the scrub unit running at the priority setup would write? Read back
     // from systemd, not from the unit file: that also catches a drop-in that
     // overrides it. Only systemd has the unit (bd DAS-Backup-Manager-su1b.1).
     if config.init.system == crate::setup::config::InitSystem::Systemd {
-        for line in scrub_priority_report((probes.scrub_unit)()) {
-            say(line);
-        }
+        section("Scrub unit", scrub_priority_report((probes.scrub_unit)()));
     }
 
     // Are the targets hidden from udisks2? Read back from udev rather than
     // from the rule file: a rule that exists and matches nothing looks
     // installed and does nothing (bd DAS-Backup-Manager-a10).
     let export_db = (probes.export_db)();
-    for line in mount_uuid_report(&export_db, &config) {
-        say(line);
-    }
-    for line in io_scheduler_rule_report((probes.io_rule)(), &config) {
-        say(line);
-    }
-    for line in io_scheduler_live_report(&export_db, probes.active_scheduler, &config) {
-        say(line);
-    }
-    for line in udisks_report(export_db, &config) {
-        say(line);
-    }
+    section("Target mount UUIDs", mount_uuid_report(&export_db, &config));
+    section(
+        "I/O scheduler rule",
+        io_scheduler_rule_report((probes.io_rule)(), &config),
+    );
+    section(
+        "I/O scheduler, drives",
+        io_scheduler_live_report(&export_db, probes.active_scheduler, &config),
+    );
+    section("udisks visibility", udisks_report(export_db, &config));
 
+    let mut lines = Vec::new();
     for dep in &(probes.dependencies)(config.email.enabled) {
         if let Some(path) = &dep.path {
-            say(format!("{} ({})", dep.name, path));
+            lines.push(format!("{} ({})", dep.name, path));
         } else if dep.required {
-            say(format!("{} (required, not found)", dep.name));
+            lines.push(format!("{} (required, not found)", dep.name));
         } else {
-            say(format!("{} (optional, not found)", dep.name));
+            lines.push(format!("{} (optional, not found)", dep.name));
         }
     }
+    section("Dependencies", lines);
 
-    Ok(())
+    Ok(sections)
 }
 
 /// Remove a list of file paths, silently skipping any that don't exist.
@@ -6263,9 +6434,13 @@ auth = "starttls""#,
                 deps
             },
         };
-        let mut lines = Vec::new();
-        check_with(config_path, manifest_path, &probes, &mut |l| lines.push(l)).unwrap();
-        lines
+        // The report's own lines, in order: what each test below asserts on.
+        // How they are laid out is `render_check`'s, tested on its own.
+        check_sections(config_path, manifest_path, &probes)
+            .unwrap()
+            .into_iter()
+            .flat_map(|sec| sec.lines)
+            .collect()
     }
 
     /// A host that never ran `setup --upgrade` after the priority change, or a
@@ -6528,6 +6703,143 @@ auth = "starttls""#,
                 "  Reports will be saved to disk but not delivered.",
             ]
         );
+    }
+
+    /// What the operator reads: the lines that need a reader come first,
+    /// status word first, with the lines that belong to them; routine lines
+    /// follow by topic; a RESULT row per topic closes it. Every report line
+    /// is on the page exactly once (bd DAS-Backup-Manager-3gzs.12).
+    #[test]
+    fn check_puts_what_needs_a_reader_first_and_closes_with_a_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, manifest_path) = installed_paths(dir.path());
+        relay_config(1025).save(&config_path).unwrap();
+        let sections = |relay_up| {
+            let dep = |name: &str, required: bool| crate::setup::detect::DepStatus {
+                name: name.to_string(),
+                required,
+                path: None,
+            };
+            let probes = CheckProbes {
+                relay_up: &move |_| relay_up,
+                export_db: &|| Ok(String::new()),
+                io_rule: &|| Ok(None),
+                active_scheduler: &|_| Err("no".to_string()),
+                scrub_unit: &|| Ok(HEALTHY_SCRUB_SHOW.to_string()),
+                dependencies: &|_| vec![dep("smartctl", true)],
+            };
+            check_sections(&config_path, &manifest_path, &probes).unwrap()
+        };
+        let all = sections(false);
+        let flat: Vec<String> = all.iter().flat_map(|s| s.lines.clone()).collect();
+        let text = render_check(&all);
+        assert_eq!(text[0], "━━ btrdasd setup --check ━━", "{text:#?}");
+        // The deciding block, before any routine topic.
+        let attention = text
+            .iter()
+            .position(|l| l == "── NEEDS ATTENTION ──")
+            .unwrap();
+        let first_topic = text
+            .iter()
+            .position(|l| l.starts_with("── ") && !l.contains("ATTENTION"))
+            .unwrap();
+        assert!(attention < first_topic, "{text:#?}");
+        assert_eq!(
+            text[attention + 1..attention + 4],
+            [
+                "  FAIL  Mail relay UNREACHABLE at 127.0.0.1:1025",
+                "        Port 1025 is Protonmail Bridge, which this version no longer uses.",
+                "        Fix with: sudo btrdasd setup --upgrade",
+            ],
+            "{text:#?}"
+        );
+        // Nothing added, nothing lost: every report line shows once, in the
+        // text or its continuation.
+        let strip = |l: &str| {
+            let t = l.trim();
+            for w in ["FAIL ", "WARN "] {
+                if let Some(rest) = t.strip_prefix(w) {
+                    return rest.trim().to_string();
+                }
+            }
+            t.to_string()
+        };
+        for line in &flat {
+            let want = flat.iter().filter(|l| l.trim() == line.trim()).count();
+            let got = text.iter().filter(|t| strip(t) == line.trim()).count();
+            assert_eq!(got, want, "{line:?} in {text:#?}");
+        }
+        // The RESULT closes the page, one row per topic, status in a column.
+        let result = text.iter().position(|l| l == "RESULT").unwrap();
+        assert!(result > first_topic);
+        assert!(
+            text[result + 1..].contains(
+                &"  Mail relay              FAIL  1 line to read, listed above".to_string()
+            ),
+            "{text:#?}"
+        );
+        assert!(
+            text[result + 1..].contains(
+                &"  Dependencies            FAIL  1 line to read, listed above".to_string()
+            ),
+            "{text:#?}"
+        );
+        // A healthy relay: no relay line in the block, the row is OK.
+        let healthy = render_check(&sections(true));
+        assert!(
+            healthy.contains(&"  Mail relay              OK".to_string()),
+            "{healthy:#?}"
+        );
+        assert!(
+            !healthy.iter().any(|l| l.contains("UNREACHABLE")),
+            "{healthy:#?}"
+        );
+    }
+
+    /// The status words: every line a report function prints that needs a
+    /// reader reads WARN or FAIL, and a routine line OK; a continuation line
+    /// has no status of its own.
+    #[test]
+    fn check_status_words_cover_every_report_function() {
+        let fail = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Fail), "{l}");
+        let warn = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Warn), "{l}");
+        let ok = |l: &str| assert_eq!(line_status(l), Some(LineStatus::Ok), "{l}");
+        // scrub_priority_report
+        fail(&scrub_priority_report(Ok("LoadState=not-found\n".into()))[0]);
+        fail(&scrub_priority_report(Ok("LoadState=loaded\nNice=19\n".into()))[0]);
+        warn(&scrub_priority_report(Err("x".into()))[0]);
+        ok(&scrub_priority_report(Ok(HEALTHY_SCRUB_SHOW.into()))[0]);
+        // udisks_report
+        let cfg = exposure_config();
+        let lines = udisks_report(Ok(export_db(false, true)), &cfg);
+        fail(&lines[0]); // EXPOSED
+        assert_eq!(line_status(&lines[1]), None); // "  Fix with"
+        ok(&lines[2]); // hidden
+        warn(&lines[3]); // not attached
+        warn(&udisks_report(Err("e".into()), &cfg)[0]);
+        // mount_uuid_report, the rule and the live scheduler
+        let mut c = Config::default();
+        c.das.io_scheduler = "mq-deadline".into();
+        warn(&io_scheduler_rule_report(Err("e".into()), &c)[0]);
+        fail(&io_scheduler_rule_report(Ok(None), &c)[0]);
+        fail(&io_scheduler_rule_report(Ok(Some("old".into())), &c)[0]);
+        warn(&io_scheduler_live_report(&Err("e".into()), &|_| Err("x".into()), &c)[0]);
+        warn(&io_scheduler_live_report(&Ok(String::new()), &|_| Err("x".into()), &c)[0]);
+        c.das.io_scheduler.clear();
+        ok(&io_scheduler_rule_report(Ok(None), &c)[0]);
+        // Drive off its scheduler (the line io_scheduler_live_report builds).
+        fail("Drive sda runs bfq, not mq-deadline");
+        ok("Drive sda runs mq-deadline");
+        // The check's own lines.
+        fail("Config error: no targets");
+        warn("Config warning: x is not a key");
+        ok("Config is valid");
+        fail("1 of 9 generated files missing:");
+        ok("All 9 generated files present");
+        warn("No manifest found. Files may be from a manual install.");
+        warn("mbuffer (optional, not found)");
+        fail("smartctl (required, not found)");
+        ok("btrbk (/usr/bin/btrbk)");
     }
 
     #[test]
