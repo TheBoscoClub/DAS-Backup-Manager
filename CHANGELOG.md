@@ -143,6 +143,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`btrdasd scrub run`, `scrub status` and the emailed scrub report are reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
+  - `scrub status` opens with `━━ btrdasd scrub status — <local time and zone> ━━`, sets each filesystem that failed (FAIL) or needs a look (WARN: never scrubbed, paused, yielded) in a `── NEEDS ATTENTION ──` block, keeps its table and detail lines as they were, and closes with a `RESULT` block of one row per filesystem; `--json` is unchanged
+  - `scrub run` prints the line it always printed (`Scrub pass <status>: N of M filesystems clean`), then the attention block and a `RESULT` row per filesystem
+  - The emailed scrub report names the pass's start in local time with its zone, moves what was the `PROBLEMS` section to a `── NEEDS ATTENTION ──` block right after the header (status word first: `FAILED`, `PAUSED`; the same lines), and closes with a `RESULT` block; the `Status:` line, the pass summary and the per-filesystem table stay, and the word `FAILURE` still appears only when something failed
+  - New `caldate::local_stamp` (`2026-11-27 03:19 CST`) for the time with its zone
+
 - **The operations table of a Rust-run report keeps its statuses in one column when a target name is long** (bd `DAS-Backup-Manager-3gzs.12`): the name column was a fixed 21 characters, so `Target <label>` and `RAID-1 <label>` rows overflowed it and their status stood a few columns to the right of the rest
   - The column is as wide as the longest name in the block (21 at least); every row's text is unchanged, only the padding moves, and the `NEEDS ATTENTION` block uses the same width
 

@@ -160,6 +160,38 @@ pub fn local_datetime(epoch: i64) -> Option<String> {
     ))
 }
 
+/// The local time of `epoch` as the operator reads it, with its zone and
+/// without seconds: `2026-11-27 03:19 CST` (spec 2026-11-27 rule 6).
+/// `None` when the C library cannot convert it.
+#[allow(clippy::useless_conversion)] // see `local_datetime`
+pub fn local_stamp(epoch: i64) -> Option<String> {
+    let t: libc::time_t = epoch.try_into().ok()?;
+    reread_zone();
+    // SAFETY: an all-zero `tm` is a valid value of a plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals; localtime_r writes only `tm`.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    let zone = if tm.tm_zone.is_null() {
+        String::new()
+    } else {
+        // SAFETY: localtime_r set `tm_zone` to a NUL-terminated zone
+        // abbreviation owned by the C library, read before anything else
+        // can change the zone.
+        let z = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+        format!(" {}", z.to_string_lossy())
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}{zone}",
+        i64::from(tm.tm_year) + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    ))
+}
+
 /// `tzset()`: read the host's zone (`TZ`, `/etc/localtime`) again.
 /// `localtime_r` need not do it (glibc's reads the zone once per process), so
 /// without it a helper started before `timedatectl set-timezone` would write
@@ -437,6 +469,21 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// The stamp is the host's wall clock to the minute, then its zone name:
+    /// the system `date` is the oracle for both.
+    #[test]
+    fn local_stamp_is_the_hosts_wall_clock_to_the_minute_and_its_zone() {
+        for epoch in [1_791_500_000_i64, 1_767_225_600, 1_800_000_000] {
+            let out = std::process::Command::new("date")
+                .args(["-d", &format!("@{epoch}"), "+%F %R %Z"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let want = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            assert_eq!(local_stamp(epoch), Some(want));
+        }
     }
 
     #[test]
