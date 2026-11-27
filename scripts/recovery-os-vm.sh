@@ -1,7 +1,7 @@
 #!/bin/bash
 # recovery-os-vm.sh - update a recovery drive's own OS by booting it in a VM
-# Version: 2.5.0
-# Date: 2026-11-22
+# Version: 2.6.0
+# Date: 2026-11-27
 #
 # Each role = "mirror" target (a 2 TB recovery drive) carries a fully
 # independent install: its own ESP on partition 1, its own root as subvolume
@@ -737,6 +737,8 @@ EGRESS_RESULT="not needed"
 HISTORY_FILE=""     # the session history, beside the boot record
 GUARD_KEEP_DIR=""   # each drive's last guard report and its times, beside it
 HISTORY_ARMED=false # this session took the lock: its end is written there
+HOST_MOUNT_LIST=""  # the drive's partitions found mounted on the host, as lsblk lists them
+HOST_MOUNT_LINES=() # what clearing them said (history: host_mounts)
 HISTORY_FAILURE="" HISTORY_LINES=""
 # An attended session of a "will" drive (decision 3 of bd 8249).
 WILL_BANNER=false
@@ -1438,12 +1440,63 @@ check_units() {
     fi
 }
 
+# The first look, before any lock: lists what is mounted and refuses only
+# when lsblk cannot say (nothing unread passes for "unmounted"). A mount is no
+# refusal here: clear_host_mounts, under the lock, clears it by the stop
+# policy (bd DAS-Backup-Manager-eg4j.19).
 check_not_mounted() {
-    local mounted
-    mounted="$(mounted_partitions "$DISK_DEV")" || refuse "cannot list the mounts of $DISK_DEV"
-    if [[ -n "$mounted" ]]; then
-        refuse "$DISK_DEV is mounted on this host: $mounted -- unmount it first"
+    HOST_MOUNT_LIST="$(mounted_partitions "$DISK_DEV")" || refuse "cannot list the mounts of $DISK_DEV"
+    if [[ -n "$HOST_MOUNT_LIST" ]]; then
+        log "$DISK_DEV is mounted on this host: $HOST_MOUNT_LIST -- cleared by the stop policy once this run holds the lock; a writer refuses"
     fi
+}
+
+# Every mount another program made of the drive's partitions (udisks, a
+# `.mount` unit, a hand mount), cleared by the operator's stop policy through
+# `btrdasd recovery-os clear-drive` -- the one implementation, never a second
+# one here: idle, it is unmounted; readers get SIGTERM, then SIGKILL; a writer
+# or a protected process refuses. UNDER THE HELD LOCK, before the holder
+# claims the disk (a mounted partition makes the claim fail). What it says is
+# logged line by line and kept for the history (host_mounts). A dry run only
+# looks (--report-only) and never continues beside a mount.
+clear_host_mounts() {
+    local mounted out status body line detail="" flags=() now
+    mounted="$(mounted_partitions "$DISK_DEV")" || refuse "cannot list the mounts of $DISK_DEV"
+    [[ -n "$mounted" ]] || return 0
+    [[ "$DRY_RUN" != true ]] || flags+=(--report-only)
+    log "DRIVE MOUNTED ON HOST"
+    log "    $mounted"
+    # The answer and its status in one capture, the status travelling inside it
+    # (a capture without the status line is a failure, never a pass).
+    out="$(DAS_MAINTENANCE_LOCK_FD=$LOCK_FD "$BTRDASD_BIN" recovery-os clear-drive --label "$LABEL" "${flags[@]}" 2>&1 && printf '\nstatus=0' || printf '\nstatus=%s' "$?")"
+    if [[ "$out" != *$'\n'status=* ]]; then
+        refuse "cannot clear the drive's host mounts: btrdasd recovery-os clear-drive gave no answer"
+    fi
+    status=${out##*$'\n'status=}
+    body=${out%$'\n'status=*}
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        line="$(printable "$line")"
+        HOST_MOUNT_LINES+=("$line")
+        log "    $line"
+        if [[ "$line" =~ ^CLEAR\ DRIVE:\ [A-Z-]+\ +\((.*)\)$ ]]; then
+            detail=${BASH_REMATCH[1]}
+        fi
+    done <<<"$body"
+    case "$status" in
+        0)
+            if [[ "$DRY_RUN" == true ]]; then
+                refuse "dry run: the drive is mounted on this host, and a real run clears it ($detail) -- nothing was stopped or unmounted"
+            fi
+            now="$(mounted_partitions "$DISK_DEV")" || refuse "cannot list the mounts of $DISK_DEV after clearing them"
+            if [[ -n "$now" ]]; then
+                refuse "$DISK_DEV is still mounted after clearing: $now"
+            fi
+            log "drive clear -- continuing"
+            ;;
+        3) refuse "drive in use on this host -- ${detail:-no detail}" ;;
+        *) refuse "cannot clear the drive's host mounts: ${detail:-clear-drive exited $status}" ;;
+    esac
 }
 
 # A managed-save image is the memory of a recovery OS that was RUNNING when
@@ -5117,11 +5170,12 @@ write_history() {
     ((${#BOOT_OVERRIDES[@]} == 0)) || overridden=true
     printf 'RESULT %s %s %s\n' "$LABEL" "$1" "$outcome"
     if ! line="$(jq -cn --arg label "$LABEL" --argjson start "$SESSION_EPOCH" --argjson end "$(date +%s)" \
-        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --arg also "${P_ALSO[*]}" --arg desktop "$DESKTOP_PROVEN" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
+        --arg mode "${HISTORY_MODE:-$RUN_MODE}" --arg stamp "$PROVISION_STAMP" --arg also "${P_ALSO[*]}" --arg desktop "$DESKTOP_PROVEN" --arg hostmounts "$(printf '%s\n' "${HOST_MOUNT_LINES[@]}")" --argjson unattended "$UNATTENDED" --arg outcome "$outcome" --argjson exit "$1" \
         --argjson overridden "$overridden" --arg kernel "$KERNEL" --arg stage "$UNATTENDED_STAGE" \
         '{label: $label, start: $start, end: $end, mode: $mode, unattended: $unattended, outcome: $outcome,
           exit: $exit, overridden: $overridden, kernel: (if $kernel == "" then null else $kernel end),
-          stopped_at: (if $stage == "" then null else $stage end)}
+          stopped_at: (if $stage == "" then null else $stage end),
+          host_mounts: ($hostmounts | split("\n") | map(select(. != "")))}
           + (if $stamp == "" then {} else {stamp: $stamp} end)
           + (if $mode == "provision" then {also_replace: ($also | split(" ") | map(select(. != "")))} else {} end)
           + (if $desktop == "true" then {desktop: "proven"} else {} end)' 2>&1)"; then
@@ -5963,6 +6017,7 @@ cmd_session() {
     else
         progress preflight ok "lock taken; attended, $RUN_MODE"
     fi
+    clear_host_mounts
     if ! start_holder; then
         refuse "could not hold $DISK ($HOLDER_FAILURE)"
     fi
@@ -7205,6 +7260,7 @@ provision_undo() {
     HISTORY_ARMED=true
     HISTORY_MODE=undo
     progress preflight ok "lock taken; undo $PROVISION_STAMP"
+    clear_host_mounts
     if ! start_holder; then
         refuse "could not hold $DISK ($HOLDER_FAILURE)"
     fi
@@ -7233,6 +7289,9 @@ cmd_provision() {
     provision_preflight
     if [[ "$P_UNDO" == true ]]; then
         if [[ "$DRY_RUN" == true ]]; then
+            if [[ -n "$HOST_MOUNT_LIST" ]]; then
+                log "a real run clears these host mounts by the stop policy (a writer refuses); this dry run holds no lock and clears nothing"
+            fi
             log "undo the provision of $LABEL stamped $PROVISION_STAMP (also set aside: ${P_ALSO[*]:-none}): boot the live system, run the installer's undo -- allowed until delete-replaced has started; the new root is set aside, never deleted"
             exit 0
         fi
@@ -7240,6 +7299,9 @@ cmd_provision() {
     fi
     PROVISION_STAMP="$(date +%Y%m%d-%H%M%S)"
     if [[ "$DRY_RUN" == true ]]; then
+        if [[ -n "$HOST_MOUNT_LIST" ]]; then
+            log "a real run clears these host mounts by the stop policy (a writer refuses); this dry run holds no lock and clears nothing"
+        fi
         provision_plan_text
         exit 0
     fi
@@ -7256,6 +7318,7 @@ cmd_provision() {
     HISTORY_ARMED=true
     HISTORY_MODE=provision
     progress preflight ok "lock taken; provision $PROVISION_STAMP"
+    clear_host_mounts
     if ! start_holder; then
         refuse "could not hold $DISK ($HOLDER_FAILURE)"
     fi

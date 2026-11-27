@@ -1046,6 +1046,27 @@ case "${1:-} ${2:-}" in
         echo "held $dev pid $$"
         while :; do read -r -t 1 -u 7 _ || :; done
         ;;
+    "recovery-os clear-drive")
+        # What `btrdasd recovery-os clear-drive` is asked, under what lock,
+        # and whether the disk holder already claimed the drive; its answer
+        # is the test's: cleardrive.out printed, cleardrive.rc the status
+        # (default 2, CANNOT-RUN), cleardrive.unmount takes the disk's
+        # mounts away (lsblk.mounts.<name>) as an unmount would.
+        printf '%s fd=%s\n' "$*" "${DAS_MAINTENANCE_LOCK_FD:-}" >>"$STUB/cleardrive.calls"
+        if "$REAL_FLOCK" -n "$DAS_RECOVERY_VM_TEST_ROOT/run/das-maintenance.lock" true; then
+            echo free >>"$STUB/cleardrive.lock"
+        else
+            echo held >>"$STUB/cleardrive.lock"
+        fi
+        if [[ -e "$STUB/holder.calls" ]]; then echo after-holder >>"$STUB/cleardrive.holder"; else echo before-holder >>"$STUB/cleardrive.holder"; fi
+        if [[ -f "$STUB/cleardrive.rc" ]]; then
+            cat "$STUB/cleardrive.out"
+            if [[ -f "$STUB/cleardrive.unmount" && "$*" != *--report-only* ]]; then rm -f "$STUB"/lsblk.mounts.sdj "$STUB"/lsblk.mounts.sdk; fi
+            exit "$(<"$STUB/cleardrive.rc")"
+        fi
+        echo "CLEAR DRIVE: CANNOT-RUN  (stub: no answer scripted)"
+        exit 2
+        ;;
     *) echo "stub btrdasd: unexpected $*" >&2; exit 99 ;;
 esac
 STUB
@@ -1689,14 +1710,89 @@ has "unit states unreadable: says so" "$OUT" "cannot tell whether"
 fixture
 printf 'sdj \nsdj1 \nsdj2 /mnt/backup-system-recovery-A\n' >"$S/lsblk.mounts.sdj"
 run_driver session A --dry-run
-check "a partition mounted: refused" "$RC" "1"
+check "a partition mounted, clear-drive cannot run: refused" "$RC" "1"
 has "a partition mounted: names it" "$OUT" "sdj2 on /mnt/backup-system-recovery-A"
-check "a partition mounted: no lock taken" "$(file "$S/flock.calls")" ""
+has "a partition mounted: says clearing failed, not 'unmount it first'" "$OUT" "cannot clear the drive's host mounts: stub: no answer scripted"
+lacks "a partition mounted: no old advice" "$OUT" "unmount it first"
+check "a partition mounted: the lock was taken and is released" "$(lock_state)" "free"
+check "a partition mounted: clear-drive ran under the held lock" "$(file "$S/cleardrive.lock")" "held"
 
 fixture
 touch "$S/lsblk_mounts_fail"
 run_driver session A --dry-run
 check "mounts unreadable: refused (not read as unmounted)" "$RC" "1"
+
+echo "--- another program's mount of the drive is cleared by the stop policy (bd eg4j.19)"
+# <rc> <clear-drive's output> [unmount]: the drive's ESP mounted by udisks,
+# and what `btrdasd recovery-os clear-drive` will answer.
+host_mount() {
+    printf 'sdj \nsdj1 /run/media/root/RECOV-ESP-1\nsdj2 \n' >"$S/lsblk.mounts.sdj"
+    printf '%s' "$2" >"$S/cleardrive.out"
+    echo "$1" >"$S/cleardrive.rc"
+    if [[ "${3:-}" == unmount ]]; then : >"$S/cleardrive.unmount"; fi
+}
+CLEARED_OUT=$'Target \'system-recovery-A-2tb\': /dev/sdj1 is mounted at /run/media/root/RECOV-ESP-1 by udisks (vfat rw)\nCLEAR DRIVE: OK  (another program\'s mount of /dev/sdj, held by nothing, was unmounted)\n'
+WRITER_OUT=$'Target \'system-recovery-A-2tb\': pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled\nCLEAR DRIVE: REFUSED  (pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled)\n'
+
+fixture
+host_mount 0 "$CLEARED_OUT" unmount
+run_driver session A
+check "idle host mount: the session goes on to the end" "$RC" "0"
+has "idle host mount: the block is headed" "$OUT" "DRIVE MOUNTED ON HOST"
+has "idle host mount: the mount is shown" "$OUT" "sdj1 on /run/media/root/RECOV-ESP-1"
+has "idle host mount: clear-drive's own lines are shown" "$OUT" "is mounted at /run/media/root/RECOV-ESP-1 by udisks"
+has "idle host mount: continues" "$OUT" "drive clear -- continuing"
+has "idle host mount: asked by label" "$(file "$S/cleardrive.calls")" "recovery-os clear-drive --label system-recovery-A-2tb fd="
+lacks "idle host mount: a real run is not report-only" "$(file "$S/cleardrive.calls")" "--report-only"
+check "idle host mount: asked once, under the held lock" "$(file "$S/cleardrive.lock")" "held"
+check "idle host mount: before the disk is claimed" "$(file "$S/cleardrive.holder")" "before-holder"
+check "idle host mount: history carries the lines" "$(jq -r '.host_mounts | length' "$H")" "2"
+has "idle host mount: history carries the result line" "$(jq -r '.host_mounts[-1]' "$H")" "CLEAR DRIVE: OK"
+check "idle host mount: lock free at the end" "$(lock_state)" "free"
+
+fixture
+run_driver session A
+check "no host mount: no clear-drive call" "$(file "$S/cleardrive.calls")" ""
+check "no host mount: history host_mounts empty" "$(jq -c '.host_mounts' "$H")" "[]"
+
+fixture
+host_mount 3 "$WRITER_OUT"
+run_driver session A
+check "host mount with a writer: refused" "$RC" "1"
+has "host mount with a writer: the holder is named" "$OUT" "pid 4121 kate (writing EFI/loader/loader.conf) -- writer, not signalled"
+has "host mount with a writer: refusal says the drive is in use" "$OUT" "REFUSED: drive in use on this host -- pid 4121 kate"
+check "host mount with a writer: the drive was never claimed" "$(file "$S/holder.calls")" ""
+check "host mount with a writer: lock free" "$(lock_state)" "free"
+check "host mount with a writer: failed in the history" "$(jq -r '.outcome' "$H")" "failed"
+has "host mount with a writer: history says why" "$(jq -r '.host_mounts | join(" ")' "$H")" "CLEAR DRIVE: REFUSED"
+
+fixture
+host_mount 2 $'CLEAR DRIVE: CANNOT-RUN  (no attached drive has serial SERIAL04)\n'
+run_driver session A
+check "clear-drive cannot run: refused" "$RC" "1"
+has "clear-drive cannot run: says so" "$OUT" "REFUSED: cannot clear the drive's host mounts: no attached drive has serial SERIAL04"
+
+fixture
+host_mount 0 $'CLEAR DRIVE: OK  (nothing of /dev/sdj is mounted on this host)\n' unmount
+run_driver session A
+check "a mount gone before clear-drive looked: continues" "$RC" "0"
+has "a mount gone before clear-drive looked: continues, said so" "$OUT" "drive clear -- continuing"
+
+fixture
+host_mount 0 "$CLEARED_OUT"
+run_driver session A
+check "clear-drive says OK but the mount is still there: refused" "$RC" "1"
+has "clear-drive says OK but the mount is still there: says so" "$OUT" "is still mounted after clearing"
+
+fixture
+host_mount 0 $'CLEAR DRIVE: OK  (dry run: would unmount /run/media/root/RECOV-ESP-1)\n' unmount
+run_driver session A --dry-run
+check "dry run with a host mount: refused, never continues beside it" "$RC" "1"
+has "dry run with a host mount: asked report-only" "$(file "$S/cleardrive.calls")" "--report-only"
+has "dry run with a host mount: says nothing was changed" "$OUT" "nothing was stopped or unmounted"
+has "dry run with a host mount: still mounted" "$(file "$S/lsblk.mounts.sdj")" "RECOV-ESP-1"
+check "dry run with a host mount: nothing written to the history" "$(file "$H")" ""
+check "dry run with a host mount: lock released" "$(lock_state)" "free"
 
 fixture
 rm "${S:?}/defined"
@@ -5163,6 +5259,17 @@ check "both: and taken out" "$(file "$S/ip.rules")" ""
 check "both: two history lines, sequential" "$(jq -r '.mode' "$H" | sort | uniq -c | tr -s ' ')" " 2 sequential"
 check "both: nothing unexpected" "$(file "$S/forbidden")" ""
 
+# bd eg4j.19: a drive's session of a two-drive run clears a host mount of its
+# own drive under the run's lock, which it holds through the inherited descriptor.
+unattended_fixture
+host_mount 0 "$CLEARED_OUT" unmount
+run_driver session A B --unattended
+check "both, a host mount on A: exit 0" "$RC" "0"
+has "both, a host mount on A: A's session cleared it" "$OUT" "[system-recovery-A-2tb] drive clear -- continuing"
+check "both, a host mount on A: cleared once, for A only" "$(grep -c 'clear-drive --label system-recovery-A-2tb' "$S/cleardrive.calls")/$(grep -c . "$S/cleardrive.calls")" "1/1"
+check "both, a host mount on A: under the run's lock" "$(file "$S/cleardrive.lock")" "held"
+matches "both, a host mount on A: with the lock's descriptor handed down" "$(file "$S/cleardrive.calls")" "fd=[0-9]+"
+
 unattended_fixture
 echo 3 >"$S/stage.upgrade.rc"
 run_driver session A B --unattended --mode sequential
@@ -6676,6 +6783,34 @@ for s in $STEPS desktop $PSTEPS first-boot preflight start wait boot reboot kern
     [[ "$s" == delete-replaced || " egress payload capture replace-os pacstrap configure package bootloader repos verify unmount first-boot " == *" $s "* ]] && continue
     check "the GUI knows the step '$s'" "$(grep -c "^    \"$s\",\$" "$REPO/indexer/src/recovery_os/lines.rs" || :)" "1"
 done
+
+echo "--- provision: another program's mount of the drive (bd eg4j.19)"
+provision_fixture
+host_mount 0 "$CLEARED_OUT" unmount
+printf 'top: @\ntop: @home\ntop: @.archive.20260301-1200\npackage: linux-cachyos 7.2.9-1\n' >"$S/stage.capture.out"
+run_driver_env "${PROV[@]}"
+check "provision, a host mount: cleared, exit 0" "$RC" "0"
+has "provision, a host mount: the block" "$OUT" "DRIVE MOUNTED ON HOST"
+has "provision, a host mount: continues" "$OUT" "drive clear -- continuing"
+check "provision, a host mount: cleared under the held lock, before the claim" "$(file "$S/cleardrive.lock")/$(file "$S/cleardrive.holder")" "held/before-holder"
+check "provision, a host mount: history is the provision's, with the lines" "$(jq -r '[.mode, (.host_mounts | length > 0)] | join(" ")' "$H")" "provision true"
+
+provision_fixture
+host_mount 3 "$WRITER_OUT"
+run_driver_env "${PROV[@]}"
+check "provision, a host mount with a writer: refused" "$RC" "1"
+has "provision, a host mount with a writer: names it" "$OUT" "REFUSED: drive in use on this host -- pid 4121 kate"
+check "provision, a host mount with a writer: nothing booted" "$(file "$S/virsh.calls" | grep -c '^start' || :)" "0"
+check "provision, a host mount with a writer: lock free" "$(lock_state)" "free"
+
+provision_fixture
+host_mount 0 "$CLEARED_OUT" unmount
+run_driver_env "${PROV[@]}" --dry-run
+check "provision dry run, a host mount: exit 0" "$RC" "0"
+has "provision dry run, a host mount: lists it" "$OUT" "sdj1 on /run/media/root/RECOV-ESP-1"
+has "provision dry run, a host mount: says a real run clears it" "$OUT" "a real run clears these host mounts by the stop policy"
+check "provision dry run, a host mount: clear-drive never asked" "$(file "$S/cleardrive.calls")" ""
+has "provision dry run, a host mount: still mounted" "$(file "$S/lsblk.mounts.sdj")" "RECOV-ESP-1"
 
 echo "--- provision --undo (plan 2, Task 3c)"
 provision_fixture
