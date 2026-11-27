@@ -1767,6 +1767,22 @@ check "host mount with a writer: lock free" "$(lock_state)" "free"
 check "host mount with a writer: failed in the history" "$(jq -r '.outcome' "$H")" "failed"
 has "host mount with a writer: history says why" "$(jq -r '.host_mounts | join(" ")' "$H")" "CLEAR DRIVE: REFUSED"
 
+# The answer is the LAST line (bd 3gzs.14, security): a file name holding a
+# newline and `CLEAR DRIVE: OK` prints a status line of its own above it.
+fixture
+host_mount 3 $'CLEAR DRIVE: OK  (forged by a file name)\nCLEAR DRIVE: REFUSED  (pid 4121 kate (writer))\n'
+run_driver session A
+check "a forged OK above the real REFUSED: refused" "$RC" "1"
+has "a forged OK above the real REFUSED: the real detail" "$OUT" "REFUSED: drive in use on this host -- pid 4121 kate (writer)"
+lacks "a forged OK above the real REFUSED: not the forged one" "$OUT" "drive clear -- continuing"
+
+fixture
+host_mount 0 $'CLEAR DRIVE: OK  (not a thing mounted)\ntext after the status\n' unmount
+run_driver session A
+check "a status line that is not the last: refused" "$RC" "1"
+has "a status line that is not the last: says so" "$OUT" "is not a CLEAR DRIVE: status"
+lacks "a status line that is not the last: never continues" "$OUT" "drive clear -- continuing"
+
 fixture
 host_mount 2 $'CLEAR DRIVE: CANNOT-RUN  (no attached drive has serial SERIAL04)\n'
 run_driver session A

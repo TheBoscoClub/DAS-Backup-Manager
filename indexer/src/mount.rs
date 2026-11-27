@@ -1053,9 +1053,18 @@ impl ClearTarget {
     /// The one line `backup-run.sh` reads, and the exit code: 0, 3, 2.
     pub fn line(&self) -> (String, i32) {
         match self {
-            ClearTarget::Cleared(d) => (format!("CLEAR TARGET: OK  ({d})"), 0),
-            ClearTarget::Refused(d) => (format!("CLEAR TARGET: REFUSED  ({d})"), 3),
-            ClearTarget::CannotRun(d) => (format!("CLEAR TARGET: CANNOT-RUN  ({d})"), 2),
+            ClearTarget::Cleared(d) => (
+                format!("CLEAR TARGET: OK  ({})", crate::holders::safe(d)),
+                0,
+            ),
+            ClearTarget::Refused(d) => (
+                format!("CLEAR TARGET: REFUSED  ({})", crate::holders::safe(d)),
+                3,
+            ),
+            ClearTarget::CannotRun(d) => (
+                format!("CLEAR TARGET: CANNOT-RUN  ({})", crate::holders::safe(d)),
+                2,
+            ),
         }
     }
 }
@@ -1182,9 +1191,17 @@ impl ClearDrive {
     /// The one line `recovery-os-vm.sh` reads, and the exit code: 0, 3, 2.
     pub fn line(&self) -> (String, i32) {
         match self {
-            ClearDrive::Cleared(d) => (format!("CLEAR DRIVE: OK  ({d})"), 0),
-            ClearDrive::Refused(d) => (format!("CLEAR DRIVE: REFUSED  ({d})"), 3),
-            ClearDrive::CannotRun(d) => (format!("CLEAR DRIVE: CANNOT-RUN  ({d})"), 2),
+            ClearDrive::Cleared(d) => {
+                (format!("CLEAR DRIVE: OK  ({})", crate::holders::safe(d)), 0)
+            }
+            ClearDrive::Refused(d) => (
+                format!("CLEAR DRIVE: REFUSED  ({})", crate::holders::safe(d)),
+                3,
+            ),
+            ClearDrive::CannotRun(d) => (
+                format!("CLEAR DRIVE: CANNOT-RUN  ({})", crate::holders::safe(d)),
+                2,
+            ),
         }
     }
 }
@@ -1423,7 +1440,7 @@ fn mount_rows(
     mounts: &[crate::holders::MountEntry],
     tail: &str,
 ) -> Vec<String> {
-    use crate::holders::row;
+    use crate::holders::{field, row};
     let fs_of = |m: &crate::holders::MountEntry| {
         format!(
             "{} {}",
@@ -1437,26 +1454,28 @@ fn mount_rows(
     };
     let width =
         |f: &dyn Fn(&crate::holders::MountEntry) -> usize| mounts.iter().map(f).max().unwrap_or(0);
-    let source_w = width(&|m| m.source.chars().count());
-    let fs_w = width(&|m| fs_of(m).chars().count());
-    let point_w = width(&|m| m.mount_point.chars().count());
+    let source_w = width(&|m| field(&m.source).chars().count());
+    let fs_w = width(&|m| field(&fs_of(m)).chars().count());
+    let point_w = width(&|m| field(&m.mount_point).chars().count());
     let mut rows = Vec::new();
     for m in mounts {
         rows.push(row(
             "mount",
             &format!(
                 "{:<source_w$}  {:<fs_w$}  {:<point_w$}  by {}  -> {tail}",
-                m.source,
-                fs_of(m),
-                m.mount_point,
-                origin_of(runner, &m.mount_point),
+                field(&m.source),
+                field(&fs_of(m)),
+                field(&m.mount_point),
+                field(&origin_of(runner, &m.mount_point).to_string()),
             ),
         ));
         rows.push(row(
             "options",
             &format!(
                 "mount {}  filesystem {}  root {}",
-                m.options, m.super_options, m.root
+                field(&m.options),
+                field(&m.super_options),
+                field(&m.root)
             ),
         ));
     }
@@ -5207,6 +5226,58 @@ mod tests {
             format!("{who}action   unmounted {ESP_AT} (another program's mount)"),
         ];
         assert_eq!(logs, rows, "bd 3gzs.14: one aligned row each");
+    }
+
+    /// bd 3gzs.14 security: mountinfo escapes a newline as `\012`, and
+    /// decoding gives it back. A mount point holding one must not make a line
+    /// of its own in what the job logs.
+    #[test]
+    fn a_mount_point_with_a_newline_makes_no_line_of_its_own() {
+        let mut host = esp_mounted_by_udisks(None);
+        host.mountinfo[1] =
+            "50 22 8:17 / /run/media/u/x\\012CLEAR\\040TARGET:\\040OK rw,nosuid - vfat \
+                             /dev/sdx1 rw"
+                .into();
+        let runner = ScriptedRunner::succeeding();
+        let progress = Recorder::default();
+
+        let _ = clear_parts(&host, &runner, None, &progress);
+
+        let logs = progress.logs();
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("CLEAR?TARGET") || m.contains("x?CLEAR")),
+            "{logs:?}"
+        );
+        for (_, m) in &logs {
+            assert!(!m.chars().any(char::is_control), "{m:?}");
+        }
+    }
+
+    /// The status line is one line, whatever the detail carries.
+    #[test]
+    fn a_status_line_is_one_line_whatever_its_detail_carries() {
+        let evil = "a\nCLEAR TARGET: OK  (forged)\r";
+        for (line, _) in [
+            ClearTarget::Refused(evil.into()).line(),
+            ClearTarget::Cleared(evil.into()).line(),
+            ClearTarget::CannotRun(evil.into()).line(),
+        ] {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            assert!(line.starts_with("CLEAR TARGET: "), "{line:?}");
+        }
+        for (line, _) in [
+            ClearDrive::Refused(evil.into()).line(),
+            ClearDrive::Cleared(evil.into()).line(),
+            ClearDrive::CannotRun(evil.into()).line(),
+        ] {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert_eq!(
+            ClearTarget::Refused("it is held (pid 1)".into()).line().0,
+            "CLEAR TARGET: REFUSED  (it is held (pid 1))",
+            "an ordinary detail is byte for byte"
+        );
     }
 
     #[test]

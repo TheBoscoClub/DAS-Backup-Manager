@@ -1,9 +1,13 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.27.0
+# Version: 4.27.1
 # Date: 2026-11-27
 #
 # Features:
+#   - clear_target reads only the LAST line `btrdasd backup clear-target`
+#     printed as its status (v4.27.1, bd DAS-Backup-Manager-3gzs.14): a file
+#     name on the target holding a newline and `CLEAR TARGET: OK` is text, never
+#     a status; a last line that is not a status line is the could-not-run case.
 #   - The operations table's name column fits its longest name (v4.27.0, bd
 #     DAS-Backup-Manager-3gzs.14): a real label (`Target ` and 20 or more
 #     characters) overflowed the fixed 21-character column and pushed its
@@ -2495,11 +2499,24 @@ clear_target() { # clear_target <label> [--leftover]
     else
         rc="uncaptured"
     fi
+    # The status is the LAST line the command printed (before the status=
+    # marker), never a line found earlier: a text from outside (a file name on
+    # the target) must not stand in for it (bd 3gzs.14). Everything before it
+    # is logged; one that is not a status line leaves `line` empty, which is
+    # the could-not-run case below.
+    local body final
+    body="${out%$'\n'status=*}"
+    body="${body%"${body##*[![:space:]]}"}" # the newline that ended its last line
+    final="${body##*$'\n'}"
+    line=""
+    if [[ "$final" == "CLEAR TARGET: "* ]]; then
+        line="$final"
+        body="${body%"$final"}"
+    fi
     while IFS= read -r l; do
-        [[ -n "$l" && "$l" != "CLEAR TARGET: "* && "$l" != status=* ]] || continue
+        [[ -n "$l" ]] || continue
         log_warn "  $label: ${l#"${l%%[![:space:]]*}"}"
-    done <<<"$out"
-    line="$(grep -m1 '^CLEAR TARGET: ' <<<"$out" || true)"
+    done <<<"$body"
     status="${line#CLEAR TARGET: }"
     status="${status%%  (*}"
     CLEAR_DETAIL="${line#*  (}"
@@ -4836,7 +4853,7 @@ RESULT
   $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
 
 ===============================================================
-  backup-run.sh v4.27.0
+  backup-run.sh v4.27.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

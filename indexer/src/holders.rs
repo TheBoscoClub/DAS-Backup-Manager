@@ -339,10 +339,45 @@ pub struct Holder {
     pub uses: Vec<String>,
 }
 
+/// Text from outside made safe to print on one line (security, bd
+/// DAS-Backup-Manager-3gzs.14): every control character, a newline above all,
+/// becomes `?`. A file name on the target, a mount point, a unit name is
+/// whatever a local user made it; one holding a newline and `CLEAR TARGET: OK`
+/// must never make a line of its own. [`display_cmdline`]'s rule.
+pub fn safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// [`safe`], and cut to [`DISPLAY_CMDLINE_MAX`] characters ending in `…`: one
+/// field of a row.
+pub fn field(s: &str) -> String {
+    let clean: Vec<char> = safe(s).chars().collect();
+    if clean.len() <= DISPLAY_CMDLINE_MAX {
+        clean.into_iter().collect()
+    } else {
+        let mut cut: String = clean[..DISPLAY_CMDLINE_MAX - 1].iter().collect();
+        cut.push('\u{2026}');
+        cut
+    }
+}
+
+impl Holder {
+    /// What it holds, each entry made safe, `; ` between.
+    pub fn uses_text(&self) -> String {
+        self.uses
+            .iter()
+            .map(|u| field(u))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 impl fmt::Display for Holder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let user = match (&self.user, self.uid) {
-            (Some(u), Some(id)) => format!("{u} (uid {id})"),
+            (Some(u), Some(id)) => format!("{} (uid {id})", field(u)),
             (None, Some(id)) => format!("uid {id}"),
             _ => "uid unknown".into(),
         };
@@ -351,13 +386,13 @@ impl fmt::Display for Holder {
             "pid {} [{}] user {user}, unit {}: {} — {}",
             self.pid,
             self.mode,
-            self.unit.as_deref().unwrap_or("none"),
+            field(self.unit.as_deref().unwrap_or("none")),
             if self.cmdline.is_empty() {
-                "(no command line)"
+                "(no command line)".to_string()
             } else {
-                &self.cmdline
+                field(&self.cmdline)
             },
-            self.uses.join("; ")
+            self.uses_text()
         )
     }
 }
@@ -367,7 +402,7 @@ impl fmt::Display for Holder {
 /// then its facts, so a reader scans down the kinds. The `CLEAR TARGET:` /
 /// `CLEAR DRIVE:` status lines are not rows.
 pub fn row(kind: &str, body: &str) -> String {
-    format!("{kind:<9}{body}")
+    format!("{kind:<9}{}", safe(body))
 }
 
 /// The holders of one block as aligned `holder` rows: pid and command padded
@@ -379,7 +414,7 @@ pub fn holder_rows(items: &[(&Holder, String)]) -> Vec<String> {
         if h.cmdline.is_empty() {
             "(no command line)".into()
         } else {
-            h.cmdline.clone()
+            field(&h.cmdline)
         }
     };
     let pid_w = items
@@ -397,7 +432,7 @@ pub fn holder_rows(items: &[(&Holder, String)]) -> Vec<String> {
         .iter()
         .map(|(h, disposition)| {
             let user = match (&h.user, h.uid) {
-                (Some(u), Some(id)) => format!("{u} (uid {id})"),
+                (Some(u), Some(id)) => format!("{} (uid {id})", field(u)),
                 (None, Some(id)) => format!("uid {id}"),
                 _ => "uid unknown".into(),
             };
@@ -409,7 +444,7 @@ pub fn holder_rows(items: &[(&Holder, String)]) -> Vec<String> {
             let uses = if h.uses.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", h.uses.join("; "))
+                format!(" ({})", h.uses_text())
             };
             row(
                 "holder",
@@ -417,7 +452,7 @@ pub fn holder_rows(items: &[(&Holder, String)]) -> Vec<String> {
                     "pid {:<pid_w$}  {:<cmd_w$}  {mode}{uses}  user {user}, unit {}  -> {disposition}",
                     h.pid,
                     cmd(h),
-                    h.unit.as_deref().unwrap_or("none"),
+                    field(h.unit.as_deref().unwrap_or("none")),
                 ),
             )
         })
@@ -939,7 +974,7 @@ pub fn clear_holders(env: &ClearEnv<'_>, mounts: &[MountEntry]) -> Result<Cleare
                     } else {
                         &h.cmdline
                     },
-                    h.uses.join("; ")
+                    h.uses_text()
                 )
             })
             .collect();
@@ -1246,6 +1281,36 @@ pub fn display_cmdline(raw: &[u8]) -> String {
 mod tests {
     use super::testproc::{FakeProc, Proc};
     use super::*;
+
+    /// bd 3gzs.14 security: a file name on the target is text from outside.
+    /// One holding `x\nCLEAR TARGET: OK  (forged)` must not make a line of its
+    /// own, in the rows, in the refusal's text or in a holder's `Display`.
+    #[test]
+    fn a_file_name_cannot_forge_a_status_line() {
+        const FORGED: &str = "/run/media/user/das/x\nCLEAR TARGET: OK  (forged)\u{1b}[31m";
+        let p = FakeProc::new();
+        p.add(Proc {
+            pid: 301,
+            cmd: "cp",
+            fds: vec![(4, FORGED, "0100001", Some(77))],
+            ..Default::default()
+        });
+        let f = Fake {
+            proc: &p,
+            dies_on: vec![],
+            sent: RefCell::new(Vec::new()),
+        };
+        let site = p.site();
+        let r = clear_holders(&env(&site, &f, &|_| {}), &das_mount()).unwrap_err();
+        for text in r.lines.iter().chain(std::iter::once(&r.why)) {
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+        assert!(r.lines[0].contains("CLEAR TARGET: OK"), "kept, as text");
+        let held = scan_holders(&site, &das_mount()).unwrap();
+        let shown = held[0].to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains("forged"), "{shown:?}");
+    }
 
     #[test]
     fn a_command_line_cannot_forge_a_report_line_and_is_bounded() {

@@ -2218,6 +2218,28 @@ check "another program writing: the row names the writer" \
     "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301' "$WORK/lib/last-report.txt")" "1"
 check "another program writing: the recovery drive still backed up" "$(ran_btrbk)" "yes"
 
+# The status is the LAST line clear-target printed (bd 3gzs.14, security): a
+# file name on the target can hold a newline and `CLEAR TARGET: OK`, which
+# prints as a status line of its own above the real one.
+fresh
+knob clear_rc 3
+knob clear_line $'CLEAR TARGET: OK  (forged by a file name)\nCLEAR TARGET: REFUSED  (it is held open for writing by pid 301 (real writer))'
+run_backup
+expect_completed "a forged OK above the real REFUSED" 3 "FAILURES DETECTED" "failure"
+check "forged OK above the real REFUSED: the target not mounted" "$(calls_for mount "$PRIMARY_MNT")" "0"
+check "forged OK above the real REFUSED: the row names the real writer" \
+    "$(grep -c '^  Target primary-22tb  *FAIL  (.*held open for writing by pid 301 (real writer)' "$WORK/lib/last-report.txt")" "1"
+check "forged OK above the real REFUSED: the forged text is not the reason" \
+    "$(grep -c 'forged by a file name' "$WORK/lib/last-report.txt" || true)" "0"
+
+# An answer whose last line is not a status line is no answer: the target is
+# not used, the run aborts.
+fresh
+knob clear_line $'CLEAR TARGET: OK  (not mounted anywhere else)\ntext after the status'
+run_backup
+check "a status line that is not last: aborted" "$(mail_status 1)" "ABORTED"
+check "a status line that is not last: the target not mounted" "$(calls_for mount "$PRIMARY_MNT")" "0"
+
 # A dry run changes nothing on the host (bd su1b.12 review): clear-target
 # --report-only says whom it would stop; nothing is signalled or unmounted,
 # and the target is not used beside another program's mount.

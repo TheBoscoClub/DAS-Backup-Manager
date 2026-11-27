@@ -369,6 +369,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A file name on a target can no longer forge the clearing's status line** (bd `DAS-Backup-Manager-3gzs.14`): a holder's open file, working directory or a mount point is text from outside — a local user can name a file `x`, a newline, `CLEAR TARGET: OK  (nothing holds it)`, and the new detail rows (and the refusal's own text) printed it as a line of its own above the real status
+  - Every externally derived field — a holder's open files, user and unit, a mount's source, point, options and root, its origin — goes through one sanitizer (`holders::safe`/`field`: control characters become `?`, a field is cut to 160 characters) in the shared row formatter, in `Holder`'s `Display` and in the `CLEAR TARGET:` / `CLEAR DRIVE:` lines' detail; an ordinary detail is byte for byte as before
+  - `backup-run.sh` (4.27.1) and `recovery-os-vm.sh` (2.7.1) read only the last line the command printed as its status; a last line that is not a status line is the could-not-run case (a refused target or drive, never a continued one)
+
 - **CI checkouts carry no token and every container image is pinned by digest** (bd `DAS-Backup-Manager-w3pb`): `persist-credentials: false` on the nine checkouts whose jobs only read git locally; `archlinux:latest`, `debian:trixie`, `fedora:43` and the Flatpak KDE image pinned by `sha256` digest (refreshed by hand, since Dependabot does not update workflow images); two unquoted expansions in `mutants.yml` and `release-packages.yml` quoted
 
 ## [0.7.24.0] - 2026-11-12
