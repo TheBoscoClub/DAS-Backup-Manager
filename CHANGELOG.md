@@ -143,6 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The operations table of a Rust-run report keeps its statuses in one column when a target name is long** (bd `DAS-Backup-Manager-3gzs.12`): the name column was a fixed 21 characters, so `Target <label>` and `RAID-1 <label>` rows overflowed it and their status stood a few columns to the right of the rest
+  - The column is as wide as the longest name in the block (21 at least); every row's text is unchanged, only the padding moves, and the `NEEDS ATTENTION` block uses the same width
+
 - **The emailed backup report from `btrdasd backup run` is reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
   - A `── NEEDS ATTENTION ──` block follows the header whenever anything failed or warned: each error as `FAILED  <error>` and each FAIL or WARN operations row, status word first, ahead of the routine rows; the `ERRORS` section at the bottom is gone (its lines live only in that block)
   - A `RESULT` block closes the report: the overall status with the counts of FAIL, WARN and OK rows and of errors
