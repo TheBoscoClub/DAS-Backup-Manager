@@ -143,6 +143,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`backup-run.sh` 4.26.0: the nightly emailed report reads at a glance** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
+  - The header time carries its zone (`2026-11-27 03:19 CST`), in the full report and in the ABORTED one
+  - A `── NEEDS ATTENTION ──` block follows the header whenever an operation FAILed or WARNed: each one, status word first, with its reason, ahead of the table; an operation with no row of its own (a run history that was not recorded) is named there too
+  - A `RESULT` block closes the report with the status and the counts of operations, FAIL, WARN and OK
+  - The ABORTED report names what aborted and why in the same block; the `Status:` line, every table row and every other line are unchanged, but for the `Content indexer` row, whose name column was one space wider than the rest
+  - The operations table is built from one list of rows (`add_row`), so the table and the blocks cannot disagree
+
 - **The doctor's could-not-run email sets its reason apart** (bd `DAS-Backup-Manager-3gzs.12`): `doctor::format_could_not_run` builds the body, with the report's own header and `Status: COULD NOT RUN — FAILURE` line (the word the mailer reads), a `── NEEDS ATTENTION ──` block naming the reason status word first, and one `RESULT` row; `tests/test_report_mail.sh` expects the same body
 
 - **`btrdasd scrub run`, `scrub status` and the emailed scrub report are reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)

@@ -1,9 +1,17 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.25.0
+# Version: 4.26.0
 # Date: 2026-11-27
 #
 # Features:
+#   - The emailed report reads at a glance (v4.26.0, bd
+#     DAS-Backup-Manager-3gzs.12): the header time carries its zone; a
+#     `── NEEDS ATTENTION ──` block after the header lists every operation that
+#     FAILed or WARNed, status word first, its name column as wide as the
+#     longest name (the table keeps every row exactly as it was); a
+#     `RESULT` block closes the report with the status and the counts. The
+#     `Status:` line and every row's text are unchanged. The ABORTED report
+#     names what aborted in the same block and carries the zone.
 #   - The stop policy covers every target with a mount_uuid (v4.25.0, bd
 #     DAS-Backup-Manager-eg4j.19): a single-drive target's filesystem — a
 #     recovery drive's — that another program mounted elsewhere is cleared by
@@ -4657,7 +4665,7 @@ generate_report() {
     # name, for the From name, is everything before the first dot, as
     # `hostname -s` printed it (bd DAS-Backup-Manager-arv1).
     local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M')
+    timestamp=$(date '+%Y-%m-%d %H:%M %Z')
     local overall_status="ALL OPERATIONS SUCCESSFUL"
     if any_op_is FAIL; then
         overall_status="FAILURES DETECTED"
@@ -4695,15 +4703,93 @@ generate_report() {
         subvol_sections+=$'\n'"$RECOVERY_OS_REPORT"$'\n'
     fi
 
-    # One row per target detection looked at (record_op "target_<label>"),
-    # after the fixed rows: a drive that is gone is a row naming it, never
-    # just a row that is not there (bd DAS-Backup-Manager-uhi). None before
-    # detection has run.
-    local target_rows="" key
+    # The operations table, one row per operation, each remembered (name,
+    # status, detail) for the attention and RESULT blocks. The rows are the
+    # old ones byte for byte (a name longer than the 21-character column
+    # overflows it, as it always did: the suites match these rows). The target
+    # rows come after the fixed ones, one
+    # per target detection looked at (record_op "target_<label>"): a drive
+    # that is gone is a row naming it, never just a row that is not there (bd
+    # DAS-Backup-Manager-uhi); none before detection has run.
+    local -a row_name=() row_status=() row_detail=()
+    add_row() { row_name+=("$1"); row_status+=("$2"); row_detail+=("$3"); }
+    add_row "Maintenance lock" "${OP_STATUS[lock_wait]:-OK}" "${OP_STATUS[lock_wait_detail]:-no wait}"
+    add_row "Scrub yield" "${OP_STATUS[scrub_yield]:-N/A}" "${OP_STATUS[scrub_yield_detail]:-the lock was free}"
+    add_row "USB link" "${OP_STATUS[usb_link]:-N/A}" "${OP_STATUS[usb_link_detail]:-not checked}"
+    add_row "btrbk send/receive" "${OP_STATUS[btrbk]:-N/A}" "${elapsed_min}m ${elapsed_sec}s"
+    add_row "Snapshot counts" "${OP_STATUS[btrbk_counters]:-N/A}" "${OP_STATUS[btrbk_counters_detail]:-n/a}"
+    add_row "Boot subvolumes" "${OP_STATUS[boot_subvols]:-N/A}" "${OP_STATUS[boot_subvols_detail]:-n/a}"
+    add_row "Archive cleanup" "${OP_STATUS[archive_cleanup]:-N/A}" "${OP_STATUS[archive_cleanup_detail]:-n/a}"
+    add_row "Unmount targets" "${OP_STATUS[unmount]:-N/A}" "${OP_STATUS[unmount_detail]:-all clean}"
+    add_row "Content indexer" "${OP_STATUS[indexer]:-N/A}" "${OP_STATUS[indexer_detail]:-n/a}"
+    add_row "State index pass" "${OP_STATUS[state]:-N/A}" "${OP_STATUS[state_detail]:-n/a}"
+    add_row "Subvolume sync" "${OP_STATUS[subvol_sync]:-N/A}" "${OP_STATUS[subvol_sync_detail]:-n/a}"
+    add_row "Subvolume coverage" "${OP_STATUS[subvol_coverage]:-N/A}" "${OP_STATUS[subvol_coverage_detail]:-n/a}"
+    add_row "Local documents" "${OP_STATUS[local_docs]:-N/A}" "${OP_STATUS[local_docs_detail]:-n/a}"
+    add_row "Retired expiry" "${OP_STATUS[subvol_expire]:-N/A}" "${OP_STATUS[subvol_expire_detail]:-n/a}"
+    add_row "Static subvolumes" "${OP_STATUS[static_subvolumes]:-N/A}" "${OP_STATUS[static_subvolumes_detail]:-n/a}"
+    add_row "Recovery OS" "${OP_STATUS[recovery_os]:-N/A}" "${OP_STATUS[recovery_os_detail]:-n/a}"
+    local key
     while IFS= read -r key; do
         [[ -n "$key" ]] || continue
-        target_rows+=$'\n'"$(printf '  %-21s %s  (%s)' "Target ${key#target_}" "${OP_STATUS[$key]}" "${OP_STATUS[${key}_detail]:-n/a}")"
+        add_row "Target ${key#target_}" "${OP_STATUS[$key]}" "${OP_STATUS[${key}_detail]:-n/a}"
     done < <(printf '%s\n' "${!OP_STATUS[@]}" | grep '^target_' | grep -v '_detail$' | sort)
+
+    # An operation that FAILed or WARNed and has no row of its own (a run
+    # history that was not recorded, a mount that failed, an abort): named
+    # in the attention block all the same, so the status above never says
+    # more than the report shows.
+    local -a shown_keys=(lock_wait scrub_yield usb_link btrbk btrbk_counters boot_subvols archive_cleanup
+        unmount indexer state subvol_sync subvol_coverage local_docs subvol_expire static_subvolumes recovery_os)
+    local -a extra_name=() extra_status=() extra_detail=()
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        [[ "$key" == target_* ]] && continue
+        [[ " ${shown_keys[*]} " == *" $key "* ]] && continue
+        case "${OP_STATUS[$key]}" in
+        FAIL | WARN)
+            extra_name+=("${key//_/ }")
+            extra_status+=("${OP_STATUS[$key]}")
+            extra_detail+=("${OP_STATUS[${key}_detail]:-n/a}")
+            ;;
+        *) ;;
+        esac
+    done < <(printf '%s\n' "${!OP_STATUS[@]}" | grep -v '_detail$' | sort)
+
+    local width=21 i
+    for i in "${!row_name[@]}"; do
+        ((${#row_name[i]} <= width)) || width=${#row_name[i]}
+    done
+    for i in "${!extra_name[@]}"; do
+        ((${#extra_name[i]} <= width)) || width=${#extra_name[i]}
+    done
+    local ops_rows="" n_fail=0 n_warn=0 attention=""
+    for i in "${!row_name[@]}"; do
+        ops_rows+="$(printf '  %-21s %s  (%s)' "${row_name[i]}" "${row_status[i]}" "${row_detail[i]}")"$'\n'
+        case "${row_status[i]}" in
+        FAIL) n_fail=$((n_fail + 1)) ;;
+        WARN) n_warn=$((n_warn + 1)) ;;
+        *) ;;
+        esac
+        case "${row_status[i]}" in
+        FAIL | WARN)
+            attention+="$(printf '  %-8s%-*s (%s)' "${row_status[i]}" "$width" "${row_name[i]}" "${row_detail[i]}")"$'\n'
+            ;;
+        *) ;;
+        esac
+    done
+    for i in "${!extra_name[@]}"; do
+        attention+="$(printf '  %-8s%-*s (%s)' "${extra_status[i]}" "$width" "${extra_name[i]}" "${extra_detail[i]}")"$'\n'
+        case "${extra_status[i]}" in
+        FAIL) n_fail=$((n_fail + 1)) ;;
+        *) n_warn=$((n_warn + 1)) ;;
+        esac
+    done
+    local n_ops=$((${#row_name[@]} + ${#extra_name[@]}))
+    local attention_block=""
+    if [[ -n "$attention" ]]; then
+        attention_block="── NEEDS ATTENTION ──"$'\n'"${attention}"$'\n'
+    fi
 
     # Build the report
     cat <<-REPORT
@@ -4713,25 +4799,9 @@ generate_report() {
   Status: $overall_status
 ===============================================================
 
-BACKUP OPERATIONS
+${attention_block}BACKUP OPERATIONS
 ───────────────────────────────────────────────────────────────
-  Maintenance lock      ${OP_STATUS[lock_wait]:-OK}  (${OP_STATUS[lock_wait_detail]:-no wait})
-  Scrub yield           ${OP_STATUS[scrub_yield]:-N/A}  (${OP_STATUS[scrub_yield_detail]:-the lock was free})
-  USB link              ${OP_STATUS[usb_link]:-N/A}  (${OP_STATUS[usb_link_detail]:-not checked})
-  btrbk send/receive    ${OP_STATUS[btrbk]:-N/A}  (${elapsed_min}m ${elapsed_sec}s)
-  Snapshot counts       ${OP_STATUS[btrbk_counters]:-N/A}  (${OP_STATUS[btrbk_counters_detail]:-n/a})
-  Boot subvolumes       ${OP_STATUS[boot_subvols]:-N/A}  (${OP_STATUS[boot_subvols_detail]:-n/a})
-  Archive cleanup       ${OP_STATUS[archive_cleanup]:-N/A}  (${OP_STATUS[archive_cleanup_detail]:-n/a})
-  Unmount targets       ${OP_STATUS[unmount]:-N/A}  (${OP_STATUS[unmount_detail]:-all clean})
-  Content indexer        ${OP_STATUS[indexer]:-N/A}  (${OP_STATUS[indexer_detail]:-n/a})
-  State index pass      ${OP_STATUS[state]:-N/A}  (${OP_STATUS[state_detail]:-n/a})
-  Subvolume sync        ${OP_STATUS[subvol_sync]:-N/A}  (${OP_STATUS[subvol_sync_detail]:-n/a})
-  Subvolume coverage    ${OP_STATUS[subvol_coverage]:-N/A}  (${OP_STATUS[subvol_coverage_detail]:-n/a})
-  Local documents       ${OP_STATUS[local_docs]:-N/A}  (${OP_STATUS[local_docs_detail]:-n/a})
-  Retired expiry        ${OP_STATUS[subvol_expire]:-N/A}  (${OP_STATUS[subvol_expire_detail]:-n/a})
-  Static subvolumes     ${OP_STATUS[static_subvolumes]:-N/A}  (${OP_STATUS[static_subvolumes_detail]:-n/a})
-  Recovery OS           ${OP_STATUS[recovery_os]:-N/A}  (${OP_STATUS[recovery_os_detail]:-n/a})${target_rows}
-${subvol_sections}
+${ops_rows}${subvol_sections}
 THROUGHPUT
 ───────────────────────────────────────────────────────────────
 $(generate_throughput_section)
@@ -4752,8 +4822,12 @@ LATEST SNAPSHOTS
 ───────────────────────────────────────────────────────────────
 ${BTRBK_LATEST:-  (none yet)}
 
+RESULT
+───────────────────────────────────────────────────────────────
+  $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
+
 ===============================================================
-  backup-run.sh v4.25.0
+  backup-run.sh v4.26.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT
@@ -5316,7 +5390,7 @@ note_abort() {
 generate_abort_report() {
     local status="$1"
     local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M')
+    timestamp=$(date '+%Y-%m-%d %H:%M %Z')
 
     # Nothing is backed up until btrbk starts (capture_usage stamps it).
     local backed_up
@@ -5371,6 +5445,9 @@ generate_abort_report() {
   Host: $HOSTNAME
   Status: ABORTED
 ===============================================================
+
+── NEEDS ATTENTION ──
+  ABORTED ${ABORT_WHAT:-not known}: $why
 
 The backup run aborted before its report and exited $status. Its units
 count that as success, so this report, the history and the journal are
