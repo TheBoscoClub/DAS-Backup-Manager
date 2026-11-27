@@ -1187,6 +1187,7 @@ fn read_mounts(
     if irregular {
         siblings.clear();
     }
+    siblings.retain(|s| !mount_unit_has_drop_ins(trees, &s.point));
     let mut mounts = Mounts {
         points,
         fstab,
@@ -1195,6 +1196,47 @@ fn read_mounts(
     };
     mounts.declared = Some(tmpfiles::read_declarations(root, probe, &mounts));
     mounts
+}
+
+/// Whether the unit systemd makes from an fstab line for `point` (relative
+/// to the root) may have drop-ins: any directory [`drop_in_dirs`] names for
+/// it — its own (`home.mount.d`, what `systemctl edit home.mount` writes),
+/// a dash prefix's (`srv-.mount.d`), the type's (`mount.d`) — is in any
+/// unit tree, or a tree cannot be listed. A drop-in may set `What=` or
+/// `Options=subvol=` and mount something else there, so such a point is no
+/// [`Sibling`]'s (bd DAS-Backup-Manager-3nb). Present is enough: what the
+/// directory holds is not read.
+fn mount_unit_has_drop_ins(trees: &[Tree], point: &str) -> bool {
+    let Some(name) = mount_unit_name(point) else {
+        return true;
+    };
+    let dirs = drop_in_dirs(&name);
+    trees.iter().any(|tree| match &tree.listing {
+        Listing::Names(names) => names.iter().any(|n| dirs.contains(n)),
+        Listing::Absent => false,
+        Listing::Unreadable(_) => true,
+    })
+}
+
+/// The `.mount` unit name systemd gives the mount point `point` (relative
+/// to the root, as `systemd-escape --path --suffix=mount`): `/` between
+/// components is `-`; ASCII letters, digits, `:`, `_` and a `.` not first
+/// are kept; every other byte is `\xNN`. `None` for the root.
+fn mount_unit_name(point: &str) -> Option<String> {
+    if point.is_empty() {
+        return None;
+    }
+    let mut name = String::new();
+    for (i, &b) in point.as_bytes().iter().enumerate() {
+        match b {
+            b'/' => name.push('-'),
+            b'.' if i > 0 => name.push('.'),
+            b':' | b'_' => name.push(b as char),
+            _ if b.is_ascii_alphanumeric() => name.push(b as char),
+            _ => name.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    Some(format!("{name}.mount"))
 }
 
 /// Every absolute mount point of an fstab's lines, relative to the root,
@@ -1352,8 +1394,9 @@ fn irregular_mount_point(
 /// no id to read, no `noauto` or `x-systemd.automount`, not mounted at boot,
 /// no `X-mount.subdir=`, `bind`…), and a `subvol=` given once. A mount point
 /// more than one line or unit names is no sibling's ([`Mounts::sibling`]),
-/// and none is when a mount point is not spelled as systemd canonicalises it
-/// ([`irregular_mount_point`]).
+/// nor one whose generated `.mount` unit may have drop-ins
+/// ([`mount_unit_has_drop_ins`]), and none is when a mount point is not
+/// spelled as systemd canonicalises it ([`irregular_mount_point`]).
 fn fstab_siblings(root: &Path, text: &str, fs_uuid: &str) -> Vec<Sibling> {
     let Some(top) = root.parent() else {
         return Vec::new();
@@ -12571,6 +12614,118 @@ mod tests {
                 "{in_home}"
             );
         }
+    }
+
+    /// A drop-in on the unit fstab makes for a mount point (`home.mount`,
+    /// from `systemctl edit home.mount`) may change what is mounted there:
+    /// `Options=subvol=/@evil` mounts `@evil` on `/home`, so the subvolume
+    /// fstab names is not what boot sees. Any drop-in directory systemd
+    /// would read for that unit, in any unit tree — its own, its type's
+    /// (`mount.d`), a dash prefix's (`srv-.mount.d`) — leaves the point no
+    /// sibling: "may", as main reads it (bd DAS-Backup-Manager-3nb, the
+    /// 2026-11-27 final review).
+    #[test]
+    fn a_drop_in_on_the_mount_unit_of_a_sibling_point_reads_may() {
+        let evil = "[Mount]\nOptions=subvol=/@evil,noatime\n";
+        let full = format!("[Mount]\nWhat=UUID={FS}\nType=btrfs\nOptions=subvol=/@evil\n");
+        // (mount point, subvolume, drop-in path, drop-in text)
+        let cases: Vec<(&str, &str, String, &str)> = vec![
+            (
+                "home",
+                "@home",
+                format!("{ETC}/home.mount.d/override.conf"),
+                evil,
+            ),
+            (
+                "home",
+                "@home",
+                format!("{VENDOR}/home.mount.d/override.conf"),
+                evil,
+            ),
+            (
+                "home",
+                "@home",
+                "usr/local/lib/systemd/system/home.mount.d/override.conf".into(),
+                evil,
+            ),
+            (
+                "home",
+                "@home",
+                "etc/systemd/system.control/home.mount.d/override.conf".into(),
+                evil,
+            ),
+            (
+                "home",
+                "@home",
+                format!("{ETC}/mount.d/override.conf"),
+                evil,
+            ),
+            (
+                "home",
+                "@home",
+                format!("{ETC}/home.mount.d/override.conf"),
+                &full,
+            ),
+            (
+                "srv",
+                "@srv",
+                format!("{ETC}/srv.mount.d/override.conf"),
+                evil,
+            ),
+            (
+                "srv/data",
+                "@data",
+                format!("{ETC}/srv-.mount.d/override.conf"),
+                evil,
+            ),
+        ];
+        for (point, subvol, drop_in, text) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fstab_of(&home_line("subvol=/@home,noatime"));
+            let fstab = if point == "home" {
+                base
+            } else {
+                format!("{base}UUID={FS} /{point} btrfs subvol=/{subvol},noatime 0 0\n")
+            };
+            let root = drive(dir.path(), &fstab);
+            fs::create_dir_all(root.join(point)).unwrap();
+            nightly_runs(&root, &format!("ExecStart=/{point}/u/backup.sh"));
+            script(&dir.path().join(subvol), "u/backup.sh", "echo hi\n");
+            script(
+                &dir.path().join("@evil"),
+                "u/backup.sh",
+                "btrbk -c /etc/btrbk/btrbk.conf run\n",
+            );
+            // Without the drop-in the sibling is read: nothing runs btrbk.
+            assert_eq!(
+                on_drive(&root, Some(FS)),
+                (BootVerdict::No, vec![]),
+                "/{point} without {drop_in}"
+            );
+            write(&root, &drop_in, text);
+            let (verdict, why) = on_drive(&root, Some(FS));
+            assert_eq!(
+                verdict,
+                BootVerdict::May,
+                "/{point} with {drop_in}: {why:?}"
+            );
+        }
+    }
+
+    /// The twin: a drop-in on another mount point's unit leaves `/home` a
+    /// sibling.
+    #[test]
+    fn a_drop_in_on_another_mount_unit_keeps_the_sibling_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = drive(dir.path(), &fstab_of(&home_line("subvol=/@home,noatime")));
+        nightly_runs(&root, "ExecStart=/home/u/backup.sh");
+        script(&dir.path().join("@home"), "u/backup.sh", "echo hi\n");
+        write(
+            &root,
+            &format!("{ETC}/opt.mount.d/override.conf"),
+            "[Mount]\nOptions=noatime\n",
+        );
+        assert_eq!(on_drive(&root, Some(FS)), (BootVerdict::No, vec![]));
     }
 
     /// systemd's own mount units under `/dev`, `/proc` and `/sys` keep the
