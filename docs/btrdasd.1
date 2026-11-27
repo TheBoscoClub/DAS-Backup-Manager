@@ -2408,15 +2408,31 @@ line names is itself read as a program the script runs, since the kernel
 takes a script as an interpreter too: a stock shell or python is read no
 further than its first bytes, which are no
 .BR #! ,
-and a script planted under its name is read. The program
+and a script planted under its name is read. An interpreter is
+.B env
+by its last path component, however the directories before it are spelt
+.RB ( /usr/sbin/env ),
+or when its path leads through links in the image to a file named
+.BR env ;
+a link to
+.B env
+under another name in a command line is read as
+.B env
+too. The program
 .B env
 runs is looked up in the
 .BR PATH ,
 and the command line
 .B env \-S
 splits is read as a command line given to
-.BR env ;
-any other
+.BR env ,
+unless it holds a backslash or a
+.BR $ ,
+which
+.B env
+reads its own way (its escapes,
+.BR ${NAME} ):
+that is unknown; any other
 .B env
 option than
 .BR \-i ,
