@@ -129,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The emailed backup report from `btrdasd backup run` is reader-friendly** (bd `DAS-Backup-Manager-3gzs.12`, operator 2026-11-27: formatted for quicker visual acquisition, nothing added or lost)
+  - A `── NEEDS ATTENTION ──` block follows the header whenever anything failed or warned: each error as `FAILED  <error>` and each FAIL or WARN operations row, status word first, ahead of the routine rows; the `ERRORS` section at the bottom is gone (its lines live only in that block)
+  - A `RESULT` block closes the report: the overall status with the counts of FAIL, WARN and OK rows and of errors
+  - The header time carries the zone (`2026-11-27 03:19 CST`); the SMART table gets its column header; every other row, the `Status:` line the subject reads and the section names keep their exact form
+
 - **Only a job that writes to a target stops the processes reading it** (bd `DAS-Backup-Manager-su1b.12`, operator decision 2026-11-25): the stop policy (SIGTERM, 10 s, SIGKILL for a process that only reads a target another program mounted, or a busy leftover at its own path) now applies only to backup, send, boot-archive, forget/purge and the scrub
   - Doctor, walk, the helper's index walk, reindex, reconcile, restore, browse, the recovery-OS reading and raid accept signal nothing: a target anything holds is refused for that job, each holder named (`it is in use by pid N (cmdline) — this job writes nothing to the target and never stops a process`), in a dry run too
   - `raid_guard::Job::stops_readers` is the one table; `mount::ensure_targets_mounted` now takes the `Job`, and `every_target_mount_names_its_job` holds every caller to it
