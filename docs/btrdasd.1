@@ -746,7 +746,8 @@ beside
 when the targets grew and btrbk ran for at least a second, and one line per
 read target to
 .B growth.log
-(a line that cannot be appended is a warning). Directly after btrbk, and only
+(its used bytes and, when it can be read, its capacity; a line that cannot be
+appended is a warning). Directly after btrbk, and only
 when the selection is everything the configuration declares (every source and
 every target: a run of fewer expires nothing and the report's
 .B "Retired expiry"
@@ -4358,7 +4359,13 @@ Disk usage growth log for trend monitoring, appended by
 and by
 .BR "backup run" ,
 and read by
-.BR "btrdasd health" .
+.BR "btrdasd health" ,
+the helper's health query (the GUI's Growth tab) and the emailed report's
+growth figures. One line per mounted target per run:
+.IR "time mount used_bytes total_bytes" .
+The fourth field, the target's capacity, is left out on lines written before
+it was recorded and when it could not be read; it is never written as 0.
+NUL bytes before a line (a write torn by a crash) are skipped.
 .TP
 .I /var/lib/das\-backup/last\-report.txt
 The last backup report, written before it is emailed

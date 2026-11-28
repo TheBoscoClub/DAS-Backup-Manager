@@ -42,6 +42,10 @@
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QDateTimeEdit>
+#include <QChart>
+#include <QChartView>
+#include <QDateTimeAxis>
+#include <QLineSeries>
 
 #include <algorithm>
 #include <functional>
@@ -2557,6 +2561,196 @@ private Q_SLOTS:
         const QString note = health.statusNote();
         QVERIFY2(note.contains(QStringLiteral("denied")), qPrintable(note));
         QVERIFY2(note.contains(QStringLiteral("no reading yet")), qPrintable(note));
+    }
+
+    // --- The Growth tab (bd DAS-Backup-Manager-3gzs.15) ---------------------
+
+    // A health reading whose growth holds a retired series that ended 200 days
+    // ago (sorted first, as the helper's BTreeMap sorts "/mnt/..." before
+    // letters) and the current target "primary": a reading a day for the
+    // last 30 days, growing 10 GiB a day, capacity 1000 GiB, the 3 oldest
+    // with no capacity known (null).
+    static QString growthReading()
+    {
+        constexpr qint64 gib = qint64{1} << 30;
+        const QDate today = QDate::currentDate();
+        QJsonArray old;
+        for (int i = 0; i < 10; ++i) {
+            old.append(QJsonObject{
+                {QStringLiteral("date"), today.addDays(-209 + i).toString(Qt::ISODate)},
+                {QStringLiteral("used_bytes"), 100 * gib},
+                {QStringLiteral("total_bytes"), QJsonValue()},
+            });
+        }
+        QJsonArray primary;
+        for (int i = 0; i < 30; ++i) {
+            primary.append(QJsonObject{
+                {QStringLiteral("date"), today.addDays(-29 + i).toString(Qt::ISODate)},
+                {QStringLiteral("used_bytes"), (200 + 10 * i) * gib},
+                {QStringLiteral("total_bytes"), i < 3 ? QJsonValue() : QJsonValue(1000 * gib)},
+            });
+        }
+        const QJsonObject root{
+            {QStringLiteral("targets"),
+             QJsonArray{QJsonObject{{QStringLiteral("label"), QStringLiteral("primary")},
+                                    {QStringLiteral("serial"), QStringLiteral("SER1")},
+                                    {QStringLiteral("mounted"), false},
+                                    {QStringLiteral("total_bytes"), 0},
+                                    {QStringLiteral("used_bytes"), 0}}}},
+            {QStringLiteral("growth"),
+             QJsonArray{QJsonObject{{QStringLiteral("label"), QStringLiteral("/mnt/backup-system")},
+                                    {QStringLiteral("entries"), old}},
+                        QJsonObject{{QStringLiteral("label"), QStringLiteral("primary")},
+                                    {QStringLiteral("entries"), primary}}}},
+        };
+        return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    }
+
+    static QTableView *growthTable(HealthDashboard &health)
+    {
+        for (auto *v : health.findChildren<QTableView *>()) {
+            if (v->objectName() != QLatin1String("healthDrivesView"))
+                return v;
+        }
+        return nullptr;
+    }
+
+    // The row of `label` on `date`, or -1.
+    static int growthRow(QTableView *v, const QString &label, const QDate &date)
+    {
+        for (int r = 0; r < v->model()->rowCount(); ++r) {
+            if (v->model()->index(r, 1).data().toString() == label
+                && v->model()->index(r, 0).data().toString() == date.toString(Qt::ISODate))
+                return r;
+        }
+        return -1;
+    }
+
+    static QDateTimeAxis *growthAxisX(HealthDashboard &health)
+    {
+        auto *view = health.findChild<QChartView *>();
+        if (!view)
+            return nullptr;
+        for (auto *a : view->chart()->axes(Qt::Horizontal)) {
+            if (auto *d = qobject_cast<QDateTimeAxis *>(a))
+                return d;
+        }
+        return nullptr;
+    }
+
+    // The chart stopped at the first series' last day: only the Y axis was
+    // ranged, so the date axis kept the span of the first series attached.
+    void theGrowthChartsDateAxisReachesTodayWhateverSeriesComesFirst()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryResult(growthReading());
+        QDateTimeAxis *axis = growthAxisX(health);
+        QVERIFY(axis);
+        const QDate today = QDate::currentDate();
+        QVERIFY2(axis->max().date() >= today, qPrintable(axis->max().toString(Qt::ISODate)));
+        // Opens on 90 days ending today.
+        QVERIFY2(axis->min().date() <= today.addDays(-89) && axis->min().date() >= today.addDays(-91),
+                 qPrintable(axis->min().toString(Qt::ISODate)));
+    }
+
+    // Every row has its own projection from the 14 days up to it, not only
+    // the newest row.
+    void everyGrowthRowProjectsItsOwnFullDate()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryResult(growthReading());
+        auto *v = growthTable(health);
+        QVERIFY(v);
+        const QDate today = QDate::currentDate();
+        // 10 days ago: used 390 GiB of 1000, growing 10 GiB a day: 61 days on.
+        const int r = growthRow(v, QStringLiteral("primary"), today.addDays(-10));
+        QVERIFY(r >= 0);
+        QCOMPARE(v->model()->index(r, 4).data().toString(),
+                 today.addDays(-10 + 61).toString(Qt::ISODate));
+        QCOMPARE(v->model()->index(r, 3).data().toString(), FileModel::formatSize(qint64{610} << 30));
+        // The first day has no history before it: said in words.
+        const int first = growthRow(v, QStringLiteral("primary"), today.addDays(-29));
+        QVERIFY(first >= 0);
+        QCOMPARE(v->model()->index(first, 4).data().toString(), QStringLiteral("not enough history"));
+    }
+
+    // A capacity the helper could not give (null) is "unknown", saying why,
+    // never a bare dash or a 0.
+    void aGrowthRowWithNoCapacitySaysUnknownAndWhy()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryResult(growthReading());
+        auto *v = growthTable(health);
+        QVERIFY(v);
+        const int r = growthRow(v, QStringLiteral("primary"), QDate::currentDate().addDays(-28));
+        QVERIFY(r >= 0);
+        const QModelIndex freeCell = v->model()->index(r, 3);
+        QCOMPARE(freeCell.data().toString(), QStringLiteral("unknown"));
+        QVERIFY(!freeCell.data(Qt::ToolTipRole).toString().isEmpty());
+        QCOMPARE(v->model()->index(r, 4).data().toString(), QStringLiteral("capacity unknown"));
+    }
+
+    // A series that is no current target is retired: hidden until asked
+    // for, then grey and dashed, named "(retired)".
+    void retiredGrowthSeriesAreHiddenUntilShown()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryResult(growthReading());
+        auto *v = growthTable(health);
+        QVERIFY(v);
+        const auto rowsOf = [v](const QString &label) {
+            int n = 0;
+            for (int r = 0; r < v->model()->rowCount(); ++r)
+                n += v->model()->index(r, 1).data().toString() == label ? 1 : 0;
+            return n;
+        };
+        QCOMPARE(rowsOf(QStringLiteral("/mnt/backup-system")), 0);
+        QCOMPARE(rowsOf(QStringLiteral("primary")), 30);
+        auto *show = health.findChild<QCheckBox *>(QStringLiteral("growthShowRetired"));
+        QVERIFY(show);
+        QVERIFY(!show->isChecked());
+        QVERIFY(!show->toolTip().isEmpty());
+        show->setChecked(true);
+        QCOMPARE(rowsOf(QStringLiteral("/mnt/backup-system")), 10);
+        auto *view = health.findChild<QChartView *>();
+        bool named = false;
+        for (auto *s : view->chart()->series()) {
+            if (s->name() == QStringLiteral("/mnt/backup-system (retired)")) {
+                named = true;
+                auto *line = qobject_cast<QLineSeries *>(s);
+                QVERIFY(line);
+                QCOMPARE(line->pen().style(), Qt::DashLine);
+            }
+        }
+        QVERIFY(named);
+    }
+
+    // The range buttons and Reset, each with a tooltip; "All" reaches back to
+    // the oldest reading shown.
+    void theGrowthRangeButtonsMoveTheDateAxis()
+    {
+        DBusClient client;
+        HealthDashboard health(&client);
+        Q_EMIT client.healthQueryResult(growthReading());
+        for (const char *name :
+             {"growthRange30", "growthRange90", "growthRange365", "growthRangeAll", "growthRangeReset"}) {
+            auto *b = health.findChild<QPushButton *>(QLatin1String(name));
+            QVERIFY2(b, name);
+            QVERIFY2(!b->toolTip().isEmpty(), name);
+        }
+        const QDate today = QDate::currentDate();
+        health.findChild<QPushButton *>(QStringLiteral("growthRange30"))->click();
+        QVERIFY(growthAxisX(health)->min().date() >= today.addDays(-31));
+        health.findChild<QPushButton *>(QStringLiteral("growthRangeAll"))->click();
+        QCOMPARE(growthAxisX(health)->min().date(), today.addDays(-29)); // retired hidden
+        health.findChild<QCheckBox *>(QStringLiteral("growthShowRetired"))->setChecked(true);
+        health.findChild<QPushButton *>(QStringLiteral("growthRangeAll"))->click();
+        QCOMPARE(growthAxisX(health)->min().date(), today.addDays(-209));
+        QCOMPARE(growthAxisX(health)->max().date(), today);
     }
 
     void theStatusLineSaysUnknownNeverZeroOrStale()

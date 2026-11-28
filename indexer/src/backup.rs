@@ -1010,6 +1010,10 @@ struct StepEnv<'a> {
     /// Bytes in use on each mounted target, read after a sync
     /// ([`synced_target_usage`]): what `bytes_sent` is the difference of.
     usage: &'a UsageOf<'a>,
+    /// Each mounted target's capacity in bytes, by label
+    /// ([`measure_target_capacity`]): the 4th field of its `growth.log` line.
+    /// `None`, or a target left out, when it could not be read.
+    capacity: &'a dyn Fn(&Config) -> TargetUsage,
     /// Index the snapshots now on the mounted targets; whether any target was
     /// indexed ([`index_mounted_targets`]).
     index: &'a IndexTargets<'a>,
@@ -1122,6 +1126,7 @@ impl StepEnv<'static> {
         verify: &mount::verify_write_targets,
         is_mountpoint: &health::is_mountpoint,
         usage: &synced_target_usage,
+        capacity: &measure_target_capacity,
         index: &index_mounted_targets,
         recovery_os: &record_recovery_os,
         usb_link: &usb_link_on_host,
@@ -1841,6 +1846,30 @@ fn measure_target_usage(config: &Config, progress: &dyn ProgressCallback) -> Tar
                 ),
             );
             Some((label, Some(used)))
+        })
+        .collect()
+}
+
+/// Each mounted target's capacity, `statvfs(2)`'s blocks times the block
+/// size (the same reading [`measure_target_usage`] takes its used bytes
+/// from, so the two fields of a `growth.log` line agree). A target not
+/// mounted is left out; one that cannot be read, or reads 0, is `None`.
+fn measure_target_capacity(config: &Config) -> TargetUsage {
+    config
+        .targets
+        .iter()
+        .filter_map(|tgt| {
+            let path = health::find_any_mount(&tgt.mount, &tgt.serial, &tgt.role)?;
+            let total = std::ffi::CString::new(path).ok().and_then(|c_path| {
+                let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+                // SAFETY: `c_path` is NUL-terminated and `stat` is a properly
+                // allocated libc::statvfs.
+                let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+                (rc == 0)
+                    .then(|| stat.f_blocks.saturating_mul(stat.f_frsize))
+                    .filter(|&t| t > 0)
+            });
+            Some((tgt.label.clone(), total))
         })
         .collect()
 }
@@ -3591,13 +3620,18 @@ fn append_history_lines(
             );
         }
     }
-    let readings: Vec<(String, Option<u64>)> = config
+    let capacity = (env.capacity)(config);
+    let readings: Vec<run_steps::GrowthReading> = config
         .targets
         .iter()
         .filter_map(|t| {
-            usage_after
-                .get(&t.label)
-                .map(|used| (t.mount.clone(), *used))
+            usage_after.get(&t.label).map(|used| {
+                (
+                    t.mount.clone(),
+                    *used,
+                    capacity.get(&t.label).copied().flatten(),
+                )
+            })
         })
         .collect();
     for line in run_steps::growth_lines(&run_steps::growth_stamp(now), &readings) {
@@ -8201,6 +8235,7 @@ Legend:
             verify,
             is_mountpoint: &|_| true,
             usage: &|_, _| TargetUsage::new(),
+            capacity: &|_| TargetUsage::new(),
             index: &|_, _| false,
             recovery_os: &|_, _| quiet_recording(),
             usb_link: &|_| UsbLinkStep::NotChecked,
@@ -13384,9 +13419,13 @@ Legend:
             1_700_000_000 + if clock.get() == 1 { 0 } else { 100 }
         };
         let usb_step = |_: &Config| usb.clone();
+        // The primary's capacity reads, the recovery drive's does not.
+        let capacity =
+            |_: &Config| usage_of_labels(&[("primary-22tb", Some(20_000)), ("recovery", None)]);
         let env = StepEnv {
             is_mountpoint: &|_| true,
             usage: &usage_of,
+            capacity: &capacity,
             usb_link: &usb_step,
             expire: &expire_step,
             append_line: &append,
@@ -13558,8 +13597,31 @@ Legend:
             .map(|(_, l)| l.clone())
             .collect();
         // Both targets are mounted at `/proc` in this config; only the read
-        // one has a line, and its value is the reading.
-        assert_eq!(growth, vec![format!("{stamp} /proc 1100")]);
+        // one has a line, and its values are the readings: used, capacity.
+        assert_eq!(growth, vec![format!("{stamp} /proc 1100 20000")]);
+    }
+
+    #[test]
+    fn a_growth_line_whose_capacity_could_not_be_read_has_three_fields_never_a_zero() {
+        let run = run_steps_with(
+            &mirror_live_config(),
+            &both_targets(),
+            UsbLinkStep::NotChecked,
+            (
+                unchanged().0,
+                usage_of_labels(&[("primary-22tb", None), ("recovery", Some(300))]),
+            ),
+            quiet_expiry(),
+            false,
+        );
+        let stamp = run_steps::growth_stamp(1_700_000_100);
+        let growth: Vec<String> = run
+            .appended
+            .iter()
+            .filter(|(p, _)| p == Path::new("/gl/growth.log"))
+            .map(|(_, l)| l.clone())
+            .collect();
+        assert_eq!(growth, vec![format!("{stamp} /proc 300")]);
     }
 
     #[test]

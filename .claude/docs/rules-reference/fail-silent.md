@@ -159,6 +159,11 @@ The sites that still read `mountpoint -q` are two-answer, and an error lands in
 | `run_indexer` | `SKIP`, "primary target not mounted": recorded, never a pass |
 | `show_stats`, `capture_usage`, `capture_report_data`, `record_growth` | no `df` line, usage reading, report row or growth-log line for that target; what a consumer then does with a missing reading is a separate question |
 
+`get_total_bytes` (`df --output=size … 2>/dev/null`, bd `3gzs.15`) is the same shape on the cautious side: an
+empty or non-numeric answer, or 0, leaves `record_growth`'s line at three fields (no capacity), never a 0 capacity;
+a `get_used_bytes` answer that is not a number now gives no line at all, where it used to write a line with an empty
+third field. `compute_growth_stats` skips a line whose used field is not a number instead of doing arithmetic on it.
+
 Two of these were checked closely because a `0` sentinel on a **deletion** path
 would be the permissive direction. Both are safe: `parse_archive_timestamp`
 returning `0` reaches `if (( archive_epoch == 0 )); then log_warn; continue`, so

@@ -59,8 +59,8 @@ pub fn backup_history_json(runs: &[BackupRunRecord]) -> serde_json::Value {
 /// Generate a backup report for the Rust (manual `btrdasd backup run`) path.
 ///
 /// Sections: Header, Backup Operations, Throughput, Disk Capacity, SMART Status,
-/// Latest Snapshots, Footer. The Growth Analysis section requires historical data
-/// from the growth log — if available, it is included.
+/// Latest Snapshots, Footer. It has no Growth Analysis section: that is the
+/// script's, computed from the growth log (`compute_growth_stats`).
 ///
 /// # This deliberately does NOT match `scripts/backup-run.sh` row-for-row
 ///

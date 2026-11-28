@@ -389,7 +389,7 @@ The GUI's configuration editor shows the file exactly as it is on disk and saves
 | `install_prefix` | string | `"/usr/local"` | Binary and script install prefix |
 | `db_path` | string | `"/var/lib/das-backup/backup-index.db"` | SQLite database path |
 | `log_file` | string | `"/var/log/das-backup.log"` | Backup log path |
-| `growth_log` | string | `"/var/lib/das-backup/growth.log"` | Capacity growth trend log path |
+| `growth_log` | string | `"/var/lib/das-backup/growth.log"` | Capacity growth trend log path: one line per mounted target per backup, `<time> <mount> <used bytes> <capacity bytes>` (the capacity is absent on lines written before it was recorded, or when it could not be read) |
 | `last_report` | string | `"/var/lib/das-backup/last-report.txt"` | Most recent email report body, cached for the GUI |
 | `btrbk_conf` | string | `"/etc/btrbk/btrbk.conf"` | btrbk config path |
 | `recovery_drive` | boolean | `false` | Set by `btrdasd config derive-recovery` in the configuration a recovery drive's own OS carries: no sources, every target kept with the booted drive first, restores allowed only under the recovery roots (see `btrdasd(1)`); never set by hand on a host |

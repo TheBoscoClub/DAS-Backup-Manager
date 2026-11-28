@@ -404,6 +404,11 @@ pub struct GrowthPoint {
     pub timestamp: i64,
     pub target_label: String,
     pub used_bytes: u64,
+    /// The target's capacity, from the line's 4th field (written since bd
+    /// DAS-Backup-Manager-3gzs.15). `None` on an older 3-field line, or when
+    /// the field is not a positive number: never a 0 that reads as a disk
+    /// with no room.
+    pub total_bytes: Option<u64>,
 }
 
 /// Full health report for the backup system.
@@ -1576,13 +1581,17 @@ fn parse_iso_datetime(s: &str) -> Option<i64> {
 
 /// Parse a growth.log file into GrowthPoint entries.
 ///
-/// Each line has the format: `<timestamp> <mount_path_or_label> <used_bytes>`
-/// where timestamp can be either a Unix epoch integer or an ISO 8601 datetime
-/// string (`YYYY-MM-DDTHH:MM:SS`).
+/// Each line has the format: `<timestamp> <mount_path_or_label> <used_bytes>
+/// [<total_bytes>]` where timestamp can be either a Unix epoch integer or an
+/// ISO 8601 datetime string (`YYYY-MM-DDTHH:MM:SS`). The 4th field, the
+/// target's capacity, is written since bd DAS-Backup-Manager-3gzs.15; a line
+/// without it, or with one that is not a positive number, keeps its reading
+/// with no capacity. NUL bytes before a line (a write torn by a crash) are
+/// dropped, so the reading after them is kept.
 pub fn parse_growth_log(content: &str) -> Vec<GrowthPoint> {
     let mut points = Vec::new();
     for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let parts: Vec<&str> = line.trim_start_matches('\0').split_whitespace().collect();
         if parts.len() >= 3
             && let (Some(ts), Ok(used)) = (parse_iso_datetime(parts[0]), parts[2].parse::<u64>())
         {
@@ -1590,6 +1599,10 @@ pub fn parse_growth_log(content: &str) -> Vec<GrowthPoint> {
                 timestamp: ts,
                 target_label: parts[1].to_string(),
                 used_bytes: used,
+                total_bytes: parts
+                    .get(3)
+                    .and_then(|t| t.parse::<u64>().ok())
+                    .filter(|&t| t > 0),
             });
         }
     }
@@ -2084,6 +2097,47 @@ daily = 7
         let points = parse_growth_log(log);
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].target_label, "ok");
+    }
+
+    #[test]
+    fn parse_growth_log_reads_the_capacity_of_a_four_field_line() {
+        let log = "2026-11-27T03:10:00 /mnt/backup-22tb 1000 20000\n\
+                   2026-11-26T03:10:00 /mnt/backup-22tb 900\n";
+        let points = parse_growth_log(log);
+        assert_eq!(points.len(), 2, "both lines, 4 and 3 fields");
+        assert_eq!(points[0].used_bytes, 1000);
+        assert_eq!(points[0].total_bytes, Some(20000));
+        assert_eq!(points[1].used_bytes, 900);
+        assert_eq!(
+            points[1].total_bytes, None,
+            "a 3-field line has no capacity"
+        );
+    }
+
+    #[test]
+    fn parse_growth_log_keeps_the_reading_of_a_bad_capacity_field() {
+        let log = "2026-11-27T03:10:00 /mnt/a 1000 0\n\
+                   2026-11-27T03:10:00 /mnt/b 2000 lots\n";
+        let points = parse_growth_log(log);
+        assert_eq!(points.len(), 2, "{points:?}");
+        assert_eq!(points[0].used_bytes, 1000);
+        assert_eq!(points[0].total_bytes, None, "0 is no capacity");
+        assert_eq!(points[1].used_bytes, 2000);
+        assert_eq!(points[1].total_bytes, None, "not a number");
+    }
+
+    #[test]
+    fn parse_growth_log_keeps_a_line_a_torn_write_left_nul_bytes_before() {
+        // growth.log line 234 on the author's host: 111 NUL bytes, then a
+        // whole line (a write torn by a crash, 2026-05-07).
+        let log = format!(
+            "2026-05-06T03:10:00 /mnt/a 100\n{}2026-05-07T03:10:00 /mnt/a 200 9000\n",
+            "\0".repeat(111)
+        );
+        let points = parse_growth_log(&log);
+        assert_eq!(points.len(), 2, "{points:?}");
+        assert_eq!(points[1].used_bytes, 200);
+        assert_eq!(points[1].total_bytes, Some(9000));
     }
 
     #[test]

@@ -577,6 +577,7 @@ EOF
 stub df <<'EOF'
 case " $* " in
 *" --output=used "*) printf 'Used\n1000\n' ;;
+*" --output=size "*) printf '1B-blocks\n10000\n' ;;
 *" --output=avail "*) printf 'Avail\n5000\n' ;;
 *" -h "*) printf 'Filesystem Size Used Avail Use%% Mounted on\nstub 10G 1.0K 5.0K 1%% %s\n' "${*: -1}" ;;
 *) echo "df stub: unexpected: $*" >&2; exit 1 ;;

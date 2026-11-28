@@ -32,7 +32,116 @@
 #include <QLineSeries>
 #include <QValueAxis>
 
+#include <QButtonGroup>
+#include <QCheckBox>
+#include <QMouseEvent>
+#include <QWheelEvent>
+
+#include <algorithm>
 #include <cmath>
+#include <functional>
+
+// ---------------------------------------------------------------------------
+// The growth chart's view: the wheel zooms the date axis about the pointer,
+// a left drag pans it (bd DAS-Backup-Manager-3gzs.15). It only reports where
+// across the plot area the gesture was; the dashboard moves the range.
+// ---------------------------------------------------------------------------
+
+class GrowthChartView : public QChartView
+{
+public:
+    using QChartView::QChartView;
+
+    // `fraction` of the way across the plot (0 left, 1 right); `factor` below
+    // 1 zooms in.
+    std::function<void(double fraction, double factor)> onZoom;
+    // The drag so far as a fraction of the plot's width (right is positive).
+    std::function<void(double fraction)> onPan;
+
+protected:
+    void wheelEvent(QWheelEvent *event) override
+    {
+        const QRectF plot = chart()->plotArea();
+        const int delta = event->angleDelta().y();
+        if (!onZoom || plot.width() <= 0 || delta == 0) {
+            QChartView::wheelEvent(event);
+            return;
+        }
+        const QPointF at = chart()->mapFromScene(mapToScene(event->position().toPoint()));
+        const double fraction = std::clamp((at.x() - plot.left()) / plot.width(), 0.0, 1.0);
+        onZoom(fraction, std::pow(0.8, delta / 120.0));
+        event->accept();
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton && onPan) {
+            m_dragging = true;
+            m_lastX = event->position().x();
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+            return;
+        }
+        QChartView::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        const QRectF plot = chart()->plotArea();
+        if (m_dragging && plot.width() > 0) {
+            const double x = event->position().x();
+            onPan((x - m_lastX) / plot.width());
+            m_lastX = x;
+            event->accept();
+            return;
+        }
+        QChartView::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (m_dragging && event->button() == Qt::LeftButton) {
+            m_dragging = false;
+            unsetCursor();
+            event->accept();
+            return;
+        }
+        QChartView::mouseReleaseEvent(event);
+    }
+
+private:
+    bool m_dragging = false;
+    double m_lastX = 0;
+};
+
+namespace {
+
+constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+
+qint64 dayMs(const QDate &date)
+{
+    return QDateTime(date, QTime(0, 0)).toMSecsSinceEpoch();
+}
+
+qint64 todayMs()
+{
+    return dayMs(QDate::currentDate());
+}
+
+// A capacity the helper sends: a positive whole number, else none. null (it
+// could not tell) and a missing field are no capacity, never the 0
+// toInteger() would make of them.
+std::optional<qint64> capacityFromJson(const QJsonValue &value)
+{
+    if (!value.isDouble())
+        return std::nullopt;
+    const qint64 total = value.toInteger(-1);
+    if (total <= 0)
+        return std::nullopt;
+    return total;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Column indices for the drives table
@@ -108,6 +217,20 @@ HealthDashboard::HealthDashboard(DBusClient *client, QWidget *parent)
             this, &HealthDashboard::onHealthResult);
     connect(m_client, &DBusClient::refreshFailed,
             this, &HealthDashboard::onRefreshFailed);
+
+    // A backup this GUI started has moved the growth log on: read it again
+    // when the job ends (bd DAS-Backup-Manager-3gzs.15). The nightly timer's
+    // run sends no job signal; the tab reads it when next opened.
+    connect(m_client, &DBusClient::jobStarted, this,
+            [this](const QString &jobId, const QString &operation) {
+                if (operation == QLatin1String("BackupRun"))
+                    m_backupJobs.insert(jobId);
+            });
+    connect(m_client, &DBusClient::jobFinished, this,
+            [this](const QString &jobId, bool, const QString &) {
+                if (m_backupJobs.remove(jobId))
+                    refresh();
+            });
 
     refresh();
 }
@@ -255,26 +378,98 @@ void HealthDashboard::setupGrowthTab()
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(4);
 
-    auto *info = new QLabel(i18n("Storage usage over time — chart + table with ETA projection"),
-                            m_growthWidget);
+    auto *info = new QLabel(
+        i18n("Storage usage over time — chart + table with a full-by projection for every row. "
+             "Mouse wheel: zoom the dates; drag: move along them."),
+        m_growthWidget);
+    info->setWordWrap(true);
     info->setToolTip(i18n("Storage usage over time for each backup target"));
     layout->addWidget(info);
+
+    // Range buttons above the chart (bd DAS-Backup-Manager-3gzs.15).
+    auto *controls = new QHBoxLayout();
+    auto *presets = new QButtonGroup(m_growthWidget);
+    presets->setExclusive(true);
+    const struct {
+        const char *name;
+        QString text;
+        QString tip;
+        GrowthMath::Preset preset;
+    } buttons[] = {
+        {"growthRange30", i18n("30 days"), i18n("Show the 30 days ending today"), GrowthMath::Preset::Days30},
+        {"growthRange90", i18n("90 days"), i18n("Show the 90 days ending today"), GrowthMath::Preset::Days90},
+        {"growthRange365", i18n("1 year"), i18n("Show the year ending today"), GrowthMath::Preset::Year},
+        {"growthRangeAll", i18n("All"),
+         i18n("Show every reading of the targets shown, from the earliest to the latest"),
+         GrowthMath::Preset::All},
+    };
+    for (const auto &b : buttons) {
+        auto *button = new QPushButton(b.text, m_growthWidget);
+        button->setObjectName(QLatin1String(b.name));
+        button->setToolTip(b.tip);
+        button->setCheckable(true);
+        button->setChecked(b.preset == m_growthPreset);
+        presets->addButton(button);
+        const GrowthMath::Preset preset = b.preset;
+        connect(button, &QPushButton::clicked, this, [this, preset] { chooseGrowthPreset(preset); });
+        controls->addWidget(button);
+    }
+    auto *reset = new QPushButton(i18n("Reset"), m_growthWidget);
+    reset->setObjectName(QStringLiteral("growthRangeReset"));
+    reset->setToolTip(i18n("Undo any zoom or drag: back to the range chosen above"));
+    connect(reset, &QPushButton::clicked, this, [this] { chooseGrowthPreset(m_growthPreset); });
+    controls->addWidget(reset);
+    controls->addStretch(1);
+    m_showRetired = new QCheckBox(i18n("Show retired targets"), m_growthWidget);
+    m_showRetired->setObjectName(QStringLiteral("growthShowRetired"));
+    m_showRetired->setToolTip(
+        i18n("Also show the growth-log series of targets no longer in the configuration, "
+             "as grey dashed lines and in the table"));
+    connect(m_showRetired, &QCheckBox::toggled, this, [this] { renderGrowth(); });
+    controls->addWidget(m_showRetired);
+    layout->addLayout(controls);
 
     // Splitter: chart on top, table on bottom
     m_growthSplitter = new QSplitter(Qt::Vertical, m_growthWidget);
 
-    // Chart view
+    // Chart view. No series animation: it lags the wheel and a grab can catch
+    // a line half drawn.
     auto *chart = new QChart();
     chart->setTitle(i18n("Growth Trend"));
-    chart->setAnimationOptions(QChart::SeriesAnimations);
+    chart->setAnimationOptions(QChart::NoAnimation);
     chart->legend()->setAlignment(Qt::AlignBottom);
 
-    m_chartView = new QChartView(chart, m_growthSplitter);
+    m_chartView = new GrowthChartView(chart, m_growthSplitter);
+    m_chartView->setObjectName(QStringLiteral("growthChartView"));
+    m_chartView->setToolTip(i18n("Mouse wheel: zoom the dates about the pointer; drag: move along them; "
+                                 "Reset: back to the chosen range"));
     m_chartView->setRenderHint(QPainter::Antialiasing);
-    m_chartView->setMinimumHeight(200);
+    m_chartView->setMinimumHeight(320);
+    m_chartView->onZoom = [this](double fraction, double factor) {
+        if (!m_growthHaveRange)
+            return;
+        const qint64 anchor =
+            m_growthRange.startMs + static_cast<qint64>(fraction * static_cast<double>(m_growthRange.span()));
+        m_growthRange = GrowthMath::zoomRange(m_growthRange, anchor, factor, growthLimit());
+        m_growthMoved = true;
+        applyGrowthRange();
+    };
+    m_chartView->onPan = [this](double fraction) {
+        if (!m_growthHaveRange)
+            return;
+        // Dragging right brings earlier dates into view.
+        const auto delta = static_cast<qint64>(-fraction * static_cast<double>(m_growthRange.span()));
+        m_growthRange = GrowthMath::panRange(m_growthRange, delta, growthLimit());
+        m_growthMoved = true;
+        applyGrowthRange();
+    };
 
     // Table view
     m_growthView = new QTableView(m_growthSplitter);
+    m_growthView->setObjectName(QStringLiteral("healthGrowthView"));
+    m_growthView->setToolTip(
+        i18n("Each reading of each target shown: used, free and the projected full-by date "
+             "from the 14 days up to that row"));
 
     auto *model = new QStandardItemModel(0, GrowthCol::Count, m_growthView);
     model->setHorizontalHeaderLabels({
@@ -308,6 +503,9 @@ void HealthDashboard::setupGrowthTab()
     m_growthSplitter->addWidget(m_growthView);
     m_growthSplitter->setStretchFactor(0, 2);  // chart gets more space
     m_growthSplitter->setStretchFactor(1, 1);
+    // Two thirds to the chart at first: the table's size hint would
+    // otherwise squeeze it to a strip.
+    m_growthSplitter->setSizes({600, 300});
 
     layout->addWidget(m_growthSplitter, 1);
 
@@ -552,8 +750,73 @@ void HealthDashboard::updateDrives(const QString &json)
 void HealthDashboard::updateGrowth(const QString &json)
 {
     const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
-    const QJsonArray growthArr = doc.object().value(QLatin1String("growth")).toArray();
+    const QJsonObject root = doc.object();
 
+    // The current targets: a growth series under any other name is retired
+    // (bd DAS-Backup-Manager-3gzs.15).
+    QStringList current;
+    for (const QJsonValue &t : root.value(QLatin1String("targets")).toArray())
+        current.append(t.toObject().value(QLatin1String("label")).toString());
+
+    m_growthSeries.clear();
+    for (const QJsonValue &gval : root.value(QLatin1String("growth")).toArray()) {
+        const QJsonObject gobj = gval.toObject();
+        GrowthSeries series;
+        series.label = gobj.value(QLatin1String("label")).toString();
+        series.retired = GrowthMath::isRetired(series.label, current);
+        for (const QJsonValue &eval : gobj.value(QLatin1String("entries")).toArray()) {
+            const QJsonObject entry = eval.toObject();
+            const QDate date =
+                QDate::fromString(entry.value(QLatin1String("date")).toString(), Qt::ISODate);
+            if (!date.isValid())
+                continue;
+            series.readings.append({date, entry.value(QLatin1String("used_bytes")).toInteger(),
+                                    capacityFromJson(entry.value(QLatin1String("total_bytes")))});
+        }
+        std::stable_sort(series.readings.begin(), series.readings.end(),
+                         [](const GrowthMath::Reading &a, const GrowthMath::Reading &b) {
+                             return a.date < b.date;
+                         });
+        if (!series.readings.isEmpty())
+            m_growthSeries.append(series);
+    }
+    renderGrowth();
+}
+
+GrowthMath::Range HealthDashboard::growthPresetRange(GrowthMath::Preset preset) const
+{
+    std::optional<qint64> earliest;
+    std::optional<qint64> latest;
+    const bool showRetired = m_showRetired && m_showRetired->isChecked();
+    for (const GrowthSeries &s : m_growthSeries) {
+        if (s.retired && !showRetired)
+            continue;
+        const qint64 first = dayMs(s.readings.first().date);
+        const qint64 last = dayMs(s.readings.last().date);
+        earliest = earliest ? std::min(*earliest, first) : first;
+        latest = latest ? std::max(*latest, last) : last;
+    }
+    return GrowthMath::presetRange(preset, earliest, latest, todayMs());
+}
+
+GrowthMath::Range HealthDashboard::growthLimit() const
+{
+    const GrowthMath::Range all = growthPresetRange(GrowthMath::Preset::All);
+    const GrowthMath::Range preset = growthPresetRange(m_growthPreset);
+    return {std::min(all.startMs, preset.startMs), std::max(all.endMs, preset.endMs)};
+}
+
+void HealthDashboard::chooseGrowthPreset(GrowthMath::Preset preset)
+{
+    m_growthPreset = preset;
+    m_growthMoved = false;
+    m_growthRange = growthPresetRange(m_growthPreset);
+    m_growthHaveRange = true;
+    applyGrowthRange();
+}
+
+void HealthDashboard::renderGrowth()
+{
     auto *growthProxyModel = qobject_cast<QSortFilterProxyModel *>(m_growthView->model());
     auto *model = growthProxyModel
         ? qobject_cast<QStandardItemModel *>(growthProxyModel->sourceModel())
@@ -563,176 +826,175 @@ void HealthDashboard::updateGrowth(const QString &json)
 
     model->removeRows(0, model->rowCount());
 
-    // Chart: rebuild series
     auto *chart = m_chartView->chart();
     chart->removeAllSeries();
+    // One pair of axes for the chart's life: an axis removed and replaced on
+    // every refresh left its labels drawn under the new one's.
+    QDateTimeAxis *axisX = nullptr;
+    QValueAxis *axisY = nullptr;
+    for (auto *a : chart->axes()) {
+        if (!axisX)
+            axisX = qobject_cast<QDateTimeAxis *>(a);
+        if (!axisY)
+            axisY = qobject_cast<QValueAxis *>(a);
+    }
+    if (!axisX) {
+        axisX = new QDateTimeAxis();
+        axisX->setTitleText(i18n("Date"));
+        axisX->setTickCount(7);
+        chart->addAxis(axisX, Qt::AlignBottom);
+    }
+    if (!axisY) {
+        axisY = new QValueAxis();
+        axisY->setTitleText(i18n("Used (GiB)"));
+        axisY->setLabelFormat(QStringLiteral("%.0f"));
+        chart->addAxis(axisY, Qt::AlignLeft);
+    }
 
-    // Remove old axes
-    const auto oldAxes = chart->axes();
-    for (auto *axis : oldAxes)
-        chart->removeAxis(axis);
+    const bool showRetired = m_showRetired->isChecked();
+    int currentIdx = 0;
+    int retiredIdx = 0;
 
-    auto *axisX = new QDateTimeAxis();
-    axisX->setFormat(QStringLiteral("MM-dd"));
-    axisX->setTitleText(i18n("Date"));
-
-    auto *axisY = new QValueAxis();
-    axisY->setTitleText(i18n("Used (GiB)"));
-    axisY->setLabelFormat(QStringLiteral("%.0f"));
-
-    chart->addAxis(axisX, Qt::AlignBottom);
-    chart->addAxis(axisY, Qt::AlignLeft);
-
-    qreal yMax = 0;
-
-    // Color palette for target lines
-    const QColor colors[] = {
-        QColor(0x21, 0x96, 0xF3),  // blue
-        QColor(0x4C, 0xAF, 0x50),  // green
-        QColor(0xFF, 0x98, 0x00),  // amber
-        QColor(0xE9, 0x1E, 0x63),  // pink
-    };
-    int colorIdx = 0;
-
-    for (const QJsonValue &gval : growthArr) {
-        const QJsonObject gobj   = gval.toObject();
-        const QString     glabel = gobj.value(QLatin1String("label")).toString();
-        const QJsonArray  entries = gobj.value(QLatin1String("entries")).toArray();
-
-        if (entries.isEmpty())
+    for (const GrowthSeries &gs : std::as_const(m_growthSeries)) {
+        if (gs.retired && !showRetired)
             continue;
 
         auto *series = new QLineSeries();
-        series->setName(glabel);
-        series->setColor(colors[colorIdx % 4]);
-        ++colorIdx;
+        QPen pen;
+        pen.setWidth(2);
+        if (gs.retired) {
+            series->setName(i18n("%1 (retired)", gs.label));
+            pen.setColor(GrowthMath::retiredColor(retiredIdx++));
+            pen.setStyle(Qt::DashLine);
+        } else {
+            series->setName(gs.label);
+            pen.setColor(GrowthMath::seriesColor(currentIdx++));
+        }
+        series->setPen(pen);
 
-        // Collect data for ETA calculation (linear regression on last 14 points)
-        struct GrowthEntry {
-            QDateTime date;
-            qint64 used;
-            qint64 total;
-        };
-        QVector<GrowthEntry> allEntries;
+        for (int i = 0; i < gs.readings.size(); ++i) {
+            const GrowthMath::Reading &r = gs.readings[i];
+            series->append(static_cast<qreal>(dayMs(r.date)), static_cast<qreal>(r.used) / kGiB);
 
-        qint64 lastTotal = 0;
+            QList<QStandardItem *> row;
+            row.reserve(GrowthCol::Count);
+            row.append(new QStandardItem(r.date.toString(Qt::ISODate)));
+            auto *labelItem = new QStandardItem(gs.label);
+            if (gs.retired)
+                labelItem->setToolTip(i18n("Retired: no target in the configuration has this name"));
+            row.append(labelItem);
+            row.append(new QStandardItem(FileModel::formatSize(r.used)));
 
-        for (const QJsonValue &eval : entries) {
-            const QJsonObject entry = eval.toObject();
-            const QString     date  = entry.value(QLatin1String("date")).toString();
-            const qint64      used  = entry.value(QLatin1String("used_bytes")).toInteger();
-            const qint64      total = entry.value(QLatin1String("total_bytes")).toInteger();
+            auto *freeItem = new QStandardItem();
+            if (const auto free = GrowthMath::freeOf(r)) {
+                freeItem->setText(FileModel::formatSize(*free));
+                freeItem->setToolTip(i18n("Capacity %1 less used %2", FileModel::formatSize(*r.total),
+                                          FileModel::formatSize(r.used)));
+            } else {
+                freeItem->setText(i18n("unknown"));
+                freeItem->setToolTip(
+                    i18n("No capacity is known for this reading: its growth-log line carries none, no "
+                         "other line for this target records one, and the target is not mounted now"));
+            }
+            row.append(freeItem);
 
-            const QDateTime dt = QDateTime::fromString(date, QStringLiteral("yyyy-MM-dd"));
-            if (!dt.isValid())
-                continue;
+            const GrowthMath::Eta eta = GrowthMath::etaAt(gs.readings, i);
+            auto *etaItem = new QStandardItem();
+            const QString window = i18n("%1 reading(s), %2 to %3", eta.readings,
+                                        eta.windowStart.toString(Qt::ISODate),
+                                        eta.windowEnd.toString(Qt::ISODate));
+            const QString rate = FileModel::formatSize(static_cast<qint64>(std::llround(eta.bytesPerDay)));
+            switch (eta.kind) {
+            case GrowthMath::EtaKind::Date:
+                etaItem->setText(eta.date.toString(Qt::ISODate));
+                etaItem->setToolTip(i18n("Projected from %1: %2 a day", window, rate));
+                break;
+            case GrowthMath::EtaKind::BeyondTenYears:
+                etaItem->setText(i18n("> 10 years"));
+                etaItem->setToolTip(i18n("Projected from %1: %2 a day", window, rate));
+                break;
+            case GrowthMath::EtaKind::NotEnoughHistory:
+                etaItem->setText(i18n("not enough history"));
+                etaItem->setToolTip(i18n("Fewer than two days of readings in the %1 days up to this date",
+                                         GrowthMath::kEtaWindowDays));
+                break;
+            case GrowthMath::EtaKind::CapacityUnknown:
+                etaItem->setText(i18n("capacity unknown"));
+                etaItem->setToolTip(i18n("No capacity is known for this reading, so there is nothing "
+                                         "to project to"));
+                break;
+            case GrowthMath::EtaKind::NotGrowing:
+                etaItem->setText(i18n("not growing"));
+                etaItem->setToolTip(i18n("No growth in %1", window));
+                break;
+            case GrowthMath::EtaKind::Full:
+                etaItem->setText(i18n("full"));
+                etaItem->setToolTip(i18n("Used is at or past the capacity"));
+                break;
+            }
+            row.append(etaItem);
 
-            allEntries.append({dt, used, total});
-            if (total > 0)
-                lastTotal = total;
-
-            // Chart point
-            const qreal usedGiB = static_cast<qreal>(used) / (1024.0 * 1024.0 * 1024.0);
-            series->append(static_cast<qreal>(dt.toMSecsSinceEpoch()), usedGiB);
-
-            if (usedGiB > yMax)
-                yMax = usedGiB;
+            for (QStandardItem *item : row)
+                item->setEditable(false);
+            model->appendRow(row);
         }
 
         chart->addSeries(series);
         series->attachAxis(axisX);
         series->attachAxis(axisY);
-
-        // Capacity ceiling line for this target
-        if (lastTotal > 0) {
-            auto *capLine = new QLineSeries();
-            capLine->setName(glabel + i18n(" capacity"));
-            capLine->setColor(colors[(colorIdx - 1) % 4].lighter(150));
-
-            QPen dashPen(colors[(colorIdx - 1) % 4].lighter(150));
-            dashPen.setStyle(Qt::DashLine);
-            dashPen.setWidth(1);
-            capLine->setPen(dashPen);
-
-            const qreal capGiB = static_cast<qreal>(lastTotal) / (1024.0 * 1024.0 * 1024.0);
-            if (!allEntries.isEmpty()) {
-                capLine->append(static_cast<qreal>(allEntries.first().date.toMSecsSinceEpoch()), capGiB);
-                capLine->append(static_cast<qreal>(allEntries.last().date.toMSecsSinceEpoch()), capGiB);
-            }
-
-            chart->addSeries(capLine);
-            capLine->attachAxis(axisX);
-            capLine->attachAxis(axisY);
-
-            if (capGiB > yMax)
-                yMax = capGiB;
-        }
-
-        // Compute ETA using linear regression on last 14 entries
-        const int regressN = std::min(14, static_cast<int>(allEntries.size()));
-        double growthRatePerDay = 0.0;
-        bool hasEta = false;
-
-        if (regressN >= 2) {
-            const int startIdx = static_cast<int>(allEntries.size()) - regressN;
-            double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
-            const qint64 epoch0 = allEntries[startIdx].date.toSecsSinceEpoch();
-
-            for (int i = startIdx; i < allEntries.size(); ++i) {
-                const double x = static_cast<double>(
-                    allEntries[i].date.toSecsSinceEpoch() - epoch0) / 86400.0;
-                const double y = static_cast<double>(allEntries[i].used);
-                sumX  += x;
-                sumY  += y;
-                sumXX += x * x;
-                sumXY += x * y;
-            }
-
-            const double denom = regressN * sumXX - sumX * sumX;
-            if (std::abs(denom) > 1e-9) {
-                growthRatePerDay = (regressN * sumXY - sumX * sumY) / denom;
-                hasEta = growthRatePerDay > 0 && lastTotal > 0;
-            }
-        }
-
-        // Populate table rows for this target
-        for (int i = 0; i < allEntries.size(); ++i) {
-            const auto &ge = allEntries[i];
-            const qint64 free = ge.total > 0 ? ge.total - ge.used : 0;
-
-            QList<QStandardItem *> row;
-            row.reserve(GrowthCol::Count);
-
-            row.append(new QStandardItem(ge.date.toString(QStringLiteral("yyyy-MM-dd"))));
-            row.append(new QStandardItem(glabel));
-            row.append(new QStandardItem(FileModel::formatSize(ge.used)));
-            row.append(new QStandardItem(
-                ge.total > 0 ? FileModel::formatSize(free < 0 ? 0 : free)
-                             : QStringLiteral("—")));
-
-            // ETA: only show on the last row per target
-            QString etaStr = QStringLiteral("—");
-            if (i == allEntries.size() - 1 && hasEta) {
-                const qint64 remaining = lastTotal - ge.used;
-                const double daysLeft = static_cast<double>(remaining) / growthRatePerDay;
-                if (daysLeft > 0 && daysLeft < 365 * 10) {
-                    const QDate etaDate = ge.date.date().addDays(static_cast<qint64>(daysLeft));
-                    etaStr = etaDate.toString(QStringLiteral("yyyy-MM-dd"));
-                } else if (daysLeft >= 365 * 10) {
-                    etaStr = i18n("> 10 years");
-                }
-            }
-            row.append(new QStandardItem(etaStr));
-
-            for (QStandardItem *item : row)
-                item->setEditable(false);
-
-            model->appendRow(row);
-        }
     }
 
-    // Finalize Y axis
-    axisY->setRange(0, yMax * 1.05);
+    // The label column fits its longest label (it stays resizable).
+    m_growthView->resizeColumnToContents(GrowthCol::Label);
+
+    // The view the user had survives a refresh; otherwise the chosen range,
+    // which a new day or a newly shown series moves.
+    if (!m_growthHaveRange || !m_growthMoved) {
+        m_growthRange = growthPresetRange(m_growthPreset);
+        m_growthHaveRange = true;
+    }
+    applyGrowthRange();
+}
+
+void HealthDashboard::applyGrowthRange()
+{
+    auto *chart = m_chartView->chart();
+    QDateTimeAxis *axisX = nullptr;
+    QValueAxis *axisY = nullptr;
+    for (auto *a : chart->axes()) {
+        if (!axisX)
+            axisX = qobject_cast<QDateTimeAxis *>(a);
+        if (!axisY)
+            axisY = qobject_cast<QValueAxis *>(a);
+    }
+    if (!axisX || !axisY)
+        return;
+
+    // The date axis is always ranged here: left alone, it keeps the span of
+    // the first series attached (the chart stopped at 05-17).
+    axisX->setFormat(GrowthMath::dateFormatFor(m_growthRange.span()));
+    axisX->setRange(QDateTime::fromMSecsSinceEpoch(m_growthRange.startMs),
+                    QDateTime::fromMSecsSinceEpoch(m_growthRange.endMs));
+
+    // The value axis fits what is visible in that window.
+    std::optional<double> lo;
+    std::optional<double> hi;
+    const bool showRetired = m_showRetired->isChecked();
+    for (const GrowthSeries &gs : std::as_const(m_growthSeries)) {
+        if (gs.retired && !showRetired)
+            continue;
+        for (const GrowthMath::Reading &r : gs.readings) {
+            const qint64 at = dayMs(r.date);
+            if (at < m_growthRange.startMs || at > m_growthRange.endMs)
+                continue;
+            const double v = static_cast<double>(r.used) / kGiB;
+            lo = lo ? std::min(*lo, v) : v;
+            hi = hi ? std::max(*hi, v) : v;
+        }
+    }
+    const GrowthMath::Axis y = GrowthMath::niceAxis(lo.value_or(0), hi.value_or(1));
+    axisY->setRange(y.lo, y.hi);
+    axisY->setTickCount(y.ticks);
 }
 
 void HealthDashboard::updateStatus(const QString &json)

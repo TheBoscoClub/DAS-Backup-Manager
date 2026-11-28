@@ -1,9 +1,13 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.27.2
+# Version: 4.28.0
 # Date: 2026-11-27
 #
 # Features:
+#   - growth.log lines carry the target's capacity as a 4th field (v4.28.0, bd
+#     DAS-Backup-Manager-3gzs.15): `<ts> <mount> <used> <total>`; an unread
+#     capacity leaves three fields, never a 0, and a target whose used bytes
+#     could not be read gets no line. compute_growth_stats reads both shapes.
 #   - A dry run's recovery-OS check passes `--report-only` (v4.27.2, bd
 #     DAS-Backup-Manager-eg4j.19): another program's mount of a drive's ESP is
 #     said, never taken down, and that ESP is not read.
@@ -4117,6 +4121,12 @@ get_used_bytes() {
     df --output=used -B1 "$1" 2>/dev/null | tail -1 | tr -d ' '
 }
 
+# Get the capacity in bytes of a mounted filesystem (empty when df cannot
+# read it; record_growth then writes no capacity, never a 0)
+get_total_bytes() {
+    df --output=size -B1 "$1" 2>/dev/null | tail -1 | tr -d ' '
+}
+
 # Format byte count to human-readable string
 format_bytes() {
     local bytes=$1
@@ -4388,11 +4398,21 @@ record_growth() {
     local ts
     ts=$(date '+%Y-%m-%dT%H:%M:%S')
 
+    # `<ts> <mount> <used> <total>` (bd DAS-Backup-Manager-3gzs.15). Used bytes
+    # that cannot be read give no line; a capacity that cannot be read, or
+    # reads 0, leaves the line at three fields: never a 0 that reads as a
+    # measurement (fail-silent.md "always a defect" #1).
+    local mnt used total
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
-            local used
             used=$(get_used_bytes "$mnt")
-            echo "$ts $mnt $used" >> "$GROWTH_LOG"
+            [[ "$used" =~ ^[[:digit:]]+$ ]] || continue
+            total=$(get_total_bytes "$mnt")
+            if [[ "$total" =~ ^[[:digit:]]+$ ]] && (( total > 0 )); then
+                echo "$ts $mnt $used $total" >> "$GROWTH_LOG"
+            else
+                echo "$ts $mnt $used" >> "$GROWTH_LOG"
+            fi
         fi
     done
 }
@@ -4416,9 +4436,13 @@ compute_growth_stats() {
 
     # Find the oldest entry for this mount within the lookback window
     local oldest_epoch=0 oldest_used=0
+    # A line is `<ts> <mount> <used>` or, since bd DAS-Backup-Manager-3gzs.15,
+    # `<ts> <mount> <used> <total>`: the capacity goes to `_`. A line whose
+    # used bytes are not a number (a torn write) is skipped, never read as 0.
     local ts entry_mnt entry_used entry_epoch
-    while IFS=' ' read -r ts entry_mnt entry_used; do
+    while IFS=' ' read -r ts entry_mnt entry_used _; do
         [[ "$entry_mnt" != "$mnt" ]] && continue
+        [[ "$entry_used" =~ ^[[:digit:]]+$ ]] || continue
         # Parse ISO timestamp to epoch
         entry_epoch=$(date -d "$ts" '+%s' 2>/dev/null || echo 0)
         if (( entry_epoch >= cutoff && oldest_epoch == 0 )); then
@@ -4860,7 +4884,7 @@ RESULT
   $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
 
 ===============================================================
-  backup-run.sh v4.27.2
+  backup-run.sh v4.28.0
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

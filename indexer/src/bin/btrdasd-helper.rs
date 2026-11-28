@@ -417,6 +417,62 @@ fn start_scrub_unit() -> Result<(), String> {
     }
 }
 
+/// Each target's capacity as measured now: only a mounted target whose usage
+/// was read and is above 0 has one (an unmounted target's `total_bytes` is
+/// the 0 that means "not measured", never a capacity).
+fn live_totals(targets: &[health::TargetHealth]) -> std::collections::BTreeMap<String, u64> {
+    targets
+        .iter()
+        .filter(|t| t.mounted && t.usage_known && t.total_bytes > 0)
+        .map(|t| (t.label.clone(), t.total_bytes))
+        .collect()
+}
+
+/// The `growth` array of the `HealthQuery` JSON: one series per label in the
+/// growth log, its entries in the log's order. Each entry's `total_bytes` is
+/// the line's own capacity, else the newest capacity the log records for
+/// that series, else the target's capacity measured now (`live`), else
+/// `null` — never 0, which reads as a full disk (bd
+/// DAS-Backup-Manager-3gzs.15).
+fn growth_series_json(
+    points: &[health::GrowthPoint],
+    live: &std::collections::BTreeMap<String, u64>,
+) -> Vec<serde_json::Value> {
+    let mut newest: std::collections::BTreeMap<&str, (i64, u64)> =
+        std::collections::BTreeMap::new();
+    for gp in points {
+        if let Some(total) = gp.total_bytes {
+            let slot = newest
+                .entry(gp.target_label.as_str())
+                .or_insert((gp.timestamp, total));
+            if gp.timestamp >= slot.0 {
+                *slot = (gp.timestamp, total);
+            }
+        }
+    }
+    let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for gp in points {
+        let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
+        let total: Option<u64> = gp
+            .total_bytes
+            .or_else(|| newest.get(gp.target_label.as_str()).map(|&(_, t)| t))
+            .or_else(|| live.get(&gp.target_label).copied());
+        growth_map
+            .entry(gp.target_label.clone())
+            .or_default()
+            .push(serde_json::json!({
+                "date": format!("{y:04}-{m:02}-{d:02}"),
+                "used_bytes": gp.used_bytes,
+                "total_bytes": total,
+            }));
+    }
+    growth_map
+        .into_iter()
+        .map(|(label, entries)| serde_json::json!({"label": label, "entries": entries}))
+        .collect()
+}
+
 /// The `scrub` object of one target in the `HealthQuery` JSON. A target
 /// paused by hand also carries when and by whom (bd
 /// DAS-Backup-Manager-su1b.18), else `null` and `""`.
@@ -2418,35 +2474,8 @@ impl HelperInterface {
                     })
                     .collect();
 
-                // Build total_bytes lookup per target label
-                let target_totals: std::collections::HashMap<&str, u64> = report
-                    .targets
-                    .iter()
-                    .map(|t| (t.label.as_str(), t.total_bytes))
-                    .collect();
-
-                // Build growth data grouped by target label
-                let mut growth_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
-                    std::collections::BTreeMap::new();
-                for gp in &report.growth_points {
-                    let (y, m, d) = health::days_to_ymd(gp.timestamp / 86400);
-                    let date_str = format!("{y:04}-{m:02}-{d:02}");
-                    let total = target_totals
-                        .get(gp.target_label.as_str())
-                        .copied()
-                        .unwrap_or(0);
-                    growth_map.entry(gp.target_label.clone()).or_default().push(
-                        serde_json::json!({
-                            "date": date_str,
-                            "used_bytes": gp.used_bytes,
-                            "total_bytes": total,
-                        }),
-                    );
-                }
-                let growth_json: Vec<serde_json::Value> = growth_map
-                    .into_iter()
-                    .map(|(label, entries)| serde_json::json!({"label": label, "entries": entries}))
-                    .collect();
+                let growth_json =
+                    growth_series_json(&report.growth_points, &live_totals(&report.targets));
 
                 // Service status
                 let btrbk_available = std::process::Command::new("which")
@@ -4863,6 +4892,90 @@ mod tests {
         let failing = || Err("systemctl failed".to_string());
         let err = scrub_resume_text(&paths, &failing).unwrap_err().to_string();
         assert!(err.contains("systemctl failed"), "{err}");
+    }
+
+    fn growth_point(day: i64, label: &str, used: u64, total: Option<u64>) -> health::GrowthPoint {
+        health::GrowthPoint {
+            timestamp: day * 86400,
+            target_label: label.into(),
+            used_bytes: used,
+            total_bytes: total,
+        }
+    }
+
+    fn totals_of(series: &serde_json::Value) -> Vec<serde_json::Value> {
+        series["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|e| e["total_bytes"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn growth_capacity_is_the_lines_own_then_the_newest_logged_then_live_then_null() {
+        use serde_json::json;
+        let points = [
+            // a: an old 3-field line, then lines with their own capacity.
+            growth_point(20_000, "a", 1, None),
+            growth_point(20_001, "a", 2, Some(500)),
+            growth_point(20_002, "a", 3, Some(600)),
+            // b: no capacity anywhere in the log, mounted now.
+            growth_point(20_000, "b", 1, None),
+            // c: no capacity in the log, not mounted.
+            growth_point(20_000, "c", 1, None),
+        ];
+        let live = std::collections::BTreeMap::from([
+            ("a".to_string(), 9999u64),
+            ("b".to_string(), 700u64),
+        ]);
+        let series = growth_series_json(&points, &live);
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0]["label"], "a");
+        // The line's own, else the newest the log holds (600, not 500), never
+        // the live 9999 while the log has one.
+        assert_eq!(
+            totals_of(&series[0]),
+            vec![json!(600), json!(500), json!(600)]
+        );
+        assert_eq!(totals_of(&series[1]), vec![json!(700)], "live total");
+        assert_eq!(
+            totals_of(&series[2]),
+            vec![serde_json::Value::Null],
+            "unknown is null, never 0"
+        );
+        assert_eq!(series[0]["entries"][0]["date"], "2024-10-04");
+        assert_eq!(series[0]["entries"][0]["used_bytes"], 1);
+    }
+
+    #[test]
+    fn only_a_mounted_measured_target_gives_a_live_capacity() {
+        let target = |label: &str, mounted: bool, known: bool, total: u64| health::TargetHealth {
+            label: label.into(),
+            serial: String::new(),
+            mounted,
+            total_bytes: total,
+            used_bytes: 0,
+            usage_known: known,
+            snapshot_count: None,
+            snapshot_reading_age_secs: None,
+            smart_status: None,
+            temperature_c: None,
+            power_on_hours: None,
+            errors: None,
+            scrub: health::ScrubHealth::not_applicable(),
+            members: Vec::new(),
+        };
+        let live = live_totals(&[
+            target("up", true, true, 100),
+            target("down", false, false, 0),
+            target("unread", true, false, 0),
+            target("zero", true, true, 0),
+        ]);
+        assert_eq!(
+            live,
+            std::collections::BTreeMap::from([("up".to_string(), 100)])
+        );
     }
 
     #[test]
