@@ -54,8 +54,12 @@ Eta etaAt(const QVector<Reading> &series, int index)
         eta.kind = EtaKind::Full;
         return eta;
     }
-    if (!(eta.bytesPerDay > 0)) {
-        eta.kind = EtaKind::NotGrowing;
+    if (eta.bytesPerDay < 0) {
+        eta.kind = EtaKind::Shrinking;
+        return eta;
+    }
+    if (!(eta.bytesPerDay > 0)) { // zero, or no trend at all
+        eta.kind = EtaKind::Flat;
         return eta;
     }
     const double daysLeft = static_cast<double>(*row.total - row.used) / eta.bytesPerDay;
@@ -186,6 +190,9 @@ Axis niceAxis(double lo, double hi, int maxTicks)
 
 QString dateFormatFor(qint64 spanMs)
 {
+    // A gap between two ticks under a day puts two labels on one day.
+    if (spanMs < static_cast<qint64>(kDateTicks - 1) * kDayMs)
+        return QStringLiteral("MM-dd HH:mm");
     return spanMs <= 120 * kDayMs ? QStringLiteral("MM-dd") : QStringLiteral("yyyy-MM");
 }
 

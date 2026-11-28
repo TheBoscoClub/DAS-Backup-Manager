@@ -28,7 +28,8 @@ enum class EtaKind {
     BeyondTenYears,   // growing, but more than ten years from full
     NotEnoughHistory, // fewer than two days of readings in the window
     CapacityUnknown,  // the row has no capacity
-    NotGrowing,       // the window's trend is flat or shrinking
+    Flat,             // the window's trend is flat
+    Shrinking,        // the window's trend is falling: `bytesPerDay` < 0
     Full,             // used is already at or past the capacity
 };
 
@@ -98,8 +99,12 @@ struct Axis {
 };
 [[nodiscard]] Axis niceAxis(double lo, double hi, int maxTicks = 6);
 
-// The date-axis label format for a span: day and month up to ~four months,
-// year and month beyond.
+// Ticks on the date axis: the chart sets this many, and dateFormatFor knows
+// two labels fall on one day once a gap between them is under a day.
+inline constexpr int kDateTicks = 7;
+
+// The date-axis label format for a span: day, month and time while two ticks
+// could fall on one day, day and month up to ~four months, year and month beyond.
 [[nodiscard]] QString dateFormatFor(qint64 spanMs);
 
 } // namespace GrowthMath

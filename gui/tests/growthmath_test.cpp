@@ -73,8 +73,12 @@ private Q_SLOTS:
     {
         QCOMPARE(etaAt(daily(1, 100, 10, 1000), 0).kind, EtaKind::NotEnoughHistory);
         QCOMPARE(etaAt(daily(10, 100, 10, 0), 9).kind, EtaKind::CapacityUnknown);
-        QCOMPARE(etaAt(daily(10, 100, 0, 1000), 9).kind, EtaKind::NotGrowing);
-        QCOMPARE(etaAt(daily(10, 500, -10, 1000), 9).kind, EtaKind::NotGrowing);
+        QCOMPARE(etaAt(daily(10, 100, 0, 1000), 9).kind, EtaKind::Flat);
+        // Shrinking is said as such, with its rate (operator 2026-11-27: the
+        // targets lost 39 GiB a day while the row read "not growing").
+        const Eta shrinking = etaAt(daily(10, 500, -10, 1000), 9);
+        QCOMPARE(shrinking.kind, EtaKind::Shrinking);
+        QVERIFY(shrinking.bytesPerDay < 0);
         QCOMPARE(etaAt(daily(10, 1000, 10, 1000), 9).kind, EtaKind::Full);
         // 1 GiB a day with 9000 GiB left: past ten years.
         QCOMPARE(etaAt(daily(10, 100, 1, 10000), 9).kind, EtaKind::BeyondTenYears);
@@ -164,6 +168,10 @@ private Q_SLOTS:
 
     void dateLabelsFollowTheSpan()
     {
+        // Zoomed in until two ticks fall on one day, the labels carry the
+        // time, so no two read the same (operator 2026-11-27: 10-12, 10-12, 10-13).
+        QCOMPARE(dateFormatFor(2 * kDayMs), QStringLiteral("MM-dd HH:mm"));
+        QCOMPARE(dateFormatFor((kDateTicks - 1) * kDayMs), QStringLiteral("MM-dd"));
         QCOMPARE(dateFormatFor(30 * kDayMs), QStringLiteral("MM-dd"));
         QCOMPARE(dateFormatFor(90 * kDayMs), QStringLiteral("MM-dd"));
         QCOMPARE(dateFormatFor(365 * kDayMs), QStringLiteral("yyyy-MM"));

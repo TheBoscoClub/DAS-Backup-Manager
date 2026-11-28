@@ -841,7 +841,7 @@ void HealthDashboard::renderGrowth()
     if (!axisX) {
         axisX = new QDateTimeAxis();
         axisX->setTitleText(i18n("Date"));
-        axisX->setTickCount(7);
+        axisX->setTickCount(GrowthMath::kDateTicks);
         chart->addAxis(axisX, Qt::AlignBottom);
     }
     if (!axisY) {
@@ -923,10 +923,17 @@ void HealthDashboard::renderGrowth()
                 etaItem->setToolTip(i18n("No capacity is known for this reading, so there is nothing "
                                          "to project to"));
                 break;
-            case GrowthMath::EtaKind::NotGrowing:
-                etaItem->setText(i18n("not growing"));
-                etaItem->setToolTip(i18n("No growth in %1", window));
+            case GrowthMath::EtaKind::Flat:
+                etaItem->setText(i18n("flat"));
+                etaItem->setToolTip(i18n("No change in %1", window));
                 break;
+            case GrowthMath::EtaKind::Shrinking: {
+                const QString loss = FileModel::formatSize(static_cast<qint64>(std::llround(-eta.bytesPerDay)));
+                etaItem->setText(i18n("shrinking (%1/day)", loss));
+                etaItem->setToolTip(i18n("Used fell by %1 a day over %2: no full-by date while it shrinks",
+                                         loss, window));
+                break;
+            }
             case GrowthMath::EtaKind::Full:
                 etaItem->setText(i18n("full"));
                 etaItem->setToolTip(i18n("Used is at or past the capacity"));
