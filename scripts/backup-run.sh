@@ -1,9 +1,11 @@
 #!/bin/bash
 # backup-run.sh - Run btrbk backup to DAS drives (config-driven)
-# Version: 4.28.0
+# Version: 4.28.1
 # Date: 2026-11-27
 #
 # Features:
+#   - A df that fails while record_growth reads a target costs that reading,
+#     never the run (v4.28.1, bd DAS-Backup-Manager-3gzs.15).
 #   - growth.log lines carry the target's capacity as a 4th field (v4.28.0, bd
 #     DAS-Backup-Manager-3gzs.15): `<ts> <mount> <used> <total>`; an unread
 #     capacity leaves three fields, never a 0, and a target whose used bytes
@@ -4405,9 +4407,11 @@ record_growth() {
     local mnt used total
     for mnt in "${ALL_TARGET_MOUNTS[@]}"; do
         if mountpoint -q "$mnt" 2>/dev/null; then
-            used=$(get_used_bytes "$mnt")
+            # A df that fails must cost the reading, never the run (set -e,
+            # pipefail): empty falls through to no line / three fields.
+            used=$(get_used_bytes "$mnt") || used=""
             [[ "$used" =~ ^[[:digit:]]+$ ]] || continue
-            total=$(get_total_bytes "$mnt")
+            total=$(get_total_bytes "$mnt") || total=""
             if [[ "$total" =~ ^[[:digit:]]+$ ]] && (( total > 0 )); then
                 echo "$ts $mnt $used $total" >> "$GROWTH_LOG"
             else
@@ -4884,7 +4888,7 @@ RESULT
   $overall_status  ($n_ops operations: $n_fail FAIL, $n_warn WARN, $((n_ops - n_fail - n_warn)) OK or not applicable)
 
 ===============================================================
-  backup-run.sh v4.28.0
+  backup-run.sh v4.28.1
   Next scheduled: $(next_scheduled)
 ===============================================================
 REPORT

@@ -68,7 +68,9 @@ rg_body="$(sed -n '/^record_growth() {/,/^}/p' "$SCRIPT")"
 eval "$rg_body"
 # The functions it calls, stubbed on their readings (never df on the host).
 mountpoint() { [[ "$2" != /mnt/absent ]]; }
+# shellcheck disable=SC2329 # called by the eval'd record_growth
 get_used_bytes() { case "$1" in /mnt/a) echo 1000 ;; /mnt/b) echo 2000 ;; /mnt/c) echo "" ;; esac; }
+# shellcheck disable=SC2329 # called by the eval'd record_growth
 get_total_bytes() { case "$1" in /mnt/a) echo 50000 ;; /mnt/b) echo "" ;; /mnt/c) echo 9 ;; esac; }
 GROWTH_LOG="$WORK/rg/growth.log"
 # shellcheck disable=SC2034 # read by the eval'd record_growth
@@ -90,6 +92,26 @@ fi
 # What record_growth wrote, compute_growth_stats reads.
 check "compute_growth_stats reads record_growth's line" \
     "$(compute_growth_stats /mnt/a 1000 7)" "unknown"
+
+# A df that FAILS (exit 1 through pipefail, as get_*_bytes do when df cannot
+# read the mount) costs that reading, never the nightly run: record_growth runs
+# under set -e here, as in backup-run.sh, and must reach its end.
+get_used_bytes() { case "$1" in /mnt/e) return 1 ;; *) echo 3000 ;; esac; }
+get_total_bytes() { case "$1" in /mnt/f) return 1 ;; *) echo 60000 ;; esac; }
+GROWTH_LOG="$WORK/rg/growth-fail.log"
+# Its own bash: set -e is ignored inside anything on the left of || (even when
+# set again there), so a subshell in this script could not show the abort.
+survived="$(bash -c "set -euo pipefail
+$(declare -f mountpoint get_used_bytes get_total_bytes record_growth)
+GROWTH_LOG='$GROWTH_LOG'; ALL_TARGET_MOUNTS=(/mnt/e /mnt/f)
+record_growth; echo survived" 2>/dev/null)" || true
+[[ -n "$survived" ]] || survived="aborted"
+check "a failing df read does not end the run" "$survived" "survived"
+if [[ "$(cat "$GROWTH_LOG" 2>/dev/null)" =~ ^${re_ts}\ /mnt/f\ 3000$ ]]; then
+    echo "ok   a failed used read writes no line, a failed capacity read three fields"
+else
+    echo "FAIL a failing df read: got '$(cat "$GROWTH_LOG" 2>/dev/null)'"; fails=$((fails + 1))
+fi
 
 if ((fails > 0)); then
     echo "test_growth_stats: $fails FAILED"
