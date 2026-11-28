@@ -53,6 +53,7 @@ target_sources(btrdasd-gui PRIVATE
     src/backupsteps.cpp
     src/statustext.cpp
     src/healthdashboard.cpp
+    src/growthmath.cpp
     src/recoverystatus.cpp
     src/recoverypanel.cpp
     src/configdialog.cpp
@@ -110,6 +111,7 @@ if(BUILD_TESTING)
         src/dbusclient.cpp
         src/filemodel.cpp
         src/healthdashboard.cpp
+        src/growthmath.cpp
         src/backuphistory.cpp
         src/backupsteps.cpp
         src/statustext.cpp
@@ -145,6 +147,14 @@ if(BUILD_TESTING)
         KF6::ColorScheme
     )
     add_test(NAME gui-smoketest COMMAND gui-smoketest)
+    # The Growth tab's arithmetic, without a widget (bd DAS-Backup-Manager-3gzs.15):
+    # each row's full-by projection and free space, retired series, colours,
+    # the date ranges, zoom, pan and the value axis.
+    add_executable(gui-growthmath tests/growthmath_test.cpp src/growthmath.cpp)
+    target_compile_features(gui-growthmath PRIVATE cxx_std_20)
+    target_compile_options(gui-growthmath PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(gui-growthmath PRIVATE Qt6::Test Qt6::Core Qt6::Gui)
+    add_test(NAME gui-growthmath COMMAND gui-growthmath)
     # Every KNotification event id has an [Event/<id>] group in the notifyrc.
     add_test(NAME gui-notifyrc
         COMMAND ${CMAKE_COMMAND} -DGUI_DIR=${CMAKE_CURRENT_SOURCE_DIR}

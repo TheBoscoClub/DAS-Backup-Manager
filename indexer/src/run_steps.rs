@@ -144,12 +144,23 @@ pub fn throughput_line(ts: &str, elapsed_s: u64, bytes: u64, link: &str) -> Opti
     ))
 }
 
-/// `growth.log` lines: `<ts> <mount> <used bytes>` for each target with a
-/// reading; a target with none gets no line, never a 0.
-pub fn growth_lines(ts: &str, readings: &[(String, Option<u64>)]) -> Vec<String> {
+/// One target's `growth.log` reading: its mount, the bytes in use and its
+/// capacity, each `None` when it could not be read.
+pub type GrowthReading = (String, Option<u64>, Option<u64>);
+
+/// `growth.log` lines: `<ts> <mount> <used bytes> <total bytes>` for each
+/// target with a reading; a target with none gets no line, never a 0. A
+/// capacity that could not be read, or read as 0, leaves the line at three
+/// fields, never a 0 that reads as a full disk (bd DAS-Backup-Manager-3gzs.15).
+pub fn growth_lines(ts: &str, readings: &[GrowthReading]) -> Vec<String> {
     readings
         .iter()
-        .filter_map(|(mount, used)| used.map(|u| format!("{ts} {mount} {u}")))
+        .filter_map(|(mount, used, total)| {
+            used.map(|u| match total.filter(|&t| t > 0) {
+                Some(t) => format!("{ts} {mount} {u} {t}"),
+                None => format!("{ts} {mount} {u}"),
+            })
+        })
         .collect()
 }
 
@@ -486,16 +497,19 @@ mod tests {
         let lines = growth_lines(
             "2026-11-10T03:00:00",
             &[
-                ("/mnt/a".into(), Some(123)),
-                ("/mnt/b".into(), None),
-                ("/mnt/c".into(), Some(0)),
+                ("/mnt/a".into(), Some(123), Some(1000)),
+                ("/mnt/b".into(), None, Some(1000)),
+                ("/mnt/c".into(), Some(0), None),
+                ("/mnt/d".into(), Some(7), Some(0)),
             ],
         );
         assert_eq!(
             lines,
             vec![
-                "2026-11-10T03:00:00 /mnt/a 123".to_string(),
-                "2026-11-10T03:00:00 /mnt/c 0".to_string()
+                "2026-11-10T03:00:00 /mnt/a 123 1000".to_string(),
+                "2026-11-10T03:00:00 /mnt/c 0".to_string(),
+                // A capacity of 0 is no reading: three fields, never a 0.
+                "2026-11-10T03:00:00 /mnt/d 7".to_string(),
             ]
         );
     }
